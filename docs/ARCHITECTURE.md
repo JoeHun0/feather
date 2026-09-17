@@ -601,3 +601,67 @@ skinning; animation state machines; local reflection probes / irradiance
 volumes; audio occlusion + reverb zones; TAA; streaming + stage pipelining;
 X-Ray (`.ogf`/level) importer for the SoC-rebuild stretch dream (becomes just
 another importer feeding the same bake).
+
+## 26. Implementation status
+
+Snapshot of what's actually built vs. the design above. The design sections are
+unchanged targets; this records reality so the doc doesn't drift. Update as
+milestones land.
+
+### Done (milestones 0–2 + basic lighting)
+
+- **Workspace/toolchain**: 6 crates, `rust-toolchain.toml` (stable), GLSL→SPIR-V
+  at build time via `shaderc` in `render/build.rs`, embedded from `OUT_DIR`.
+- **Deps in use**: ash 0.38, ash-window 0.13, raw-window-handle 0.6, winit 0.30,
+  vk-mem 0.4, glam 0.29, bevy_ecs 0.16, serde 1. Not yet added: rapier, kira,
+  egui, tracy.
+- **gfx**: instance/debug messenger/surface/device/queues; VK 1.3 **dynamic
+  rendering** (feature enabled); swapchain + image views + resize; **depth**
+  (D32_SFLOAT) created with the swapchain; **vk-mem** allocator held as
+  `Arc<Allocator>`; RAII `Buffer`/`Image`/`MappedBuffer` (self-freeing);
+  device-local staging upload (`create_device_local_buffer`) and persistently-
+  mapped host buffers (`create_host_visible_buffer`); per-frame command buffers;
+  sync with per-image `render_finished`; `wait_idle` + ordered teardown
+  (resources → allocator → device). `FRAMES_IN_FLIGHT = 2`.
+- **render**: instanced `MeshRenderer` — generated UV sphere (pos+normal Vertex),
+  per-frame instance **SSBO** `InstanceData { model, color }` (std430, 80 B) with
+  one descriptor set per frame-in-flight, `view_proj` + `light_dir` in a push
+  constant, ambient + Lambert **directional light**, `cull NONE` + depth. One
+  `cmd_draw_indexed`, `instanceCount` = live entity count (verified to 8000).
+- **app**: winit loop; bevy_ecs world + multi-threaded schedule (`integrate`,
+  `tick`); render-rate **fly camera** (WASD/mouse/Esc, pointer locked); inline
+  **extract** (`World` query → `Vec<InstanceData>` each frame).
+- **Build order (§23)**: step 1 done; step 2 done; step 3 only partially — basic
+  directional lighting, *not* CSM/GTAO/IBL. Steps 4+ not started.
+
+### Current simplifications to revisit
+
+- **Extract seam (§4)**: extract is inline in `app`, writing straight to the
+  instance SSBO each frame. No double-buffered `RenderFrame` struct yet; stages
+  run sequentially (stage pipelining deferred by design).
+- **Timestep (§4)**: sim runs once per frame with a hardcoded `dt = 1/60`. No
+  accumulator and **no interpolation** yet — needed before physics. Camera is
+  already render-rate (matches design).
+- **Descriptors (§9)**: only one set type exists (per-frame instance SSBO), as
+  N discrete per-frame sets+buffers. Not yet the Set 0 (resident/bindless) /
+  Set 1 (per-frame ring + dynamic offsets) / Set 2 (per-view) scheme; **no
+  bindless**.
+- **Push constants**: currently carry `view_proj` + `light_dir` (provisional).
+  Design reserves push constants for tiny per-draw scalars and puts camera in a
+  per-frame UBO — revisit when Set 1 lands.
+- **Vertex layout (§6)**: pos+normal only; tangent/uv deferred until textures.
+  Per-instance `color` stands in for the eventual `material_id`.
+- **Lighting (§3, §13)**: provisional gamma-space ambient+Lambert. This is
+  **not** the baseline (PBR + linear-space + HDR + tonemapping + IBL); colours
+  read washed out because shading is gamma-space into an sRGB swapchain. The
+  linear/HDR/tonemap pipeline is the intended next lighting milestone.
+- **Geometry**: hardcoded generated sphere; the `assets` crate is still a stub —
+  no glTF import, bake tool, runtime blob, or load-time allocator yet.
+
+### Not yet started
+
+Culling; materials/bindless + textures; shadows (CSM); clustered lighting; IBL;
+post/HDR/tonemap; transparents; asset bake pipeline + glTF loader; scene format /
+spawning / save; physics + FPS controller (rapier); skinning; UI/HUD; audio;
+debug/profiling tooling (Tracy/RenderDoc/timestamp queries); GPU-driven culling;
+streaming; stage pipelining.
