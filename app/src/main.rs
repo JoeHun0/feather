@@ -1,10 +1,11 @@
-//! Milestone 0: a window that presents a cleared swapchain, driven by a
+//! Milestone: a window presenting a triangle via dynamic rendering, driven by a
 //! multi-threaded bevy_ecs schedule that ticks once per frame.
 
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::ExecutorKind;
 use feather_gfx::Renderer;
 use feather_platform::winit;
+use feather_render::TrianglePipeline;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -21,9 +22,6 @@ struct Velocity(glam::Vec3);
 #[derive(Resource, Default)]
 struct FrameCount(u64);
 
-// integrate (writes Position, reads Velocity) and tick (writes FrameCount) touch
-// disjoint data, so the multi-threaded executor may run them on different threads
-// in the same frame.
 fn integrate(mut q: Query<(&mut Position, &Velocity)>) {
     let dt = 1.0 / 60.0;
     for (mut pos, vel) in &mut q {
@@ -38,8 +36,11 @@ fn tick(mut frame: ResMut<FrameCount>) {
 // ---- App ----
 
 struct App {
-    // Declared before `window`: fields drop top-to-bottom, so the renderer (and
-    // its VkSurfaceKHR) is torn down before the window it targets.
+    // Drop order (fields drop top-to-bottom):
+    //   pipeline -> before the device is destroyed (its Drop calls into it)
+    //   renderer -> destroys device + surface, before the window
+    //   window   -> last
+    pipeline: Option<TrianglePipeline>,
     renderer: Option<Renderer>,
     window: Option<Window>,
     world: World,
@@ -62,6 +63,7 @@ impl App {
         schedule.add_systems((integrate, tick));
 
         Self {
+            pipeline: None,
             renderer: None,
             window: None,
             world,
@@ -76,11 +78,16 @@ impl ApplicationHandler for App {
             return;
         }
         let window = event_loop
-            .create_window(feather_platform::window_attributes("feather — milestone 0"))
+            .create_window(feather_platform::window_attributes("feather — triangle"))
             .expect("create window");
         let size = window.inner_size();
-        self.renderer =
-            Some(Renderer::new(&window, size.width, size.height).expect("create renderer"));
+        let renderer =
+            Renderer::new(&window, size.width, size.height).expect("create renderer");
+        let device = renderer.device();
+        let pipeline = TrianglePipeline::new(&device, renderer.color_format());
+
+        self.pipeline = Some(pipeline);
+        self.renderer = Some(renderer);
         self.window = Some(window);
     }
 
@@ -94,8 +101,8 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.schedule.run(&mut self.world);
-                if let Some(r) = &mut self.renderer {
-                    r.draw_frame();
+                if let (Some(r), Some(p)) = (self.renderer.as_mut(), self.pipeline.as_ref()) {
+                    r.draw_frame(|cmd, extent| p.draw(cmd, extent));
                 }
             }
             _ => {}
