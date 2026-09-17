@@ -15,7 +15,7 @@ use ash::{vk, Device, Entry, Instance};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use vk_mem::Alloc; // brings create_buffer/create_image into scope
 
-const MAX_FRAMES_IN_FLIGHT: usize = 2;
+pub const FRAMES_IN_FLIGHT: usize = 2;
 const VALIDATION: bool = cfg!(debug_assertions);
 const CLEAR_COLOR: [f32; 4] = [0.02, 0.02, 0.05, 1.0];
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
@@ -29,6 +29,29 @@ pub struct Buffer {
 }
 
 impl Drop for Buffer {
+    fn drop(&mut self) {
+        unsafe { self.allocator.destroy_buffer(self.handle, &mut self.allocation) };
+    }
+}
+
+/// A persistently-mapped host-visible buffer for per-frame data (SSBO/UBO).
+pub struct MappedBuffer {
+    allocator: Arc<vk_mem::Allocator>,
+    allocation: vk_mem::Allocation,
+    ptr: *mut u8,
+    pub handle: vk::Buffer,
+    pub size: vk::DeviceSize,
+}
+
+impl MappedBuffer {
+    /// Copy `data` into the mapped buffer (clamped to its size). Host-coherent.
+    pub fn write(&mut self, data: &[u8]) {
+        let n = data.len().min(self.size as usize);
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr, n) };
+    }
+}
+
+impl Drop for MappedBuffer {
     fn drop(&mut self) {
         unsafe { self.allocator.destroy_buffer(self.handle, &mut self.allocation) };
     }
@@ -198,15 +221,15 @@ impl Renderer {
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(command_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(MAX_FRAMES_IN_FLIGHT as u32),
+                    .command_buffer_count(FRAMES_IN_FLIGHT as u32),
             )?
         };
 
         let sem = vk::SemaphoreCreateInfo::default();
         let fence = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-        let mut image_available = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
-        let mut in_flight = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
-        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+        let mut image_available = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        let mut in_flight = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for _ in 0..FRAMES_IN_FLIGHT {
             image_available.push(unsafe { device.create_semaphore(&sem, None)? });
             in_flight.push(unsafe { device.create_fence(&fence, None)? });
         }
@@ -312,6 +335,35 @@ impl Renderer {
         }
     }
 
+    /// A persistently-mapped host-visible buffer, e.g. for per-frame SSBO data.
+    pub fn create_host_visible_buffer(
+        &self,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+    ) -> MappedBuffer {
+        let allocator = self.allocator();
+        let ci = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let ai = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferHost,
+            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                | vk_mem::AllocationCreateFlags::MAPPED,
+            ..Default::default()
+        };
+        let (handle, allocation) =
+            unsafe { allocator.create_buffer(&ci, &ai).expect("host-visible buffer") };
+        let ptr = allocator.get_allocation_info(&allocation).mapped_data as *mut u8;
+        MappedBuffer {
+            allocator: allocator.clone(),
+            allocation,
+            ptr,
+            handle,
+            size,
+        }
+    }
+
     fn one_time_submit(&self, record: impl FnOnce(vk::CommandBuffer)) {
         unsafe {
             let cmd = self
@@ -351,7 +403,7 @@ impl Renderer {
         self.recreate_swapchain();
     }
 
-    pub fn draw_frame(&mut self, record: impl FnOnce(vk::CommandBuffer, vk::Extent2D)) {
+    pub fn draw_frame(&mut self, record: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize)) {
         if self.window_extent.width == 0 || self.window_extent.height == 0 {
             return;
         }
@@ -486,7 +538,7 @@ impl Renderer {
                 .depth_attachment(&depth_attachment);
 
             dev.cmd_begin_rendering(cmd, &rendering_info);
-            record(cmd, extent);
+            record(cmd, extent, frame);
             dev.cmd_end_rendering(cmd);
 
             let to_present = vk::ImageMemoryBarrier::default()
@@ -535,7 +587,7 @@ impl Renderer {
             }
         }
 
-        self.current_frame = (frame + 1) % MAX_FRAMES_IN_FLIGHT;
+        self.current_frame = (frame + 1) % FRAMES_IN_FLIGHT;
     }
 
     fn recreate_swapchain(&mut self) {
