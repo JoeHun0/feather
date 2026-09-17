@@ -1,0 +1,6 @@
+# Repo root. Ensures your machine and CI use the same toolchain + components.
+# Swap "stable" for a pinned version (e.g. "1.83.0") if you want fully
+# reproducible builds; "stable" tracks the latest and is fine solo.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
