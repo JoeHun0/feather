@@ -1,27 +1,27 @@
-//! Minimal triangle pipeline: no vertex buffer (positions/colors baked into the
-//! vertex shader via gl_VertexIndex), dynamic viewport/scissor, dynamic
-//! rendering (no render pass object). This is the first real graphics pipeline
-//! and exercises the build-time GLSL->SPIR-V path.
+//! Cube pipeline: geometry baked into the vertex shader (no vertex buffer yet),
+//! MVP delivered via a push constant, backface culling so a convex cube renders
+//! correctly without a depth buffer. Real vertex/index buffers (vk-mem) and a
+//! depth attachment come with the first loaded mesh.
 
 use ash::vk;
+use glam::Mat4;
 
-/// Embed a compiled SPIR-V blob from OUT_DIR (produced by build.rs).
 macro_rules! spv {
     ($name:expr) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"))
     };
 }
 
-pub struct TrianglePipeline {
-    device: ash::Device, // cheap clone of the handle; used in Drop
+pub struct CubePipeline {
+    device: ash::Device,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
 }
 
-impl TrianglePipeline {
+impl CubePipeline {
     pub fn new(device: &ash::Device, color_format: vk::Format) -> Self {
-        let vert = load_shader(device, spv!("triangle.vert"));
-        let frag = load_shader(device, spv!("triangle.frag"));
+        let vert = load_shader(device, spv!("cube.vert"));
+        let frag = load_shader(device, spv!("cube.frag"));
 
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
@@ -38,7 +38,6 @@ impl TrianglePipeline {
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
 
-        // Viewport/scissor are dynamic, so the pipeline survives window resizes.
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
             .scissor_count(1);
@@ -46,10 +45,12 @@ impl TrianglePipeline {
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
 
+        // Y is flipped in the projection (Vulkan clip space), which reverses the
+        // apparent winding, so outward CCW-in-world faces become CW on screen.
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
             .line_width(1.0);
 
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
@@ -61,14 +62,19 @@ impl TrianglePipeline {
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
 
+        let push_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(64)]; // one mat4
         let layout = unsafe {
             device
-                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_ranges),
+                    None,
+                )
                 .expect("create pipeline layout")
         };
 
-        // Dynamic rendering: declare the color attachment format here instead of
-        // using a VkRenderPass.
         let color_formats = [color_format];
         let mut rendering =
             vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
@@ -92,7 +98,6 @@ impl TrianglePipeline {
                 .expect("create graphics pipeline")[0]
         };
 
-        // Shader modules can go once the pipeline is built.
         unsafe {
             device.destroy_shader_module(vert, None);
             device.destroy_shader_module(frag, None);
@@ -105,10 +110,19 @@ impl TrianglePipeline {
         }
     }
 
-    /// Record the draw. Called inside an active dynamic-rendering scope that the
-    /// caller (gfx) has already begun for this frame's swapchain image.
-    pub fn draw(&self, cmd: vk::CommandBuffer, extent: vk::Extent2D) {
+    /// Record the cube draw inside the caller's active dynamic-rendering scope.
+    pub fn draw(&self, cmd: vk::CommandBuffer, extent: vk::Extent2D, mvp: Mat4) {
+        let cols = mvp.to_cols_array(); // column-major, matches GLSL mat4
+        let bytes =
+            unsafe { std::slice::from_raw_parts(cols.as_ptr() as *const u8, 64) };
         unsafe {
+            self.device.cmd_push_constants(
+                cmd,
+                self.layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                bytes,
+            );
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
 
@@ -126,12 +140,12 @@ impl TrianglePipeline {
             };
             self.device.cmd_set_viewport(cmd, 0, &[viewport]);
             self.device.cmd_set_scissor(cmd, 0, &[scissor]);
-            self.device.cmd_draw(cmd, 3, 1, 0, 0);
+            self.device.cmd_draw(cmd, 36, 1, 0, 0);
         }
     }
 }
 
-impl Drop for TrianglePipeline {
+impl Drop for CubePipeline {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
@@ -141,8 +155,7 @@ impl Drop for TrianglePipeline {
 }
 
 fn load_shader(device: &ash::Device, bytes: &[u8]) -> vk::ShaderModule {
-    let code =
-        ash::util::read_spv(&mut std::io::Cursor::new(bytes)).expect("read SPIR-V");
+    let code = ash::util::read_spv(&mut std::io::Cursor::new(bytes)).expect("read SPIR-V");
     let info = vk::ShaderModuleCreateInfo::default().code(&code);
     unsafe {
         device
