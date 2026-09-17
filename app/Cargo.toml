@@ -14,3 +14,5 @@ feather-gfx.workspace = true
 feather-render.workspace = true
 feather-assets.workspace = true
 feather-game.workspace = true
+bevy_ecs.workspace = true
+glam.workspace = true
