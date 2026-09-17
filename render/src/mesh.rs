@@ -1,13 +1,12 @@
-//! Instanced cube renderer. One shared cube mesh (vertex + index buffer) drawn
-//! N times in a single `cmd_draw_indexed`, with per-instance model matrices read
-//! from a storage buffer indexed by `gl_InstanceIndex`. The view-projection is a
-//! push constant. Instance data lives in per-frame-in-flight mapped buffers, each
-//! with its own descriptor set, so writing this frame's data never races the GPU
-//! reading the previous frame's.
+//! Instanced, lit mesh renderer. A single mesh (here a generated UV sphere with
+//! normals) drawn N times in one `cmd_draw_indexed`. Per-instance data is
+//! `{ model, color }` from a storage buffer; a directional light is applied in
+//! the fragment shader. Geometry is generalized enough that a loaded glTF mesh
+//! will drop straight in (same Vertex + index buffers).
 
 use ash::vk;
 use feather_gfx::{Buffer, MappedBuffer, Renderer, FRAMES_IN_FLIGHT};
-use glam::Mat4;
+use glam::{Mat4, Vec4};
 
 macro_rules! spv {
     ($name:expr) => {
@@ -19,49 +18,18 @@ macro_rules! spv {
 #[derive(Clone, Copy)]
 struct Vertex {
     pos: [f32; 3],
-    color: [f32; 3],
+    normal: [f32; 3],
 }
 
-const RED: [f32; 3] = [1.0, 0.0, 0.0];
-const GREEN: [f32; 3] = [0.0, 1.0, 0.0];
-const BLUE: [f32; 3] = [0.0, 0.0, 1.0];
-const YELLOW: [f32; 3] = [1.0, 1.0, 0.0];
-const CYAN: [f32; 3] = [0.0, 1.0, 1.0];
-const MAGENTA: [f32; 3] = [1.0, 0.0, 1.0];
+/// Per-instance data uploaded to the storage buffer (std430: 80 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InstanceData {
+    pub model: Mat4,
+    pub color: Vec4,
+}
 
-#[rustfmt::skip]
-const VERTICES: [Vertex; 24] = [
-    // +X (red)
-    Vertex { pos: [ 0.5,-0.5,-0.5], color: RED }, Vertex { pos: [ 0.5, 0.5,-0.5], color: RED },
-    Vertex { pos: [ 0.5, 0.5, 0.5], color: RED }, Vertex { pos: [ 0.5,-0.5, 0.5], color: RED },
-    // -X (green)
-    Vertex { pos: [-0.5,-0.5,-0.5], color: GREEN }, Vertex { pos: [-0.5,-0.5, 0.5], color: GREEN },
-    Vertex { pos: [-0.5, 0.5, 0.5], color: GREEN }, Vertex { pos: [-0.5, 0.5,-0.5], color: GREEN },
-    // +Y (blue)
-    Vertex { pos: [-0.5, 0.5,-0.5], color: BLUE }, Vertex { pos: [-0.5, 0.5, 0.5], color: BLUE },
-    Vertex { pos: [ 0.5, 0.5, 0.5], color: BLUE }, Vertex { pos: [ 0.5, 0.5,-0.5], color: BLUE },
-    // -Y (yellow)
-    Vertex { pos: [-0.5,-0.5,-0.5], color: YELLOW }, Vertex { pos: [ 0.5,-0.5,-0.5], color: YELLOW },
-    Vertex { pos: [ 0.5,-0.5, 0.5], color: YELLOW }, Vertex { pos: [-0.5,-0.5, 0.5], color: YELLOW },
-    // +Z (cyan)
-    Vertex { pos: [-0.5,-0.5, 0.5], color: CYAN }, Vertex { pos: [ 0.5,-0.5, 0.5], color: CYAN },
-    Vertex { pos: [ 0.5, 0.5, 0.5], color: CYAN }, Vertex { pos: [-0.5, 0.5, 0.5], color: CYAN },
-    // -Z (magenta)
-    Vertex { pos: [-0.5,-0.5,-0.5], color: MAGENTA }, Vertex { pos: [-0.5, 0.5,-0.5], color: MAGENTA },
-    Vertex { pos: [ 0.5, 0.5,-0.5], color: MAGENTA }, Vertex { pos: [ 0.5,-0.5,-0.5], color: MAGENTA },
-];
-
-#[rustfmt::skip]
-const INDICES: [u16; 36] = [
-     0, 1, 2,  0, 2, 3,
-     4, 5, 6,  4, 6, 7,
-     8, 9,10,  8,10,11,
-    12,13,14, 12,14,15,
-    16,17,18, 16,18,19,
-    20,21,22, 20,22,23,
-];
-
-const MAT4_SIZE: u64 = std::mem::size_of::<Mat4>() as u64; // 64
+const INSTANCE_SIZE: u64 = std::mem::size_of::<InstanceData>() as u64; // 80
 
 fn as_bytes<T>(slice: &[T]) -> &[u8] {
     unsafe {
@@ -69,32 +37,67 @@ fn as_bytes<T>(slice: &[T]) -> &[u8] {
     }
 }
 
-pub struct CubeRenderer {
+fn generate_sphere(stacks: u32, slices: u32, radius: f32) -> (Vec<Vertex>, Vec<u16>) {
+    let mut verts = Vec::with_capacity(((stacks + 1) * (slices + 1)) as usize);
+    for i in 0..=stacks {
+        let phi = std::f32::consts::PI * i as f32 / stacks as f32; // 0..pi
+        let (sp, cp) = phi.sin_cos();
+        for j in 0..=slices {
+            let theta = std::f32::consts::TAU * j as f32 / slices as f32; // 0..2pi
+            let (st, ct) = theta.sin_cos();
+            let n = [sp * ct, cp, sp * st];
+            verts.push(Vertex {
+                pos: [n[0] * radius, n[1] * radius, n[2] * radius],
+                normal: n,
+            });
+        }
+    }
+    let mut idx = Vec::with_capacity((stacks * slices * 6) as usize);
+    let stride = slices + 1;
+    for i in 0..stacks {
+        for j in 0..slices {
+            let a = i * stride + j;
+            let b = a + stride;
+            // Winding is irrelevant: the pipeline uses cull NONE + depth test,
+            // which renders a closed convex mesh correctly regardless.
+            idx.extend_from_slice(&[
+                a as u16, (a + 1) as u16, b as u16,
+                (a + 1) as u16, (b + 1) as u16, b as u16,
+            ]);
+        }
+    }
+    (verts, idx)
+}
+
+pub struct MeshRenderer {
     device: ash::Device,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     set_layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
-    sets: Vec<vk::DescriptorSet>,        // one per frame-in-flight
-    instance_buffers: Vec<MappedBuffer>, // one per frame-in-flight
+    sets: Vec<vk::DescriptorSet>,
+    instance_buffers: Vec<MappedBuffer>,
     vertex_buffer: Buffer,
     index_buffer: Buffer,
+    index_count: u32,
     max_instances: u32,
 }
 
-impl CubeRenderer {
+impl MeshRenderer {
     pub fn new(renderer: &Renderer, max_instances: u32) -> Self {
         let device = renderer.device();
 
+        let (vertices, indices) = generate_sphere(16, 24, 0.5);
+        let index_count = indices.len() as u32;
         let vertex_buffer = renderer
-            .create_device_local_buffer(as_bytes(&VERTICES), vk::BufferUsageFlags::VERTEX_BUFFER);
+            .create_device_local_buffer(as_bytes(&vertices), vk::BufferUsageFlags::VERTEX_BUFFER);
         let index_buffer = renderer
-            .create_device_local_buffer(as_bytes(&INDICES), vk::BufferUsageFlags::INDEX_BUFFER);
+            .create_device_local_buffer(as_bytes(&indices), vk::BufferUsageFlags::INDEX_BUFFER);
 
         let instance_buffers: Vec<MappedBuffer> = (0..FRAMES_IN_FLIGHT)
             .map(|_| {
                 renderer.create_host_visible_buffer(
-                    max_instances as u64 * MAT4_SIZE,
+                    max_instances as u64 * INSTANCE_SIZE,
                     vk::BufferUsageFlags::STORAGE_BUFFER,
                 )
             })
@@ -138,7 +141,6 @@ impl CubeRenderer {
                 )
                 .expect("allocate descriptor sets")
         };
-
         for (i, &set) in sets.iter().enumerate() {
             let info = [vk::DescriptorBufferInfo::default()
                 .buffer(instance_buffers[i].handle)
@@ -152,8 +154,8 @@ impl CubeRenderer {
             unsafe { device.update_descriptor_sets(&[write], &[]) };
         }
 
-        let vert = load_shader(&device, spv!("cube.vert"));
-        let frag = load_shader(&device, spv!("cube.frag"));
+        let vert = load_shader(&device, spv!("mesh.vert"));
+        let frag = load_shader(&device, spv!("mesh.frag"));
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -179,7 +181,7 @@ impl CubeRenderer {
                 .location(1)
                 .binding(0)
                 .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(12),
+                .offset(12), // after pos
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vbindings)
@@ -195,7 +197,7 @@ impl CubeRenderer {
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::BACK)
+            .cull_mode(vk::CullModeFlags::NONE)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
@@ -212,9 +214,9 @@ impl CubeRenderer {
 
         let set_layouts = [set_layout];
         let push_ranges = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(64)];
+            .size(80)]; // mat4 view_proj + vec4 light_dir
         let layout = unsafe {
             device
                 .create_pipeline_layout(
@@ -265,31 +267,36 @@ impl CubeRenderer {
             instance_buffers,
             vertex_buffer,
             index_buffer,
+            index_count,
             max_instances,
         }
     }
 
-    /// Upload this frame's instance transforms and draw them all in one call.
     pub fn draw(
         &mut self,
         cmd: vk::CommandBuffer,
         extent: vk::Extent2D,
         frame: usize,
         view_proj: Mat4,
-        models: &[Mat4],
+        light_dir: Vec4,
+        instances: &[InstanceData],
     ) {
-        let count = (models.len() as u32).min(self.max_instances);
-        self.instance_buffers[frame].write(as_bytes(&models[..count as usize]));
+        let count = (instances.len() as u32).min(self.max_instances);
+        self.instance_buffers[frame].write(as_bytes(&instances[..count as usize]));
 
-        let cols = view_proj.to_cols_array();
-        let vp_bytes = unsafe { std::slice::from_raw_parts(cols.as_ptr() as *const u8, 64) };
+        // Push constant: mat4 view_proj (16 f32) + vec4 light_dir (4 f32) = 80 bytes.
+        let mut push = [0f32; 20];
+        push[..16].copy_from_slice(&view_proj.to_cols_array());
+        push[16..].copy_from_slice(&light_dir.to_array());
+        let push_bytes = unsafe { std::slice::from_raw_parts(push.as_ptr() as *const u8, 80) };
+
         unsafe {
             self.device.cmd_push_constants(
                 cmd,
                 self.layout,
-                vk::ShaderStageFlags::VERTEX,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
-                vp_bytes,
+                push_bytes,
             );
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
@@ -326,12 +333,12 @@ impl CubeRenderer {
                 vk::IndexType::UINT16,
             );
             self.device
-                .cmd_draw_indexed(cmd, INDICES.len() as u32, count, 0, 0, 0);
+                .cmd_draw_indexed(cmd, self.index_count, count, 0, 0, 0);
         }
     }
 }
 
-impl Drop for CubeRenderer {
+impl Drop for MeshRenderer {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);

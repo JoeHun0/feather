@@ -1,4 +1,4 @@
 //! Render: frame graph, passes, pipelines, the RenderFrame consumer.
 
-mod cube;
-pub use cube::CubeRenderer;
+mod mesh;
+pub use mesh::{InstanceData, MeshRenderer};

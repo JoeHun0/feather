@@ -1,7 +1,7 @@
-//! Milestone 2: a drifting field of ~1000 cubes, each a real ECS entity, drawn
-//! in a single instanced draw. The schedule integrates their positions; an
-//! extract step turns (Position, Spin) into per-instance model matrices that the
-//! renderer uploads to a storage buffer. WASD/mouse fly the camera; Esc quits.
+//! Milestone 2+: a drifting field of ~1000 lit, individually-colored spheres,
+//! each an ECS entity, drawn in one instanced draw. Per-instance data is
+//! { model, color }; a single directional light shades them. WASD/mouse fly the
+//! camera; Esc quits.
 
 use std::time::Instant;
 
@@ -9,16 +9,16 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::ExecutorKind;
 use feather_gfx::Renderer;
 use feather_platform::winit;
-use feather_render::CubeRenderer;
-use glam::{Mat4, Vec3};
+use feather_render::{InstanceData, MeshRenderer};
+use glam::{Mat4, Vec3, Vec4};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-const GRID: i32 = 10; // GRID^3 cubes
-const MAX_INSTANCES: u32 = 4096;
+const GRID: i32 = 10; // GRID^3 entities
+const MAX_INSTANCES: u32 = 8192;
 const BOUND: f32 = 9.0;
 
 // ---- ECS data ----
@@ -29,6 +29,8 @@ struct Position(Vec3);
 struct Velocity(Vec3);
 #[derive(Component)]
 struct Spin(f32);
+#[derive(Component)]
+struct Tint(Vec4);
 #[derive(Resource, Default)]
 struct FrameCount(u64);
 
@@ -102,13 +104,14 @@ struct Input {
 }
 
 struct App {
-    cube: Option<CubeRenderer>,
+    mesh: Option<MeshRenderer>,
     renderer: Option<Renderer>,
     window: Option<Window>,
     world: World,
     schedule: Schedule,
     camera: Camera,
     input: Input,
+    light_dir: Vec4,
     start: Instant,
     last_frame: Instant,
 }
@@ -129,16 +132,23 @@ impl App {
                 rand01(u * 3 + 2) - 0.5,
             ) * 1.5;
             let spin = (rand01(u * 7 + 11) - 0.5) * 3.0;
-            world.spawn((Position(pos), Velocity(vel), Spin(spin)));
+            let tint = Vec4::new(
+                0.35 + 0.65 * rand01(u * 13),
+                0.35 + 0.65 * rand01(u * 13 + 1),
+                0.35 + 0.65 * rand01(u * 13 + 2),
+                1.0,
+            );
+            world.spawn((Position(pos), Velocity(vel), Spin(spin), Tint(tint)));
         }
 
         let mut schedule = Schedule::default();
         schedule.set_executor_kind(ExecutorKind::MultiThreaded);
         schedule.add_systems((integrate, tick));
 
+        let light = Vec3::new(-0.4, -1.0, -0.3).normalize();
         let now = Instant::now();
         Self {
-            cube: None,
+            mesh: None,
             renderer: None,
             window: None,
             world,
@@ -149,6 +159,7 @@ impl App {
                 pitch: 0.0,
             },
             input: Input::default(),
+            light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             start: now,
             last_frame: now,
         }
@@ -169,7 +180,7 @@ impl ApplicationHandler for App {
             return;
         }
         let window = event_loop
-            .create_window(feather_platform::window_attributes("feather — instanced cubes"))
+            .create_window(feather_platform::window_attributes("feather — lit spheres"))
             .expect("create window");
         window
             .set_cursor_grab(CursorGrabMode::Locked)
@@ -179,9 +190,9 @@ impl ApplicationHandler for App {
 
         let size = window.inner_size();
         let renderer = Renderer::new(&window, size.width, size.height).expect("create renderer");
-        let cube = CubeRenderer::new(&renderer, MAX_INSTANCES);
+        let mesh = MeshRenderer::new(&renderer, MAX_INSTANCES);
 
-        self.cube = Some(cube);
+        self.mesh = Some(mesh);
         self.renderer = Some(renderer);
         self.window = Some(window);
     }
@@ -221,7 +232,6 @@ impl ApplicationHandler for App {
                 let dt = (now - self.last_frame).as_secs_f32();
                 self.last_frame = now;
 
-                // Look.
                 let sens = 0.0025;
                 self.camera.yaw += self.input.mouse_dx * sens;
                 self.camera.pitch =
@@ -229,7 +239,6 @@ impl ApplicationHandler for App {
                 self.input.mouse_dx = 0.0;
                 self.input.mouse_dy = 0.0;
 
-                // Move.
                 let fwd = self.camera.forward();
                 let right = fwd.cross(Vec3::Y).normalize();
                 let mut delta = Vec3::ZERO;
@@ -255,28 +264,31 @@ impl ApplicationHandler for App {
                     self.camera.pos += delta.normalize() * (12.0 * dt);
                 }
 
-                // Simulate.
                 self.schedule.run(&mut self.world);
 
-                // Extract: (Position, Spin) -> per-instance model matrices.
+                // Extract: (Position, Spin, Tint) -> per-instance { model, color }.
                 let t = (now - self.start).as_secs_f32();
-                let mut models: Vec<Mat4> = Vec::with_capacity((GRID * GRID * GRID) as usize);
-                let mut q = self.world.query::<(&Position, &Spin)>();
-                for (p, s) in q.iter(&self.world) {
-                    models.push(
-                        Mat4::from_translation(p.0)
-                            * Mat4::from_rotation_y(t * s.0)
-                            * Mat4::from_scale(Vec3::splat(0.3)),
-                    );
+                let mut instances: Vec<InstanceData> =
+                    Vec::with_capacity((GRID * GRID * GRID) as usize);
+                let mut q = self.world.query::<(&Position, &Spin, &Tint)>();
+                for (p, s, tint) in q.iter(&self.world) {
+                    let model = Mat4::from_translation(p.0)
+                        * Mat4::from_rotation_y(t * s.0)
+                        * Mat4::from_scale(Vec3::splat(0.6));
+                    instances.push(InstanceData {
+                        model,
+                        color: tint.0,
+                    });
                 }
 
                 let size = self.window.as_ref().unwrap().inner_size();
                 let aspect = size.width as f32 / size.height.max(1) as f32;
                 let view_proj = self.camera.view_proj(aspect);
+                let light_dir = self.light_dir;
 
-                if let (Some(r), Some(c)) = (self.renderer.as_mut(), self.cube.as_mut()) {
+                if let (Some(r), Some(m)) = (self.renderer.as_mut(), self.mesh.as_mut()) {
                     r.draw_frame(|cmd, extent, frame| {
-                        c.draw(cmd, extent, frame, view_proj, &models)
+                        m.draw(cmd, extent, frame, view_proj, light_dir, &instances)
                     });
                 }
             }
