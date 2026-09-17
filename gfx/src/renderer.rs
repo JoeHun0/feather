@@ -216,6 +216,13 @@ impl Renderer {
         self.surface_format.format
     }
 
+    /// Block until the GPU is idle. Call before tearing down GPU resources that
+    /// live outside the renderer (e.g. pipelines) so their destroy calls don't
+    /// race in-flight command buffers.
+    pub fn wait_idle(&self) {
+        unsafe { self.device.device_wait_idle().ok() };
+    }
+
     /// Call on the window's resize event.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.window_extent = vk::Extent2D { width, height };

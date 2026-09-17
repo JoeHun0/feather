@@ -72,6 +72,16 @@ impl App {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        // Drain the GPU before the field drops below destroy the pipeline etc.
+        // (Drop::drop runs first, then fields drop top-to-bottom.)
+        if let Some(r) = &self.renderer {
+            r.wait_idle();
+        }
+    }
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
