@@ -1,0 +1,12 @@
+[package]
+name = "feather-game"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+bevy_ecs.workspace = true
+glam.workspace = true
+feather-render.workspace = true
+feather-assets.workspace = true
+feather-platform.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "feather-gfx"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+ash.workspace = true
+ash-window.workspace = true
+vk-mem.workspace = true

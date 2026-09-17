@@ -1,0 +1,9 @@
+[package]
+name = "feather-assets"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true

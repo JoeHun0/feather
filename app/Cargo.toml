@@ -1,0 +1,16 @@
+[package]
+name = "feather-app"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "feather"
+path = "src/main.rs"
+
+[dependencies]
+feather-platform.workspace = true
+feather-gfx.workspace = true
+feather-render.workspace = true
+feather-assets.workspace = true
+feather-game.workspace = true

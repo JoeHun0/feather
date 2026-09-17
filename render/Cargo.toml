@@ -1,0 +1,13 @@
+[package]
+name = "feather-render"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+feather-gfx.workspace = true
+ash.workspace = true
+glam.workspace = true
+
+[build-dependencies]
+shaderc.workspace = true

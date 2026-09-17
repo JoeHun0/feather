@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["platform", "gfx", "render", "assets", "game", "app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+# external
+ash        = "0.38"
+ash-window = "0.13"
+winit      = "0.30"
+vk-mem     = "0.4"
+glam       = "0.29"
+bevy_ecs   = { version = "0.16", features = ["multi_threaded"] }
+serde      = { version = "1", features = ["derive"] }
+shaderc    = "0.8"
+# internal (path deps, referenced as `<crate>.workspace = true`)
+feather-platform = { path = "platform" }
+feather-gfx      = { path = "gfx" }
+feather-render   = { path = "render" }
+feather-assets   = { path = "assets" }
+feather-game     = { path = "game" }
