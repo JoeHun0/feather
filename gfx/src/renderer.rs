@@ -17,8 +17,12 @@ use vk_mem::Alloc; // brings create_buffer/create_image into scope
 
 pub const FRAMES_IN_FLIGHT: usize = 2;
 const VALIDATION: bool = cfg!(debug_assertions);
+// Linear-space clear for the HDR target (tonemap encodes to sRGB on output).
 const CLEAR_COLOR: [f32; 4] = [0.02, 0.02, 0.05, 1.0];
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+// Offscreen scene color. Geometry lights in linear space into this; the tonemap
+// pass reads it and writes the sRGB swapchain. RGBA16F gives HDR headroom.
+const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
 /// A GPU buffer that frees itself (and its allocation) on drop.
 pub struct Buffer {
@@ -98,6 +102,10 @@ pub struct Renderer {
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     depth: Option<Image>,
+    // Engine-owned offscreen HDR scene color (sized to the swapchain, recreated
+    // on resize). Geometry renders here; the tonemap pass samples it.
+    hdr: Option<Image>,
+    hdr_sampler: vk::Sampler,
     surface_format: vk::SurfaceFormatKHR,
     window_extent: vk::Extent2D,
 
@@ -207,6 +215,18 @@ impl Renderer {
             vk::SwapchainKHR::null(),
         )?;
         let depth = create_depth(&allocator, &device, sc.extent);
+        let hdr = create_hdr(&allocator, &device, sc.extent);
+        let hdr_sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )?
+        };
 
         let command_pool = unsafe {
             device.create_command_pool(
@@ -250,6 +270,8 @@ impl Renderer {
             images: sc.images,
             image_views: sc.image_views,
             depth: Some(depth),
+            hdr: Some(hdr),
+            hdr_sampler,
             surface_format: sc.format,
             window_extent: sc.extent,
             command_pool,
@@ -271,6 +293,22 @@ impl Renderer {
 
     pub fn depth_format(&self) -> vk::Format {
         DEPTH_FORMAT
+    }
+
+    /// Format of the offscreen HDR scene-color target (geometry render target).
+    pub fn hdr_format(&self) -> vk::Format {
+        HDR_FORMAT
+    }
+
+    /// View of the current HDR target. Changes on resize, so consumers that hold
+    /// a descriptor pointing at it must refresh when the handle changes.
+    pub fn hdr_view(&self) -> vk::ImageView {
+        self.hdr.as_ref().expect("hdr target alive").view
+    }
+
+    /// Shared sampler for reading the HDR target in the tonemap pass.
+    pub fn hdr_sampler(&self) -> vk::Sampler {
+        self.hdr_sampler
     }
 
     pub fn wait_idle(&self) {
@@ -403,7 +441,14 @@ impl Renderer {
         self.recreate_swapchain();
     }
 
-    pub fn draw_frame(&mut self, record: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize)) {
+    /// Records and submits one frame: `geometry` draws into the linear HDR
+    /// target, then `post` (the tonemap pass) samples it and writes the sRGB
+    /// swapchain. Both receive `(cmd, extent, frame_in_flight)`.
+    pub fn draw_frame(
+        &mut self,
+        geometry: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
+        post: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
+    ) {
         if self.window_extent.width == 0 || self.window_extent.height == 0 {
             return;
         }
@@ -439,8 +484,9 @@ impl Renderer {
 
         let cmd = self.command_buffers[frame];
         let image = self.images[image_index as usize];
-        let view = self.image_views[image_index as usize];
+        let swap_view = self.image_views[image_index as usize];
         let depth = self.depth.as_ref().unwrap();
+        let hdr = self.hdr.as_ref().unwrap();
         let extent = self.window_extent;
         let color_range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -468,13 +514,15 @@ impl Renderer {
             )
             .unwrap();
 
-            // Color: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
-            let to_color = vk::ImageMemoryBarrier::default()
+            // ---- Geometry pass: render into the linear HDR target. ----
+
+            // HDR: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL (prior contents discarded).
+            let to_hdr = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
+                .image(hdr.handle)
                 .subresource_range(color_range)
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
@@ -485,7 +533,7 @@ impl Renderer {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[to_color],
+                &[to_hdr],
             );
 
             // Depth: UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL
@@ -508,8 +556,8 @@ impl Renderer {
                 &[to_depth],
             );
 
-            let color_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(view)
+            let hdr_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(hdr.view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
@@ -527,20 +575,83 @@ impl Renderer {
                         stencil: 0,
                     },
                 });
-            let color_attachments = [color_attachment];
-            let rendering_info = vk::RenderingInfo::default()
+            let hdr_attachments = [hdr_attachment];
+            let geo_rendering = vk::RenderingInfo::default()
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
                     extent,
                 })
                 .layer_count(1)
-                .color_attachments(&color_attachments)
+                .color_attachments(&hdr_attachments)
                 .depth_attachment(&depth_attachment);
 
-            dev.cmd_begin_rendering(cmd, &rendering_info);
-            record(cmd, extent, frame);
+            dev.cmd_begin_rendering(cmd, &geo_rendering);
+            geometry(cmd, extent, frame);
             dev.cmd_end_rendering(cmd);
 
+            // ---- Tonemap pass: sample HDR, write the sRGB swapchain. ----
+
+            // HDR: COLOR_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL (frag read).
+            let hdr_to_read = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(hdr.handle)
+                .subresource_range(color_range)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[hdr_to_read],
+            );
+
+            // Swapchain: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
+            let to_color = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(color_range)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_color],
+            );
+
+            // The fullscreen tonemap covers every pixel, so the swapchain load
+            // op is DONT_CARE (no clear needed).
+            let swap_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(swap_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .store_op(vk::AttachmentStoreOp::STORE);
+            let swap_attachments = [swap_attachment];
+            let post_rendering = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                })
+                .layer_count(1)
+                .color_attachments(&swap_attachments);
+
+            dev.cmd_begin_rendering(cmd, &post_rendering);
+            post(cmd, extent, frame);
+            dev.cmd_end_rendering(cmd);
+
+            // Swapchain: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
             let to_present = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
@@ -618,8 +729,9 @@ impl Renderer {
             self.swapchain_loader.destroy_swapchain(old, None);
         }
 
-        // Drops the old depth Image (frees view+image) before assigning the new one.
+        // Drops the old depth/HDR images (frees view+image) before reassigning.
         self.depth = Some(create_depth(self.allocator(), &self.device, sc.extent));
+        self.hdr = Some(create_hdr(self.allocator(), &self.device, sc.extent));
         self.swapchain = sc.swapchain;
         self.images = sc.images;
         self.image_views = sc.image_views;
@@ -637,6 +749,8 @@ impl Drop for Renderer {
 
             // Free VMA-backed resources while the device + allocator are alive.
             self.depth.take();
+            self.hdr.take();
+            self.device.destroy_sampler(self.hdr_sampler, None);
 
             for &v in &self.image_views {
                 self.device.destroy_image_view(v, None);
@@ -811,6 +925,52 @@ fn create_depth(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk:
         handle: image,
         view,
         format: DEPTH_FORMAT,
+    }
+}
+
+fn create_hdr(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::Extent2D) -> Image {
+    let image_ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(HDR_FORMAT)
+        .extent(vk::Extent3D {
+            width: extent.width.max(1),
+            height: extent.height.max(1),
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        // Rendered into as a color attachment, then sampled by the tonemap pass.
+        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let ai = vk_mem::AllocationCreateInfo {
+        usage: vk_mem::MemoryUsage::AutoPreferDevice,
+        ..Default::default()
+    };
+    let (image, allocation) = unsafe { allocator.create_image(&image_ci, &ai).expect("hdr image") };
+
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(HDR_FORMAT)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let view = unsafe { device.create_image_view(&view_info, None).expect("hdr view") };
+
+    Image {
+        allocator: allocator.clone(),
+        allocation,
+        device: device.clone(),
+        handle: image,
+        view,
+        format: HDR_FORMAT,
     }
 }
 

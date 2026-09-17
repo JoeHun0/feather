@@ -1,7 +1,8 @@
 //! Milestone 2+: a drifting field of ~1000 lit, individually-colored spheres,
 //! each an ECS entity, drawn in one instanced draw. Per-instance data is
-//! { model, color }; a single directional light shades them. WASD/mouse fly the
-//! camera; Esc quits.
+//! { model, color }; a single directional light shades them in linear space into
+//! an HDR target, which a tonemap pass resolves to the sRGB swapchain.
+//! WASD/mouse fly the camera; `[` / `]` adjust exposure; Esc quits.
 
 use std::time::Instant;
 
@@ -9,7 +10,7 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::ExecutorKind;
 use feather_gfx::Renderer;
 use feather_platform::winit;
-use feather_render::{InstanceData, MeshRenderer};
+use feather_render::{InstanceData, MeshRenderer, TonemapPass};
 use glam::{Mat4, Vec3, Vec4};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
@@ -105,6 +106,7 @@ struct Input {
 
 struct App {
     mesh: Option<MeshRenderer>,
+    tonemap: Option<TonemapPass>,
     renderer: Option<Renderer>,
     window: Option<Window>,
     world: World,
@@ -112,6 +114,7 @@ struct App {
     camera: Camera,
     input: Input,
     light_dir: Vec4,
+    exposure: f32,
     start: Instant,
     last_frame: Instant,
 }
@@ -149,6 +152,7 @@ impl App {
         let now = Instant::now();
         Self {
             mesh: None,
+            tonemap: None,
             renderer: None,
             window: None,
             world,
@@ -160,6 +164,7 @@ impl App {
             },
             input: Input::default(),
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
+            exposure: 1.0,
             start: now,
             last_frame: now,
         }
@@ -191,8 +196,10 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         let renderer = Renderer::new(&window, size.width, size.height).expect("create renderer");
         let mesh = MeshRenderer::new(&renderer, MAX_INSTANCES);
+        let tonemap = TonemapPass::new(&renderer);
 
         self.mesh = Some(mesh);
+        self.tonemap = Some(tonemap);
         self.renderer = Some(renderer);
         self.window = Some(window);
     }
@@ -222,6 +229,13 @@ impl ApplicationHandler for App {
                         KeyCode::KeyD => self.input.right = pressed,
                         KeyCode::Space => self.input.up = pressed,
                         KeyCode::ControlLeft => self.input.down = pressed,
+                        // Exposure control (showcases the HDR/tonemap pipeline).
+                        KeyCode::BracketLeft if pressed => {
+                            self.exposure = (self.exposure * 0.8).max(0.05);
+                        }
+                        KeyCode::BracketRight if pressed => {
+                            self.exposure = (self.exposure * 1.25).min(16.0);
+                        }
                         KeyCode::Escape if pressed => event_loop.exit(),
                         _ => {}
                     }
@@ -286,10 +300,25 @@ impl ApplicationHandler for App {
                 let view_proj = self.camera.view_proj(aspect);
                 let light_dir = self.light_dir;
 
-                if let (Some(r), Some(m)) = (self.renderer.as_mut(), self.mesh.as_mut()) {
-                    r.draw_frame(|cmd, extent, frame| {
-                        m.draw(cmd, extent, frame, view_proj, light_dir, &instances)
-                    });
+                let exposure = self.exposure;
+                if let (Some(r), Some(m), Some(tm)) = (
+                    self.renderer.as_mut(),
+                    self.mesh.as_mut(),
+                    self.tonemap.as_mut(),
+                ) {
+                    // HDR view/sampler are stable except across resize; capture
+                    // before the mutable draw_frame borrow, refresh in `update`.
+                    let hdr_view = r.hdr_view();
+                    let hdr_sampler = r.hdr_sampler();
+                    r.draw_frame(
+                        |cmd, extent, frame| {
+                            m.draw(cmd, extent, frame, view_proj, light_dir, &instances)
+                        },
+                        |cmd, extent, frame| {
+                            tm.update(frame, hdr_view, hdr_sampler);
+                            tm.draw(cmd, extent, frame, exposure);
+                        },
+                    );
                 }
             }
             _ => {}

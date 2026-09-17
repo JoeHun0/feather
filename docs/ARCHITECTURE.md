@@ -622,15 +622,24 @@ milestones land.
   device-local staging upload (`create_device_local_buffer`) and persistently-
   mapped host buffers (`create_host_visible_buffer`); per-frame command buffers;
   sync with per-image `render_finished`; `wait_idle` + ordered teardown
-  (resources → allocator → device). `FRAMES_IN_FLIGHT = 2`.
+  (resources → allocator → device). `FRAMES_IN_FLIGHT = 2`. Engine-owned
+  **HDR scene-color target** (RGBA16F) + linear sampler, created with the
+  swapchain and recreated on resize; `draw_frame` runs two passes — geometry
+  into the HDR target, then a caller-supplied post pass into the swapchain —
+  with the HDR write→read barrier between.
 - **render**: instanced `MeshRenderer` — generated UV sphere (pos+normal Vertex),
   per-frame instance **SSBO** `InstanceData { model, color }` (std430, 80 B) with
   one descriptor set per frame-in-flight, `view_proj` + `light_dir` in a push
-  constant, ambient + Lambert **directional light**, `cull NONE` + depth. One
-  `cmd_draw_indexed`, `instanceCount` = live entity count (verified to 8000).
+  constant, **linear-space** ambient + Lambert **directional light** (albedo
+  decoded sRGB→linear, HDR sun) written unclamped to the HDR target, `cull NONE`
+  + depth. One `cmd_draw_indexed`, `instanceCount` = live entity count (verified
+  to 8000). `TonemapPass` — attributeless fullscreen triangle sampling the HDR
+  target, **exposure + Narkowicz ACES**, output left linear for the `_SRGB`
+  swapchain to encode (no double gamma); exposure via push constant.
 - **app**: winit loop; bevy_ecs world + multi-threaded schedule (`integrate`,
   `tick`); render-rate **fly camera** (WASD/mouse/Esc, pointer locked); inline
-  **extract** (`World` query → `Vec<InstanceData>` each frame).
+  **extract** (`World` query → `Vec<InstanceData>` each frame); `[`/`]` adjust
+  tonemap exposure at runtime.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 only partially — basic
   directional lighting, *not* CSM/GTAO/IBL. Steps 4+ not started.
 
@@ -651,17 +660,25 @@ milestones land.
   per-frame UBO — revisit when Set 1 lands.
 - **Vertex layout (§6)**: pos+normal only; tangent/uv deferred until textures.
   Per-instance `color` stands in for the eventual `material_id`.
-- **Lighting (§3, §13)**: provisional gamma-space ambient+Lambert. This is
-  **not** the baseline (PBR + linear-space + HDR + tonemapping + IBL); colours
-  read washed out because shading is gamma-space into an sRGB swapchain. The
-  linear/HDR/tonemap pipeline is the intended next lighting milestone.
+- **Lighting (§3, §13)**: now **linear-space** ambient+Lambert into an RGBA16F
+  HDR target, resolved by an ACES **tonemap** pass — the color-management seam is
+  correct. Still **not** the full baseline: no PBR BRDF and no IBL yet, exposure
+  is a fixed constant (no auto-exposure), and no bloom. The tonemap curve is a
+  drop-in point for AgX. This unblocks bloom/SSR/transparents, which all read the
+  resolved HDR.
+- **HDR/depth targets (§9)**: single engine-owned images shared across both
+  frames-in-flight (matches the design: render targets are engine-owned, not
+  per-frame). With `FRAMES_IN_FLIGHT = 2` this carries a latent cross-frame WAW
+  hazard on the shared targets — pending the sync2 barrier + timeline-semaphore
+  pass (§10). The intra-frame HDR write→read hazard *is* handled.
 - **Geometry**: hardcoded generated sphere; the `assets` crate is still a stub —
   no glTF import, bake tool, runtime blob, or load-time allocator yet.
 
 ### Not yet started
 
 Culling; materials/bindless + textures; shadows (CSM); clustered lighting; IBL;
-post/HDR/tonemap; transparents; asset bake pipeline + glTF loader; scene format /
-spawning / save; physics + FPS controller (rapier); skinning; UI/HUD; audio;
-debug/profiling tooling (Tracy/RenderDoc/timestamp queries); GPU-driven culling;
-streaming; stage pipelining.
+bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
+bake pipeline + glTF loader; scene format / spawning / save; physics + FPS
+controller (rapier); skinning; UI/HUD; audio; debug/profiling tooling
+(Tracy/RenderDoc/timestamp queries); GPU-driven culling; streaming; stage
+pipelining.

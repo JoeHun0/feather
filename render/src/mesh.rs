@@ -228,7 +228,8 @@ impl MeshRenderer {
                 .expect("pipeline layout")
         };
 
-        let color_formats = [renderer.color_format()];
+        // Geometry now renders into the offscreen HDR target, not the swapchain.
+        let color_formats = [renderer.hdr_format()];
         let mut rendering = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&color_formats)
             .depth_attachment_format(renderer.depth_format());
