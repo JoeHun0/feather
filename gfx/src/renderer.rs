@@ -1,21 +1,57 @@
-//! Milestone: bring up Vulkan and draw via dynamic rendering (VK 1.3).
+//! Vulkan bring-up + dynamic-rendering frame loop, plus vk-mem-backed buffer
+//! and image allocation.
 //!
-//! gfx owns the device/swapchain/frame mechanics and the per-frame render-target
-//! setup (image transitions + begin/end rendering). It does NOT own pipelines —
-//! `draw_frame` takes a callback so a higher layer (feather-render) records the
-//! actual draw into the active rendering scope.
-//!
-//! Windowing-agnostic: `new` is generic over the raw-window-handle traits.
+//! Allocation ownership: the VMA allocator is held as an `Arc`, so `Buffer` and
+//! `Image` are RAII — they free themselves on drop via their `Arc` clone. As
+//! long as every buffer/image lives in something that drops before the renderer
+//! (true for app/render-held resources), the renderer's final `Arc` is released
+//! before `destroy_device`.
 
 use std::error::Error;
 use std::ffi::{c_char, c_void, CStr};
+use std::sync::Arc;
 
 use ash::{vk, Device, Entry, Instance};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use vk_mem::Alloc; // brings create_buffer/create_image into scope
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const VALIDATION: bool = cfg!(debug_assertions);
 const CLEAR_COLOR: [f32; 4] = [0.02, 0.02, 0.05, 1.0];
+const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+
+/// A GPU buffer that frees itself (and its allocation) on drop.
+pub struct Buffer {
+    allocator: Arc<vk_mem::Allocator>,
+    allocation: vk_mem::Allocation,
+    pub handle: vk::Buffer,
+    pub size: vk::DeviceSize,
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        unsafe { self.allocator.destroy_buffer(self.handle, &mut self.allocation) };
+    }
+}
+
+/// A GPU image + view that free themselves on drop.
+pub struct Image {
+    allocator: Arc<vk_mem::Allocator>,
+    allocation: vk_mem::Allocation,
+    device: Device,
+    pub handle: vk::Image,
+    pub view: vk::ImageView,
+    pub format: vk::Format,
+}
+
+impl Drop for Image {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_image_view(self.view, None);
+            self.allocator.destroy_image(self.handle, &mut self.allocation);
+        }
+    }
+}
 
 pub struct Renderer {
     _entry: Entry,
@@ -28,25 +64,27 @@ pub struct Renderer {
     physical_device: vk::PhysicalDevice,
     device: Device,
     queue: vk::Queue,
-    #[allow(dead_code)] // used at pool creation; kept for future queue-ownership work
+    #[allow(dead_code)]
     queue_family_index: u32,
+
+    // Held before device destruction; buffers/images clone this Arc.
+    allocator: Option<Arc<vk_mem::Allocator>>,
 
     swapchain_loader: ash::khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
+    depth: Option<Image>,
     surface_format: vk::SurfaceFormatKHR,
     window_extent: vk::Extent2D,
 
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
 
-    image_available: Vec<vk::Semaphore>, // per frame-in-flight
-    render_finished: Vec<vk::Semaphore>, // per swapchain image
-    in_flight: Vec<vk::Fence>,           // per frame-in-flight
+    image_available: Vec<vk::Semaphore>,
+    render_finished: Vec<vk::Semaphore>,
+    in_flight: Vec<vk::Fence>,
     current_frame: usize,
-
-    allocator: Option<vk_mem::Allocator>,
 }
 
 impl Renderer {
@@ -57,7 +95,6 @@ impl Renderer {
     ) -> Result<Self, Box<dyn Error>> {
         let entry = unsafe { Entry::load()? };
 
-        // ---- Instance ----
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"feather")
             .application_version(vk::make_api_version(0, 0, 1, 0))
@@ -81,7 +118,6 @@ impl Renderer {
         }
         let instance = unsafe { entry.create_instance(&create_info, None)? };
 
-        // ---- Debug messenger (debug builds only) ----
         let debug = if VALIDATION {
             let du = ash::ext::debug_utils::Instance::new(&entry, &instance);
             let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
@@ -101,7 +137,6 @@ impl Renderer {
             None
         };
 
-        // ---- Surface ----
         let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
         let surface = unsafe {
             ash_window::create_surface(
@@ -113,12 +148,10 @@ impl Renderer {
             )?
         };
 
-        // ---- Physical device + a graphics-and-present queue family ----
         let (physical_device, queue_family_index) =
             pick_device(&instance, &surface_loader, surface)
                 .ok_or("no GPU with a graphics+present queue and swapchain support")?;
 
-        // ---- Logical device (enable dynamic rendering, core in 1.3 but opt-in) ----
         let priorities = [1.0f32];
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
@@ -133,7 +166,12 @@ impl Renderer {
         let device = unsafe { instance.create_device(physical_device, &device_create, None)? };
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
-        // ---- Swapchain ----
+        // Allocator first — the depth image is allocated through it.
+        let allocator = {
+            let info = vk_mem::AllocatorCreateInfo::new(&instance, &device, physical_device);
+            Arc::new(unsafe { vk_mem::Allocator::new(info)? })
+        };
+
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
         let hint = vk::Extent2D { width, height };
         let sc = create_swapchain_resources(
@@ -145,8 +183,8 @@ impl Renderer {
             hint,
             vk::SwapchainKHR::null(),
         )?;
+        let depth = create_depth(&allocator, &device, sc.extent);
 
-        // ---- Command pool + buffers ----
         let command_pool = unsafe {
             device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -164,7 +202,6 @@ impl Renderer {
             )?
         };
 
-        // ---- Sync objects ----
         let sem = vk::SemaphoreCreateInfo::default();
         let fence = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
         let mut image_available = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
@@ -173,12 +210,6 @@ impl Renderer {
             image_available.push(unsafe { device.create_semaphore(&sem, None)? });
             in_flight.push(unsafe { device.create_fence(&fence, None)? });
         }
-
-        // ---- VMA allocator (wired now; first buffers allocated next milestone) ----
-        let allocator = {
-            let info = vk_mem::AllocatorCreateInfo::new(&instance, &device, physical_device);
-            unsafe { vk_mem::Allocator::new(info)? }
-        };
 
         Ok(Self {
             _entry: entry,
@@ -190,10 +221,12 @@ impl Renderer {
             device,
             queue,
             queue_family_index,
+            allocator: Some(allocator),
             swapchain_loader,
             swapchain: sc.swapchain,
             images: sc.images,
             image_views: sc.image_views,
+            depth: Some(depth),
             surface_format: sc.format,
             window_extent: sc.extent,
             command_pool,
@@ -202,44 +235,131 @@ impl Renderer {
             render_finished: sc.render_finished,
             in_flight,
             current_frame: 0,
-            allocator: Some(allocator),
         })
     }
 
-    /// Cheap clone of the device handle, for building pipelines in higher layers.
     pub fn device(&self) -> Device {
         self.device.clone()
     }
 
-    /// Swapchain color format — needed to build dynamic-rendering pipelines.
     pub fn color_format(&self) -> vk::Format {
         self.surface_format.format
     }
 
-    /// Block until the GPU is idle. Call before tearing down GPU resources that
-    /// live outside the renderer (e.g. pipelines) so their destroy calls don't
-    /// race in-flight command buffers.
+    pub fn depth_format(&self) -> vk::Format {
+        DEPTH_FORMAT
+    }
+
     pub fn wait_idle(&self) {
         unsafe { self.device.device_wait_idle().ok() };
     }
 
-    /// Call on the window's resize event.
+    fn allocator(&self) -> &Arc<vk_mem::Allocator> {
+        self.allocator.as_ref().expect("allocator alive")
+    }
+
+    /// Create a device-local buffer initialized from `data` via a staging copy.
+    pub fn create_device_local_buffer(
+        &self,
+        data: &[u8],
+        usage: vk::BufferUsageFlags,
+    ) -> Buffer {
+        let size = data.len() as vk::DeviceSize;
+        let allocator = self.allocator();
+
+        // Staging (host-visible, mappable).
+        let staging_ci = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let staging_ai = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferHost,
+            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
+            ..Default::default()
+        };
+        let (staging_buf, mut staging_alloc) =
+            unsafe { allocator.create_buffer(&staging_ci, &staging_ai).expect("staging buffer") };
+        unsafe {
+            let ptr = allocator.map_memory(&mut staging_alloc).expect("map staging");
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            allocator.unmap_memory(&mut staging_alloc);
+        }
+
+        // Device-local target.
+        let dev_ci = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(usage | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let dev_ai = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferDevice,
+            ..Default::default()
+        };
+        let (dev_buf, dev_alloc) =
+            unsafe { allocator.create_buffer(&dev_ci, &dev_ai).expect("device buffer") };
+
+        self.one_time_submit(|cmd| unsafe {
+            let region = vk::BufferCopy::default().size(size);
+            self.device.cmd_copy_buffer(cmd, staging_buf, dev_buf, &[region]);
+        });
+
+        unsafe { allocator.destroy_buffer(staging_buf, &mut staging_alloc) };
+
+        Buffer {
+            allocator: allocator.clone(),
+            allocation: dev_alloc,
+            handle: dev_buf,
+            size,
+        }
+    }
+
+    fn one_time_submit(&self, record: impl FnOnce(vk::CommandBuffer)) {
+        unsafe {
+            let cmd = self
+                .device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.command_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .expect("alloc one-time cmd")[0];
+            self.device
+                .begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .unwrap();
+            record(cmd);
+            self.device.end_command_buffer(cmd).unwrap();
+
+            let fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .unwrap();
+            let cmds = [cmd];
+            let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+            self.device.queue_submit(self.queue, &[submit], fence).unwrap();
+            self.device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(self.command_pool, &[cmd]);
+        }
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         self.window_extent = vk::Extent2D { width, height };
         self.recreate_swapchain();
     }
 
-    /// Acquire -> begin dynamic rendering (clear) -> `record` the draw -> end ->
-    /// present. `record` runs inside the active rendering scope.
     pub fn draw_frame(&mut self, record: impl FnOnce(vk::CommandBuffer, vk::Extent2D)) {
         if self.window_extent.width == 0 || self.window_extent.height == 0 {
-            return; // minimized
+            return;
         }
         let frame = self.current_frame;
-        let dev = &self.device;
 
         unsafe {
-            dev.wait_for_fences(&[self.in_flight[frame]], true, u64::MAX)
+            self.device
+                .wait_for_fences(&[self.in_flight[frame]], true, u64::MAX)
                 .unwrap();
         }
 
@@ -251,7 +371,7 @@ impl Renderer {
                 vk::Fence::null(),
             )
         } {
-            Ok((idx, _suboptimal)) => idx,
+            Ok((idx, _)) => idx,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_swapchain();
                 return;
@@ -259,20 +379,33 @@ impl Renderer {
             Err(e) => panic!("acquire_next_image: {e:?}"),
         };
 
-        unsafe { dev.reset_fences(&[self.in_flight[frame]]).unwrap() };
+        unsafe {
+            self.device
+                .reset_fences(&[self.in_flight[frame]])
+                .unwrap()
+        };
 
         let cmd = self.command_buffers[frame];
         let image = self.images[image_index as usize];
         let view = self.image_views[image_index as usize];
+        let depth = self.depth.as_ref().unwrap();
         let extent = self.window_extent;
-        let range = vk::ImageSubresourceRange {
+        let color_range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
             layer_count: 1,
         };
+        let depth_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::DEPTH,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
 
+        let dev = &self.device;
         unsafe {
             dev.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
                 .unwrap();
@@ -283,14 +416,14 @@ impl Renderer {
             )
             .unwrap();
 
-            // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
+            // Color: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
             let to_color = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
-                .subresource_range(range)
+                .subresource_range(color_range)
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
             dev.cmd_pipeline_barrier(
@@ -303,15 +436,43 @@ impl Renderer {
                 &[to_color],
             );
 
-            // ---- Dynamic rendering scope ----
+            // Depth: UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL
+            let to_depth = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(depth.handle)
+                .subresource_range(depth_range)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_depth],
+            );
+
             let color_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .clear_value(vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: CLEAR_COLOR,
+                    color: vk::ClearColorValue { float32: CLEAR_COLOR },
+                });
+            let depth_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(depth.view)
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
                     },
                 });
             let color_attachments = [color_attachment];
@@ -321,20 +482,20 @@ impl Renderer {
                     extent,
                 })
                 .layer_count(1)
-                .color_attachments(&color_attachments);
+                .color_attachments(&color_attachments)
+                .depth_attachment(&depth_attachment);
 
             dev.cmd_begin_rendering(cmd, &rendering_info);
             record(cmd, extent);
             dev.cmd_end_rendering(cmd);
 
-            // COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
             let to_present = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
-                .subresource_range(range)
+                .subresource_range(color_range)
                 .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::empty());
             dev.cmd_pipeline_barrier(
@@ -405,6 +566,8 @@ impl Renderer {
             self.swapchain_loader.destroy_swapchain(old, None);
         }
 
+        // Drops the old depth Image (frees view+image) before assigning the new one.
+        self.depth = Some(create_depth(self.allocator(), &self.device, sc.extent));
         self.swapchain = sc.swapchain;
         self.images = sc.images;
         self.image_views = sc.image_views;
@@ -419,7 +582,9 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             self.device.device_wait_idle().ok();
-            self.allocator.take(); // VMA before the device it was built on
+
+            // Free VMA-backed resources while the device + allocator are alive.
+            self.depth.take();
 
             for &v in &self.image_views {
                 self.device.destroy_image_view(v, None);
@@ -435,6 +600,10 @@ impl Drop for Renderer {
             }
             self.device.destroy_command_pool(self.command_pool, None);
             self.swapchain_loader.destroy_swapchain(self.swapchain, None);
+
+            // Now release the allocator (last Arc ref) before destroying the device.
+            self.allocator.take();
+
             self.device.destroy_device(None);
             self.surface_loader.destroy_surface(self.surface, None);
             if let Some((du, m)) = self.debug.take() {
@@ -545,6 +714,52 @@ fn create_swapchain_resources(
         extent,
         render_finished,
     })
+}
+
+fn create_depth(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::Extent2D) -> Image {
+    let image_ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(DEPTH_FORMAT)
+        .extent(vk::Extent3D {
+            width: extent.width.max(1),
+            height: extent.height.max(1),
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let ai = vk_mem::AllocationCreateInfo {
+        usage: vk_mem::MemoryUsage::AutoPreferDevice,
+        ..Default::default()
+    };
+    let (image, allocation) =
+        unsafe { allocator.create_image(&image_ci, &ai).expect("depth image") };
+
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(DEPTH_FORMAT)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::DEPTH,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let view = unsafe { device.create_image_view(&view_info, None).expect("depth view") };
+
+    Image {
+        allocator: allocator.clone(),
+        allocation,
+        device: device.clone(),
+        handle: image,
+        view,
+        format: DEPTH_FORMAT,
+    }
 }
 
 fn pick_device(

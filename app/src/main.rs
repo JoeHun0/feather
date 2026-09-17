@@ -141,8 +141,7 @@ impl ApplicationHandler for App {
 
         let size = window.inner_size();
         let renderer = Renderer::new(&window, size.width, size.height).expect("create renderer");
-        let device = renderer.device();
-        let pipeline = CubePipeline::new(&device, renderer.color_format());
+        let pipeline = CubePipeline::new(&renderer);
 
         self.pipeline = Some(pipeline);
         self.renderer = Some(renderer);
