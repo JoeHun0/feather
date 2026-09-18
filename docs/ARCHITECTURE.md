@@ -634,25 +634,27 @@ milestones land.
   keyed by `MeshId`; per-mesh indices stay 0-based (rebased via `vertexOffset`).
   Per-frame instance **SSBO** `InstanceData { model, material_id }` (std430, 80 B)
   at set0/binding0 (vertex); a **resident materials SSBO** `GpuMaterial` (§5: 64 B
-  — base color, metallic, roughness, emissive, `tex.x` = base-color slot) at
-  binding1 (fragment); and a **bindless-lite texture array** — fixed
-  `sampler2D textures[64]` at binding2, non-uniformly indexed by `material_id`
-  (slot 0 = white default, unused slots also white). Vertex is pos+normal+uv.
-  `view_proj` + `light_dir` + `camera_pos` in a push constant (96 B),
-  **linear-space** Cook-Torrance **PBR** (metallic-roughness) directional light on
-  `base_color_texture × base_color_factor`, plus flat ambient, written
-  unclamped to the HDR target, `cull NONE` + depth. Draw sorts `(MeshId,
-  instance)` by mesh, emits **one `cmd_draw_indexed` per contiguous run**
-  (`firstInstance` = run start). `TonemapPass` — attributeless fullscreen triangle
-  sampling the HDR target, **exposure + Narkowicz ACES**, output left linear for
-  the `_SRGB` swapchain to encode; exposure via push constant.
+  — base color, metallic, roughness, emissive, normal_scale, `tex` = base /
+  normal / MR slots) at binding1 (fragment); and a **bindless-lite texture
+  array** — fixed `sampler2D textures[64]` at binding2, non-uniformly indexed by
+  material (slot 0 = white, slot 1 = flat normal; unused slots point at those).
+  Vertex is pos+normal+uv. `view_proj` + `light_dir` + `camera_pos` in a push
+  constant (96 B), **linear-space** Cook-Torrance **PBR** (metallic-roughness)
+  directional light with **base-color + normal + metallic-roughness textures**
+  (normal mapping via screen-space-derivative TBN, no per-vertex tangent), plus
+  flat ambient, written unclamped to the HDR target, `cull NONE` + depth. Draw
+  sorts `(MeshId, instance)` by mesh, emits **one `cmd_draw_indexed` per
+  contiguous run** (`firstInstance` = run start). `TonemapPass` — attributeless
+  fullscreen triangle sampling the HDR target, **exposure + Narkowicz ACES**,
+  output left linear for the `_SRGB` swapchain to encode; exposure via push
+  constant.
 - **assets**: Vulkan-free CPU mesh types (`Vertex` = pos+normal+uv, `MeshData` +
-  bounds + `Material` incl. optional decoded `base_color_texture`), procedural
-  `uv_sphere` + `cube`, and a **glTF/GLB loader** (`load_gltf`, via `gltf::import`)
-  — merges all triangle primitives across the node hierarchy with transforms,
-  reads UVs, computes normals when absent, reads the first primitive's material
-  (factors + base-color texture decoded to RGBA8), resolves .glb / external /
-  data-URI buffers and images.
+  bounds + `Material` with optional decoded base-color / normal / MR textures),
+  procedural `uv_sphere` + `cube`, and a **glTF/GLB loader** (`load_gltf`, via
+  `gltf::import`) — merges all triangle primitives across the node hierarchy with
+  transforms, reads UVs, computes normals when absent, reads the first
+  primitive's material (factors + base-color/normal/MR textures decoded to
+  RGBA8, normal scale), resolves .glb / external / data-URI buffers and images.
 - **app**: winit loop; bevy_ecs world + multi-threaded schedule (`integrate`,
   `tick`); render-rate **fly camera** (WASD/mouse/Esc, pointer locked); inline
   **extract** (`World` query → sorted `Vec<(MeshId, InstanceData)>` each frame);
@@ -680,7 +682,9 @@ milestones land.
 - **Push constants**: currently carry `view_proj` + `light_dir` (provisional).
   Design reserves push constants for tiny per-draw scalars and puts camera in a
   per-frame UBO — revisit when Set 1 lands.
-- **Vertex layout (§6)**: pos+normal+uv; **tangent deferred** until normal maps.
+- **Vertex layout (§6)**: pos+normal+uv. Normal mapping uses a screen-space
+  **derivative TBN** (no per-vertex tangent); MikkTSpace vertex tangents are the
+  higher-quality follow-up (§6 reserves the tangent attribute).
 - **Lighting (§3, §13)**: **linear-space** Cook-Torrance **PBR** (metallic-
   roughness) for one directional light + flat ambient, into an RGBA16F HDR target
   resolved by an ACES **tonemap** pass. Still **not** the full baseline: no IBL
@@ -693,22 +697,21 @@ milestones land.
   hazard on the shared targets — pending the sync2 barrier + timeline-semaphore
   pass (§10). The intra-frame HDR write→read hazard *is* handled.
 - **Geometry / assets (§6, §7)**: a **mesh registry**, a **material table**, and a
-  **base-color texture** path now exist — several meshes in shared vertex/index
-  buffers drawn by sorted per-mesh runs; a resident `materials[]` SSBO indexed by
-  per-instance `material_id`; and a fixed bindless `textures[]` array with each
-  material's base-color image (glTF or white default), consumed by a
-  Cook-Torrance PBR BRDF. Still missing: **normal + metallic-roughness textures**
-  (+ tangents; metallic/roughness come only from the material factors for now),
-  mips, pipeline buckets (one pipeline for everything), IBL, skinning/animation,
-  and the offline **bake** path (runtime blob, handle tables, load-time
-  allocator). glTF loads directly each
+  full **base-color + normal + metallic-roughness texture** path now exist —
+  several meshes in shared vertex/index buffers drawn by sorted per-mesh runs; a
+  resident `materials[]` SSBO indexed by per-instance `material_id`; and a fixed
+  bindless `textures[]` array (glTF images or white/flat-normal defaults),
+  consumed by a Cook-Torrance PBR BRDF. Still missing: **mips**, IBL, MikkTSpace
+  vertex tangents (normal mapping is derivative-based), pipeline buckets (one
+  pipeline for everything), skinning/animation, and the offline **bake** path
+  (runtime blob, handle tables, load-time allocator). glTF loads directly each
   run; nothing is freed/streamed; one material per merged glTF (first primitive
   wins).
 
 ### Not yet started
 
-Culling; normal + metallic-roughness textures + mips + tangents; pipeline buckets
-(PBR BRDF + base-color textures landed); shadows (CSM); clustered lighting; IBL;
+Culling; mips + MikkTSpace vertex tangents; pipeline buckets (PBR BRDF +
+base-color/normal/MR textures landed); shadows (CSM); clustered lighting; IBL;
 bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
 bake pipeline (runtime glTF + multi-mesh registry landed); scene format /
 spawning / save; physics + FPS controller (rapier);

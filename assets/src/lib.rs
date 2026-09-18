@@ -30,26 +30,33 @@ pub struct TextureData {
 }
 
 /// Surface parameters for a mesh (glTF metallic-roughness aligned). Factor
-/// colors are **linear**; `base_color_texture` is sRGB (the renderer uploads it
-/// as an `_SRGB` image and multiplies the sampled value by `base_color`).
+/// colors are **linear**; `base_color_texture` is sRGB; `normal_texture` and
+/// `metallic_roughness_texture` are linear data (uploaded `_UNORM`). MR packing
+/// follows glTF: green = roughness, blue = metallic.
 #[derive(Clone, Debug)]
 pub struct Material {
     pub base_color: [f32; 4], // linear RGBA factor
     pub metallic: f32,
     pub roughness: f32,
     pub emissive: [f32; 3], // linear RGB
+    pub normal_scale: f32,
     pub base_color_texture: Option<TextureData>,
+    pub normal_texture: Option<TextureData>,
+    pub metallic_roughness_texture: Option<TextureData>,
 }
 
 impl Default for Material {
     fn default() -> Self {
-        // White dielectric, no texture.
+        // White dielectric, no textures.
         Self {
             base_color: [1.0, 1.0, 1.0, 1.0],
             metallic: 0.0,
             roughness: 1.0,
             emissive: [0.0, 0.0, 0.0],
+            normal_scale: 1.0,
             base_color_texture: None,
+            normal_texture: None,
+            metallic_roughness_texture: None,
         }
     }
 }
@@ -178,16 +185,26 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<MeshData, Box<dyn Error>> {
 
 fn read_material(m: &gltf::Material, images: &[gltf::image::Data]) -> Material {
     let pbr = m.pbr_metallic_roughness();
+    let tex = |idx: usize| images.get(idx).and_then(to_rgba8);
     let base_color_texture = pbr
         .base_color_texture()
-        .and_then(|info| images.get(info.texture().source().index()))
-        .and_then(to_rgba8);
+        .and_then(|i| tex(i.texture().source().index()));
+    let metallic_roughness_texture = pbr
+        .metallic_roughness_texture()
+        .and_then(|i| tex(i.texture().source().index()));
+    let (normal_texture, normal_scale) = match m.normal_texture() {
+        Some(nt) => (tex(nt.texture().source().index()), nt.scale()),
+        None => (None, 1.0),
+    };
     Material {
         base_color: pbr.base_color_factor(), // linear RGBA
         metallic: pbr.metallic_factor(),
         roughness: pbr.roughness_factor(),
         emissive: m.emissive_factor(), // linear RGB
+        normal_scale,
         base_color_texture,
+        normal_texture,
+        metallic_roughness_texture,
     }
 }
 

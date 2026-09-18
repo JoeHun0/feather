@@ -438,7 +438,10 @@ fn palette_material(k: u32) -> feather_assets::Material {
         metallic: if rand01(k * 13 + 4) > 0.7 { 1.0 } else { 0.0 },
         roughness: 0.3 + 0.6 * rand01(k * 13 + 5),
         emissive: [0.0, 0.0, 0.0],
+        normal_scale: 1.0,
         base_color_texture: None,
+        normal_texture: None,
+        metallic_roughness_texture: None,
     }
 }
 

@@ -43,16 +43,16 @@ struct GpuMaterial {
     base_color_factor: [f32; 4],
     emissive: [f32; 4], // rgb = emissive, a = metallic
     params: [f32; 4],   // x = roughness, y = normal_scale, z = occlusion, w = alpha_cutoff
-    tex: [u32; 4],      // x = base color; y/z/w reserved (normal/orm/emissive)
+    tex: [u32; 4],      // x = base color, y = normal, z = metallic-roughness, w reserved
 }
 
 impl GpuMaterial {
-    fn from_material(m: &Material, base_color_slot: u32) -> Self {
+    fn from_material(m: &Material, slots: [u32; 3]) -> Self {
         Self {
             base_color_factor: m.base_color,
             emissive: [m.emissive[0], m.emissive[1], m.emissive[2], m.metallic],
-            params: [m.roughness, 1.0, 1.0, 0.5],
-            tex: [base_color_slot, 0, 0, 0],
+            params: [m.roughness, m.normal_scale, 1.0, 0.5],
+            tex: [slots[0], slots[1], slots[2], 0],
         }
     }
 }
@@ -142,8 +142,9 @@ impl MeshRenderer {
         let index_buffer = renderer
             .create_device_local_buffer(as_bytes(&indices), vk::BufferUsageFlags::INDEX_BUFFER);
 
-        // Bindless texture array: slot 0 is a white default. Each material with a
-        // base-color texture takes the next slot; the rest fall back to white.
+        // Bindless texture array. Fixed defaults: slot 0 = white (base color / MR
+        // fallback — white samples to 1.0, so factors pass through), slot 1 = flat
+        // normal (0,0,1). Each material's real textures take the next slots.
         let sampler = unsafe {
             device
                 .create_sampler(
@@ -157,25 +158,38 @@ impl MeshRenderer {
                 )
                 .expect("texture sampler")
         };
-        let mut textures: Vec<Image> = vec![renderer.create_texture(&[255, 255, 255, 255], 1, 1, true)];
-        let mut base_color_slots: Vec<u32> = Vec::with_capacity(materials.len());
-        for m in materials {
-            let slot = match &m.base_color_texture {
-                Some(t) if textures.len() < MAX_TEXTURES => {
-                    let slot = textures.len() as u32;
-                    textures.push(renderer.create_texture(&t.pixels, t.width, t.height, true));
-                    slot
-                }
-                _ => 0, // no texture (or array full) -> white default
-            };
-            base_color_slots.push(slot);
-        }
+        let mut textures: Vec<Image> = vec![
+            renderer.create_texture(&[255, 255, 255, 255], 1, 1, true), // 0: white (sRGB)
+            renderer.create_texture(&[128, 128, 255, 255], 1, 1, false), // 1: flat normal (UNORM)
+        ];
+        // Upload each material's real textures into the next free slots.
+        let tex_slots: Vec<[u32; 3]> = {
+            let mut upload =
+                |tex: &Option<feather_assets::TextureData>, srgb: bool, default: u32| match tex {
+                    Some(t) if textures.len() < MAX_TEXTURES => {
+                        let slot = textures.len() as u32;
+                        textures.push(renderer.create_texture(&t.pixels, t.width, t.height, srgb));
+                        slot
+                    }
+                    _ => default,
+                };
+            materials
+                .iter()
+                .map(|m| {
+                    [
+                        upload(&m.base_color_texture, true, 0),
+                        upload(&m.normal_texture, false, 1),
+                        upload(&m.metallic_roughness_texture, false, 0),
+                    ]
+                })
+                .collect()
+        };
 
         // Resident material table (§5). Uploaded once; indexed by material_id.
         let gpu_materials: Vec<GpuMaterial> = materials
             .iter()
-            .zip(&base_color_slots)
-            .map(|(m, &slot)| GpuMaterial::from_material(m, slot))
+            .zip(&tex_slots)
+            .map(|(m, &slots)| GpuMaterial::from_material(m, slots))
             .collect();
         let materials_buffer = renderer.create_device_local_buffer(
             as_bytes(&gpu_materials),
