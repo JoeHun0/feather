@@ -649,7 +649,9 @@ milestones land.
   contiguous run** (`firstInstance` = run start). `TonemapPass` — attributeless
   fullscreen triangle sampling the HDR target, **exposure + Narkowicz ACES**,
   output left linear for the `_SRGB` swapchain to encode; exposure via push
-  constant.
+  constant. `SkyPass` — fullscreen procedural-sky background drawn first in the
+  geometry pass (depth off), reconstructing view rays from the inverse
+  view-projection so meshes' IBL reflections match the visible sky.
 - **assets**: Vulkan-free CPU mesh types (`Vertex` = pos+normal+uv, `MeshData` +
   bounds + `Material` with optional decoded base-color / normal / MR textures),
   procedural `uv_sphere` + `cube`, and a **glTF/GLB loader** (`load_gltf`, via
@@ -692,11 +694,12 @@ milestones land.
   hemisphere irradiance for diffuse, reflection-vector sky sample for specular,
   Karis analytic env-BRDF), into an RGBA16F HDR target resolved by an ACES
   **tonemap** pass. The environment is a **procedural sky evaluated in-shader**,
-  not a precomputed cubemap — so no arbitrary HDR environments, the specular
-  "prefilter" is a crude roughness lerp (no real GGX convolution/mips), and the
-  sky isn't drawn as a visible background yet. Real cubemap IBL (equirect→cube,
-  irradiance/prefilter passes, BRDF LUT) is the follow-up. Also still missing:
-  shadows, auto-exposure, bloom. The tonemap curve is a drop-in point for AgX.
+  not a precomputed cubemap — so no arbitrary HDR environments and the specular
+  "prefilter" is a crude roughness lerp (no real GGX convolution/mips). The sky
+  *is* now drawn as a visible background (SkyPass) matching the reflected
+  environment. Real cubemap IBL (equirect→cube, irradiance/prefilter passes,
+  BRDF LUT) is the follow-up. Also still missing: shadows, auto-exposure, bloom.
+  The tonemap curve is a drop-in point for AgX.
 - **HDR/depth targets (§9)**: single engine-owned images shared across both
   frames-in-flight (matches the design: render targets are engine-owned, not
   per-frame). With `FRAMES_IN_FLIGHT = 2` this carries a latent cross-frame WAW

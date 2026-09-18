@@ -9,7 +9,7 @@
 //! per glTF/GLB path on the CLI (`cargo run -- a.glb b.glb`), each auto-fitted
 //! to the grid. A directional light with a Cook-Torrance **PBR** BRDF plus
 //! analytic environment ambient (IBL) shades in
-//! linear space into an HDR target,
+//! linear space into an HDR target, over a procedural **sky background**,
 //! which a tonemap pass resolves to the sRGB swapchain. WASD/mouse fly the
 //! camera; `[` / `]` adjust exposure; Esc quits.
 
@@ -20,7 +20,7 @@ use bevy_ecs::schedule::ExecutorKind;
 use feather_assets::MeshData;
 use feather_gfx::Renderer;
 use feather_platform::winit;
-use feather_render::{InstanceData, MeshId, MeshRenderer, TonemapPass};
+use feather_render::{InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass};
 use glam::{Mat4, Vec3, Vec4};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
@@ -130,6 +130,7 @@ struct Input {
 struct App {
     mesh: Option<MeshRenderer>,
     tonemap: Option<TonemapPass>,
+    sky: Option<SkyPass>,
     renderer: Option<Renderer>,
     window: Option<Window>,
     world: World,
@@ -190,6 +191,7 @@ impl App {
         Self {
             mesh: None,
             tonemap: None,
+            sky: None,
             renderer: None,
             window: None,
             world,
@@ -274,9 +276,11 @@ impl ApplicationHandler for App {
 
         let (mesh, _ids) = MeshRenderer::new(&renderer, &meshes, &materials, MAX_INSTANCES);
         let tonemap = TonemapPass::new(&renderer);
+        let sky = SkyPass::new(&renderer);
 
         self.mesh = Some(mesh);
         self.tonemap = Some(tonemap);
+        self.sky = Some(sky);
         self.renderer = Some(renderer);
         self.window = Some(window);
     }
@@ -376,14 +380,16 @@ impl ApplicationHandler for App {
                 let size = self.window.as_ref().unwrap().inner_size();
                 let aspect = size.width as f32 / size.height.max(1) as f32;
                 let view_proj = self.camera.view_proj(aspect);
+                let inv_view_proj = view_proj.inverse();
                 let light_dir = self.light_dir;
                 let camera_pos = self.camera.pos;
 
                 let exposure = self.exposure;
-                if let (Some(r), Some(m), Some(tm)) = (
+                if let (Some(r), Some(m), Some(tm), Some(sky)) = (
                     self.renderer.as_mut(),
                     self.mesh.as_mut(),
                     self.tonemap.as_mut(),
+                    self.sky.as_ref(),
                 ) {
                     // HDR view/sampler are stable except across resize; capture
                     // before the mutable draw_frame borrow, refresh in `update`.
@@ -391,6 +397,8 @@ impl ApplicationHandler for App {
                     let hdr_sampler = r.hdr_sampler();
                     r.draw_frame(
                         |cmd, extent, frame| {
+                            // Background first (depth off), then meshes over it.
+                            sky.draw(cmd, extent, inv_view_proj, camera_pos, light_dir);
                             m.draw(cmd, extent, frame, view_proj, light_dir, camera_pos, &mut items)
                         },
                         |cmd, extent, frame| {
