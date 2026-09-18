@@ -7,3 +7,6 @@ publish = false
 [dependencies]
 glam.workspace = true
 serde.workspace = true
+# Lean glTF: parse document + read buffers only. default-features off drops the
+# `image`/`base64` deps (no texture decoding yet), keeping compile times down.
+gltf = { version = "1", default-features = false, features = ["utils"] }

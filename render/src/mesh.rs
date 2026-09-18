@@ -1,10 +1,10 @@
-//! Instanced, lit mesh renderer. A single mesh (here a generated UV sphere with
-//! normals) drawn N times in one `cmd_draw_indexed`. Per-instance data is
+//! Instanced, lit mesh renderer. One mesh (a procedural sphere or a loaded
+//! glTF) drawn N times in a single `cmd_draw_indexed`. Per-instance data is
 //! `{ model, color }` from a storage buffer; a directional light is applied in
-//! the fragment shader. Geometry is generalized enough that a loaded glTF mesh
-//! will drop straight in (same Vertex + index buffers).
+//! the fragment shader. The mesh comes in as a Vulkan-free `assets::MeshData`.
 
 use ash::vk;
+use feather_assets::{MeshData, Vertex};
 use feather_gfx::{Buffer, MappedBuffer, Renderer, FRAMES_IN_FLIGHT};
 use glam::{Mat4, Vec4};
 
@@ -12,13 +12,6 @@ macro_rules! spv {
     ($name:expr) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"))
     };
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Vertex {
-    pos: [f32; 3],
-    normal: [f32; 3],
 }
 
 /// Per-instance data uploaded to the storage buffer (std430: 80 bytes).
@@ -37,38 +30,6 @@ fn as_bytes<T>(slice: &[T]) -> &[u8] {
     }
 }
 
-fn generate_sphere(stacks: u32, slices: u32, radius: f32) -> (Vec<Vertex>, Vec<u16>) {
-    let mut verts = Vec::with_capacity(((stacks + 1) * (slices + 1)) as usize);
-    for i in 0..=stacks {
-        let phi = std::f32::consts::PI * i as f32 / stacks as f32; // 0..pi
-        let (sp, cp) = phi.sin_cos();
-        for j in 0..=slices {
-            let theta = std::f32::consts::TAU * j as f32 / slices as f32; // 0..2pi
-            let (st, ct) = theta.sin_cos();
-            let n = [sp * ct, cp, sp * st];
-            verts.push(Vertex {
-                pos: [n[0] * radius, n[1] * radius, n[2] * radius],
-                normal: n,
-            });
-        }
-    }
-    let mut idx = Vec::with_capacity((stacks * slices * 6) as usize);
-    let stride = slices + 1;
-    for i in 0..stacks {
-        for j in 0..slices {
-            let a = i * stride + j;
-            let b = a + stride;
-            // Winding is irrelevant: the pipeline uses cull NONE + depth test,
-            // which renders a closed convex mesh correctly regardless.
-            idx.extend_from_slice(&[
-                a as u16, (a + 1) as u16, b as u16,
-                (a + 1) as u16, (b + 1) as u16, b as u16,
-            ]);
-        }
-    }
-    (verts, idx)
-}
-
 pub struct MeshRenderer {
     device: ash::Device,
     layout: vk::PipelineLayout,
@@ -84,15 +45,16 @@ pub struct MeshRenderer {
 }
 
 impl MeshRenderer {
-    pub fn new(renderer: &Renderer, max_instances: u32) -> Self {
+    pub fn new(renderer: &Renderer, mesh: &MeshData, max_instances: u32) -> Self {
         let device = renderer.device();
 
-        let (vertices, indices) = generate_sphere(16, 24, 0.5);
-        let index_count = indices.len() as u32;
-        let vertex_buffer = renderer
-            .create_device_local_buffer(as_bytes(&vertices), vk::BufferUsageFlags::VERTEX_BUFFER);
+        let index_count = mesh.indices.len() as u32;
+        let vertex_buffer = renderer.create_device_local_buffer(
+            as_bytes(&mesh.vertices),
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        );
         let index_buffer = renderer
-            .create_device_local_buffer(as_bytes(&indices), vk::BufferUsageFlags::INDEX_BUFFER);
+            .create_device_local_buffer(as_bytes(&mesh.indices), vk::BufferUsageFlags::INDEX_BUFFER);
 
         let instance_buffers: Vec<MappedBuffer> = (0..FRAMES_IN_FLIGHT)
             .map(|_| {
@@ -331,7 +293,7 @@ impl MeshRenderer {
                 cmd,
                 self.index_buffer.handle,
                 0,
-                vk::IndexType::UINT16,
+                vk::IndexType::UINT32,
             );
             self.device
                 .cmd_draw_indexed(cmd, self.index_count, count, 0, 0, 0);

@@ -1,13 +1,16 @@
-//! Milestone 2+: a drifting field of ~1000 lit, individually-colored spheres,
-//! each an ECS entity, drawn in one instanced draw. Per-instance data is
-//! { model, color }; a single directional light shades them in linear space into
-//! an HDR target, which a tonemap pass resolves to the sRGB swapchain.
+//! Milestone 2+: a drifting field of ~1000 lit, individually-colored instances,
+//! each an ECS entity, drawn in one instanced draw. The instanced mesh is a
+//! procedural sphere by default, or a glTF/GLB passed as the first CLI arg
+//! (`cargo run -- model.glb`), auto-fitted to the grid. Per-instance data is
+//! { model, color }; a directional light shades in linear space into an HDR
+//! target, which a tonemap pass resolves to the sRGB swapchain.
 //! WASD/mouse fly the camera; `[` / `]` adjust exposure; Esc quits.
 
 use std::time::Instant;
 
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::ExecutorKind;
+use feather_assets::MeshData;
 use feather_gfx::Renderer;
 use feather_platform::winit;
 use feather_render::{InstanceData, MeshRenderer, TonemapPass};
@@ -115,6 +118,10 @@ struct App {
     input: Input,
     light_dir: Vec4,
     exposure: f32,
+    // Optional glTF/GLB path (first CLI arg); falls back to a sphere.
+    model_path: Option<String>,
+    // Centers + unit-scales the loaded mesh so any model fits the demo grid.
+    fit: Mat4,
     start: Instant,
     last_frame: Instant,
 }
@@ -165,6 +172,8 @@ impl App {
             input: Input::default(),
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             exposure: 1.0,
+            model_path: None,
+            fit: Mat4::IDENTITY,
             start: now,
             last_frame: now,
         }
@@ -195,7 +204,28 @@ impl ApplicationHandler for App {
 
         let size = window.inner_size();
         let renderer = Renderer::new(&window, size.width, size.height).expect("create renderer");
-        let mesh = MeshRenderer::new(&renderer, MAX_INSTANCES);
+
+        // Load the requested model, or fall back to the procedural sphere.
+        let mesh_data = match &self.model_path {
+            Some(path) => match feather_assets::load_gltf(path) {
+                Ok(m) => {
+                    eprintln!(
+                        "loaded {path}: {} vertices, {} indices",
+                        m.vertices.len(),
+                        m.indices.len()
+                    );
+                    m
+                }
+                Err(e) => {
+                    eprintln!("failed to load {path}: {e}\nfalling back to sphere");
+                    MeshData::uv_sphere(16, 24, 0.5)
+                }
+            },
+            None => MeshData::uv_sphere(16, 24, 0.5),
+        };
+        self.fit = fit_transform(&mesh_data);
+
+        let mesh = MeshRenderer::new(&renderer, &mesh_data, MAX_INSTANCES);
         let tonemap = TonemapPass::new(&renderer);
 
         self.mesh = Some(mesh);
@@ -282,13 +312,15 @@ impl ApplicationHandler for App {
 
                 // Extract: (Position, Spin, Tint) -> per-instance { model, color }.
                 let t = (now - self.start).as_secs_f32();
+                let fit = self.fit;
                 let mut instances: Vec<InstanceData> =
                     Vec::with_capacity((GRID * GRID * GRID) as usize);
                 let mut q = self.world.query::<(&Position, &Spin, &Tint)>();
                 for (p, s, tint) in q.iter(&self.world) {
                     let model = Mat4::from_translation(p.0)
                         * Mat4::from_rotation_y(t * s.0)
-                        * Mat4::from_scale(Vec3::splat(0.6));
+                        * Mat4::from_scale(Vec3::splat(0.6))
+                        * fit;
                     instances.push(InstanceData {
                         model,
                         color: tint.0,
@@ -332,9 +364,21 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Center the mesh at the origin and scale its largest extent to ~1 unit, so an
+/// arbitrarily-sized glTF drops into the demo grid at the same scale as the
+/// sphere. Applied as the innermost factor of each instance's model matrix.
+fn fit_transform(mesh: &MeshData) -> Mat4 {
+    let (min, max) = mesh.bounds();
+    let center = (min + max) * 0.5;
+    let extent = (max - min).max_element().max(1e-4);
+    Mat4::from_scale(Vec3::splat(1.0 / extent)) * Mat4::from_translation(-center)
+}
+
 fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new();
+    // Optional model path: `cargo run -- path/to/model.glb`.
+    app.model_path = std::env::args().nth(1);
     event_loop.run_app(&mut app).expect("run app");
 }

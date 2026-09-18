@@ -627,19 +627,27 @@ milestones land.
   swapchain and recreated on resize; `draw_frame` runs two passes — geometry
   into the HDR target, then a caller-supplied post pass into the swapchain —
   with the HDR write→read barrier between.
-- **render**: instanced `MeshRenderer` — generated UV sphere (pos+normal Vertex),
-  per-frame instance **SSBO** `InstanceData { model, color }` (std430, 80 B) with
-  one descriptor set per frame-in-flight, `view_proj` + `light_dir` in a push
-  constant, **linear-space** ambient + Lambert **directional light** (albedo
-  decoded sRGB→linear, HDR sun) written unclamped to the HDR target, `cull NONE`
-  + depth. One `cmd_draw_indexed`, `instanceCount` = live entity count (verified
-  to 8000). `TonemapPass` — attributeless fullscreen triangle sampling the HDR
-  target, **exposure + Narkowicz ACES**, output left linear for the `_SRGB`
-  swapchain to encode (no double gamma); exposure via push constant.
+- **render**: instanced `MeshRenderer` — one `assets::MeshData` (pos+normal
+  Vertex, u32 indices) uploaded to device-local vertex/index buffers; the mesh is
+  a procedural sphere or a loaded glTF. Per-frame instance **SSBO**
+  `InstanceData { model, color }` (std430, 80 B) with one descriptor set per
+  frame-in-flight, `view_proj` + `light_dir` in a push constant, **linear-space**
+  ambient + Lambert **directional light** (albedo decoded sRGB→linear, HDR sun)
+  written unclamped to the HDR target, `cull NONE` + depth. One
+  `cmd_draw_indexed`, `instanceCount` = live entity count (verified to 8000).
+  `TonemapPass` — attributeless fullscreen triangle sampling the HDR target,
+  **exposure + Narkowicz ACES**, output left linear for the `_SRGB` swapchain to
+  encode (no double gamma); exposure via push constant.
+- **assets**: Vulkan-free CPU mesh types (`Vertex`, `MeshData` + bounds), a
+  procedural `uv_sphere`, and a minimal **glTF/GLB loader** (`load_gltf`) —
+  merges all triangle primitives across the node hierarchy with transforms,
+  computes normals when absent, .glb blob + external `.bin` (gltf crate, no
+  image/base64 deps).
 - **app**: winit loop; bevy_ecs world + multi-threaded schedule (`integrate`,
   `tick`); render-rate **fly camera** (WASD/mouse/Esc, pointer locked); inline
   **extract** (`World` query → `Vec<InstanceData>` each frame); `[`/`]` adjust
-  tonemap exposure at runtime.
+  tonemap exposure at runtime; optional glTF path as the first CLI arg
+  (auto-centered + unit-scaled to the grid), sphere fallback.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 only partially — basic
   directional lighting, *not* CSM/GTAO/IBL. Steps 4+ not started.
 
@@ -671,14 +679,17 @@ milestones land.
   per-frame). With `FRAMES_IN_FLIGHT = 2` this carries a latent cross-frame WAW
   hazard on the shared targets — pending the sync2 barrier + timeline-semaphore
   pass (§10). The intra-frame HDR write→read hazard *is* handled.
-- **Geometry**: hardcoded generated sphere; the `assets` crate is still a stub —
-  no glTF import, bake tool, runtime blob, or load-time allocator yet.
+- **Geometry / assets (§6, §7)**: a **runtime glTF loader** now feeds the
+  renderer, but it's still **one merged mesh, one draw** — no mesh registry /
+  shared-buffer slices / per-mesh batching, no materials/textures/UVs/tangents,
+  no skinning/animation, and no offline **bake** path (runtime blob, handle
+  tables, load-time bindless allocator). glTF geometry loads directly each run.
 
 ### Not yet started
 
 Culling; materials/bindless + textures; shadows (CSM); clustered lighting; IBL;
 bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
-bake pipeline + glTF loader; scene format / spawning / save; physics + FPS
-controller (rapier); skinning; UI/HUD; audio; debug/profiling tooling
-(Tracy/RenderDoc/timestamp queries); GPU-driven culling; streaming; stage
-pipelining.
+bake pipeline + mesh registry / multi-mesh draws (runtime glTF loader landed);
+scene format / spawning / save; physics + FPS controller (rapier); skinning;
+UI/HUD; audio; debug/profiling tooling (Tracy/RenderDoc/timestamp queries);
+GPU-driven culling; streaming; stage pipelining.
