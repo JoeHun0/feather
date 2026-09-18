@@ -7,7 +7,8 @@
 //! instances use a shared palette. Meshes are a procedural sphere + cube by
 //! default, or one
 //! per glTF/GLB path on the CLI (`cargo run -- a.glb b.glb`), each auto-fitted
-//! to the grid. A directional light shades in linear space into an HDR target,
+//! to the grid. A directional light with a Cook-Torrance **PBR** BRDF shades in
+//! linear space into an HDR target,
 //! which a tonemap pass resolves to the sRGB swapchain. WASD/mouse fly the
 //! camera; `[` / `]` adjust exposure; Esc quits.
 
@@ -375,6 +376,7 @@ impl ApplicationHandler for App {
                 let aspect = size.width as f32 / size.height.max(1) as f32;
                 let view_proj = self.camera.view_proj(aspect);
                 let light_dir = self.light_dir;
+                let camera_pos = self.camera.pos;
 
                 let exposure = self.exposure;
                 if let (Some(r), Some(m), Some(tm)) = (
@@ -388,7 +390,7 @@ impl ApplicationHandler for App {
                     let hdr_sampler = r.hdr_sampler();
                     r.draw_frame(
                         |cmd, extent, frame| {
-                            m.draw(cmd, extent, frame, view_proj, light_dir, &mut items)
+                            m.draw(cmd, extent, frame, view_proj, light_dir, camera_pos, &mut items)
                         },
                         |cmd, extent, frame| {
                             tm.update(frame, hdr_view, hdr_sampler);

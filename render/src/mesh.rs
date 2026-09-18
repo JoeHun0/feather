@@ -361,7 +361,7 @@ impl MeshRenderer {
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(80)]; // mat4 view_proj + vec4 light_dir
+            .size(96)]; // mat4 view_proj + vec4 light_dir + vec4 camera_pos
         let layout = unsafe {
             device
                 .create_pipeline_layout(
@@ -433,6 +433,7 @@ impl MeshRenderer {
         frame: usize,
         view_proj: Mat4,
         light_dir: Vec4,
+        camera_pos: glam::Vec3,
         items: &mut [(MeshId, InstanceData)],
     ) {
         // Contiguous runs per mesh -> one draw each. Unstable sort is fine; draw
@@ -445,11 +446,12 @@ impl MeshRenderer {
             .extend(items[..count].iter().map(|(_, inst)| *inst));
         self.instance_buffers[frame].write(as_bytes(&self.scratch));
 
-        // Push constant: mat4 view_proj (16 f32) + vec4 light_dir (4 f32) = 80 bytes.
-        let mut push = [0f32; 20];
+        // Push constant (96 B): mat4 view_proj + vec4 light_dir + vec4 camera_pos.
+        let mut push = [0f32; 24];
         push[..16].copy_from_slice(&view_proj.to_cols_array());
-        push[16..].copy_from_slice(&light_dir.to_array());
-        let push_bytes = unsafe { std::slice::from_raw_parts(push.as_ptr() as *const u8, 80) };
+        push[16..20].copy_from_slice(&light_dir.to_array());
+        push[20..23].copy_from_slice(&camera_pos.to_array());
+        let push_bytes = unsafe { std::slice::from_raw_parts(push.as_ptr() as *const u8, 96) };
 
         unsafe {
             self.device.cmd_push_constants(

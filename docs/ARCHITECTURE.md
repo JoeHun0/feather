@@ -638,8 +638,9 @@ milestones land.
   binding1 (fragment); and a **bindless-lite texture array** — fixed
   `sampler2D textures[64]` at binding2, non-uniformly indexed by `material_id`
   (slot 0 = white default, unused slots also white). Vertex is pos+normal+uv.
-  `view_proj` + `light_dir` in a push constant, **linear-space** ambient + Lambert
-  **directional light** on `base_color_texture × base_color_factor`, written
+  `view_proj` + `light_dir` + `camera_pos` in a push constant (96 B),
+  **linear-space** Cook-Torrance **PBR** (metallic-roughness) directional light on
+  `base_color_texture × base_color_factor`, plus flat ambient, written
   unclamped to the HDR target, `cull NONE` + depth. Draw sorts `(MeshId,
   instance)` by mesh, emits **one `cmd_draw_indexed` per contiguous run**
   (`firstInstance` = run start). `TonemapPass` — attributeless fullscreen triangle
@@ -659,8 +660,8 @@ milestones land.
   cube by default or one per glTF path on the CLI (each auto-fitted to the grid);
   each entity assigned a mesh + `material_id` at random (glTF meshes use their
   file material; procedural meshes use a shared generated palette).
-- **Build order (§23)**: step 1 done; step 2 done; step 3 only partially — basic
-  directional lighting, *not* CSM/GTAO/IBL. Steps 4+ not started.
+- **Build order (§23)**: step 1 done; step 2 done; step 3 partially — PBR direct
+  lighting + textures, *not* CSM/GTAO/IBL. Steps 4+ not started.
 
 ### Current simplifications to revisit
 
@@ -680,12 +681,12 @@ milestones land.
   Design reserves push constants for tiny per-draw scalars and puts camera in a
   per-frame UBO — revisit when Set 1 lands.
 - **Vertex layout (§6)**: pos+normal+uv; **tangent deferred** until normal maps.
-- **Lighting (§3, §13)**: now **linear-space** ambient+Lambert into an RGBA16F
-  HDR target, resolved by an ACES **tonemap** pass — the color-management seam is
-  correct. Still **not** the full baseline: no PBR BRDF and no IBL yet, exposure
-  is a fixed constant (no auto-exposure), and no bloom. The tonemap curve is a
-  drop-in point for AgX. This unblocks bloom/SSR/transparents, which all read the
-  resolved HDR.
+- **Lighting (§3, §13)**: **linear-space** Cook-Torrance **PBR** (metallic-
+  roughness) for one directional light + flat ambient, into an RGBA16F HDR target
+  resolved by an ACES **tonemap** pass. Still **not** the full baseline: no IBL
+  (ambient is a flat constant × albedo, wrong for metals), no shadows, exposure is
+  a fixed constant (no auto-exposure), and no bloom. The tonemap curve is a
+  drop-in point for AgX. Bloom/SSR/transparents all read the resolved HDR.
 - **HDR/depth targets (§9)**: single engine-owned images shared across both
   frames-in-flight (matches the design: render targets are engine-owned, not
   per-frame). With `FRAMES_IN_FLIGHT = 2` this carries a latent cross-frame WAW
@@ -695,20 +696,21 @@ milestones land.
   **base-color texture** path now exist — several meshes in shared vertex/index
   buffers drawn by sorted per-mesh runs; a resident `materials[]` SSBO indexed by
   per-instance `material_id`; and a fixed bindless `textures[]` array with each
-  material's base-color image (glTF or white default). Still missing: **normal +
-  metallic-roughness textures** (+ tangents), mips, pipeline buckets (one pipeline
-  for everything), a PBR BRDF (shading is Lambert on base color — metallic/
-  roughness stored but unused), skinning/animation, and the offline **bake** path
-  (runtime blob, handle tables, load-time allocator). glTF loads directly each
+  material's base-color image (glTF or white default), consumed by a
+  Cook-Torrance PBR BRDF. Still missing: **normal + metallic-roughness textures**
+  (+ tangents; metallic/roughness come only from the material factors for now),
+  mips, pipeline buckets (one pipeline for everything), IBL, skinning/animation,
+  and the offline **bake** path (runtime blob, handle tables, load-time
+  allocator). glTF loads directly each
   run; nothing is freed/streamed; one material per merged glTF (first primitive
   wins).
 
 ### Not yet started
 
-Culling; normal + metallic-roughness textures + mips + tangents; PBR BRDF +
-pipeline buckets (base-color textures + material table landed); shadows (CSM);
-clustered lighting; IBL; bloom + auto-exposure (HDR target + tonemap now in
-place); transparents; asset bake pipeline (runtime glTF + multi-mesh registry
-landed); scene format / spawning / save; physics + FPS controller (rapier);
+Culling; normal + metallic-roughness textures + mips + tangents; pipeline buckets
+(PBR BRDF + base-color textures landed); shadows (CSM); clustered lighting; IBL;
+bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
+bake pipeline (runtime glTF + multi-mesh registry landed); scene format /
+spawning / save; physics + FPS controller (rapier);
 skinning; UI/HUD; audio; debug/profiling tooling (Tracy/RenderDoc/timestamp
 queries); GPU-driven culling; streaming; stage pipelining.

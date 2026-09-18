@@ -2,7 +2,8 @@
 
 layout(push_constant) uniform Push {
     mat4 view_proj;
-    vec4 light_dir; // xyz = direction the light travels
+    vec4 light_dir;   // xyz = direction the light travels
+    vec4 camera_pos;  // xyz = world-space eye
 } pc;
 
 struct Instance {
@@ -23,11 +24,14 @@ layout(location = 2) in vec2 in_uv;
 layout(location = 0) out vec3 v_normal;
 layout(location = 1) out flat uint v_material;
 layout(location = 2) out vec2 v_uv;
+layout(location = 3) out vec3 v_world_pos;
 
 void main() {
     Instance it = insts[gl_InstanceIndex];
-    gl_Position = pc.view_proj * it.model * vec4(in_pos, 1.0);
-    // Uniform scale, so the model's 3x3 transforms normals correctly.
+    vec4 world = it.model * vec4(in_pos, 1.0);
+    gl_Position = pc.view_proj * world;
+    v_world_pos = world.xyz;
+    // Uniform scale in the demo transforms, so mat3(model) is fine for normals.
     v_normal = normalize(mat3(it.model) * in_normal);
     v_material = it.material_id;
     v_uv = in_uv;
