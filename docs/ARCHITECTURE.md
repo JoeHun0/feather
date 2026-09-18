@@ -630,26 +630,30 @@ milestones land.
 - **render**: instanced `MeshRenderer` — **several meshes share one** device-local
   vertex + index buffer, each a `{first_index, index_count, vertex_offset}` slice
   keyed by `MeshId`; per-mesh indices stay 0-based (rebased via `vertexOffset`).
-  Per-frame instance **SSBO** `InstanceData { model, color }` (std430, 80 B), one
-  descriptor set per frame-in-flight, `view_proj` + `light_dir` in a push
-  constant, **linear-space** ambient + Lambert **directional light** (albedo
-  decoded sRGB→linear, HDR sun) written unclamped to the HDR target, `cull NONE`
-  + depth. Draw sorts `(MeshId, instance)` by mesh, uploads in that order, emits
-  **one `cmd_draw_indexed` per contiguous run** (`firstInstance` = run start).
+  Per-frame instance **SSBO** `InstanceData { model, material_id }` (std430, 80 B)
+  at set0/binding0 (vertex), plus a **resident materials SSBO** `GpuMaterial`
+  (§5: 64 B — base color, metallic, roughness, emissive; `tex` zeroed) at
+  set0/binding1 (fragment). `view_proj` + `light_dir` in a push constant,
+  **linear-space** ambient + Lambert **directional light** on the material's base
+  color, written unclamped to the HDR target, `cull NONE` + depth. Draw sorts
+  `(MeshId, instance)` by mesh, uploads in that order, emits **one
+  `cmd_draw_indexed` per contiguous run** (`firstInstance` = run start).
   `TonemapPass` — attributeless fullscreen triangle sampling the HDR target,
   **exposure + Narkowicz ACES**, output left linear for the `_SRGB` swapchain to
   encode (no double gamma); exposure via push constant.
-- **assets**: Vulkan-free CPU mesh types (`Vertex`, `MeshData` + bounds),
-  procedural `uv_sphere` + `cube`, and a minimal **glTF/GLB loader**
+- **assets**: Vulkan-free CPU mesh types (`Vertex`, `MeshData` + bounds +
+  `Material`), procedural `uv_sphere` + `cube`, and a minimal **glTF/GLB loader**
   (`load_gltf`) — merges all triangle primitives across the node hierarchy with
-  transforms, computes normals when absent, .glb blob + external `.bin` (gltf
-  crate, no image/base64 deps).
+  transforms, computes normals when absent, reads the first primitive's
+  **material** (base color / metallic / roughness / emissive factors), .glb blob
+  + external `.bin` (gltf crate, no image/base64 deps).
 - **app**: winit loop; bevy_ecs world + multi-threaded schedule (`integrate`,
   `tick`); render-rate **fly camera** (WASD/mouse/Esc, pointer locked); inline
   **extract** (`World` query → sorted `Vec<(MeshId, InstanceData)>` each frame);
   `[`/`]` adjust tonemap exposure at runtime; meshes are a procedural sphere +
-  cube by default or one per glTF path on the CLI (each auto-fitted to the grid),
-  each entity assigned a mesh at random.
+  cube by default or one per glTF path on the CLI (each auto-fitted to the grid);
+  each entity assigned a mesh + `material_id` at random (glTF meshes use their
+  file material; procedural meshes use a shared generated palette).
 - **Build order (§23)**: step 1 done; step 2 done; step 3 only partially — basic
   directional lighting, *not* CSM/GTAO/IBL. Steps 4+ not started.
 
@@ -661,15 +665,15 @@ milestones land.
 - **Timestep (§4)**: sim runs once per frame with a hardcoded `dt = 1/60`. No
   accumulator and **no interpolation** yet — needed before physics. Camera is
   already render-rate (matches design).
-- **Descriptors (§9)**: only one set type exists (per-frame instance SSBO), as
-  N discrete per-frame sets+buffers. Not yet the Set 0 (resident/bindless) /
-  Set 1 (per-frame ring + dynamic offsets) / Set 2 (per-view) scheme; **no
-  bindless**.
+- **Descriptors (§9)**: one set with two bindings — per-frame instances
+  (binding 0) + resident materials (binding 1), as N discrete per-frame sets.
+  Not yet the Set 0 (resident/bindless) / Set 1 (per-frame ring + dynamic
+  offsets) / Set 2 (per-view) scheme; materials are a plain SSBO, **not bindless
+  textures**.
 - **Push constants**: currently carry `view_proj` + `light_dir` (provisional).
   Design reserves push constants for tiny per-draw scalars and puts camera in a
   per-frame UBO — revisit when Set 1 lands.
 - **Vertex layout (§6)**: pos+normal only; tangent/uv deferred until textures.
-  Per-instance `color` stands in for the eventual `material_id`.
 - **Lighting (§3, §13)**: now **linear-space** ambient+Lambert into an RGBA16F
   HDR target, resolved by an ACES **tonemap** pass — the color-management seam is
   correct. Still **not** the full baseline: no PBR BRDF and no IBL yet, exposure
@@ -681,18 +685,23 @@ milestones land.
   per-frame). With `FRAMES_IN_FLIGHT = 2` this carries a latent cross-frame WAW
   hazard on the shared targets — pending the sync2 barrier + timeline-semaphore
   pass (§10). The intra-frame HDR write→read hazard *is* handled.
-- **Geometry / assets (§6, §7)**: a **mesh registry** now exists — several meshes
-  in shared vertex/index buffers, drawn by sorted per-mesh runs. Still missing:
-  materials/textures/UVs/tangents, per-instance `material_id` + pipeline buckets
-  (one pipeline for everything), skinning/animation, and the offline **bake**
-  path (runtime blob, handle tables, load-time bindless allocator). glTF geometry
-  loads directly each run; a mesh's buffers are never freed/streamed.
+- **Geometry / assets (§6, §7)**: a **mesh registry** and a **material table**
+  now exist — several meshes in shared vertex/index buffers drawn by sorted
+  per-mesh runs, and a resident `materials[]` SSBO indexed by per-instance
+  `material_id` (base-color/metallic/roughness/emissive factors from glTF or a
+  generated palette). Still missing: **textures + bindless**, pipeline buckets
+  (one pipeline for everything), UVs/tangents, a PBR BRDF (shading is Lambert on
+  base color — metallic/roughness are stored but unused), skinning/animation, and
+  the offline **bake** path (runtime blob, handle tables, load-time allocator).
+  glTF loads directly each run; buffers are never freed/streamed; one material
+  per merged glTF (first primitive wins).
 
 ### Not yet started
 
-Culling; materials/bindless + textures + pipeline buckets; shadows (CSM);
-clustered lighting; IBL; bloom + auto-exposure (HDR target + tonemap now in
-place); transparents; asset bake pipeline (runtime glTF + multi-mesh registry
-landed); scene format / spawning / save; physics + FPS controller (rapier);
+Culling; textures + bindless + PBR BRDF + pipeline buckets (material factor
+table landed); shadows (CSM); clustered lighting; IBL; bloom + auto-exposure
+(HDR target + tonemap now in place); transparents; asset bake pipeline (runtime
+glTF + multi-mesh registry landed); scene format / spawning / save; physics + FPS
+controller (rapier);
 skinning; UI/HUD; audio; debug/profiling tooling (Tracy/RenderDoc/timestamp
 queries); GPU-driven culling; streaming; stage pipelining.

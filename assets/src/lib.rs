@@ -20,12 +20,37 @@ pub struct Vertex {
     pub normal: [f32; 3],
 }
 
-/// CPU-side mesh: interleaved vertices + a 32-bit index buffer. One shared
-/// representation for both procedural and loaded geometry.
+/// Surface parameters for a mesh (glTF metallic-roughness aligned). Colors are
+/// **linear** (glTF `baseColorFactor`/`emissiveFactor` are linear; procedural
+/// meshes must supply linear values too). Textures are deferred — this is the
+/// factor-only subset the renderer shades with for now.
+#[derive(Clone, Copy, Debug)]
+pub struct Material {
+    pub base_color: [f32; 4], // linear RGBA
+    pub metallic: f32,
+    pub roughness: f32,
+    pub emissive: [f32; 3], // linear RGB
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        // White dielectric.
+        Self {
+            base_color: [1.0, 1.0, 1.0, 1.0],
+            metallic: 0.0,
+            roughness: 1.0,
+            emissive: [0.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// CPU-side mesh: interleaved vertices + a 32-bit index buffer, plus the surface
+/// material. One shared representation for both procedural and loaded geometry.
 #[derive(Clone, Default)]
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+    pub material: Material,
 }
 
 impl MeshData {
@@ -69,7 +94,7 @@ impl MeshData {
                 indices.extend_from_slice(&[a, a + 1, b, a + 1, b + 1, b]);
             }
         }
-        Self { vertices, indices }
+        Self { vertices, indices, material: Material::default() }
     }
 
     /// Unit-ish cube with per-face (flat) normals: 24 vertices, 36 indices.
@@ -93,7 +118,7 @@ impl MeshData {
             }
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
-        Self { vertices, indices }
+        Self { vertices, indices, material: Material::default() }
     }
 }
 
@@ -136,16 +161,17 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<MeshData, Box<dyn Error>> {
     }
 
     let mut out = MeshData::default();
+    let mut material: Option<Material> = None;
     match gltf.default_scene().or_else(|| gltf.scenes().next()) {
         Some(scene) => {
             for node in scene.nodes() {
-                accumulate_node(&node, Mat4::IDENTITY, &buffers, &mut out);
+                accumulate_node(&node, Mat4::IDENTITY, &buffers, &mut out, &mut material);
             }
         }
         // No scene graph: take mesh geometry directly, untransformed.
         None => {
             for mesh in gltf.meshes() {
-                append_mesh(&mesh, Mat4::IDENTITY, &buffers, &mut out);
+                append_mesh(&mesh, Mat4::IDENTITY, &buffers, &mut out, &mut material);
             }
         }
     }
@@ -153,25 +179,52 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<MeshData, Box<dyn Error>> {
     if out.vertices.is_empty() {
         return Err("glTF contained no triangle mesh geometry".into());
     }
+    // First primitive's material wins (merging is single-material for now).
+    out.material = material.unwrap_or_default();
     Ok(out)
 }
 
-fn accumulate_node(node: &gltf::Node, parent: Mat4, buffers: &[Vec<u8>], out: &mut MeshData) {
-    let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
-    if let Some(mesh) = node.mesh() {
-        append_mesh(&mesh, world, buffers, out);
-    }
-    for child in node.children() {
-        accumulate_node(&child, world, buffers, out);
+fn read_material(m: &gltf::Material) -> Material {
+    let pbr = m.pbr_metallic_roughness();
+    Material {
+        base_color: pbr.base_color_factor(), // linear RGBA
+        metallic: pbr.metallic_factor(),
+        roughness: pbr.roughness_factor(),
+        emissive: m.emissive_factor(), // linear RGB
     }
 }
 
-fn append_mesh(mesh: &gltf::Mesh, world: Mat4, buffers: &[Vec<u8>], out: &mut MeshData) {
+fn accumulate_node(
+    node: &gltf::Node,
+    parent: Mat4,
+    buffers: &[Vec<u8>],
+    out: &mut MeshData,
+    material: &mut Option<Material>,
+) {
+    let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
+    if let Some(mesh) = node.mesh() {
+        append_mesh(&mesh, world, buffers, out, material);
+    }
+    for child in node.children() {
+        accumulate_node(&child, world, buffers, out, material);
+    }
+}
+
+fn append_mesh(
+    mesh: &gltf::Mesh,
+    world: Mat4,
+    buffers: &[Vec<u8>],
+    out: &mut MeshData,
+    material: &mut Option<Material>,
+) {
     // Normals transform by the inverse-transpose (correct under non-uniform scale).
     let normal_mat = Mat3::from_mat4(world).inverse().transpose();
     for prim in mesh.primitives() {
         if prim.mode() != gltf::mesh::Mode::Triangles {
             continue;
+        }
+        if material.is_none() {
+            *material = Some(read_material(&prim.material()));
         }
         let reader = prim.reader(|b| buffers.get(b.index()).map(|v| v.as_slice()));
         let positions: Vec<[f32; 3]> = match reader.read_positions() {

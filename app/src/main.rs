@@ -1,11 +1,13 @@
-//! Milestone 2+: a drifting field of ~1000 lit, individually-colored ECS
-//! entities. Several meshes share one vertex/index buffer; each entity picks one
-//! at random, and extract sorts instances by mesh so each draws as one batched
-//! run. Meshes are a procedural sphere + cube by default, or one per glTF/GLB
-//! path on the CLI (`cargo run -- a.glb b.glb`), each auto-fitted to the grid.
-//! Per-instance data is { model, color }; a directional light shades in linear
-//! space into an HDR target, which a tonemap pass resolves to the sRGB
-//! swapchain. WASD/mouse fly the camera; `[` / `]` adjust exposure; Esc quits.
+//! Milestone 2+: a drifting field of ~1000 lit ECS entities. Several meshes
+//! share one vertex/index buffer; each entity picks a mesh at random, and
+//! extract sorts instances by mesh so each draws as one batched run. Shading
+//! reads a **material** per instance (`material_id` → a materials SSBO): loaded
+//! glTF meshes use their file's base color, procedural sphere/cube instances use
+//! a shared palette. Meshes are a procedural sphere + cube by default, or one
+//! per glTF/GLB path on the CLI (`cargo run -- a.glb b.glb`), each auto-fitted
+//! to the grid. A directional light shades in linear space into an HDR target,
+//! which a tonemap pass resolves to the sRGB swapchain. WASD/mouse fly the
+//! camera; `[` / `]` adjust exposure; Esc quits.
 
 use std::time::Instant;
 
@@ -35,11 +37,14 @@ struct Velocity(Vec3);
 #[derive(Component)]
 struct Spin(f32);
 #[derive(Component)]
-struct Tint(Vec4);
-#[derive(Component)]
 struct Mesh(MeshId);
+#[derive(Component)]
+struct Material(u32); // material_id into the renderer's material table
 #[derive(Resource, Default)]
 struct FrameCount(u64);
+
+/// Number of shared palette materials generated for procedural meshes.
+const PALETTE: u32 = 24;
 
 /// What to register with the renderer. Resolved into `MeshData` at startup; the
 /// index in the source list is the mesh's `MeshId`.
@@ -129,7 +134,6 @@ struct App {
     input: Input,
     light_dir: Vec4,
     exposure: f32,
-    // Optional glTF/GLB path (first CLI arg); falls back to a sphere.
     // Meshes to register (decided up front); index == MeshId.
     sources: Vec<MeshSource>,
     // Per-mesh transform that centers + unit-scales it into the demo grid.
@@ -155,20 +159,21 @@ impl App {
                 rand01(u * 3 + 2) - 0.5,
             ) * 1.5;
             let spin = (rand01(u * 7 + 11) - 0.5) * 3.0;
-            let tint = Vec4::new(
-                0.35 + 0.65 * rand01(u * 13),
-                0.35 + 0.65 * rand01(u * 13 + 1),
-                0.35 + 0.65 * rand01(u * 13 + 2),
-                1.0,
-            );
             // Assign a mesh at random among those registered.
             let mesh = ((rand01(u * 17 + 5) * mesh_count as f32) as u32).min(mesh_count - 1);
+            // glTF meshes use their own file material (id = PALETTE + mesh index);
+            // procedural meshes pick a random shared palette material.
+            let material = if matches!(sources.get(mesh as usize), Some(MeshSource::Gltf(_))) {
+                PALETTE + mesh
+            } else {
+                (rand01(u * 23 + 7) * PALETTE as f32) as u32 % PALETTE
+            };
             world.spawn((
                 Position(pos),
                 Velocity(vel),
                 Spin(spin),
-                Tint(tint),
                 Mesh(MeshId(mesh)),
+                Material(material),
             ));
         }
 
@@ -226,13 +231,14 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         let renderer = Renderer::new(&window, size.width, size.height).expect("create renderer");
 
-        // Resolve every source into MeshData (loading glTF, generating procedurals),
-        // dropping any that fail; index order becomes the MeshId order.
+        // Resolve every source into MeshData (loading glTF, generating
+        // procedurals). A failed glTF is replaced with a sphere so mesh indices
+        // stay aligned with `sources` (and thus with spawned Mesh ids).
         let mut meshes: Vec<MeshData> = Vec::with_capacity(self.sources.len());
         for src in &self.sources {
-            match src {
-                MeshSource::Sphere => meshes.push(MeshData::uv_sphere(16, 24, 0.5)),
-                MeshSource::Cube => meshes.push(MeshData::cube(1.0)),
+            let mesh = match src {
+                MeshSource::Sphere => MeshData::uv_sphere(16, 24, 0.5),
+                MeshSource::Cube => MeshData::cube(1.0),
                 MeshSource::Gltf(path) => match feather_assets::load_gltf(path) {
                     Ok(m) => {
                         eprintln!(
@@ -240,19 +246,29 @@ impl ApplicationHandler for App {
                             m.vertices.len(),
                             m.indices.len()
                         );
-                        meshes.push(m);
+                        m
                     }
-                    Err(e) => eprintln!("failed to load {path}: {e} (skipping)"),
+                    Err(e) => {
+                        eprintln!("failed to load {path}: {e} (using sphere)");
+                        MeshData::uv_sphere(16, 24, 0.5)
+                    }
                 },
-            }
+            };
+            meshes.push(mesh);
         }
         if meshes.is_empty() {
-            eprintln!("no meshes loaded; falling back to sphere");
             meshes.push(MeshData::uv_sphere(16, 24, 0.5));
         }
         self.fits = meshes.iter().map(fit_transform).collect();
 
-        let (mesh, _ids) = MeshRenderer::new(&renderer, &meshes, MAX_INSTANCES);
+        // Material table: shared palette first (indices 0..PALETTE), then each
+        // mesh's own material (index PALETTE + mesh_id) — matches the ids that
+        // App::new assigned to entities.
+        let mut materials: Vec<feather_assets::Material> =
+            (0..PALETTE).map(palette_material).collect();
+        materials.extend(meshes.iter().map(|m| m.material));
+
+        let (mesh, _ids) = MeshRenderer::new(&renderer, &meshes, &materials, MAX_INSTANCES);
         let tonemap = TonemapPass::new(&renderer);
 
         self.mesh = Some(mesh);
@@ -337,21 +353,20 @@ impl ApplicationHandler for App {
 
                 self.schedule.run(&mut self.world);
 
-                // Extract: (Position, Spin, Tint, Mesh) -> (MeshId, {model, color}).
+                // Extract: (Position, Spin, Mesh, Material) -> (MeshId, instance).
                 let t = (now - self.start).as_secs_f32();
                 let fits = &self.fits;
                 let mesh_max = fits.len().saturating_sub(1);
                 let mut items: Vec<(MeshId, InstanceData)> =
                     Vec::with_capacity((GRID * GRID * GRID) as usize);
-                let mut q = self.world.query::<(&Position, &Spin, &Tint, &Mesh)>();
-                for (p, s, tint, mesh) in q.iter(&self.world) {
-                    // Clamp in case a source mesh failed to load and was dropped.
+                let mut q = self.world.query::<(&Position, &Spin, &Mesh, &Material)>();
+                for (p, s, mesh, material) in q.iter(&self.world) {
                     let id = (mesh.0 .0 as usize).min(mesh_max);
                     let model = Mat4::from_translation(p.0)
                         * Mat4::from_rotation_y(t * s.0)
                         * Mat4::from_scale(Vec3::splat(0.6))
                         * fits[id];
-                    items.push((MeshId(id as u32), InstanceData { model, color: tint.0 }));
+                    items.push((MeshId(id as u32), InstanceData::new(model, material.0)));
                 }
 
                 let size = self.window.as_ref().unwrap().inner_size();
@@ -399,6 +414,27 @@ fn fit_transform(mesh: &MeshData) -> Mat4 {
     let center = (min + max) * 0.5;
     let extent = (max - min).max_element().max(1e-4);
     Mat4::from_scale(Vec3::splat(1.0 / extent)) * Mat4::from_translation(-center)
+}
+
+/// A varied shared material for the procedural demo. Base color is generated in
+/// sRGB then stored linear (the renderer shades in linear space).
+fn palette_material(k: u32) -> feather_assets::Material {
+    let srgb_to_linear = |c: f32| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let r = 0.1 + 0.85 * rand01(k * 13 + 1);
+    let g = 0.1 + 0.85 * rand01(k * 13 + 2);
+    let b = 0.1 + 0.85 * rand01(k * 13 + 3);
+    feather_assets::Material {
+        base_color: [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0],
+        metallic: if rand01(k * 13 + 4) > 0.7 { 1.0 } else { 0.0 },
+        roughness: 0.3 + 0.6 * rand01(k * 13 + 5),
+        emissive: [0.0, 0.0, 0.0],
+    }
 }
 
 fn main() {

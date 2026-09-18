@@ -2,11 +2,12 @@
 //! index buffer (each a `{first_index, index_count, vertex_offset}` slice);
 //! per-frame instances are sorted by mesh so each mesh draws as one contiguous
 //! run (`cmd_draw_indexed` with `firstInstance`). Per-instance data is
-//! `{ model, color }` from a storage buffer; a directional light is applied in
-//! the fragment shader. Meshes come in as Vulkan-free `assets::MeshData`.
+//! `{ model, material_id }`; the fragment shader reads the material from a
+//! resident materials SSBO and applies a directional light. Meshes and materials
+//! come in as Vulkan-free `assets` types.
 
 use ash::vk;
-use feather_assets::{MeshData, Vertex};
+use feather_assets::{Material, MeshData, Vertex};
 use feather_gfx::{Buffer, MappedBuffer, Renderer, FRAMES_IN_FLIGHT};
 use glam::{Mat4, Vec4};
 
@@ -30,12 +31,46 @@ struct MeshSlice {
     vertex_offset: i32,
 }
 
-/// Per-instance data uploaded to the storage buffer (std430: 80 bytes).
+/// GPU material record (§5): std430, 64 bytes, indexed by `material_id`. Only the
+/// factors are populated for now; `tex` (bindless indices) stays zeroed until the
+/// textures milestone.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpuMaterial {
+    base_color_factor: [f32; 4],
+    emissive: [f32; 4], // rgb = emissive, a = metallic
+    params: [f32; 4],   // x = roughness, y = normal_scale, z = occlusion, w = alpha_cutoff
+    tex: [u32; 4],      // bindless indices (unused until textures)
+}
+
+impl GpuMaterial {
+    fn from_material(m: &Material) -> Self {
+        Self {
+            base_color_factor: m.base_color,
+            emissive: [m.emissive[0], m.emissive[1], m.emissive[2], m.metallic],
+            params: [m.roughness, 1.0, 1.0, 0.5],
+            tex: [0, 0, 0, 0],
+        }
+    }
+}
+
+/// Per-instance data uploaded to the storage buffer (§6: std430, 80 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct InstanceData {
     pub model: Mat4,
-    pub color: Vec4,
+    pub material_id: u32,
+    _pad: [u32; 3],
+}
+
+impl InstanceData {
+    pub fn new(model: Mat4, material_id: u32) -> Self {
+        Self {
+            model,
+            material_id,
+            _pad: [0; 3],
+        }
+    }
 }
 
 const INSTANCE_SIZE: u64 = std::mem::size_of::<InstanceData>() as u64; // 80
@@ -56,6 +91,9 @@ pub struct MeshRenderer {
     instance_buffers: Vec<MappedBuffer>,
     vertex_buffer: Buffer,
     index_buffer: Buffer,
+    // Held for its lifetime: the descriptor sets reference it. Freed on drop.
+    #[allow(dead_code)]
+    materials_buffer: Buffer,
     slices: Vec<MeshSlice>,
     // Reused each frame to gather sorted instances before the SSBO upload.
     scratch: Vec<InstanceData>,
@@ -63,9 +101,16 @@ pub struct MeshRenderer {
 }
 
 impl MeshRenderer {
-    /// Registers `meshes` into shared vertex/index buffers. Returns the renderer
-    /// and a `MeshId` per input mesh (same order). `meshes` must be non-empty.
-    pub fn new(renderer: &Renderer, meshes: &[MeshData], max_instances: u32) -> (Self, Vec<MeshId>) {
+    /// Registers `meshes` into shared vertex/index buffers and uploads a resident
+    /// `materials` table (indexed by `material_id` on each instance). Returns the
+    /// renderer and a `MeshId` per input mesh (same order). Both slices must be
+    /// non-empty.
+    pub fn new(
+        renderer: &Renderer,
+        meshes: &[MeshData],
+        materials: &[Material],
+        max_instances: u32,
+    ) -> (Self, Vec<MeshId>) {
         let device = renderer.device();
 
         // Merge every mesh into one vertex + one index buffer; record each slice.
@@ -90,6 +135,14 @@ impl MeshRenderer {
         let index_buffer = renderer
             .create_device_local_buffer(as_bytes(&indices), vk::BufferUsageFlags::INDEX_BUFFER);
 
+        // Resident material table (§5). Uploaded once; indexed by material_id.
+        let gpu_materials: Vec<GpuMaterial> =
+            materials.iter().map(GpuMaterial::from_material).collect();
+        let materials_buffer = renderer.create_device_local_buffer(
+            as_bytes(&gpu_materials),
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        );
+
         let instance_buffers: Vec<MappedBuffer> = (0..FRAMES_IN_FLIGHT)
             .map(|_| {
                 renderer.create_host_visible_buffer(
@@ -99,11 +152,20 @@ impl MeshRenderer {
             })
             .collect();
 
-        let bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX)];
+        let bindings = [
+            // binding 0: per-frame instances (vertex stage).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX),
+            // binding 1: resident materials (fragment stage).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
         let set_layout = unsafe {
             device
                 .create_descriptor_set_layout(
@@ -113,9 +175,10 @@ impl MeshRenderer {
                 .expect("descriptor set layout")
         };
 
+        // Two STORAGE_BUFFER descriptors per set (instances + materials).
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(FRAMES_IN_FLIGHT as u32)];
+            .descriptor_count(2 * FRAMES_IN_FLIGHT as u32)];
         let pool = unsafe {
             device
                 .create_descriptor_pool(
@@ -138,16 +201,29 @@ impl MeshRenderer {
                 .expect("allocate descriptor sets")
         };
         for (i, &set) in sets.iter().enumerate() {
-            let info = [vk::DescriptorBufferInfo::default()
+            // binding 0 -> this frame's instance buffer; binding 1 -> the shared
+            // resident materials buffer.
+            let inst_info = [vk::DescriptorBufferInfo::default()
                 .buffer(instance_buffers[i].handle)
                 .offset(0)
                 .range(vk::WHOLE_SIZE)];
-            let write = vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&info);
-            unsafe { device.update_descriptor_sets(&[write], &[]) };
+            let mat_info = [vk::DescriptorBufferInfo::default()
+                .buffer(materials_buffer.handle)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&inst_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&mat_info),
+            ];
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
 
         let vert = load_shader(&device, spv!("mesh.vert"));
@@ -264,6 +340,7 @@ impl MeshRenderer {
             instance_buffers,
             vertex_buffer,
             index_buffer,
+            materials_buffer,
             slices,
             scratch: Vec::new(),
             max_instances,
