@@ -18,9 +18,11 @@ layout(set = 0, binding = 0) readonly buffer Instances {
 
 layout(location = 0) in vec3 in_pos;
 layout(location = 1) in vec3 in_normal;
+layout(location = 2) in vec2 in_uv;
 
 layout(location = 0) out vec3 v_normal;
 layout(location = 1) out flat uint v_material;
+layout(location = 2) out vec2 v_uv;
 
 void main() {
     Instance it = insts[gl_InstanceIndex];
@@ -28,4 +30,5 @@ void main() {
     // Uniform scale, so the model's 3x3 transforms normals correctly.
     v_normal = normalize(mat3(it.model) * in_normal);
     v_material = it.material_id;
+    v_uv = in_uv;
 }

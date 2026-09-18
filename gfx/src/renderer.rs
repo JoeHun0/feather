@@ -190,10 +190,15 @@ impl Renderer {
         let device_exts = [ash::khr::swapchain::NAME.as_ptr()];
         let mut features13 =
             vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        // Bindless-lite: non-uniform indexing into a fixed-size sampled-image
+        // array (material_id -> textures[]). Widely supported on modern GPUs.
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
+            .shader_sampled_image_array_non_uniform_indexing(true);
         let device_create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&device_exts)
-            .push_next(&mut features13);
+            .push_next(&mut features13)
+            .push_next(&mut features12);
         let device = unsafe { instance.create_device(physical_device, &device_create, None)? };
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
@@ -399,6 +404,150 @@ impl Renderer {
             ptr,
             handle,
             size,
+        }
+    }
+
+    /// Upload RGBA8 `pixels` into a sampled 2D image (single mip) and leave it in
+    /// `SHADER_READ_ONLY_OPTIMAL`. `srgb` picks `R8G8B8A8_SRGB` (base color, gets
+    /// linearized on sample) vs `_UNORM`. No mip chain yet — a follow-up.
+    pub fn create_texture(&self, pixels: &[u8], width: u32, height: u32, srgb: bool) -> Image {
+        let allocator = self.allocator();
+        let format = if srgb {
+            vk::Format::R8G8B8A8_SRGB
+        } else {
+            vk::Format::R8G8B8A8_UNORM
+        };
+        let extent = vk::Extent3D {
+            width: width.max(1),
+            height: height.max(1),
+            depth: 1,
+        };
+
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(extent)
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let ai = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferDevice,
+            ..Default::default()
+        };
+        let (image, allocation) =
+            unsafe { allocator.create_image(&image_ci, &ai).expect("texture image") };
+
+        // Staging buffer holding the pixels.
+        let staging_ci = vk::BufferCreateInfo::default()
+            .size(pixels.len() as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let staging_ai = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferHost,
+            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
+            ..Default::default()
+        };
+        let (staging_buf, mut staging_alloc) = unsafe {
+            allocator
+                .create_buffer(&staging_ci, &staging_ai)
+                .expect("texture staging")
+        };
+        unsafe {
+            let ptr = allocator.map_memory(&mut staging_alloc).expect("map staging");
+            std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr, pixels.len());
+            allocator.unmap_memory(&mut staging_alloc);
+        }
+
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        self.one_time_submit(|cmd| unsafe {
+            // UNDEFINED -> TRANSFER_DST_OPTIMAL
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
+
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(extent);
+            self.device.cmd_copy_buffer_to_image(
+                cmd,
+                staging_buf,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+
+            // TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL
+            let to_read = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_read],
+            );
+        });
+
+        unsafe { allocator.destroy_buffer(staging_buf, &mut staging_alloc) };
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(range);
+        let view = unsafe {
+            self.device
+                .create_image_view(&view_info, None)
+                .expect("texture view")
+        };
+
+        Image {
+            allocator: allocator.clone(),
+            allocation,
+            device: self.device.clone(),
+            handle: image,
+            view,
+            format,
         }
     }
 

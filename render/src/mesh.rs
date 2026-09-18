@@ -8,7 +8,7 @@
 
 use ash::vk;
 use feather_assets::{Material, MeshData, Vertex};
-use feather_gfx::{Buffer, MappedBuffer, Renderer, FRAMES_IN_FLIGHT};
+use feather_gfx::{Buffer, Image, MappedBuffer, Renderer, FRAMES_IN_FLIGHT};
 use glam::{Mat4, Vec4};
 
 macro_rules! spv {
@@ -16,6 +16,10 @@ macro_rules! spv {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"))
     };
 }
+
+/// Fixed size of the bindless texture array (`textures[]` in the shader). Slot 0
+/// is a resident white default; unused slots also point at it.
+const MAX_TEXTURES: usize = 64;
 
 /// Handle to a mesh registered with the renderer, in `new`'s input order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -31,25 +35,24 @@ struct MeshSlice {
     vertex_offset: i32,
 }
 
-/// GPU material record (§5): std430, 64 bytes, indexed by `material_id`. Only the
-/// factors are populated for now; `tex` (bindless indices) stays zeroed until the
-/// textures milestone.
+/// GPU material record (§5): std430, 64 bytes, indexed by `material_id`.
+/// `tex.x` = base-color texture slot into the bindless array (0 = white).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GpuMaterial {
     base_color_factor: [f32; 4],
     emissive: [f32; 4], // rgb = emissive, a = metallic
     params: [f32; 4],   // x = roughness, y = normal_scale, z = occlusion, w = alpha_cutoff
-    tex: [u32; 4],      // bindless indices (unused until textures)
+    tex: [u32; 4],      // x = base color; y/z/w reserved (normal/orm/emissive)
 }
 
 impl GpuMaterial {
-    fn from_material(m: &Material) -> Self {
+    fn from_material(m: &Material, base_color_slot: u32) -> Self {
         Self {
             base_color_factor: m.base_color,
             emissive: [m.emissive[0], m.emissive[1], m.emissive[2], m.metallic],
             params: [m.roughness, 1.0, 1.0, 0.5],
-            tex: [0, 0, 0, 0],
+            tex: [base_color_slot, 0, 0, 0],
         }
     }
 }
@@ -94,6 +97,10 @@ pub struct MeshRenderer {
     // Held for its lifetime: the descriptor sets reference it. Freed on drop.
     #[allow(dead_code)]
     materials_buffer: Buffer,
+    // Bindless texture array + its sampler. Images free on drop; sampler in Drop.
+    #[allow(dead_code)]
+    textures: Vec<Image>,
+    sampler: vk::Sampler,
     slices: Vec<MeshSlice>,
     // Reused each frame to gather sorted instances before the SSBO upload.
     scratch: Vec<InstanceData>,
@@ -135,9 +142,41 @@ impl MeshRenderer {
         let index_buffer = renderer
             .create_device_local_buffer(as_bytes(&indices), vk::BufferUsageFlags::INDEX_BUFFER);
 
+        // Bindless texture array: slot 0 is a white default. Each material with a
+        // base-color texture takes the next slot; the rest fall back to white.
+        let sampler = unsafe {
+            device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::LINEAR)
+                        .min_filter(vk::Filter::LINEAR)
+                        .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                        .address_mode_w(vk::SamplerAddressMode::REPEAT),
+                    None,
+                )
+                .expect("texture sampler")
+        };
+        let mut textures: Vec<Image> = vec![renderer.create_texture(&[255, 255, 255, 255], 1, 1, true)];
+        let mut base_color_slots: Vec<u32> = Vec::with_capacity(materials.len());
+        for m in materials {
+            let slot = match &m.base_color_texture {
+                Some(t) if textures.len() < MAX_TEXTURES => {
+                    let slot = textures.len() as u32;
+                    textures.push(renderer.create_texture(&t.pixels, t.width, t.height, true));
+                    slot
+                }
+                _ => 0, // no texture (or array full) -> white default
+            };
+            base_color_slots.push(slot);
+        }
+
         // Resident material table (§5). Uploaded once; indexed by material_id.
-        let gpu_materials: Vec<GpuMaterial> =
-            materials.iter().map(GpuMaterial::from_material).collect();
+        let gpu_materials: Vec<GpuMaterial> = materials
+            .iter()
+            .zip(&base_color_slots)
+            .map(|(m, &slot)| GpuMaterial::from_material(m, slot))
+            .collect();
         let materials_buffer = renderer.create_device_local_buffer(
             as_bytes(&gpu_materials),
             vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -165,6 +204,12 @@ impl MeshRenderer {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // binding 2: bindless texture array (fragment stage).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(MAX_TEXTURES as u32)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let set_layout = unsafe {
             device
@@ -175,10 +220,16 @@ impl MeshRenderer {
                 .expect("descriptor set layout")
         };
 
-        // Two STORAGE_BUFFER descriptors per set (instances + materials).
-        let pool_sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(2 * FRAMES_IN_FLIGHT as u32)];
+        let pool_sizes = [
+            // instances + materials.
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(2 * FRAMES_IN_FLIGHT as u32),
+            // the texture array, per set.
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count((MAX_TEXTURES * FRAMES_IN_FLIGHT) as u32),
+        ];
         let pool = unsafe {
             device
                 .create_descriptor_pool(
@@ -200,9 +251,20 @@ impl MeshRenderer {
                 )
                 .expect("allocate descriptor sets")
         };
+        // Texture array image infos (resident; the same for every frame's set).
+        // Every slot is bound — used slots to their texture, the rest to white.
+        let tex_infos: Vec<vk::DescriptorImageInfo> = (0..MAX_TEXTURES)
+            .map(|i| {
+                let view = textures.get(i).unwrap_or(&textures[0]).view;
+                vk::DescriptorImageInfo::default()
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image_view(view)
+                    .sampler(sampler)
+            })
+            .collect();
         for (i, &set) in sets.iter().enumerate() {
             // binding 0 -> this frame's instance buffer; binding 1 -> the shared
-            // resident materials buffer.
+            // resident materials buffer; binding 2 -> the shared texture array.
             let inst_info = [vk::DescriptorBufferInfo::default()
                 .buffer(instance_buffers[i].handle)
                 .offset(0)
@@ -222,6 +284,12 @@ impl MeshRenderer {
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(&mat_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(2)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&tex_infos),
             ];
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
@@ -254,6 +322,11 @@ impl MeshRenderer {
                 .binding(0)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(12), // after pos
+            vk::VertexInputAttributeDescription::default()
+                .location(2)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(24), // after pos + normal
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vbindings)
@@ -341,6 +414,8 @@ impl MeshRenderer {
             vertex_buffer,
             index_buffer,
             materials_buffer,
+            textures,
+            sampler,
             slices,
             scratch: Vec::new(),
             max_instances,
@@ -443,6 +518,7 @@ impl MeshRenderer {
 impl Drop for MeshRenderer {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_sampler(self.sampler, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_pool(self.pool, None);

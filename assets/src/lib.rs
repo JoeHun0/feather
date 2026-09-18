@@ -11,35 +11,45 @@ use std::path::Path;
 use glam::{Mat3, Mat4, Vec3};
 
 /// Interleaved static vertex. Matches the renderer's vertex attribute layout
-/// (position at offset 0, normal at offset 12). `#[repr(C)]` so a slice uploads
-/// straight into a device-local vertex buffer.
+/// (position at offset 0, normal at offset 12, uv at offset 24). `#[repr(C)]` so
+/// a slice uploads straight into a device-local vertex buffer.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Vertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
+    pub uv: [f32; 2],
 }
 
-/// Surface parameters for a mesh (glTF metallic-roughness aligned). Colors are
-/// **linear** (glTF `baseColorFactor`/`emissiveFactor` are linear; procedural
-/// meshes must supply linear values too). Textures are deferred — this is the
-/// factor-only subset the renderer shades with for now.
-#[derive(Clone, Copy, Debug)]
+/// Decoded RGBA8 image (sRGB base-color). Owned CPU pixels the renderer uploads.
+#[derive(Clone, Debug)]
+pub struct TextureData {
+    pub pixels: Vec<u8>, // RGBA8, row-major, width*height*4 bytes
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Surface parameters for a mesh (glTF metallic-roughness aligned). Factor
+/// colors are **linear**; `base_color_texture` is sRGB (the renderer uploads it
+/// as an `_SRGB` image and multiplies the sampled value by `base_color`).
+#[derive(Clone, Debug)]
 pub struct Material {
-    pub base_color: [f32; 4], // linear RGBA
+    pub base_color: [f32; 4], // linear RGBA factor
     pub metallic: f32,
     pub roughness: f32,
     pub emissive: [f32; 3], // linear RGB
+    pub base_color_texture: Option<TextureData>,
 }
 
 impl Default for Material {
     fn default() -> Self {
-        // White dielectric.
+        // White dielectric, no texture.
         Self {
             base_color: [1.0, 1.0, 1.0, 1.0],
             metallic: 0.0,
             roughness: 1.0,
             emissive: [0.0, 0.0, 0.0],
+            base_color_texture: None,
         }
     }
 }
@@ -82,6 +92,7 @@ impl MeshData {
                 vertices.push(Vertex {
                     pos: [n[0] * radius, n[1] * radius, n[2] * radius],
                     normal: n,
+                    uv: [j as f32 / slices as f32, i as f32 / stacks as f32],
                 });
             }
         }
@@ -111,10 +122,15 @@ impl MeshData {
         ];
         let mut vertices = Vec::with_capacity(24);
         let mut indices = Vec::with_capacity(36);
+        let face_uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
         for (normal, corners) in faces {
             let base = vertices.len() as u32;
-            for pos in corners {
-                vertices.push(Vertex { pos, normal });
+            for (k, pos) in corners.into_iter().enumerate() {
+                vertices.push(Vertex {
+                    pos,
+                    normal,
+                    uv: face_uv[k],
+                });
             }
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
@@ -123,55 +139,31 @@ impl MeshData {
 }
 
 /// Load a glTF / GLB file and merge every mesh primitive (across the node
-/// hierarchy, node transforms applied) into a single `MeshData`.
+/// hierarchy, node transforms applied) into a single `MeshData` with UVs and the
+/// first primitive's material (factors + base-color texture, decoded to RGBA8).
 ///
-/// Handled: positions (required), normals (computed if absent), indices
-/// (generated if absent), node transforms, triangle primitives, the `.glb`
-/// binary blob, and external `.bin` buffers.
+/// Handled: positions (required), normals (computed if absent), UVs (0 if
+/// absent), indices (generated if absent), node transforms, triangle primitives,
+/// .glb / external / data: URI buffers and images, base-color texture.
 ///
-/// Deferred: materials, textures, UVs, tangents, skinning, animation, morph
-/// targets, non-triangle primitives, and `data:` URI buffers (export as `.glb`
-/// or with an external `.bin` for now).
+/// Deferred: normal + metallic-roughness textures, tangents, skinning,
+/// animation, morph targets, non-triangle primitives.
 pub fn load_gltf(path: impl AsRef<Path>) -> Result<MeshData, Box<dyn Error>> {
-    let path = path.as_ref();
-    let bytes = std::fs::read(path)?;
-    let gltf = gltf::Gltf::from_slice(&bytes)?;
-    let blob = gltf.blob.clone();
-
-    // Resolve every buffer declared by the document to raw bytes.
-    let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(gltf.buffers().count());
-    for buffer in gltf.buffers() {
-        match buffer.source() {
-            gltf::buffer::Source::Bin => {
-                let b = blob
-                    .as_ref()
-                    .ok_or("glTF references the GLB binary blob but none is present")?;
-                buffers.push(b.clone());
-            }
-            gltf::buffer::Source::Uri(uri) => {
-                if uri.starts_with("data:") {
-                    return Err("data: URI buffers are not supported yet; \
-                                export as .glb or with an external .bin"
-                        .into());
-                }
-                let dir = path.parent().unwrap_or_else(|| Path::new("."));
-                buffers.push(std::fs::read(dir.join(uri))?);
-            }
-        }
-    }
+    // import resolves all buffers (blob / external / data URI) and decodes images.
+    let (doc, buffers, images) = gltf::import(path)?;
 
     let mut out = MeshData::default();
     let mut material: Option<Material> = None;
-    match gltf.default_scene().or_else(|| gltf.scenes().next()) {
+    match doc.default_scene().or_else(|| doc.scenes().next()) {
         Some(scene) => {
             for node in scene.nodes() {
-                accumulate_node(&node, Mat4::IDENTITY, &buffers, &mut out, &mut material);
+                accumulate_node(&node, Mat4::IDENTITY, &buffers, &images, &mut out, &mut material);
             }
         }
         // No scene graph: take mesh geometry directly, untransformed.
         None => {
-            for mesh in gltf.meshes() {
-                append_mesh(&mesh, Mat4::IDENTITY, &buffers, &mut out, &mut material);
+            for mesh in doc.meshes() {
+                append_mesh(&mesh, Mat4::IDENTITY, &buffers, &images, &mut out, &mut material);
             }
         }
     }
@@ -184,36 +176,82 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<MeshData, Box<dyn Error>> {
     Ok(out)
 }
 
-fn read_material(m: &gltf::Material) -> Material {
+fn read_material(m: &gltf::Material, images: &[gltf::image::Data]) -> Material {
     let pbr = m.pbr_metallic_roughness();
+    let base_color_texture = pbr
+        .base_color_texture()
+        .and_then(|info| images.get(info.texture().source().index()))
+        .and_then(to_rgba8);
     Material {
         base_color: pbr.base_color_factor(), // linear RGBA
         metallic: pbr.metallic_factor(),
         roughness: pbr.roughness_factor(),
         emissive: m.emissive_factor(), // linear RGB
+        base_color_texture,
     }
+}
+
+/// Normalize a decoded glTF image to RGBA8. Returns None for formats not handled
+/// yet (16-/32-bit), in which case the material falls back to its color factor.
+fn to_rgba8(img: &gltf::image::Data) -> Option<TextureData> {
+    use gltf::image::Format;
+    let (width, height) = (img.width, img.height);
+    let n = (width as usize) * (height as usize) * 4;
+    let px = &img.pixels;
+    let pixels = match img.format {
+        Format::R8G8B8A8 => px.clone(),
+        Format::R8G8B8 => {
+            let mut out = Vec::with_capacity(n);
+            for c in px.chunks_exact(3) {
+                out.extend_from_slice(&[c[0], c[1], c[2], 255]);
+            }
+            out
+        }
+        Format::R8 => {
+            let mut out = Vec::with_capacity(n);
+            for &g in px {
+                out.extend_from_slice(&[g, g, g, 255]);
+            }
+            out
+        }
+        Format::R8G8 => {
+            let mut out = Vec::with_capacity(n);
+            for c in px.chunks_exact(2) {
+                out.extend_from_slice(&[c[0], c[0], c[0], c[1]]);
+            }
+            out
+        }
+        _ => return None,
+    };
+    Some(TextureData {
+        pixels,
+        width,
+        height,
+    })
 }
 
 fn accumulate_node(
     node: &gltf::Node,
     parent: Mat4,
-    buffers: &[Vec<u8>],
+    buffers: &[gltf::buffer::Data],
+    images: &[gltf::image::Data],
     out: &mut MeshData,
     material: &mut Option<Material>,
 ) {
     let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
     if let Some(mesh) = node.mesh() {
-        append_mesh(&mesh, world, buffers, out, material);
+        append_mesh(&mesh, world, buffers, images, out, material);
     }
     for child in node.children() {
-        accumulate_node(&child, world, buffers, out, material);
+        accumulate_node(&child, world, buffers, images, out, material);
     }
 }
 
 fn append_mesh(
     mesh: &gltf::Mesh,
     world: Mat4,
-    buffers: &[Vec<u8>],
+    buffers: &[gltf::buffer::Data],
+    images: &[gltf::image::Data],
     out: &mut MeshData,
     material: &mut Option<Material>,
 ) {
@@ -224,9 +262,9 @@ fn append_mesh(
             continue;
         }
         if material.is_none() {
-            *material = Some(read_material(&prim.material()));
+            *material = Some(read_material(&prim.material(), images));
         }
-        let reader = prim.reader(|b| buffers.get(b.index()).map(|v| v.as_slice()));
+        let reader = prim.reader(|b| Some(&buffers[b.index()][..]));
         let positions: Vec<[f32; 3]> = match reader.read_positions() {
             Some(p) => p.collect(),
             None => continue,
@@ -239,15 +277,19 @@ fn append_mesh(
             Some(n) => n.collect(),
             None => compute_normals(&positions, &indices),
         };
+        let uvs: Option<Vec<[f32; 2]>> =
+            reader.read_tex_coords(0).map(|t| t.into_f32().collect());
 
         let base = out.vertices.len() as u32;
         for (i, p) in positions.iter().enumerate() {
             let wp = world.transform_point3(Vec3::from(*p));
             let n = normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
             let wn = (normal_mat * Vec3::from(n)).normalize_or_zero();
+            let uv = uvs.as_ref().and_then(|u| u.get(i).copied()).unwrap_or([0.0, 0.0]);
             out.vertices.push(Vertex {
                 pos: wp.to_array(),
                 normal: wn.to_array(),
+                uv,
             });
         }
         out.indices.extend(indices.iter().map(|i| base + *i));

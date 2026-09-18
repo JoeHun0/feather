@@ -1,9 +1,11 @@
 //! Milestone 2+: a drifting field of ~1000 lit ECS entities. Several meshes
 //! share one vertex/index buffer; each entity picks a mesh at random, and
 //! extract sorts instances by mesh so each draws as one batched run. Shading
-//! reads a **material** per instance (`material_id` → a materials SSBO): loaded
-//! glTF meshes use their file's base color, procedural sphere/cube instances use
-//! a shared palette. Meshes are a procedural sphere + cube by default, or one
+//! reads a **material** per instance (`material_id` → a materials SSBO), whose
+//! base color can be a **texture** sampled from a bindless array: loaded glTF
+//! meshes use their file's base-color texture/factor, procedural sphere/cube
+//! instances use a shared palette. Meshes are a procedural sphere + cube by
+//! default, or one
 //! per glTF/GLB path on the CLI (`cargo run -- a.glb b.glb`), each auto-fitted
 //! to the grid. A directional light shades in linear space into an HDR target,
 //! which a tonemap pass resolves to the sRGB swapchain. WASD/mouse fly the
@@ -266,7 +268,7 @@ impl ApplicationHandler for App {
         // App::new assigned to entities.
         let mut materials: Vec<feather_assets::Material> =
             (0..PALETTE).map(palette_material).collect();
-        materials.extend(meshes.iter().map(|m| m.material));
+        materials.extend(meshes.iter().map(|m| m.material.clone()));
 
         let (mesh, _ids) = MeshRenderer::new(&renderer, &meshes, &materials, MAX_INSTANCES);
         let tonemap = TonemapPass::new(&renderer);
@@ -434,6 +436,7 @@ fn palette_material(k: u32) -> feather_assets::Material {
         metallic: if rand01(k * 13 + 4) > 0.7 { 1.0 } else { 0.0 },
         roughness: 0.3 + 0.6 * rand01(k * 13 + 5),
         emissive: [0.0, 0.0, 0.0],
+        base_color_texture: None,
     }
 }
 
