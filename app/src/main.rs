@@ -12,6 +12,13 @@
 //! linear space into an HDR target, over a procedural **sky background**,
 //! which a tonemap pass resolves to the sRGB swapchain. WASD/mouse fly the
 //! camera; `[` / `]` adjust exposure; Esc quits.
+//!
+//! Simulation runs on a **fixed timestep** (accumulator; `FIXED_DT`), decoupled
+//! from the render rate. Entity sim state (position + spin angle) is
+//! double-buffered per entity (`Prev*` / current); extract **interpolates**
+//! between the two by `alpha = accumulator / FIXED_DT`, so motion is smooth at
+//! any framerate and the sim speed no longer scales with it. This is the
+//! groundwork physics needs (§4, §15).
 
 use std::time::Instant;
 
@@ -32,14 +39,32 @@ const GRID: i32 = 10; // GRID^3 entities
 const MAX_INSTANCES: u32 = 8192;
 const BOUND: f32 = 9.0;
 
+// Fixed-timestep sim (§4). The schedule advances in whole `FIXED_DT` steps from
+// an accumulator; render interpolates the remainder. `MAX_FRAME_TIME` clamps a
+// single frame's real delta and `MAX_STEPS` caps steps per frame — together the
+// spiral-of-death guard when the app stalls (debugger break, lost focus).
+const FIXED_DT: f32 = 1.0 / 60.0;
+const MAX_FRAME_TIME: f32 = 0.25;
+const MAX_STEPS: u32 = 8;
+
 // ---- ECS data ----
 
 #[derive(Component)]
 struct Position(Vec3);
+/// Position at the start of the latest completed fixed step (the other endpoint
+/// extract interpolates from). Kept in the same wrapped space as `Position`.
+#[derive(Component)]
+struct PrevPosition(Vec3);
 #[derive(Component)]
 struct Velocity(Vec3);
+/// Accumulated Y rotation (radians), advanced by `Spin` each fixed step.
 #[derive(Component)]
-struct Spin(f32);
+struct Rotation(f32);
+/// `Rotation` at the start of the latest completed fixed step.
+#[derive(Component)]
+struct PrevRotation(f32);
+#[derive(Component)]
+struct Spin(f32); // angular velocity, rad/s
 #[derive(Component)]
 struct Mesh(MeshId);
 #[derive(Component)]
@@ -58,25 +83,43 @@ enum MeshSource {
     Gltf(String),
 }
 
-fn integrate(mut q: Query<(&mut Position, &Velocity)>) {
-    let dt = 1.0 / 60.0;
-    for (mut p, v) in &mut q {
-        p.0 += v.0 * dt;
-        if p.0.x > BOUND {
-            p.0.x -= 2.0 * BOUND;
-        } else if p.0.x < -BOUND {
-            p.0.x += 2.0 * BOUND;
-        }
-        if p.0.y > BOUND {
-            p.0.y -= 2.0 * BOUND;
-        } else if p.0.y < -BOUND {
-            p.0.y += 2.0 * BOUND;
-        }
-        if p.0.z > BOUND {
-            p.0.z -= 2.0 * BOUND;
-        } else if p.0.z < -BOUND {
-            p.0.z += 2.0 * BOUND;
-        }
+/// One fixed step: snapshot the current state into `Prev*`, then advance
+/// position by velocity and the spin angle by angular velocity. Runs at
+/// `FIXED_DT`, so motion is now framerate-independent.
+fn integrate(
+    mut q: Query<(
+        &mut Position,
+        &mut PrevPosition,
+        &Velocity,
+        &mut Rotation,
+        &mut PrevRotation,
+        &Spin,
+    )>,
+) {
+    for (mut pos, mut prev, vel, mut rot, mut prev_rot, spin) in &mut q {
+        prev.0 = pos.0;
+        prev_rot.0 = rot.0;
+        pos.0 += vel.0 * FIXED_DT;
+        rot.0 += spin.0 * FIXED_DT;
+        // Toroidal wrap. Shifting `prev` by the same amount keeps the segment
+        // extract interpolates over local, so no full-width streak on the wrap
+        // frame. (The angle accumulates unbounded — its matrix is periodic, so
+        // it needs no wrap.)
+        wrap_axis(&mut pos.0.x, &mut prev.0.x);
+        wrap_axis(&mut pos.0.y, &mut prev.0.y);
+        wrap_axis(&mut pos.0.z, &mut prev.0.z);
+    }
+}
+
+/// Wrap one axis into `[-BOUND, BOUND]`, moving `prev` with it so the current↔
+/// prev delta the renderer interpolates stays small across the seam.
+fn wrap_axis(cur: &mut f32, prev: &mut f32) {
+    if *cur > BOUND {
+        *cur -= 2.0 * BOUND;
+        *prev -= 2.0 * BOUND;
+    } else if *cur < -BOUND {
+        *cur += 2.0 * BOUND;
+        *prev += 2.0 * BOUND;
     }
 }
 
@@ -143,8 +186,10 @@ struct App {
     sources: Vec<MeshSource>,
     // Per-mesh transform that centers + unit-scales it into the demo grid.
     fits: Vec<Mat4>,
-    start: Instant,
     last_frame: Instant,
+    // Fixed-timestep accumulator: real time not yet consumed by a sim step,
+    // carried across frames. Its fraction of FIXED_DT is the render alpha.
+    accumulator: f32,
 }
 
 impl App {
@@ -175,7 +220,10 @@ impl App {
             };
             world.spawn((
                 Position(pos),
+                PrevPosition(pos), // prev == curr on frame 0: first interp is a no-op
                 Velocity(vel),
+                Rotation(0.0),
+                PrevRotation(0.0),
                 Spin(spin),
                 Mesh(MeshId(mesh)),
                 Material(material),
@@ -206,8 +254,8 @@ impl App {
             exposure: 1.0,
             sources,
             fits: Vec::new(),
-            start: now,
             last_frame: now,
+            accumulator: 0.0,
         }
     }
 }
@@ -359,19 +407,42 @@ impl ApplicationHandler for App {
                     self.camera.pos += delta.normalize() * (12.0 * dt);
                 }
 
-                self.schedule.run(&mut self.world);
+                // Fixed-timestep sim: consume the accumulator in whole FIXED_DT
+                // steps. The frame delta is clamped so a long stall can't enqueue
+                // a huge backlog, and MAX_STEPS caps the catch-up per frame; any
+                // leftover beyond the cap is dropped (clamped alpha) so the sim
+                // doesn't run away.
+                self.accumulator += dt.min(MAX_FRAME_TIME);
+                let mut steps = 0;
+                while self.accumulator >= FIXED_DT && steps < MAX_STEPS {
+                    self.schedule.run(&mut self.world);
+                    self.accumulator -= FIXED_DT;
+                    steps += 1;
+                }
+                // How far we are into the next step, in [0,1): the render alpha.
+                let alpha = (self.accumulator / FIXED_DT).clamp(0.0, 1.0);
 
-                // Extract: (Position, Spin, Mesh, Material) -> (MeshId, instance).
-                let t = (now - self.start).as_secs_f32();
+                // Extract: interpolate each entity's sim state (prev -> curr) by
+                // alpha, then build its model matrix. This is the sim<->render
+                // seam; interpolation lives here per §4.
                 let fits = &self.fits;
                 let mesh_max = fits.len().saturating_sub(1);
                 let mut items: Vec<(MeshId, InstanceData)> =
                     Vec::with_capacity((GRID * GRID * GRID) as usize);
-                let mut q = self.world.query::<(&Position, &Spin, &Mesh, &Material)>();
-                for (p, s, mesh, material) in q.iter(&self.world) {
+                let mut q = self.world.query::<(
+                    &Position,
+                    &PrevPosition,
+                    &Rotation,
+                    &PrevRotation,
+                    &Mesh,
+                    &Material,
+                )>();
+                for (p, pp, r, pr, mesh, material) in q.iter(&self.world) {
                     let id = (mesh.0 .0 as usize).min(mesh_max);
-                    let model = Mat4::from_translation(p.0)
-                        * Mat4::from_rotation_y(t * s.0)
+                    let pos = pp.0.lerp(p.0, alpha);
+                    let angle = pr.0 + (r.0 - pr.0) * alpha;
+                    let model = Mat4::from_translation(pos)
+                        * Mat4::from_rotation_y(angle)
                         * Mat4::from_scale(Vec3::splat(0.6))
                         * fits[id];
                     items.push((MeshId(id as u32), InstanceData::new(model, material.0)));

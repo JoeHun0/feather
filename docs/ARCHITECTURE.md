@@ -661,8 +661,12 @@ milestones land.
   primitive's material (factors + base-color/normal/MR textures decoded to
   RGBA8, normal scale), resolves .glb / external / data-URI buffers and images.
 - **app**: winit loop; bevy_ecs world + multi-threaded schedule (`integrate`,
-  `tick`); render-rate **fly camera** (WASD/mouse/Esc, pointer locked); inline
-  **extract** (`World` query → sorted `Vec<(MeshId, InstanceData)>` each frame);
+  `tick`) driven on a **fixed timestep** (accumulator + `FIXED_DT`, frame delta
+  clamped and steps capped as a spiral-of-death guard) so sim speed no longer
+  tracks framerate; render-rate **fly camera** (WASD/mouse/Esc, pointer locked);
+  inline **extract** (`World` query → sorted `Vec<(MeshId, InstanceData)>` each
+  frame) that **interpolates** each entity's double-buffered sim state
+  (prev/curr position + spin angle) by `alpha = accumulator / FIXED_DT`;
   `[`/`]` adjust tonemap exposure at runtime; meshes are a procedural sphere +
   cube by default or one per glTF path on the CLI (each auto-fitted to the grid);
   each entity assigned a mesh + `material_id` at random (glTF meshes use their
@@ -674,11 +678,18 @@ milestones land.
 ### Current simplifications to revisit
 
 - **Extract seam (§4)**: extract is inline in `app`, writing straight to the
-  instance SSBO each frame. No double-buffered `RenderFrame` struct yet; stages
-  run sequentially (stage pipelining deferred by design).
-- **Timestep (§4)**: sim runs once per frame with a hardcoded `dt = 1/60`. No
-  accumulator and **no interpolation** yet — needed before physics. Camera is
-  already render-rate (matches design).
+  instance SSBO each frame; sim-state interpolation (prev↔curr by `alpha`) now
+  happens here, as the design specifies. No double-buffered `RenderFrame` struct
+  yet; stages run sequentially (stage pipelining deferred by design).
+- **Timestep (§4)**: **landed.** Sim runs on a fixed-`FIXED_DT` accumulator with
+  render **interpolation** (`alpha = accumulator / FIXED_DT`, computed at
+  extract) over per-entity double-buffered state (`Prev*` / current). Toroidal
+  wrap shifts `prev` with `curr` so the interpolated segment never streaks across
+  the seam; frame delta is clamped and steps capped (spiral-of-death guard).
+  Camera stays render-rate (matches design). The remaining §4 gap is the
+  double-buffered **`RenderFrame` snapshot** for stage pipelining — extract is
+  still inline. This is the groundwork physics needs; **rapier is the next step
+  it unblocks** (spin is a cosmetic angular velocity today, not yet a rigid body).
 - **Descriptors (§9)**: one set with three bindings — per-frame instances
   (binding 0), resident materials (binding 1), and a resident **fixed-size**
   `sampler2D textures[64]` (binding 2), as N discrete per-frame sets. Not yet the
