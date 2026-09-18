@@ -1,7 +1,9 @@
-//! Instanced, lit mesh renderer. One mesh (a procedural sphere or a loaded
-//! glTF) drawn N times in a single `cmd_draw_indexed`. Per-instance data is
+//! Instanced, lit mesh renderer. Several meshes live in one shared vertex +
+//! index buffer (each a `{first_index, index_count, vertex_offset}` slice);
+//! per-frame instances are sorted by mesh so each mesh draws as one contiguous
+//! run (`cmd_draw_indexed` with `firstInstance`). Per-instance data is
 //! `{ model, color }` from a storage buffer; a directional light is applied in
-//! the fragment shader. The mesh comes in as a Vulkan-free `assets::MeshData`.
+//! the fragment shader. Meshes come in as Vulkan-free `assets::MeshData`.
 
 use ash::vk;
 use feather_assets::{MeshData, Vertex};
@@ -12,6 +14,20 @@ macro_rules! spv {
     ($name:expr) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"))
     };
+}
+
+/// Handle to a mesh registered with the renderer, in `new`'s input order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MeshId(pub u32);
+
+/// Where one mesh lives inside the shared vertex/index buffers. `vertex_offset`
+/// is added to each (mesh-local) index at draw time, so per-mesh indices stay
+/// 0-based.
+#[derive(Clone, Copy)]
+struct MeshSlice {
+    first_index: u32,
+    index_count: u32,
+    vertex_offset: i32,
 }
 
 /// Per-instance data uploaded to the storage buffer (std430: 80 bytes).
@@ -40,21 +56,39 @@ pub struct MeshRenderer {
     instance_buffers: Vec<MappedBuffer>,
     vertex_buffer: Buffer,
     index_buffer: Buffer,
-    index_count: u32,
+    slices: Vec<MeshSlice>,
+    // Reused each frame to gather sorted instances before the SSBO upload.
+    scratch: Vec<InstanceData>,
     max_instances: u32,
 }
 
 impl MeshRenderer {
-    pub fn new(renderer: &Renderer, mesh: &MeshData, max_instances: u32) -> Self {
+    /// Registers `meshes` into shared vertex/index buffers. Returns the renderer
+    /// and a `MeshId` per input mesh (same order). `meshes` must be non-empty.
+    pub fn new(renderer: &Renderer, meshes: &[MeshData], max_instances: u32) -> (Self, Vec<MeshId>) {
         let device = renderer.device();
 
-        let index_count = mesh.indices.len() as u32;
-        let vertex_buffer = renderer.create_device_local_buffer(
-            as_bytes(&mesh.vertices),
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-        );
+        // Merge every mesh into one vertex + one index buffer; record each slice.
+        let mut vertices: Vec<Vertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut slices: Vec<MeshSlice> = Vec::with_capacity(meshes.len());
+        let mut ids: Vec<MeshId> = Vec::with_capacity(meshes.len());
+        for (i, mesh) in meshes.iter().enumerate() {
+            slices.push(MeshSlice {
+                first_index: indices.len() as u32,
+                index_count: mesh.indices.len() as u32,
+                vertex_offset: vertices.len() as i32,
+            });
+            ids.push(MeshId(i as u32));
+            vertices.extend_from_slice(&mesh.vertices);
+            // Per-mesh indices stay 0-based; vertex_offset rebases them at draw.
+            indices.extend_from_slice(&mesh.indices);
+        }
+
+        let vertex_buffer = renderer
+            .create_device_local_buffer(as_bytes(&vertices), vk::BufferUsageFlags::VERTEX_BUFFER);
         let index_buffer = renderer
-            .create_device_local_buffer(as_bytes(&mesh.indices), vk::BufferUsageFlags::INDEX_BUFFER);
+            .create_device_local_buffer(as_bytes(&indices), vk::BufferUsageFlags::INDEX_BUFFER);
 
         let instance_buffers: Vec<MappedBuffer> = (0..FRAMES_IN_FLIGHT)
             .map(|_| {
@@ -220,7 +254,7 @@ impl MeshRenderer {
             device.destroy_shader_module(frag, None);
         }
 
-        Self {
+        let renderer = Self {
             device,
             layout,
             pipeline,
@@ -230,11 +264,16 @@ impl MeshRenderer {
             instance_buffers,
             vertex_buffer,
             index_buffer,
-            index_count,
+            slices,
+            scratch: Vec::new(),
             max_instances,
-        }
+        };
+        (renderer, ids)
     }
 
+    /// Draws all `items` (mesh + instance). Sorts them by mesh in place, uploads
+    /// the instances in that order, then emits one `cmd_draw_indexed` per
+    /// contiguous same-mesh run.
     pub fn draw(
         &mut self,
         cmd: vk::CommandBuffer,
@@ -242,10 +281,17 @@ impl MeshRenderer {
         frame: usize,
         view_proj: Mat4,
         light_dir: Vec4,
-        instances: &[InstanceData],
+        items: &mut [(MeshId, InstanceData)],
     ) {
-        let count = (instances.len() as u32).min(self.max_instances);
-        self.instance_buffers[frame].write(as_bytes(&instances[..count as usize]));
+        // Contiguous runs per mesh -> one draw each. Unstable sort is fine; draw
+        // order within a mesh doesn't matter (opaque + depth test).
+        items.sort_unstable_by_key(|(mesh, _)| mesh.0);
+
+        let count = (items.len()).min(self.max_instances as usize);
+        self.scratch.clear();
+        self.scratch
+            .extend(items[..count].iter().map(|(_, inst)| *inst));
+        self.instance_buffers[frame].write(as_bytes(&self.scratch));
 
         // Push constant: mat4 view_proj (16 f32) + vec4 light_dir (4 f32) = 80 bytes.
         let mut push = [0f32; 20];
@@ -289,14 +335,30 @@ impl MeshRenderer {
 
             self.device
                 .cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer.handle], &[0]);
-            self.device.cmd_bind_index_buffer(
-                cmd,
-                self.index_buffer.handle,
-                0,
-                vk::IndexType::UINT32,
-            );
             self.device
-                .cmd_draw_indexed(cmd, self.index_count, count, 0, 0, 0);
+                .cmd_bind_index_buffer(cmd, self.index_buffer.handle, 0, vk::IndexType::UINT32);
+
+            // One draw per contiguous run of the same mesh. firstInstance is the
+            // run's start, so gl_InstanceIndex indexes the sorted instance SSBO.
+            let mut first = 0usize;
+            while first < count {
+                let mesh = items[first].0;
+                let mut run = 1usize;
+                while first + run < count && items[first + run].0 == mesh {
+                    run += 1;
+                }
+                if let Some(slice) = self.slices.get(mesh.0 as usize) {
+                    self.device.cmd_draw_indexed(
+                        cmd,
+                        slice.index_count,
+                        run as u32,
+                        slice.first_index,
+                        slice.vertex_offset,
+                        first as u32,
+                    );
+                }
+                first += run;
+            }
         }
     }
 }

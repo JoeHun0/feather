@@ -71,6 +71,30 @@ impl MeshData {
         }
         Self { vertices, indices }
     }
+
+    /// Unit-ish cube with per-face (flat) normals: 24 vertices, 36 indices.
+    pub fn cube(size: f32) -> Self {
+        let h = size * 0.5;
+        // (normal, four CCW corners) per face; winding is irrelevant (cull NONE).
+        let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
+            ([0.0, 0.0, 1.0], [[-h, -h, h], [h, -h, h], [h, h, h], [-h, h, h]]), // +Z
+            ([0.0, 0.0, -1.0], [[h, -h, -h], [-h, -h, -h], [-h, h, -h], [h, h, -h]]), // -Z
+            ([1.0, 0.0, 0.0], [[h, -h, h], [h, -h, -h], [h, h, -h], [h, h, h]]), // +X
+            ([-1.0, 0.0, 0.0], [[-h, -h, -h], [-h, -h, h], [-h, h, h], [-h, h, -h]]), // -X
+            ([0.0, 1.0, 0.0], [[-h, h, h], [h, h, h], [h, h, -h], [-h, h, -h]]), // +Y
+            ([0.0, -1.0, 0.0], [[-h, -h, -h], [h, -h, -h], [h, -h, h], [-h, -h, h]]), // -Y
+        ];
+        let mut vertices = Vec::with_capacity(24);
+        let mut indices = Vec::with_capacity(36);
+        for (normal, corners) in faces {
+            let base = vertices.len() as u32;
+            for pos in corners {
+                vertices.push(Vertex { pos, normal });
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        Self { vertices, indices }
+    }
 }
 
 /// Load a glTF / GLB file and merge every mesh primitive (across the node

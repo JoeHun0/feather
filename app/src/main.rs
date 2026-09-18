@@ -1,10 +1,11 @@
-//! Milestone 2+: a drifting field of ~1000 lit, individually-colored instances,
-//! each an ECS entity, drawn in one instanced draw. The instanced mesh is a
-//! procedural sphere by default, or a glTF/GLB passed as the first CLI arg
-//! (`cargo run -- model.glb`), auto-fitted to the grid. Per-instance data is
-//! { model, color }; a directional light shades in linear space into an HDR
-//! target, which a tonemap pass resolves to the sRGB swapchain.
-//! WASD/mouse fly the camera; `[` / `]` adjust exposure; Esc quits.
+//! Milestone 2+: a drifting field of ~1000 lit, individually-colored ECS
+//! entities. Several meshes share one vertex/index buffer; each entity picks one
+//! at random, and extract sorts instances by mesh so each draws as one batched
+//! run. Meshes are a procedural sphere + cube by default, or one per glTF/GLB
+//! path on the CLI (`cargo run -- a.glb b.glb`), each auto-fitted to the grid.
+//! Per-instance data is { model, color }; a directional light shades in linear
+//! space into an HDR target, which a tonemap pass resolves to the sRGB
+//! swapchain. WASD/mouse fly the camera; `[` / `]` adjust exposure; Esc quits.
 
 use std::time::Instant;
 
@@ -13,7 +14,7 @@ use bevy_ecs::schedule::ExecutorKind;
 use feather_assets::MeshData;
 use feather_gfx::Renderer;
 use feather_platform::winit;
-use feather_render::{InstanceData, MeshRenderer, TonemapPass};
+use feather_render::{InstanceData, MeshId, MeshRenderer, TonemapPass};
 use glam::{Mat4, Vec3, Vec4};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
@@ -35,8 +36,18 @@ struct Velocity(Vec3);
 struct Spin(f32);
 #[derive(Component)]
 struct Tint(Vec4);
+#[derive(Component)]
+struct Mesh(MeshId);
 #[derive(Resource, Default)]
 struct FrameCount(u64);
+
+/// What to register with the renderer. Resolved into `MeshData` at startup; the
+/// index in the source list is the mesh's `MeshId`.
+enum MeshSource {
+    Sphere,
+    Cube,
+    Gltf(String),
+}
 
 fn integrate(mut q: Query<(&mut Position, &Velocity)>) {
     let dt = 1.0 / 60.0;
@@ -119,18 +130,20 @@ struct App {
     light_dir: Vec4,
     exposure: f32,
     // Optional glTF/GLB path (first CLI arg); falls back to a sphere.
-    model_path: Option<String>,
-    // Centers + unit-scales the loaded mesh so any model fits the demo grid.
-    fit: Mat4,
+    // Meshes to register (decided up front); index == MeshId.
+    sources: Vec<MeshSource>,
+    // Per-mesh transform that centers + unit-scales it into the demo grid.
+    fits: Vec<Mat4>,
     start: Instant,
     last_frame: Instant,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(sources: Vec<MeshSource>) -> Self {
         let mut world = World::new();
         world.insert_resource(FrameCount::default());
 
+        let mesh_count = sources.len().max(1) as u32;
         let half = (GRID as f32 - 1.0) / 2.0;
         for i in 0..(GRID * GRID * GRID) {
             let (x, y, z) = (i % GRID, (i / GRID) % GRID, i / (GRID * GRID));
@@ -148,7 +161,15 @@ impl App {
                 0.35 + 0.65 * rand01(u * 13 + 2),
                 1.0,
             );
-            world.spawn((Position(pos), Velocity(vel), Spin(spin), Tint(tint)));
+            // Assign a mesh at random among those registered.
+            let mesh = ((rand01(u * 17 + 5) * mesh_count as f32) as u32).min(mesh_count - 1);
+            world.spawn((
+                Position(pos),
+                Velocity(vel),
+                Spin(spin),
+                Tint(tint),
+                Mesh(MeshId(mesh)),
+            ));
         }
 
         let mut schedule = Schedule::default();
@@ -172,8 +193,8 @@ impl App {
             input: Input::default(),
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             exposure: 1.0,
-            model_path: None,
-            fit: Mat4::IDENTITY,
+            sources,
+            fits: Vec::new(),
             start: now,
             last_frame: now,
         }
@@ -205,27 +226,33 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         let renderer = Renderer::new(&window, size.width, size.height).expect("create renderer");
 
-        // Load the requested model, or fall back to the procedural sphere.
-        let mesh_data = match &self.model_path {
-            Some(path) => match feather_assets::load_gltf(path) {
-                Ok(m) => {
-                    eprintln!(
-                        "loaded {path}: {} vertices, {} indices",
-                        m.vertices.len(),
-                        m.indices.len()
-                    );
-                    m
-                }
-                Err(e) => {
-                    eprintln!("failed to load {path}: {e}\nfalling back to sphere");
-                    MeshData::uv_sphere(16, 24, 0.5)
-                }
-            },
-            None => MeshData::uv_sphere(16, 24, 0.5),
-        };
-        self.fit = fit_transform(&mesh_data);
+        // Resolve every source into MeshData (loading glTF, generating procedurals),
+        // dropping any that fail; index order becomes the MeshId order.
+        let mut meshes: Vec<MeshData> = Vec::with_capacity(self.sources.len());
+        for src in &self.sources {
+            match src {
+                MeshSource::Sphere => meshes.push(MeshData::uv_sphere(16, 24, 0.5)),
+                MeshSource::Cube => meshes.push(MeshData::cube(1.0)),
+                MeshSource::Gltf(path) => match feather_assets::load_gltf(path) {
+                    Ok(m) => {
+                        eprintln!(
+                            "loaded {path}: {} vertices, {} indices",
+                            m.vertices.len(),
+                            m.indices.len()
+                        );
+                        meshes.push(m);
+                    }
+                    Err(e) => eprintln!("failed to load {path}: {e} (skipping)"),
+                },
+            }
+        }
+        if meshes.is_empty() {
+            eprintln!("no meshes loaded; falling back to sphere");
+            meshes.push(MeshData::uv_sphere(16, 24, 0.5));
+        }
+        self.fits = meshes.iter().map(fit_transform).collect();
 
-        let mesh = MeshRenderer::new(&renderer, &mesh_data, MAX_INSTANCES);
+        let (mesh, _ids) = MeshRenderer::new(&renderer, &meshes, MAX_INSTANCES);
         let tonemap = TonemapPass::new(&renderer);
 
         self.mesh = Some(mesh);
@@ -310,21 +337,21 @@ impl ApplicationHandler for App {
 
                 self.schedule.run(&mut self.world);
 
-                // Extract: (Position, Spin, Tint) -> per-instance { model, color }.
+                // Extract: (Position, Spin, Tint, Mesh) -> (MeshId, {model, color}).
                 let t = (now - self.start).as_secs_f32();
-                let fit = self.fit;
-                let mut instances: Vec<InstanceData> =
+                let fits = &self.fits;
+                let mesh_max = fits.len().saturating_sub(1);
+                let mut items: Vec<(MeshId, InstanceData)> =
                     Vec::with_capacity((GRID * GRID * GRID) as usize);
-                let mut q = self.world.query::<(&Position, &Spin, &Tint)>();
-                for (p, s, tint) in q.iter(&self.world) {
+                let mut q = self.world.query::<(&Position, &Spin, &Tint, &Mesh)>();
+                for (p, s, tint, mesh) in q.iter(&self.world) {
+                    // Clamp in case a source mesh failed to load and was dropped.
+                    let id = (mesh.0 .0 as usize).min(mesh_max);
                     let model = Mat4::from_translation(p.0)
                         * Mat4::from_rotation_y(t * s.0)
                         * Mat4::from_scale(Vec3::splat(0.6))
-                        * fit;
-                    instances.push(InstanceData {
-                        model,
-                        color: tint.0,
-                    });
+                        * fits[id];
+                    items.push((MeshId(id as u32), InstanceData { model, color: tint.0 }));
                 }
 
                 let size = self.window.as_ref().unwrap().inner_size();
@@ -344,7 +371,7 @@ impl ApplicationHandler for App {
                     let hdr_sampler = r.hdr_sampler();
                     r.draw_frame(
                         |cmd, extent, frame| {
-                            m.draw(cmd, extent, frame, view_proj, light_dir, &instances)
+                            m.draw(cmd, extent, frame, view_proj, light_dir, &mut items)
                         },
                         |cmd, extent, frame| {
                             tm.update(frame, hdr_view, hdr_sampler);
@@ -375,10 +402,17 @@ fn fit_transform(mesh: &MeshData) -> Mat4 {
 }
 
 fn main() {
+    // One MeshId per CLI path (`cargo run -- a.glb b.glb`). With no args, a
+    // procedural sphere + cube so multi-mesh batching is visible out of the box.
+    let paths: Vec<String> = std::env::args().skip(1).collect();
+    let sources = if paths.is_empty() {
+        vec![MeshSource::Sphere, MeshSource::Cube]
+    } else {
+        paths.into_iter().map(MeshSource::Gltf).collect()
+    };
+
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new();
-    // Optional model path: `cargo run -- path/to/model.glb`.
-    app.model_path = std::env::args().nth(1);
+    let mut app = App::new(sources);
     event_loop.run_app(&mut app).expect("run app");
 }

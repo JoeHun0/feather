@@ -627,27 +627,29 @@ milestones land.
   swapchain and recreated on resize; `draw_frame` runs two passes — geometry
   into the HDR target, then a caller-supplied post pass into the swapchain —
   with the HDR write→read barrier between.
-- **render**: instanced `MeshRenderer` — one `assets::MeshData` (pos+normal
-  Vertex, u32 indices) uploaded to device-local vertex/index buffers; the mesh is
-  a procedural sphere or a loaded glTF. Per-frame instance **SSBO**
-  `InstanceData { model, color }` (std430, 80 B) with one descriptor set per
-  frame-in-flight, `view_proj` + `light_dir` in a push constant, **linear-space**
-  ambient + Lambert **directional light** (albedo decoded sRGB→linear, HDR sun)
-  written unclamped to the HDR target, `cull NONE` + depth. One
-  `cmd_draw_indexed`, `instanceCount` = live entity count (verified to 8000).
+- **render**: instanced `MeshRenderer` — **several meshes share one** device-local
+  vertex + index buffer, each a `{first_index, index_count, vertex_offset}` slice
+  keyed by `MeshId`; per-mesh indices stay 0-based (rebased via `vertexOffset`).
+  Per-frame instance **SSBO** `InstanceData { model, color }` (std430, 80 B), one
+  descriptor set per frame-in-flight, `view_proj` + `light_dir` in a push
+  constant, **linear-space** ambient + Lambert **directional light** (albedo
+  decoded sRGB→linear, HDR sun) written unclamped to the HDR target, `cull NONE`
+  + depth. Draw sorts `(MeshId, instance)` by mesh, uploads in that order, emits
+  **one `cmd_draw_indexed` per contiguous run** (`firstInstance` = run start).
   `TonemapPass` — attributeless fullscreen triangle sampling the HDR target,
   **exposure + Narkowicz ACES**, output left linear for the `_SRGB` swapchain to
   encode (no double gamma); exposure via push constant.
-- **assets**: Vulkan-free CPU mesh types (`Vertex`, `MeshData` + bounds), a
-  procedural `uv_sphere`, and a minimal **glTF/GLB loader** (`load_gltf`) —
-  merges all triangle primitives across the node hierarchy with transforms,
-  computes normals when absent, .glb blob + external `.bin` (gltf crate, no
-  image/base64 deps).
+- **assets**: Vulkan-free CPU mesh types (`Vertex`, `MeshData` + bounds),
+  procedural `uv_sphere` + `cube`, and a minimal **glTF/GLB loader**
+  (`load_gltf`) — merges all triangle primitives across the node hierarchy with
+  transforms, computes normals when absent, .glb blob + external `.bin` (gltf
+  crate, no image/base64 deps).
 - **app**: winit loop; bevy_ecs world + multi-threaded schedule (`integrate`,
   `tick`); render-rate **fly camera** (WASD/mouse/Esc, pointer locked); inline
-  **extract** (`World` query → `Vec<InstanceData>` each frame); `[`/`]` adjust
-  tonemap exposure at runtime; optional glTF path as the first CLI arg
-  (auto-centered + unit-scaled to the grid), sphere fallback.
+  **extract** (`World` query → sorted `Vec<(MeshId, InstanceData)>` each frame);
+  `[`/`]` adjust tonemap exposure at runtime; meshes are a procedural sphere +
+  cube by default or one per glTF path on the CLI (each auto-fitted to the grid),
+  each entity assigned a mesh at random.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 only partially — basic
   directional lighting, *not* CSM/GTAO/IBL. Steps 4+ not started.
 
@@ -679,17 +681,18 @@ milestones land.
   per-frame). With `FRAMES_IN_FLIGHT = 2` this carries a latent cross-frame WAW
   hazard on the shared targets — pending the sync2 barrier + timeline-semaphore
   pass (§10). The intra-frame HDR write→read hazard *is* handled.
-- **Geometry / assets (§6, §7)**: a **runtime glTF loader** now feeds the
-  renderer, but it's still **one merged mesh, one draw** — no mesh registry /
-  shared-buffer slices / per-mesh batching, no materials/textures/UVs/tangents,
-  no skinning/animation, and no offline **bake** path (runtime blob, handle
-  tables, load-time bindless allocator). glTF geometry loads directly each run.
+- **Geometry / assets (§6, §7)**: a **mesh registry** now exists — several meshes
+  in shared vertex/index buffers, drawn by sorted per-mesh runs. Still missing:
+  materials/textures/UVs/tangents, per-instance `material_id` + pipeline buckets
+  (one pipeline for everything), skinning/animation, and the offline **bake**
+  path (runtime blob, handle tables, load-time bindless allocator). glTF geometry
+  loads directly each run; a mesh's buffers are never freed/streamed.
 
 ### Not yet started
 
-Culling; materials/bindless + textures; shadows (CSM); clustered lighting; IBL;
-bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
-bake pipeline + mesh registry / multi-mesh draws (runtime glTF loader landed);
-scene format / spawning / save; physics + FPS controller (rapier); skinning;
-UI/HUD; audio; debug/profiling tooling (Tracy/RenderDoc/timestamp queries);
-GPU-driven culling; streaming; stage pipelining.
+Culling; materials/bindless + textures + pipeline buckets; shadows (CSM);
+clustered lighting; IBL; bloom + auto-exposure (HDR target + tonemap now in
+place); transparents; asset bake pipeline (runtime glTF + multi-mesh registry
+landed); scene format / spawning / save; physics + FPS controller (rapier);
+skinning; UI/HUD; audio; debug/profiling tooling (Tracy/RenderDoc/timestamp
+queries); GPU-driven culling; streaming; stage pipelining.
