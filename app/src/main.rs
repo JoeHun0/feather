@@ -7,7 +7,8 @@
 //! instances use a shared palette. Meshes are a procedural sphere + cube by
 //! default, or one
 //! per glTF/GLB path on the CLI (`cargo run -- a.glb b.glb`), each auto-fitted
-//! to the grid. A directional light with a Cook-Torrance **PBR** BRDF shades in
+//! to the grid. A directional light with a Cook-Torrance **PBR** BRDF plus
+//! analytic environment ambient (IBL) shades in
 //! linear space into an HDR target,
 //! which a tonemap pass resolves to the sRGB swapchain. WASD/mouse fly the
 //! camera; `[` / `]` adjust exposure; Esc quits.

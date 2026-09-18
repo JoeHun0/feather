@@ -642,7 +642,9 @@ milestones land.
   constant (96 B), **linear-space** Cook-Torrance **PBR** (metallic-roughness)
   directional light with **base-color + normal + metallic-roughness textures**
   (normal mapping via screen-space-derivative TBN, no per-vertex tangent), plus
-  flat ambient, written unclamped to the HDR target, `cull NONE` + depth. Draw
+  **analytic-sky environment ambient** (split-sum IBL: hemisphere irradiance +
+  reflection + Karis env-BRDF, no cubemap), written unclamped to the HDR target,
+  `cull NONE` + depth. Draw
   sorts `(MeshId, instance)` by mesh, emits **one `cmd_draw_indexed` per
   contiguous run** (`firstInstance` = run start). `TonemapPass` — attributeless
   fullscreen triangle sampling the HDR target, **exposure + Narkowicz ACES**,
@@ -686,11 +688,15 @@ milestones land.
   **derivative TBN** (no per-vertex tangent); MikkTSpace vertex tangents are the
   higher-quality follow-up (§6 reserves the tangent attribute).
 - **Lighting (§3, §13)**: **linear-space** Cook-Torrance **PBR** (metallic-
-  roughness) for one directional light + flat ambient, into an RGBA16F HDR target
-  resolved by an ACES **tonemap** pass. Still **not** the full baseline: no IBL
-  (ambient is a flat constant × albedo, wrong for metals), no shadows, exposure is
-  a fixed constant (no auto-exposure), and no bloom. The tonemap curve is a
-  drop-in point for AgX. Bloom/SSR/transparents all read the resolved HDR.
+  roughness) for one directional light plus **analytic-sky IBL** ambient (split-sum:
+  hemisphere irradiance for diffuse, reflection-vector sky sample for specular,
+  Karis analytic env-BRDF), into an RGBA16F HDR target resolved by an ACES
+  **tonemap** pass. The environment is a **procedural sky evaluated in-shader**,
+  not a precomputed cubemap — so no arbitrary HDR environments, the specular
+  "prefilter" is a crude roughness lerp (no real GGX convolution/mips), and the
+  sky isn't drawn as a visible background yet. Real cubemap IBL (equirect→cube,
+  irradiance/prefilter passes, BRDF LUT) is the follow-up. Also still missing:
+  shadows, auto-exposure, bloom. The tonemap curve is a drop-in point for AgX.
 - **HDR/depth targets (§9)**: single engine-owned images shared across both
   frames-in-flight (matches the design: render targets are engine-owned, not
   per-frame). With `FRAMES_IN_FLIGHT = 2` this carries a latent cross-frame WAW
@@ -711,7 +717,8 @@ milestones land.
 ### Not yet started
 
 Culling; mips + MikkTSpace vertex tangents; pipeline buckets (PBR BRDF +
-base-color/normal/MR textures landed); shadows (CSM); clustered lighting; IBL;
+base-color/normal/MR textures landed); shadows (CSM); clustered lighting;
+precomputed cubemap/HDR IBL (analytic-sky IBL landed);
 bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
 bake pipeline (runtime glTF + multi-mesh registry landed); scene format /
 spawning / save; physics + FPS controller (rapier);
