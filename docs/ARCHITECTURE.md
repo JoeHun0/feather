@@ -1,6 +1,7 @@
 # Feather — Engine Architecture
 
-Status: design reference (pre-implementation beyond the bootstrap).
+Status: in active implementation — a textured-PBR forward renderer with IBL is
+up; see §26 for exactly what's built vs. still designed.
 Scope: a from-scratch Rust + Vulkan engine for a minimalist open-world FPS.
 Visual floor is a 2010-era look; the baseline actually targets ~2016 image
 quality where it costs little. Long-term goal: an original Zone-flavored
@@ -608,7 +609,7 @@ Snapshot of what's actually built vs. the design above. The design sections are
 unchanged targets; this records reality so the doc doesn't drift. Update as
 milestones land.
 
-### Done (milestones 0–2 + basic lighting)
+### Done (milestones 0–2 + textured PBR + analytic IBL + sky)
 
 - **Workspace/toolchain**: 6 crates, `rust-toolchain.toml` (stable), GLSL→SPIR-V
   at build time via `shaderc` in `render/build.rs`, embedded from `OUT_DIR`.
@@ -667,7 +668,8 @@ milestones land.
   each entity assigned a mesh + `material_id` at random (glTF meshes use their
   file material; procedural meshes use a shared generated palette).
 - **Build order (§23)**: step 1 done; step 2 done; step 3 partially — PBR direct
-  lighting + textures, *not* CSM/GTAO/IBL. Steps 4+ not started.
+  lighting + full textures + analytic-sky IBL, *not* CSM/GTAO or cubemap IBL.
+  Steps 4+ not started.
 
 ### Current simplifications to revisit
 
@@ -683,9 +685,9 @@ milestones land.
   Set 0 (resident) / Set 1 (per-frame ring) / Set 2 (per-view) split, and the
   texture array is a fixed size filled at load — **not** update-after-bind /
   partially-bound (fine until streaming; no runtime texture loading yet).
-- **Push constants**: currently carry `view_proj` + `light_dir` (provisional).
-  Design reserves push constants for tiny per-draw scalars and puts camera in a
-  per-frame UBO — revisit when Set 1 lands.
+- **Push constants**: currently carry `view_proj` + `light_dir` + `camera_pos`
+  (96 B, provisional). Design reserves push constants for tiny per-draw scalars
+  and puts camera in a per-frame UBO — revisit when Set 1 lands.
 - **Vertex layout (§6)**: pos+normal+uv. Normal mapping uses a screen-space
   **derivative TBN** (no per-vertex tangent); MikkTSpace vertex tangents are the
   higher-quality follow-up (§6 reserves the tangent attribute).
@@ -710,7 +712,7 @@ milestones land.
   several meshes in shared vertex/index buffers drawn by sorted per-mesh runs; a
   resident `materials[]` SSBO indexed by per-instance `material_id`; and a fixed
   bindless `textures[]` array (glTF images or white/flat-normal defaults),
-  consumed by a Cook-Torrance PBR BRDF. Still missing: **mips**, IBL, MikkTSpace
+  consumed by a Cook-Torrance PBR BRDF. Still missing: **mips**, MikkTSpace
   vertex tangents (normal mapping is derivative-based), pipeline buckets (one
   pipeline for everything), skinning/animation, and the offline **bake** path
   (runtime blob, handle tables, load-time allocator). glTF loads directly each
