@@ -112,6 +112,9 @@ pub struct MeshRenderer {
     pipeline: vk::Pipeline,
     // Depth-only pipeline for the sun shadow pass (§11); reuses `layout`/`sets`.
     shadow_pipeline: vk::Pipeline,
+    // Depth-only prepass into the main depth buffer (§10), so the opaque pass
+    // shades each pixel once. Shares `mesh.vert` with the main pipeline.
+    depth_pipeline: vk::Pipeline,
     set_layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
     sets: Vec<vk::DescriptorSet>,
@@ -446,10 +449,13 @@ impl MeshRenderer {
         // Must match the HDR/depth targets' sample count (the geometry-pass knob).
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(renderer.samples());
+        // Opaque pass runs after the depth prepass: depth is already laid down, so
+        // test against it and don't write. LESS_OR_EQUAL rather than EQUAL as cheap
+        // insurance — early-Z still rejects everything strictly behind.
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
-            .depth_write_enable(true)
-            .depth_compare_op(vk::CompareOp::LESS);
+            .depth_write_enable(false)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
         let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(vk::ColorComponentFlags::RGBA)
             .blend_enable(false)];
@@ -496,6 +502,53 @@ impl MeshRenderer {
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
                 .map_err(|(_, e)| e)
                 .expect("graphics pipeline")[0]
+        };
+
+        // ---- Depth prepass pipeline (§10): lays down opaque depth so the main
+        // pass can early-Z out occluded fragments instead of shading them twice.
+        // Deliberately reuses `mesh.vert` — the SAME module as the main pass — so
+        // gl_Position is bit-identical and the LESS_OR_EQUAL test above always
+        // passes for the surface that won the prepass. A separate depth-only
+        // shader (e.g. shadow.vert) associates its matrix multiply differently,
+        // which would round differently and punch holes in the image.
+        let depth_stages = [vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert)
+            .name(c"main")];
+        let prepass_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
+        // This runs *inside* the geometry pass, which has one colour attachment, so
+        // the pipeline must declare the same attachment count — writing no colour
+        // is expressed with an empty write mask, not by omitting the attachment.
+        // Depth target, sample count and vertex input all match the main pass (they
+        // must agree for the prepass depths to match).
+        let depth_blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::empty())
+            .blend_enable(false)];
+        let depth_color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&depth_blend_attachment);
+        let mut depth_rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(renderer.depth_format());
+        let depth_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&depth_stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&prepass_depth)
+            .color_blend_state(&depth_color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .push_next(&mut depth_rendering);
+        let depth_pipeline = unsafe {
+            device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[depth_pipeline_info], None)
+                .map_err(|(_, e)| e)
+                .expect("depth prepass pipeline")[0]
         };
 
         // ---- Shadow (depth-only) pipeline: renders instances from the sun into
@@ -568,6 +621,7 @@ impl MeshRenderer {
             layout,
             pipeline,
             shadow_pipeline,
+            depth_pipeline,
             set_layout,
             pool,
             sets,
@@ -683,6 +737,40 @@ impl MeshRenderer {
         }
     }
 
+    /// Record the depth prepass (§10): the camera-visible runs, depth only, into
+    /// the geometry pass's depth attachment. Run before `draw_main`, which then
+    /// tests LESS_OR_EQUAL with depth-write off and shades each pixel once.
+    /// Uses the same push constant and culled set as `draw_main`.
+    pub fn draw_depth_prepass(
+        &self,
+        cmd: vk::CommandBuffer,
+        extent: vk::Extent2D,
+        frame: usize,
+        view_proj: Mat4,
+        light_dir: Vec4,
+        camera_pos: glam::Vec3,
+    ) {
+        unsafe {
+            self.push_view_constants(cmd, view_proj, light_dir, camera_pos);
+            self.device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.depth_pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &[self.sets[frame]],
+                &[],
+            );
+            self.set_viewport_scissor(cmd, extent);
+            self.bind_geometry(cmd);
+            self.draw_runs(cmd, &self.main_runs);
+        }
+    }
+
     /// Record the main lit pass. Sorts/uploads happen in `upload_instances`; this
     /// replays the runs into the HDR target with the full PBR + shadow pipeline.
     pub fn draw_main(
@@ -694,21 +782,8 @@ impl MeshRenderer {
         light_dir: Vec4,
         camera_pos: glam::Vec3,
     ) {
-        // Push constant (96 B): mat4 view_proj + vec4 light_dir + vec4 camera_pos.
-        let mut push = [0f32; 24];
-        push[..16].copy_from_slice(&view_proj.to_cols_array());
-        push[16..20].copy_from_slice(&light_dir.to_array());
-        push[20..23].copy_from_slice(&camera_pos.to_array());
-        let push_bytes = unsafe { std::slice::from_raw_parts(push.as_ptr() as *const u8, 96) };
-
         unsafe {
-            self.device.cmd_push_constants(
-                cmd,
-                self.layout,
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                0,
-                push_bytes,
-            );
+            self.push_view_constants(cmd, view_proj, light_dir, camera_pos);
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
             self.device.cmd_bind_descriptor_sets(
@@ -723,6 +798,29 @@ impl MeshRenderer {
             self.bind_geometry(cmd);
             self.draw_runs(cmd, &self.main_runs);
         }
+    }
+
+    /// Push the shared 96 B view constants: mat4 view_proj + vec4 light_dir +
+    /// vec4 camera_pos. Identical for the depth prepass and the main pass.
+    unsafe fn push_view_constants(
+        &self,
+        cmd: vk::CommandBuffer,
+        view_proj: Mat4,
+        light_dir: Vec4,
+        camera_pos: glam::Vec3,
+    ) {
+        let mut push = [0f32; 24];
+        push[..16].copy_from_slice(&view_proj.to_cols_array());
+        push[16..20].copy_from_slice(&light_dir.to_array());
+        push[20..23].copy_from_slice(&camera_pos.to_array());
+        let push_bytes = std::slice::from_raw_parts(push.as_ptr() as *const u8, 96);
+        self.device.cmd_push_constants(
+            cmd,
+            self.layout,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            0,
+            push_bytes,
+        );
     }
 
     unsafe fn set_viewport_scissor(&self, cmd: vk::CommandBuffer, extent: vk::Extent2D) {
@@ -812,6 +910,7 @@ impl Drop for MeshRenderer {
             self.device.destroy_sampler(self.sampler, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline(self.shadow_pipeline, None);
+            self.device.destroy_pipeline(self.depth_pipeline, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_pool(self.pool, None);
             self.device

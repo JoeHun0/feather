@@ -853,9 +853,13 @@ impl ApplicationHandler for App {
                     r.draw_frame(
                         // Shadow pass: sun depth map (also flushes this frame's buffers).
                         |cmd, extent, frame| m.draw_shadow(cmd, extent, frame),
-                        // Geometry: sky background (depth off), then lit + shadowed meshes.
+                        // Geometry: sky background (depth off), then a depth prepass
+                        // so the lit pass shades each pixel once (§10).
                         |cmd, extent, frame| {
                             sky.draw(cmd, extent, inv_view_proj, camera_pos, light_dir);
+                            m.draw_depth_prepass(
+                                cmd, extent, frame, view_proj, light_dir, camera_pos,
+                            );
                             m.draw_main(cmd, extent, frame, view_proj, light_dir, camera_pos);
                         },
                         |cmd, extent, frame| {

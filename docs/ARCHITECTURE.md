@@ -328,6 +328,21 @@ Per-frame sequence:
 10. **Post** — tonemap, bloom, SMAA → swapchain.
 11. **UI/HUD**, then **present**.
 
+**Landed (§26):** steps 2, 3 and 5 in a reduced form — a sun shadow pass, then one
+geometry pass containing sky → **depth prepass** → opaque. The prepass (step 3) is
+depth-only over the camera-culled set, after which the opaque pass runs with
+**depth-write off and `LESS_OR_EQUAL`**, so early-Z discards occluded fragments
+instead of shading them. Measured **geo 5.2 ms → 3.0 ms (−42 %)**, frame 10.3 → 8.0 ms
+in a back-to-back A/B. Two implementation notes worth keeping: the prepass reuses
+**`mesh.vert`, the same module as the opaque pass**, so `gl_Position` is
+bit-identical and the depth test always matches (a separate depth-only shader
+associating its matrix multiply differently would round differently and drop
+fragments); and because it runs inside a render pass that has a colour attachment,
+its pipeline must declare that **same attachment count** with an **empty colour
+write mask** — omitting the attachment is a validation error. Still pending here:
+sky is drawn *before* opaque rather than depth-tested after it (step 6), and there
+is no cluster pass, MSAA resolve or transparent pass.
+
 Barriers: Vulkan 1.3 **sync2** (`VkImageMemoryBarrier2`, timeline semaphores).
 Key hazards: shadow depth W→R before opaque; HDR color W→R at resolve; cluster
 buffer W(compute)→R(fragment). Queues: graphics for all passes; cluster
@@ -746,7 +761,9 @@ milestones land.
   `alpha = accumulator / FIXED_DT` and reads a per-entity `Scale`; a small
   **static level** (ground box + obstacle boxes, each with a fixed cuboid
   collider in rapier; no `Velocity`/`Spin` so `integrate` skips them) drawn
-  through the same instanced path;
+  through the same instanced path; a **depth prepass** (§10) ahead of the opaque
+  draws, which then run depth-write-off + `LESS_OR_EQUAL` (−42% on the geometry
+  pass);
   `[`/`]` adjust tonemap exposure at runtime; meshes are a procedural sphere +
   cube by default or one per glTF path on the CLI (each auto-fitted to the grid),
   plus a unit cube appended for level geometry;
