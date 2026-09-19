@@ -345,8 +345,10 @@ Set 2 carries per-cascade light-space `viewProj`, split depths, world-texel
 size.
 
 **Landed (§26):** a **single, static directional shadow map** — the first step of
-the above, not the full CSM. One 2048² D32 depth target, engine-owned and fixed
-size; a depth-only shadow pass (`shadow.vert`, front-face cull + slope-scaled
+the above, not the full CSM. One 4096² D32 depth target, engine-owned and fixed
+size, covering a tight ±16-unit ortho around the origin (dense texels — a wider
+frustum or lower res looks pixelated); a depth-only shadow pass (`shadow.vert`,
+front-face cull + slope-scaled
 `vkCmdSetDepthBias`) renders all instances from a **fixed** scene-covering ortho
 along the sun; the mesh fragment shader samples it with a comparison sampler and
 **3×3 PCF**, occluding the **direct sun term only** (ambient/IBL stays lit). The
@@ -688,7 +690,7 @@ milestones land.
   Opaque `mesh.frag` also applies **exp distance fog** toward that same sky along
   the view ray, hiding the finite ground edge and reading as depth. A **directional
   sun shadow** (§11) precedes the geometry pass: a depth-only pass renders the
-  scene from a fixed light ortho into a 2048² map, which `mesh.frag` samples with
+  scene from a fixed light ortho into a 4096² map, which `mesh.frag` samples with
   3×3 PCF to occlude the direct sun term. `draw_frame` now runs three passes
   (shadow → geometry → post); the mesh renderer splits into `prepare_frame`
   (CPU sort/stage) + `draw_shadow`/`draw_main` replaying the same instance runs.

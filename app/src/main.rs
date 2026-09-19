@@ -765,9 +765,12 @@ impl ApplicationHandler for App {
                 // static, so this never moves — no shimmer, no texel-snap needed yet.
                 let sun_dir = self.light_dir.truncate().normalize_or_zero();
                 let light_center = Vec3::ZERO;
-                let light_eye = light_center - sun_dir * 50.0;
+                let light_eye = light_center - sun_dir * 40.0;
                 let light_view = Mat4::look_at_rh(light_eye, light_center, Vec3::Y);
-                let light_proj = Mat4::orthographic_rh(-24.0, 24.0, -24.0, 24.0, 0.1, 100.0);
+                // Tight ortho: the casters (orbs, boxes) sit within ~±10 of origin,
+                // so a ±16 half-extent keeps shadow-map texels dense (2048² over
+                // 32 units ≈ 0.016 u/texel) — coarser coverage looks pixelated.
+                let light_proj = Mat4::orthographic_rh(-16.0, 16.0, -16.0, 16.0, 0.1, 80.0);
                 let light_view_proj = light_proj * light_view;
 
                 let exposure = self.exposure;
