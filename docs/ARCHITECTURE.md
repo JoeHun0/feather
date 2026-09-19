@@ -576,6 +576,8 @@ app        thin binary wiring it together
 3. Lighting: CSM sun + GTAO + a few clustered lights + IBL ambient (the "better
    than 2010" look lands here).
 4. Physics + FPS controller (rapier), fixed timestep + interpolation → walkable.
+   (Fixed timestep + interpolation and a hand-rolled kinematic FPS controller
+   have landed; the rapier swap is the remaining piece.)
 5. Bounded arena content, chunked culling, bindless materials, PBR bake path.
 6. Deferred-by-design items as needed: streaming, stage pipelining, GPU-driven
    indirect culling, SSR/volumetrics, probes.
@@ -663,12 +665,19 @@ milestones land.
 - **app**: winit loop; bevy_ecs world + multi-threaded schedule (`integrate`,
   `tick`) driven on a **fixed timestep** (accumulator + `FIXED_DT`, frame delta
   clamped and steps capped as a spiral-of-death guard) so sim speed no longer
-  tracks framerate; render-rate **fly camera** (WASD/mouse/Esc, pointer locked);
-  inline **extract** (`World` query → sorted `Vec<(MeshId, InstanceData)>` each
-  frame) that **interpolates** each entity's double-buffered sim state
-  (prev/curr position + spin angle) by `alpha = accumulator / FIXED_DT`;
+  tracks framerate; a **first-person kinematic controller** stepped in the same
+  loop (WASD walk with accel toward a target speed, own gravity, edge-latched
+  jump when grounded, discrete AABB/ground-plane collision; `V` toggles a noclip
+  fly) — look is render-rate for responsive aim, body position is fixed-step and
+  camera-**interpolated**; inline **extract** (`World` query → sorted
+  `Vec<(MeshId, InstanceData)>` each frame) that **interpolates** each entity's
+  double-buffered sim state (prev/curr position + spin angle) by
+  `alpha = accumulator / FIXED_DT` and reads a per-entity `Scale`; a small
+  **static level** (ground plane + obstacle boxes, no `Velocity`/`Spin` so
+  `integrate` skips them) drawn through the same instanced path;
   `[`/`]` adjust tonemap exposure at runtime; meshes are a procedural sphere +
-  cube by default or one per glTF path on the CLI (each auto-fitted to the grid);
+  cube by default or one per glTF path on the CLI (each auto-fitted to the grid),
+  plus a unit cube appended for level geometry;
   each entity assigned a mesh + `material_id` at random (glTF meshes use their
   file material; procedural meshes use a shared generated palette).
 - **Build order (§23)**: step 1 done; step 2 done; step 3 partially — PBR direct
@@ -690,6 +699,18 @@ milestones land.
   double-buffered **`RenderFrame` snapshot** for stage pipelining — extract is
   still inline. This is the groundwork physics needs; **rapier is the next step
   it unblocks** (spin is a cosmetic angular velocity today, not yet a rigid body).
+- **FPS controller (§15)**: **landed, hand-rolled.** A kinematic first-person
+  controller runs in the fixed-step loop — WASD accel toward a target speed,
+  controller-owned gravity, edge-latched jump when grounded, and a **discrete
+  (non-swept)** collision resolver: ground as a plane clamp, obstacle boxes as
+  AABBs resolved along the axis of least penetration. Look is render-rate; the
+  body interpolates like any other entity. This stands in for §15's rapier
+  `KinematicCharacterController` + `physics.step` (same fixed-loop shape), so the
+  input→sim→collide→interpolate→camera path is proven and building; **swapping in
+  rapier is the follow-up** (replaces the resolver + integrate step, adds real
+  colliders, slopes, step-over, and the ECS↔rapier sync systems). Known limits:
+  no swept collision (tunnelling possible at very high speed), a box (not capsule)
+  player, and a single flat ground plane.
 - **Descriptors (§9)**: one set with three bindings — per-frame instances
   (binding 0), resident materials (binding 1), and a resident **fixed-size**
   `sampler2D textures[64]` (binding 2), as N discrete per-frame sets. Not yet the
@@ -737,6 +758,7 @@ base-color/normal/MR textures landed); shadows (CSM); clustered lighting;
 precomputed cubemap/HDR IBL (analytic-sky IBL landed);
 bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
 bake pipeline (runtime glTF + multi-mesh registry landed); scene format /
-spawning / save; physics + FPS controller (rapier);
+spawning / save; rapier physics (kinematic FPS controller landed hand-rolled —
+rapier swap + real colliders/slopes pending);
 skinning; UI/HUD; audio; debug/profiling tooling (Tracy/RenderDoc/timestamp
 queries); GPU-driven culling; streaming; stage pipelining.
