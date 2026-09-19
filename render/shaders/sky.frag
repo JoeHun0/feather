@@ -13,9 +13,11 @@ layout(push_constant) uniform Push {
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_color; // linear HDR
 
+// Palette + soft-glow term must stay in sync with mesh.frag's sky() (the IBL
+// reflection path). The extra sharp sun disk below is unique to the background.
 const vec3 SKY_ZENITH = vec3(0.10, 0.22, 0.55);
 const vec3 SKY_HORIZON = vec3(0.55, 0.65, 0.85);
-const vec3 SKY_GROUND = vec3(0.15, 0.13, 0.11);
+const vec3 SKY_GROUND = vec3(0.17, 0.18, 0.19);
 const vec3 SUN_COLOR = vec3(1.0, 0.95, 0.85);
 const float SKY_INTENSITY = 1.0;
 

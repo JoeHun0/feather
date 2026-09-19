@@ -661,7 +661,12 @@ milestones land.
   output left linear for the `_SRGB` swapchain to encode; exposure via push
   constant. `SkyPass` — fullscreen procedural-sky background drawn first in the
   geometry pass (depth off), reconstructing view rays from the inverse
-  view-projection so meshes' IBL reflections match the visible sky.
+  view-projection. The reflection path (`mesh.frag`) and the background
+  (`sky.frag`) share one palette + soft-glow tuning so IBL reflections match the
+  visible sky; only the background adds a sharp sun disk (a disk in the
+  reflection would double-count against the analytic sun on smooth metals).
+  Opaque `mesh.frag` also applies **exp distance fog** toward that same sky along
+  the view ray, hiding the finite ground edge and reading as depth.
 - **assets**: Vulkan-free CPU mesh types (`Vertex` = pos+normal+uv, `MeshData` +
   bounds + `Material` with optional decoded base-color / normal / MR textures),
   procedural `uv_sphere` + `cube`, and a **glTF/GLB loader** (`load_gltf`, via

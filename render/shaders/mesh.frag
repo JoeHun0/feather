@@ -30,11 +30,16 @@ layout(location = 0) out vec4 o_color; // linear HDR (RGBA16F target)
 
 const float PI = 3.14159265359;
 const vec3 SUN_RADIANCE = vec3(8.0);
+const float FOG_DENSITY = 0.010; // exp distance fog; tuned for the 200-unit far plane
 
 // Analytic procedural sky (stand-in for a precomputed IBL cubemap). Linear HDR.
+// NOTE: these constants + the soft-glow term must stay in sync with sky.frag.
+// The only intended difference is that sky.frag (the visible background) also
+// adds a sharp sun disk, which this reflection path deliberately omits.
+// SKY_GROUND tracks the level ground material tone so downward reflections match.
 const vec3 SKY_ZENITH = vec3(0.10, 0.22, 0.55);
 const vec3 SKY_HORIZON = vec3(0.55, 0.65, 0.85);
-const vec3 SKY_GROUND = vec3(0.15, 0.13, 0.11);
+const vec3 SKY_GROUND = vec3(0.17, 0.18, 0.19);
 const vec3 SUN_COLOR = vec3(1.0, 0.95, 0.85);
 const float SKY_INTENSITY = 1.0;
 
@@ -46,8 +51,9 @@ vec3 sky(vec3 d) {
     col = mix(col, SKY_GROUND, down);
     float s = max(dot(d, sundir), 0.0);
     // Soft glow only (the direct sun is a separate analytic light; a sharp disk
-    // here would double-count on smooth metals — add one when drawing the sky bg).
-    col += SUN_COLOR * pow(s, 16.0) * 2.0;
+    // here would double-count on smooth metals). Coefficient matches sky.frag's
+    // glow so a reflection shows the same haze the background sky does.
+    col += SUN_COLOR * pow(s, 16.0) * 0.6;
     return col * SKY_INTENSITY;
 }
 // Cheap hemisphere-averaged irradiance (diffuse IBL).
@@ -154,5 +160,13 @@ void main() {
     vec3 ambient = kd_amb * diffuse_ibl + specular_ibl;
 
     vec3 color = ambient + lo + m.emissive.rgb;
+
+    // Distance fog: blend toward the sky along the view ray. Hides the finite
+    // ground edge and reads as depth. sky() here has no sun disk, so no searing
+    // dot bleeds into the haze.
+    float dist = length(pc.camera_pos.xyz - v_world_pos);
+    float fog = 1.0 - exp(-dist * FOG_DENSITY);
+    color = mix(color, sky(normalize(v_world_pos - pc.camera_pos.xyz)), fog);
+
     o_color = vec4(color, 1.0);
 }
