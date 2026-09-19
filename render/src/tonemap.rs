@@ -98,6 +98,8 @@ impl TonemapPass {
             .cull_mode(vk::CullModeFlags::NONE)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
+        // Always single-sample: this pass draws to the swapchain, not the (maybe
+        // multisampled) HDR target, so it does not follow renderer.samples().
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()

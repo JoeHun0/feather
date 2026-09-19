@@ -53,8 +53,9 @@ impl SkyPass {
             .cull_mode(vk::CullModeFlags::NONE)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
+        // Must match the geometry pass's HDR/depth sample count.
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            .rasterization_samples(renderer.samples());
         // Runs in the geometry pass (which has a depth attachment) but ignores it.
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(false)

@@ -397,8 +397,12 @@ size.
    linear).
 5. **OETF/gamma** — let the `_SRGB` swapchain encode; do **not** also gamma in
    shader (no double-correction).
-6. **Anti-alias** — **SMAA** on LDR (post-tonemap). MSAA on geometry stays.
-   (TAA is a later, bigger shift that replaces MSAA and moves before tonemap.)
+6. **Anti-alias** — **user-selectable**: SMAA on LDR (post-tonemap) or MSAA
+   2×/4× on geometry (the geometry sample count is already a single knob —
+   `Renderer::samples`, see §26). SMAA is the cheaper default on bandwidth-bound
+   hardware (e.g. Steam Deck); MSAA the higher geometry-edge quality where the
+   budget allows. (TAA is a later, bigger shift that replaces both and moves
+   before tonemap.)
 7. **Output** → swapchain; **UI/HUD after tonemap** in LDR/sRGB.
 
 Maybe-hooks placed: **SSR** between resolve and transparents (HDR, pre-tonemap);
@@ -602,9 +606,10 @@ ripped SoC assets, so a public showcase is clean.
 
 GPU-driven indirect culling; async compute; auto-exposure; dual-quaternion
 skinning; animation state machines; local reflection probes / irradiance
-volumes; audio occlusion + reverb zones; TAA; streaming + stage pipelining;
-X-Ray (`.ogf`/level) importer for the SoC-rebuild stretch dream (becomes just
-another importer feeding the same bake).
+volumes; audio occlusion + reverb zones; user-selectable anti-aliasing mode
+(SMAA / MSAA 2×/4×; the geometry sample-count seam is in place, §26); TAA;
+streaming + stage pipelining; X-Ray (`.ogf`/level) importer for the SoC-rebuild
+stretch dream (becomes just another importer feeding the same bake).
 
 ## 26. Implementation status
 
@@ -768,6 +773,15 @@ milestones land.
   per-frame). With `FRAMES_IN_FLIGHT = 2` this carries a latent cross-frame WAW
   hazard on the shared targets — pending the sync2 barrier + timeline-semaphore
   pass (§10). The intra-frame HDR write→read hazard *is* handled.
+- **Anti-aliasing (§3, §10, §13)**: none yet — rendering is single-sample
+  throughout. The groundwork is a **single knob**, `MSAA_SAMPLES` /
+  `Renderer::samples()`, that the HDR + depth targets and the mesh/sky pipelines
+  all read (the tonemap pass to the swapchain stays 1× on purpose). Flipping it
+  is *not* sufficient on its own: a multisampled HDR target needs a **resolve
+  attachment** (multisample → single-sample) before the tonemap pass can sample
+  it. SMAA (the §13 post-AA alternative) would slot in as tonemap → LDR → SMAA →
+  swapchain. AA mode is left user-selectable (§13/§25); this seam is what keeps
+  either choice small.
 - **Geometry / assets (§6, §7)**: a **mesh registry**, a **material table**, and a
   full **base-color + normal + metallic-roughness texture** path now exist —
   several meshes in shared vertex/index buffers drawn by sorted per-mesh runs; a

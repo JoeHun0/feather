@@ -23,6 +23,13 @@ const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 // Offscreen scene color. Geometry lights in linear space into this; the tonemap
 // pass reads it and writes the sRGB swapchain. RGBA16F gives HDR headroom.
 const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+// Single source of truth for the geometry pass's MSAA sample count (HDR + depth
+// targets and the mesh/sky pipelines all read it via `Renderer::samples`).
+// TYPE_1 = no MSAA. NOTE: bumping this alone does NOT enable MSAA — a
+// multisampled HDR target can't be sampled directly by the tonemap pass, so a
+// resolve attachment (multisample HDR -> single-sample resolve image) must be
+// added first. This is the seam that makes that change small; see §26.
+const MSAA_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
 
 /// A GPU buffer that frees itself (and its allocation) on drop.
 pub struct Buffer {
@@ -303,6 +310,13 @@ impl Renderer {
     /// Format of the offscreen HDR scene-color target (geometry render target).
     pub fn hdr_format(&self) -> vk::Format {
         HDR_FORMAT
+    }
+
+    /// Geometry-pass MSAA sample count. The HDR + depth targets and the mesh/sky
+    /// pipelines must all agree on this; the tonemap pass to the swapchain stays
+    /// single-sample regardless. One knob for future MSAA (see `MSAA_SAMPLES`).
+    pub fn samples(&self) -> vk::SampleCountFlags {
+        MSAA_SAMPLES
     }
 
     /// View of the current HDR target. Changes on resize, so consumers that hold
@@ -1042,7 +1056,7 @@ fn create_depth(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk:
         })
         .mip_levels(1)
         .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
+        .samples(MSAA_SAMPLES)
         .tiling(vk::ImageTiling::OPTIMAL)
         .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -1088,7 +1102,7 @@ fn create_hdr(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::E
         })
         .mip_levels(1)
         .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
+        .samples(MSAA_SAMPLES)
         .tiling(vk::ImageTiling::OPTIMAL)
         // Rendered into as a color attachment, then sampled by the tonemap pass.
         .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
