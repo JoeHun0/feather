@@ -545,9 +545,13 @@ Two layers (raw events and game meaning change at different rates).
 ## 21. Debug / profiling
 
 - **CPU:** Tracy (`tracy-client`), scoped zones on systems + passes.
-- **GPU:** timestamp queries (`vkCmdWriteTimestamp2`) bracketing passes → per-
-  pass ms in Tracy GPU zones + egui overlay. This is how SSR/volumetrics cost
-  gets judged.
+- **GPU:** timestamp queries bracketing passes → per-pass ms. This is how
+  SSR/volumetrics cost gets judged. **Landed** (§26): a timestamp query pool in
+  `gfx` brackets the geometry + post passes, reads back after the frame fence
+  (no stall), and logs smoothed per-pass ms to stderr, with a `Renderer::gpu_times`
+  accessor for a future overlay. Uses core `vkCmdWriteTimestamp` for now; the
+  `vkCmdWriteTimestamp2` form arrives with the §10 sync2 barrier pass. Tracy GPU
+  zones + an egui overlay are the remaining upgrades.
 - **RenderDoc:** in-application API, capture on a keybind.
 - **Object naming:** `vkSetDebugUtilsObjectName` on buffers/images/pipelines
   from the start (readable validation + captures).
@@ -804,7 +808,9 @@ bake pipeline (runtime glTF + multi-mesh registry landed); scene format /
 spawning / save; rapier beyond the player (kinematic FPS controller + static
 colliders landed — ECS↔rapier sync systems, dynamic bodies, collision layers
 pending);
-skinning; UI/HUD; audio; debug/profiling tooling (Tracy/RenderDoc/timestamp
-queries); GPU-driven culling; streaming; stage pipelining; **anti-aliasing**
+skinning; UI/HUD; audio; debug/profiling tooling (per-pass GPU timestamp timing
+landed — stderr log + `Renderer::gpu_times`; Tracy / RenderDoc / egui overlay and
+CPU-side zones pending); GPU-driven culling; streaming; stage pipelining;
+**anti-aliasing**
 (the design assumes MSAA on geometry per §3/§10 and SMAA post per §13, but the
 renderer is single-sample everywhere — no MSAA, no resolve, no post-AA yet).

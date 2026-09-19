@@ -30,6 +30,9 @@ const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 // resolve attachment (multisample HDR -> single-sample resolve image) must be
 // added first. This is the seam that makes that change small; see §26.
 const MSAA_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
+// GPU timing (§21): timestamps per frame-in-flight — geometry (start, end) and
+// post (start, end). Frame time is derived from geometry-start → post-end.
+const TIMESTAMPS_PER_FRAME: u32 = 4;
 
 /// A GPU buffer that frees itself (and its allocation) on drop.
 pub struct Buffer {
@@ -66,6 +69,16 @@ impl Drop for MappedBuffer {
     fn drop(&mut self) {
         unsafe { self.allocator.destroy_buffer(self.handle, &mut self.allocation) };
     }
+}
+
+/// Smoothed per-pass GPU time in milliseconds (§21), from timestamp queries.
+/// Zeroed until the first frames are measured, and all zero if the device/queue
+/// doesn't support timestamps.
+#[derive(Clone, Copy, Default)]
+pub struct GpuTimes {
+    pub geometry_ms: f32,
+    pub post_ms: f32,
+    pub frame_ms: f32,
 }
 
 /// A GPU image + view that free themselves on drop.
@@ -123,6 +136,15 @@ pub struct Renderer {
     render_finished: Vec<vk::Semaphore>,
     in_flight: Vec<vk::Fence>,
     current_frame: usize,
+
+    // GPU timing (§21): one timestamp pool bracketing the geometry + post passes.
+    query_pool: vk::QueryPool,
+    timestamp_period: f32, // nanoseconds per timestamp tick (device limit)
+    timestamp_mask: u64,   // valid low bits of each timestamp value
+    timestamps_supported: bool,
+    ts_written: Vec<bool>, // per frame-in-flight: slots written at least once
+    gpu_times: GpuTimes,
+    ts_log_counter: u32,
 }
 
 impl Renderer {
@@ -266,6 +288,34 @@ impl Renderer {
             in_flight.push(unsafe { device.create_fence(&fence, None)? });
         }
 
+        // GPU timing (§21). Timestamp support is per queue family; `timestamp_period`
+        // is the ns-per-tick scale, and only the low `timestamp_valid_bits` of each
+        // written value are meaningful. Uses core `vkCmdWriteTimestamp` (not the
+        // sync2 `2` variant — `synchronization2` isn't enabled).
+        let limits = unsafe { instance.get_physical_device_properties(physical_device) }.limits;
+        let timestamp_period = limits.timestamp_period;
+        let valid_bits =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
+                [queue_family_index as usize]
+                .timestamp_valid_bits;
+        let timestamps_supported = valid_bits > 0 && timestamp_period > 0.0;
+        let timestamp_mask = if valid_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << valid_bits) - 1
+        };
+        if !timestamps_supported {
+            eprintln!("[gpu] timestamp queries unsupported on this queue; GPU profiling disabled");
+        }
+        let query_pool = unsafe {
+            device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(TIMESTAMPS_PER_FRAME * FRAMES_IN_FLIGHT as u32),
+                None,
+            )?
+        };
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -292,6 +342,13 @@ impl Renderer {
             render_finished: sc.render_finished,
             in_flight,
             current_frame: 0,
+            query_pool,
+            timestamp_period,
+            timestamp_mask,
+            timestamps_supported,
+            ts_written: vec![false; FRAMES_IN_FLIGHT],
+            gpu_times: GpuTimes::default(),
+            ts_log_counter: 0,
         })
     }
 
@@ -317,6 +374,56 @@ impl Renderer {
     /// single-sample regardless. One knob for future MSAA (see `MSAA_SAMPLES`).
     pub fn samples(&self) -> vk::SampleCountFlags {
         MSAA_SAMPLES
+    }
+
+    /// Latest smoothed per-pass GPU times (§21). All zero until a few frames have
+    /// been measured, or if timestamps are unsupported. For a future HUD overlay.
+    pub fn gpu_times(&self) -> GpuTimes {
+        self.gpu_times
+    }
+
+    /// Read the four timestamps this frame's slots recorded on their previous use,
+    /// convert to per-pass ms, smooth, and log once per ~60 frames. Called after
+    /// the frame fence, so the results are guaranteed available (no `WAIT`).
+    fn read_gpu_timestamps(&mut self, frame: usize) {
+        let base = frame as u32 * TIMESTAMPS_PER_FRAME;
+        let mut data = [0u64; TIMESTAMPS_PER_FRAME as usize];
+        if unsafe {
+            self.device.get_query_pool_results(
+                self.query_pool,
+                base,
+                &mut data,
+                vk::QueryResultFlags::TYPE_64,
+            )
+        }
+        .is_err()
+        {
+            return; // not ready (shouldn't happen post-fence) — skip this frame
+        }
+
+        let (m, period) = (self.timestamp_mask, self.timestamp_period);
+        // Mask to valid bits and wrapping-subtract, so a counter wrap within the
+        // valid range still yields the right delta. Then ns → ms.
+        let to_ms = |start: u64, end: u64| (end & m).wrapping_sub(start & m) as f32 * period * 1e-6;
+        let geo = to_ms(data[0], data[1]);
+        let post = to_ms(data[2], data[3]);
+        let frame_ms = to_ms(data[0], data[3]);
+
+        // Exponential moving average keeps the log line steady enough to read.
+        let a = 0.1;
+        self.gpu_times.geometry_ms += (geo - self.gpu_times.geometry_ms) * a;
+        self.gpu_times.post_ms += (post - self.gpu_times.post_ms) * a;
+        self.gpu_times.frame_ms += (frame_ms - self.gpu_times.frame_ms) * a;
+
+        self.ts_log_counter += 1;
+        if self.ts_log_counter >= 60 {
+            self.ts_log_counter = 0;
+            let t = self.gpu_times;
+            eprintln!(
+                "[gpu] geo {:.2}ms  post {:.2}ms  frame {:.2}ms",
+                t.geometry_ms, t.post_ms, t.frame_ms
+            );
+        }
     }
 
     /// View of the current HDR target. Changes on resize, so consumers that hold
@@ -623,6 +730,12 @@ impl Renderer {
                 .unwrap();
         }
 
+        // This frame's query slots are now complete (the fence guarantees it), so
+        // read what they measured on the previous use of this frame index.
+        if self.timestamps_supported && self.ts_written[frame] {
+            self.read_gpu_timestamps(frame);
+        }
+
         let image_index = match unsafe {
             self.swapchain_loader.acquire_next_image(
                 self.swapchain,
@@ -676,6 +789,20 @@ impl Renderer {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
             .unwrap();
+
+            // GPU timing: reset this frame's query slots (must be outside a render
+            // pass) and stamp the geometry-pass start. Bottom-of-pipe for all four,
+            // so each delta measures the work recorded between two write points.
+            let ts_base = frame as u32 * TIMESTAMPS_PER_FRAME;
+            if self.timestamps_supported {
+                dev.cmd_reset_query_pool(cmd, self.query_pool, ts_base, TIMESTAMPS_PER_FRAME);
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base,
+                );
+            }
 
             // ---- Geometry pass: render into the linear HDR target. ----
 
@@ -751,6 +878,14 @@ impl Renderer {
             dev.cmd_begin_rendering(cmd, &geo_rendering);
             geometry(cmd, extent, frame);
             dev.cmd_end_rendering(cmd);
+            if self.timestamps_supported {
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 1,
+                );
+            }
 
             // ---- Tonemap pass: sample HDR, write the sRGB swapchain. ----
 
@@ -810,9 +945,25 @@ impl Renderer {
                 .layer_count(1)
                 .color_attachments(&swap_attachments);
 
+            if self.timestamps_supported {
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 2,
+                );
+            }
             dev.cmd_begin_rendering(cmd, &post_rendering);
             post(cmd, extent, frame);
             dev.cmd_end_rendering(cmd);
+            if self.timestamps_supported {
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 3,
+                );
+            }
 
             // Swapchain: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
             let to_present = vk::ImageMemoryBarrier::default()
@@ -859,6 +1010,12 @@ impl Renderer {
                 Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swapchain(),
                 Err(e) => panic!("queue_present: {e:?}"),
             }
+        }
+
+        // The command buffer (with this frame's timestamp writes) is submitted, so
+        // its slots hold real values to read back on this frame index's next use.
+        if self.timestamps_supported {
+            self.ts_written[frame] = true;
         }
 
         self.current_frame = (frame + 1) % FRAMES_IN_FLIGHT;
@@ -927,6 +1084,7 @@ impl Drop for Renderer {
             for &f in &self.in_flight {
                 self.device.destroy_fence(f, None);
             }
+            self.device.destroy_query_pool(self.query_pool, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.swapchain_loader.destroy_swapchain(self.swapchain, None);
 
