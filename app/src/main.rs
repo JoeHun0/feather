@@ -110,6 +110,14 @@ struct Scale(Vec3);
 struct Mesh(MeshId);
 #[derive(Component)]
 struct Material(u32); // material_id into the renderer's material table
+/// Opt-out marker: this entity is not rendered into the sun shadow map (§11).
+/// Everything casts by default. The demo's flat ground carries it — a flat slab
+/// casts nothing useful (nothing is beneath it) yet rasterizes the *entire*
+/// shadow map, which dominates that pass's fill cost. This is deliberately
+/// per-entity rather than a rule about "ground": terrain with relief has to cast
+/// (hills shadow valleys), and then it simply doesn't carry this marker.
+#[derive(Component)]
+struct NoShadowCast;
 #[derive(Resource, Default)]
 struct FrameCount(u64);
 
@@ -597,13 +605,17 @@ impl ApplicationHandler for App {
         // scaled unit cube and given a matching cuboid collider (`spawn_static`).
         // Level pieces carry no Velocity/Spin, so `integrate` skips them and they
         // never wrap.
-        spawn_static(
+        let ground = spawn_static(
             &mut self.world,
             Vec3::new(0.0, GROUND_Y - 0.5, 0.0),
             Vec3::new(80.0, 1.0, 80.0),
             level_cube_id,
             ground_mat,
         );
+        // This ground is a flat slab: it casts nothing useful but would rasterize
+        // the whole shadow map. It still *receives* shadows (receiving is sampling
+        // the map, not being in it). Relief terrain would drop this marker.
+        self.world.entity_mut(ground).insert(NoShadowCast);
         // (x, half-height as y, z), size — y offset keeps each box resting on the
         // ground (center = GROUND_Y + size.y/2).
         let boxes = [
@@ -800,8 +812,9 @@ impl ApplicationHandler for App {
                     &Scale,
                     &Mesh,
                     &Material,
+                    Option<&NoShadowCast>,
                 )>();
-                for (p, pp, r, pr, scale, mesh, material) in q.iter(&self.world) {
+                for (p, pp, r, pr, scale, mesh, material, no_cast) in q.iter(&self.world) {
                     let id = (mesh.0 .0 as usize).min(mesh_max);
                     let pos = pp.0.lerp(p.0, alpha);
                     let angle = pr.0 + (r.0 - pr.0) * alpha;
@@ -817,7 +830,7 @@ impl ApplicationHandler for App {
                     if camera_frustum.contains_sphere(pos, radius) {
                         main_items.push(item);
                     }
-                    if light_frustum.contains_sphere(pos, radius) {
+                    if no_cast.is_none() && light_frustum.contains_sphere(pos, radius) {
                         shadow_items.push(item);
                     }
                 }
@@ -868,17 +881,19 @@ impl ApplicationHandler for App {
 /// wraps). `prev == curr` makes it a no-op through the interpolation path. Also
 /// registers a matching fixed cuboid collider with `Physics` (it must already be
 /// a resource).
-fn spawn_static(world: &mut World, center: Vec3, size: Vec3, mesh: u32, material: u32) {
+fn spawn_static(world: &mut World, center: Vec3, size: Vec3, mesh: u32, material: u32) -> Entity {
     world.resource_mut::<Physics>().add_static_box(center, size);
-    world.spawn((
-        Position(center),
-        PrevPosition(center),
-        Rotation(0.0),
-        PrevRotation(0.0),
-        Scale(size),
-        Mesh(MeshId(mesh)),
-        Material(material),
-    ));
+    world
+        .spawn((
+            Position(center),
+            PrevPosition(center),
+            Rotation(0.0),
+            PrevRotation(0.0),
+            Scale(size),
+            Mesh(MeshId(mesh)),
+            Material(material),
+        ))
+        .id()
 }
 
 /// A plain untextured material for level geometry. Base color is treated as

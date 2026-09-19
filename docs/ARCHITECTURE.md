@@ -371,7 +371,15 @@ along the sun; the mesh fragment shader samples it with a comparison sampler and
 **3×3 PCF**, occluding the **direct sun term only** (ambient/IBL stays lit). The
 light-space matrix rides a per-frame globals UBO (set 0 binding 4) since it won't
 fit the 96 B push constant. Casters are frustum-culled against the light ortho
-(§8), which only bites once the moving frustum leaves them behind. **Pending:**
+(§8), which only bites once the moving frustum leaves them behind, and an opt-out
+`NoShadowCast` marker drops individual entities from the caster set. The demo's
+flat ground carries it: a flat slab casts nothing useful but rasterizes the whole
+shadow map — measured at **~1.9 ms, 29 % of the shadow pass**. This is per-entity
+by design; terrain with relief must cast (hills shadow valleys) and simply omits
+the marker, which also means that cost returns then. Note the shadow pass is
+largely **fill-bound** (cost tracks shadow-map texels, not caster count), so
+cascades will *redistribute* resolution rather than reduce it — shadow resolution
+is a quality knob, like AA (§13). **Pending:**
 cascade splits + selection/blend, caster pancaking, the array atlas,
 normal-offset bias, and PCSS. Being one cascade, shadows exist only within
 `SHADOW_RADIUS` of the player — distant geometry is unshadowed until cascades land.
@@ -581,7 +589,11 @@ Two layers (raw events and game meaning change at different rates).
   SSR/volumetrics cost gets judged. **Landed** (§26): a timestamp query pool in
   `gfx` brackets the shadow, geometry, and post passes, reads back after the frame
   fence (no stall), and logs smoothed per-pass ms to stderr (`[gpu] shadow … geo …
-  post … frame …`), with a `Renderer::gpu_times` accessor for a future overlay. Uses core `vkCmdWriteTimestamp` for now; the
+  post … frame …`), with a `Renderer::gpu_times` accessor for a future overlay.
+  **Caveat when reading these numbers:** absolute per-pass ms shift with overall
+  GPU load/clock state — the fixed-size shadow pass measured 2.5 ms with a small
+  window and 4.7 ms with a large one, unchanged work. Only compare A/B runs taken
+  back-to-back at the same window size. Uses core `vkCmdWriteTimestamp` for now; the
   `vkCmdWriteTimestamp2` form arrives with the §10 sync2 barrier pass. Tracy GPU
   zones + an egui overlay are the remaining upgrades.
 - **RenderDoc:** in-application API, capture on a keybind.
