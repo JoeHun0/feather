@@ -118,6 +118,11 @@ struct Material(u32); // material_id into the renderer's material table
 /// (hills shadow valleys), and then it simply doesn't carry this marker.
 #[derive(Component)]
 struct NoShadowCast;
+/// This entity's collider in the rapier world (§15: entities carry their
+/// handles). Static level geometry for now — nothing reads it back yet, since
+/// statics never move, but it is the handle a future sync system would use.
+#[derive(Component)]
+struct ColliderRef(#[allow(dead_code)] ColliderHandle);
 #[derive(Resource, Default)]
 struct FrameCount(u64);
 
@@ -263,60 +268,42 @@ impl Physics {
 
 // ---- First-person player + input ----
 
-/// The player. `pos` is the feet position — simulated at the fixed step, then
-/// interpolated for the camera. `yaw`/`pitch` are look angles updated at render
-/// rate (responsive aim, §15). `vel` is owned by the controller: gravity and
-/// jump live here, not in a physics solver. The body is a position-based
-/// kinematic rigid body with a capsule collider in `Physics`; `controller`
-/// resolves each tick's desired motion against the level.
+/// The player's simulation state, as a component on the player entity (§1: the
+/// `World` is the single source of truth). `pos` is the feet position — advanced
+/// at the fixed step, then interpolated for the camera. `vel` is owned by the
+/// controller: gravity and jump live here, not in a physics solver. The body is a
+/// position-based kinematic rigid body with a capsule collider in `Physics`;
+/// `controller` resolves each tick's desired motion against the level.
+///
+/// Look angles are deliberately *not* here — they update at render rate, so they
+/// live in [`Look`].
+#[derive(Component)]
 struct Player {
     pos: Vec3,
     prev_pos: Vec3,
     vel: Vec3,
-    yaw: f32,
-    pitch: f32,
     on_ground: bool,
     body: RigidBodyHandle,
     collider: ColliderHandle,
     controller: KinematicCharacterController,
 }
 
-impl Player {
-    /// Create the player with its feet at `feet`, registering the kinematic body
-    /// and capsule in `physics`.
-    fn new(physics: &mut Physics, feet: Vec3) -> Self {
-        let body = physics.bodies.insert(
-            RigidBodyBuilder::kinematic_position_based()
-                .translation(to_rapier(feet + Self::CENTER)),
-        );
-        let collider = physics.colliders.insert_with_parent(
-            ColliderBuilder::capsule_y(CAPSULE_HALF_HEIGHT, PLAYER_RADIUS),
-            body,
-            &mut physics.bodies,
-        );
+/// Look angles, updated at **render rate** for responsive aim (§14/§15) — unlike
+/// [`Player`], which is fixed-step. Separate component so the two rates don't get
+/// tangled.
+#[derive(Component, Clone, Copy)]
+struct Look {
+    yaw: f32,
+    pitch: f32,
+}
+
+impl Look {
+    fn new() -> Self {
         Self {
-            pos: feet,
-            prev_pos: feet,
-            vel: Vec3::ZERO,
             yaw: -std::f32::consts::FRAC_PI_2, // looking -Z
             pitch: 0.0,
-            on_ground: true, // feet start resting on the ground
-            body,
-            collider,
-            controller: KinematicCharacterController {
-                // Step over lips up to 0.4 units while grounded.
-                autostep: Some(CharacterAutostep {
-                    max_height: CharacterLength::Absolute(0.4),
-                    min_width: CharacterLength::Absolute(0.2),
-                    include_dynamic_bodies: false,
-                }),
-                ..Default::default()
-            },
         }
     }
-
-    /// Feet → capsule center (the body's origin).
-    const CENTER: Vec3 = Vec3::new(0.0, PLAYER_HEIGHT * 0.5, 0.0);
 
     /// Full look direction (yaw + pitch), for the view matrix.
     fn forward(&self) -> Vec3 {
@@ -341,23 +328,64 @@ impl Player {
     }
 }
 
-/// Advance the player one fixed step (§15's `step_gameplay` + `physics.step`).
-/// `wish` is the desired horizontal move direction (unit or zero); `vgo` is the
-/// noclip vertical axis (+up/-down).
-///
-/// Snapshot `pos` for interpolation, work out this tick's desired motion (the
-/// controller owns velocity: chase the target speed, gravity, jump on the press
-/// edge), let the `KinematicCharacterController` shape-cast it against the level,
-/// hand the result to rapier as the kinematic body's next position, step the
-/// world, then read the body's position back.
-fn step_player(
-    p: &mut Player,
-    physics: &mut Physics,
-    wish: Vec3,
-    jump: bool,
-    vgo: f32,
+/// Gameplay input for one fixed tick (§14): abstract actions, not raw keys. The
+/// app fills this at render rate (building `wish` needs [`Look`]'s yaw); the fixed
+/// step consumes it and clears the latched jump edge, so one press feeds exactly
+/// one tick.
+#[derive(Resource, Default)]
+struct InputState {
+    wish: Vec3,    // desired horizontal move direction (unit or zero)
+    jump: bool,    // latched press edge
+    vertical: f32, // noclip vertical axis (+up/-down)
     noclip: bool,
-) {
+}
+
+impl Player {
+    /// Create the player with its feet at `feet`, registering the kinematic body
+    /// and capsule in `physics`.
+    fn new(physics: &mut Physics, feet: Vec3) -> Self {
+        let body = physics.bodies.insert(
+            RigidBodyBuilder::kinematic_position_based()
+                .translation(to_rapier(feet + Self::CENTER)),
+        );
+        let collider = physics.colliders.insert_with_parent(
+            ColliderBuilder::capsule_y(CAPSULE_HALF_HEIGHT, PLAYER_RADIUS),
+            body,
+            &mut physics.bodies,
+        );
+        Self {
+            pos: feet,
+            prev_pos: feet,
+            vel: Vec3::ZERO,
+            on_ground: true, // feet start resting on the ground
+            body,
+            collider,
+            controller: KinematicCharacterController {
+                // Step over lips up to 0.4 units while grounded.
+                autostep: Some(CharacterAutostep {
+                    max_height: CharacterLength::Absolute(0.4),
+                    min_width: CharacterLength::Absolute(0.2),
+                    include_dynamic_bodies: false,
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Feet → capsule center (the body's origin).
+    const CENTER: Vec3 = Vec3::new(0.0, PLAYER_HEIGHT * 0.5, 0.0);
+}
+
+/// **ECS → rapier** (§15's first sync half). Snapshot `pos` for interpolation,
+/// work out this tick's desired motion (the controller owns velocity: chase the
+/// target speed, gravity, jump on the press edge), let the
+/// `KinematicCharacterController` shape-cast it against the level, and hand the
+/// result to rapier as the kinematic body's next position.
+///
+/// Deliberately a plain function rather than a system body, so the physics tests
+/// can drive the real logic directly. `player_target_sys` is the thin wrapper.
+fn player_target(p: &mut Player, physics: &mut Physics, input: &InputState) {
+    let (wish, jump, vgo, noclip) = (input.wish, input.jump, input.vertical, input.noclip);
     p.prev_pos = p.pos;
 
     let motion = if noclip {
@@ -415,11 +443,40 @@ fn step_player(
         actual
     };
 
-    // ECS -> rapier: push the kinematic target; step; rapier -> player: read back.
     physics.bodies[p.body]
         .set_next_kinematic_translation(to_rapier(p.pos + Player::CENTER + motion));
-    physics.step();
+}
+
+/// **rapier → ECS** (§15's second sync half): after `Physics::step`, write the
+/// body's stepped position back into the component.
+fn player_readback(p: &mut Player, physics: &Physics) {
     p.pos = from_rapier(physics.bodies[p.body].translation()) - Player::CENTER;
+}
+
+/// ECS→rapier system: run the controller for every player entity and push its
+/// kinematic target, then clear the latched jump edge so one press feeds exactly
+/// one tick.
+fn player_target_sys(
+    mut q: Query<&mut Player>,
+    mut input: ResMut<InputState>,
+    mut physics: ResMut<Physics>,
+) {
+    for mut p in &mut q {
+        player_target(&mut p, &mut physics, &input);
+    }
+    input.jump = false;
+}
+
+/// Advance the rapier world one fixed tick — the step the two sync systems bracket.
+fn physics_step_sys(mut physics: ResMut<Physics>) {
+    physics.step();
+}
+
+/// rapier→ECS system: write stepped body positions back into components.
+fn player_readback_sys(mut q: Query<&mut Player>, physics: Res<Physics>) {
+    for mut p in &mut q {
+        player_readback(&mut p, &physics);
+    }
 }
 
 #[derive(Default)]
@@ -443,7 +500,9 @@ struct App {
     window: Option<Window>,
     world: World,
     schedule: Schedule,
-    player: Player,
+    /// The player entity in `world` — its sim state is the `Player` component,
+    /// its look angles the `Look` component (§1: the World owns simulation state).
+    player: Entity,
     input: Input,
     noclip: bool,
     light_dir: Vec4,
@@ -463,9 +522,12 @@ impl App {
         let mut world = World::new();
         world.insert_resource(FrameCount::default());
         let mut physics = Physics::new();
-        // Feet on the ground, looking -Z.
-        let player = Player::new(&mut physics, Vec3::new(0.0, GROUND_Y, 8.0));
+        // Feet on the ground, looking -Z. The player is a normal ECS entity: sim
+        // state in `Player`, render-rate angles in `Look` (§15).
+        let body = Player::new(&mut physics, Vec3::new(0.0, GROUND_Y, 8.0));
         world.insert_resource(physics);
+        world.insert_resource(InputState::default());
+        let player = world.spawn((body, Look::new())).id();
 
         let mesh_count = sources.len().max(1) as u32;
         let half = (GRID as f32 - 1.0) / 2.0;
@@ -504,6 +566,10 @@ impl App {
         let mut schedule = Schedule::default();
         schedule.set_executor_kind(ExecutorKind::MultiThreaded);
         schedule.add_systems((integrate, tick));
+        // §15's coupling: ECS -> rapier, the step, then rapier -> ECS. Chained so
+        // the bracket order is explicit (they all touch `Physics`, so bevy_ecs
+        // would serialise them regardless).
+        schedule.add_systems((player_target_sys, physics_step_sys, player_readback_sys).chain());
 
         let light = Vec3::new(-0.4, -1.0, -0.3).normalize();
         let now = Instant::now();
@@ -696,14 +762,20 @@ impl ApplicationHandler for App {
 
                 // Look updates at render rate for responsive aim (§15).
                 let sens = 0.0025;
-                self.player.yaw += self.input.mouse_dx * sens;
-                self.player.pitch =
-                    (self.player.pitch - self.input.mouse_dy * sens).clamp(-1.54, 1.54);
+                let look = {
+                    let mut look = self
+                        .world
+                        .get_mut::<Look>(self.player)
+                        .expect("player has Look");
+                    look.yaw += self.input.mouse_dx * sens;
+                    look.pitch = (look.pitch - self.input.mouse_dy * sens).clamp(-1.54, 1.54);
+                    *look
+                };
                 self.input.mouse_dx = 0.0;
                 self.input.mouse_dy = 0.0;
 
                 // Desired horizontal move direction from WASD, in the yaw plane.
-                let (fwd, right) = self.player.ground_basis();
+                let (fwd, right) = look.ground_basis();
                 let mut wish = Vec3::ZERO;
                 if self.input.forward {
                     wish += fwd;
@@ -721,24 +793,27 @@ impl ApplicationHandler for App {
                 // Noclip vertical axis (Space up / Ctrl down); ignored when grounded.
                 let vgo = (self.input.up as i32 - self.input.down as i32) as f32;
 
+                // Publish this frame's abstract input (§14); the fixed step consumes
+                // it. The jump edge is latched here and cleared by the controller
+                // system, so a press still feeds exactly one tick.
+                {
+                    let mut state = self.world.resource_mut::<InputState>();
+                    state.wish = wish;
+                    state.vertical = vgo;
+                    state.noclip = self.noclip;
+                    state.jump |= self.input.jump;
+                }
+                self.input.jump = false;
+
                 // Fixed-timestep sim: consume the accumulator in whole FIXED_DT
-                // steps. Each step advances the ECS schedule and the player
-                // controller together (snapshot -> step_gameplay -> physics.step, §15).
-                // The frame delta is clamped and MAX_STEPS caps catch-up per frame
-                // (spiral-of-death guard); leftover beyond the cap is dropped.
+                // steps. The schedule advances gameplay and brackets the rapier step
+                // with the two sync systems (§15). The frame delta is clamped and
+                // MAX_STEPS caps catch-up per frame (spiral-of-death guard);
+                // leftover beyond the cap is dropped.
                 self.accumulator += dt.min(MAX_FRAME_TIME);
                 let mut steps = 0;
                 while self.accumulator >= FIXED_DT && steps < MAX_STEPS {
                     self.schedule.run(&mut self.world);
-                    step_player(
-                        &mut self.player,
-                        &mut self.world.resource_mut::<Physics>(),
-                        wish,
-                        self.input.jump,
-                        vgo,
-                        self.noclip,
-                    );
-                    self.input.jump = false; // consumed by this step
                     self.accumulator -= FIXED_DT;
                     steps += 1;
                 }
@@ -747,11 +822,15 @@ impl ApplicationHandler for App {
 
                 // Camera + sun matrices first — the extract loop culls against them.
                 // Camera: interpolate the player's body, offset to eye height.
-                let eye = self.player.prev_pos.lerp(self.player.pos, alpha)
-                    + Vec3::new(0.0, EYE_HEIGHT, 0.0);
+                // Copy the pair out before the extract query re-borrows the World.
+                let (p_prev, p_pos) = {
+                    let p = self.world.get::<Player>(self.player).expect("player body");
+                    (p.prev_pos, p.pos)
+                };
+                let eye = p_prev.lerp(p_pos, alpha) + Vec3::new(0.0, EYE_HEIGHT, 0.0);
                 let size = self.window.as_ref().unwrap().inner_size();
                 let aspect = size.width as f32 / size.height.max(1) as f32;
-                let view_proj = self.player.view_proj(eye, aspect);
+                let view_proj = look.view_proj(eye, aspect);
                 let inv_view_proj = view_proj.inverse();
                 let light_dir = self.light_dir;
                 let camera_pos = eye;
@@ -887,7 +966,7 @@ impl ApplicationHandler for App {
 /// registers a matching fixed cuboid collider with `Physics` (it must already be
 /// a resource).
 fn spawn_static(world: &mut World, center: Vec3, size: Vec3, mesh: u32, material: u32) -> Entity {
-    world.resource_mut::<Physics>().add_static_box(center, size);
+    let collider = world.resource_mut::<Physics>().add_static_box(center, size);
     world
         .spawn((
             Position(center),
@@ -897,6 +976,7 @@ fn spawn_static(world: &mut World, center: Vec3, size: Vec3, mesh: u32, material
             Scale(size),
             Mesh(MeshId(mesh)),
             Material(material),
+            ColliderRef(collider),
         ))
         .id()
 }
@@ -1027,9 +1107,23 @@ mod tests {
         (physics, player)
     }
 
+    /// One fixed tick, mirroring the schedule's bracket: ECS→rapier, the step,
+    /// then rapier→ECS. Drives the same functions the systems do.
+    fn step(p: &mut Player, ph: &mut Physics, wish: Vec3, jump: bool, vgo: f32, noclip: bool) {
+        let input = InputState {
+            wish,
+            jump,
+            vertical: vgo,
+            noclip,
+        };
+        player_target(p, ph, &input);
+        ph.step();
+        player_readback(p, ph);
+    }
+
     fn run(p: &mut Player, ph: &mut Physics, ticks: u32, wish: Vec3) {
         for _ in 0..ticks {
-            step_player(p, ph, wish, false, 0.0, false);
+            step(p, ph, wish, false, 0.0, false);
         }
     }
 
@@ -1092,7 +1186,7 @@ mod tests {
         run(&mut p, &mut ph, 5, Vec3::ZERO);
         let mut apex = 0.0f32;
         for t in 0..total {
-            step_player(
+            step(
                 &mut p,
                 &mut ph,
                 Vec3::ZERO,
@@ -1131,7 +1225,7 @@ mod tests {
         );
         let (mut ph, mut p) = setup(&[b], Vec3::new(0.0, GROUND_Y, 2.7));
         run(&mut p, &mut ph, 5, Vec3::ZERO);
-        step_player(&mut p, &mut ph, -Vec3::Z, true, 0.0, false);
+        step(&mut p, &mut ph, -Vec3::Z, true, 0.0, false);
         run(&mut p, &mut ph, 60, -Vec3::Z);
         assert!(p.on_ground);
         assert!((p.pos.y - (GROUND_Y + 1.0)).abs() < 0.03, "y = {}", p.pos.y);
@@ -1149,7 +1243,7 @@ mod tests {
         run(&mut p, &mut ph, 5, Vec3::ZERO);
         let mut crown = f32::MIN; // height of the head above the ground
         for t in 0..120 {
-            step_player(&mut p, &mut ph, Vec3::ZERO, t == 0, 0.0, false);
+            step(&mut p, &mut ph, Vec3::ZERO, t == 0, 0.0, false);
             crown = crown.max(p.pos.y + PLAYER_HEIGHT - GROUND_Y);
         }
         assert!(crown <= 2.0 + 1e-3, "crown = {crown}");
@@ -1175,7 +1269,7 @@ mod tests {
         let b = (Vec3::new(0.0, GROUND_Y + 1.0, 0.0), Vec3::splat(2.0));
         let (mut ph, mut p) = setup(&[b], START);
         for _ in 0..90 {
-            step_player(&mut p, &mut ph, -Vec3::Z, false, 0.0, true);
+            step(&mut p, &mut ph, -Vec3::Z, false, 0.0, true);
         }
         // Straight through the box.
         assert!(p.pos.z < 0.0, "z = {}", p.pos.z);

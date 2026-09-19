@@ -485,6 +485,13 @@ Two layers (raw events and game meaning change at different rates).
   ticks; each fixed tick consumes latched state then clears edges. UI consumes
   input before gameplay via a focus flag (which also releases the cursor grab).
 
+**Landed (§26):** the `InputState` **resource** and the rate seam — the app fills
+it at render rate (abstract `wish` direction, latched `jump` edge, vertical axis,
+noclip) and the fixed step consumes it, the controller system clearing the jump
+edge so one press feeds exactly one tick. Look deltas are applied at render rate
+straight to the `Look` component. Still raw winit key polling rather than a
+bindings table; no gamepad, no UI focus flag.
+
 ## 15. FPS controller + physics coupling
 
 - **Kinematic character controller** (rapier `KinematicCharacterController`) —
@@ -648,9 +655,9 @@ app        thin binary wiring it together
 3. Lighting: CSM sun + GTAO + a few clustered lights + IBL ambient (the "better
    than 2010" look lands here).
 4. Physics + FPS controller (rapier), fixed timestep + interpolation → walkable.
-   (Landed: fixed timestep + interpolation, and the rapier kinematic FPS
-   controller against static colliders. Remaining: the ECS↔rapier sync systems
-   and dynamic bodies — see §26.)
+   (Landed: fixed timestep + interpolation, the rapier kinematic FPS controller
+   against static colliders, and the ECS↔rapier sync systems with the player as an
+   ECS entity. Remaining: dynamic bodies — see §26.)
 5. Bounded arena content, chunked culling, bindless materials, PBR bake path.
 6. Deferred-by-design items as needed: streaming, stage pipelining, GPU-driven
    indirect culling, SSR/volumetrics, probes.
@@ -760,8 +767,10 @@ milestones land.
   loop (WASD walk with accel toward a target speed, own gravity, edge-latched
   jump when grounded; a `KinematicCharacterController` moves a capsule against
   the level's colliders and `PhysicsPipeline::step` runs once per fixed tick;
-  `V` toggles a noclip fly) — look is render-rate for responsive aim, body
-  position is fixed-step and camera-**interpolated**; inline **extract** (`World` query → sorted
+  `V` toggles a noclip fly) — the player is an **ECS entity** whose fixed-step
+  state is driven by the two §15 sync systems, with input arriving as the §14
+  `InputState` resource; look is render-rate for responsive aim (its own `Look`
+  component), body position is fixed-step and camera-**interpolated**; inline **extract** (`World` query → sorted
   `Vec<(MeshId, InstanceData)>` each frame) that **interpolates** each entity's
   double-buffered sim state (prev/curr position + spin angle) by
   `alpha = accumulator / FIXED_DT` and reads a per-entity `Scale`; a small
@@ -809,12 +818,17 @@ milestones land.
   happened, so blocked axes lose their speed. The ground and every obstacle box
   are real fixed cuboid colliders (`spawn_static`); one warm-up step publishes
   them to the broad-phase BVH the controller queries. Look is render-rate; the
-  body interpolates like any other entity. Not yet §15-complete: the player is a
-  `Player` struct on `App`, not an ECS entity, and there are **no ECS↔rapier
-  sync systems** — `step_player` pushes and reads the body directly, and level
-  entities don't carry `ColliderHandle`s (statics never move, so nothing reads
-  them yet); no `InteractionGroups` layers; the drifting orbs and their spin are
-  still non-physical. Known limits: the ground is a finite 80×80 box, so walking
+  body interpolates like any other entity. The player is a **normal ECS entity**
+  (§1): sim state in a `Player` component, render-rate angles in `Look`, driven by
+  the **two sync systems §15 asks for**, chained as `player_target_sys` (ECS→rapier:
+  run the controller, push the kinematic target) → `physics_step_sys` →
+  `player_readback_sys` (rapier→ECS: body translation back into the component).
+  Input arrives as the §14 `InputState` resource rather than being read off `App`.
+  Level entities carry a `ColliderRef` handle. The controller maths stay plain
+  functions (`player_target`/`player_readback`) that the systems wrap, so the
+  physics tests drive the real logic. Still open: no `InteractionGroups` layers
+  (nothing to separate yet); the drifting orbs and their spin are still
+  non-physical (cosmetic, not rigid bodies). Known limits: the ground is a finite 80×80 box, so walking
   off the edge falls forever (no kill-plane/respawn); slope climbing/sliding uses
   rapier's 45° defaults but no level geometry exercises it; a jump that clips a
   box rim counts as grounded (vertical speed zeroed) and the capsule clambers
@@ -883,9 +897,9 @@ cascades / splits / atlas / pancaking still pending, so only a
 `SHADOW_RADIUS` box around the player is shadowed;
 bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
 bake pipeline (runtime glTF + multi-mesh registry landed); scene format /
-spawning / save; rapier beyond the player (kinematic FPS controller + static
-colliders landed — ECS↔rapier sync systems, dynamic bodies, collision layers
-pending);
+spawning / save; rapier beyond the player (kinematic FPS controller, static
+colliders and the ECS↔rapier sync systems landed — dynamic bodies and collision
+layers pending);
 skinning; UI/HUD; audio; debug/profiling tooling (per-pass GPU timestamp timing
 landed — stderr log + `Renderer::gpu_times`; Tracy / RenderDoc / egui overlay and
 CPU-side zones pending); GPU-driven culling; streaming; stage pipelining;
