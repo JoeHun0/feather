@@ -31,7 +31,10 @@ void main() {
     vec4 world = it.model * vec4(in_pos, 1.0);
     gl_Position = pc.view_proj * world;
     v_world_pos = world.xyz;
-    // Uniform scale in the demo transforms, so mat3(model) is fine for normals.
+    // mat3(model) is only correct for uniform scale. Orbs are uniformly scaled;
+    // level boxes use non-uniform Scale but are axis-aligned and unrotated, so
+    // their normals still come out right. A real inverse-transpose normal matrix
+    // is the follow-up once anything is both non-uniformly scaled and rotated.
     v_normal = normalize(mat3(it.model) * in_normal);
     v_material = it.material_id;
     v_uv = in_uv;

@@ -151,10 +151,11 @@ impl MeshData {
 ///
 /// Handled: positions (required), normals (computed if absent), UVs (0 if
 /// absent), indices (generated if absent), node transforms, triangle primitives,
-/// .glb / external / data: URI buffers and images, base-color texture.
+/// .glb / external / data: URI buffers and images, and the first primitive's
+/// base-color + normal + metallic-roughness textures (with factors + normal scale).
 ///
-/// Deferred: normal + metallic-roughness textures, tangents, skinning,
-/// animation, morph targets, non-triangle primitives.
+/// Deferred: per-primitive materials (first wins), tangents, skinning, animation,
+/// morph targets, non-triangle primitives, 16-/32-bit image formats.
 pub fn load_gltf(path: impl AsRef<Path>) -> Result<MeshData, Box<dyn Error>> {
     // import resolves all buffers (blob / external / data URI) and decodes images.
     let (doc, buffers, images) = gltf::import(path)?;

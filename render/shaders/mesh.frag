@@ -11,7 +11,7 @@ layout(push_constant) uniform Push {
 struct Material {
     vec4 base_color_factor; // linear
     vec4 emissive;          // rgb = emissive, a = metallic factor
-    vec4 params;            // x = roughness factor, y = normal_scale, z = -, w = -
+    vec4 params;            // x = roughness factor, y = normal_scale, z = occlusion, w = alpha_cutoff
     uvec4 tex;              // x = base color, y = normal, z = metallic-roughness
 };
 layout(set = 0, binding = 1) readonly buffer Materials {
@@ -74,7 +74,10 @@ mat3 cotangent_frame(vec3 n, vec3 p, vec2 uv) {
     vec3 dp1perp = cross(n, dp1);
     vec3 t = dp2perp * duv1.x + dp1perp * duv2.x;
     vec3 b = dp2perp * duv1.y + dp1perp * duv2.y;
-    float invmax = inversesqrt(max(dot(t, t), dot(b, b)));
+    // Guard against zero UV derivatives (degenerate/zero UVs), which would make
+    // invmax +inf and NaN the frame. The flat-normal path below avoids this case
+    // entirely; this is defense-in-depth for textured meshes with bad UVs.
+    float invmax = inversesqrt(max(max(dot(t, t), dot(b, b)), 1e-8));
     return mat3(t * invmax, b * invmax, n);
 }
 
@@ -107,9 +110,19 @@ void main() {
     float metallic = clamp(m.emissive.a * mr.y, 0.0, 1.0);
 
     vec3 ng = normalize(v_normal);
-    vec3 tn = texture(textures[nonuniformEXT(m.tex.y)], v_uv).xyz * 2.0 - 1.0;
-    tn.xy *= m.params.y; // normal_scale
-    vec3 N = normalize(cotangent_frame(ng, v_world_pos, v_uv) * tn);
+    vec3 N;
+    if (m.tex.y == 1u) {
+        // Slot 1 is the flat-normal default: this material has no normal map, so
+        // use the geometric normal and skip the derivative TBN. Besides saving the
+        // dFdx/dFdy + matrix build, this dodges the div-by-zero in cotangent_frame
+        // when UV derivatives are zero (untextured meshes carry uv = 0). v_material
+        // is `flat`, so this branch is uniform across the primitive.
+        N = ng;
+    } else {
+        vec3 tn = texture(textures[nonuniformEXT(m.tex.y)], v_uv).xyz * 2.0 - 1.0;
+        tn.xy *= m.params.y; // normal_scale
+        N = normalize(cotangent_frame(ng, v_world_pos, v_uv) * tn);
+    }
 
     vec3 V = normalize(pc.camera_pos.xyz - v_world_pos);
     vec3 L = normalize(-pc.light_dir.xyz); // toward the light
