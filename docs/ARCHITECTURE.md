@@ -328,8 +328,8 @@ Per-frame sequence:
 10. **Post** — tonemap, bloom, SMAA → swapchain.
 11. **UI/HUD**, then **present**.
 
-**Landed (§26):** steps 2, 3 and 5 in a reduced form — a sun shadow pass, then one
-geometry pass containing sky → **depth prepass** → opaque. The prepass (step 3) is
+**Landed (§26):** steps 2, 3, 5 and 6 in a reduced form — a sun shadow pass, then
+one geometry pass containing **depth prepass** → opaque → sky. The prepass (step 3) is
 depth-only over the camera-culled set, after which the opaque pass runs with
 **depth-write off and `LESS_OR_EQUAL`**, so early-Z discards occluded fragments
 instead of shading them. Measured **geo 5.2 ms → 3.0 ms (−42 %)**, frame 10.3 → 8.0 ms
@@ -339,9 +339,14 @@ bit-identical and the depth test always matches (a separate depth-only shader
 associating its matrix multiply differently would round differently and drop
 fragments); and because it runs inside a render pass that has a colour attachment,
 its pipeline must declare that **same attachment count** with an **empty colour
-write mask** — omitting the attachment is a validation error. Still pending here:
-sky is drawn *before* opaque rather than depth-tested after it (step 6), and there
-is no cluster pass, MSAA resolve or transparent pass.
+write mask** — omitting the attachment is a validation error.
+
+The **sky** (step 6) then draws last, as a far-plane (`z = 1.0`) fullscreen
+triangle with `LESS_OR_EQUAL` and no depth write, so it survives only where the
+depth buffer is still the cleared 1.0 and shades just the visible background
+instead of the whole screen — **geo 3.0 → 2.8 ms**. It shares `fullscreen.vert`
+with the tonemap pass, which is unaffected because that pass renders with no depth
+attachment. Still pending here: no cluster pass, MSAA resolve or transparent pass.
 
 Barriers: Vulkan 1.3 **sync2** (`VkImageMemoryBarrier2`, timeline semaphores).
 Key hazards: shadow depth W→R before opaque; HDR color W→R at resolve; cluster
@@ -727,9 +732,10 @@ milestones land.
   contiguous run** (`firstInstance` = run start). `TonemapPass` — attributeless
   fullscreen triangle sampling the HDR target, **exposure + Narkowicz ACES**,
   output left linear for the `_SRGB` swapchain to encode; exposure via push
-  constant. `SkyPass` — fullscreen procedural-sky background drawn first in the
-  geometry pass (depth off), reconstructing view rays from the inverse
-  view-projection. The reflection path (`mesh.frag`) and the background
+  constant. `SkyPass` — far-plane fullscreen procedural-sky background drawn
+  **last** in the geometry pass, depth-tested (`LESS_OR_EQUAL`, no write) so it
+  only shades pixels the opaque geometry left uncovered; it reconstructs view rays
+  from the inverse view-projection. The reflection path (`mesh.frag`) and the background
   (`sky.frag`) share one palette + soft-glow tuning so IBL reflections match the
   visible sky; only the background adds a sharp sun disk (a disk in the
   reflection would double-count against the analytic sun on smooth metals).

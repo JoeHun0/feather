@@ -1,7 +1,8 @@
-//! Sky background pass. A fullscreen triangle drawn first in the geometry pass
-//! (into the HDR target, before the meshes) that fills the frame with the
-//! procedural sky the mesh shader reflects for IBL. Depth test/write are off and
-//! it runs before geometry, so opaque meshes simply draw over it.
+//! Sky background pass. A far-plane fullscreen triangle drawn in the geometry
+//! pass **after** the opaque meshes (§10 step 6), filling the background with the
+//! procedural sky the mesh shader reflects for IBL. It depth-tests against the
+//! geometry (LESS_OR_EQUAL, no write), so it shades only pixels the geometry
+//! didn't cover rather than the whole screen and then being overdrawn.
 //!
 //! No descriptors — the inverse view-projection, camera position, and light
 //! direction come in through a push constant.
@@ -56,10 +57,16 @@ impl SkyPass {
         // Must match the geometry pass's HDR/depth sample count.
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(renderer.samples());
-        // Runs in the geometry pass (which has a depth attachment) but ignores it.
+        // Drawn after the opaque geometry (§10 step 6). The triangle sits on the far
+        // plane (z = 1.0), so LESS_OR_EQUAL keeps it only where the depth buffer is
+        // still the cleared 1.0 — background pixels — and rejects it wherever
+        // geometry wrote nearer depth. That way the sky shades only what it is
+        // actually visible through, instead of the whole screen. No depth write:
+        // the sky is a backdrop, not an occluder.
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(false)
-            .depth_write_enable(false);
+            .depth_test_enable(true)
+            .depth_write_enable(false)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
         let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(vk::ColorComponentFlags::RGBA)
             .blend_enable(false)];
@@ -116,8 +123,10 @@ impl SkyPass {
         }
     }
 
-    /// Fills the frame with the sky. Call inside the geometry pass, before the
-    /// meshes. `inv_view_proj` is the inverse of the same matrix the meshes use.
+    /// Fills the *background* with the sky. Call inside the geometry pass **after**
+    /// the depth prepass and opaque draws — the depth test then rejects it wherever
+    /// geometry is, so only visible background pixels are shaded.
+    /// `inv_view_proj` is the inverse of the same matrix the meshes use.
     pub fn draw(
         &self,
         cmd: vk::CommandBuffer,
