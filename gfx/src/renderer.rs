@@ -23,6 +23,11 @@ const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 // Offscreen scene color. Geometry lights in linear space into this; the tonemap
 // pass reads it and writes the sRGB swapchain. RGBA16F gives HDR headroom.
 const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+// Directional sun shadow map (§11): fixed-size D32 depth target, rendered
+// depth-only from the light and sampled (comparison) in the mesh fragment shader.
+// Independent of the window — never recreated on resize.
+const SHADOW_DIM: u32 = 2048;
+const SHADOW_FORMAT: vk::Format = DEPTH_FORMAT;
 // Single source of truth for the geometry pass's MSAA sample count (HDR + depth
 // targets and the mesh/sky pipelines all read it via `Renderer::samples`).
 // TYPE_1 = no MSAA. NOTE: bumping this alone does NOT enable MSAA — a
@@ -30,9 +35,9 @@ const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 // resolve attachment (multisample HDR -> single-sample resolve image) must be
 // added first. This is the seam that makes that change small; see §26.
 const MSAA_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
-// GPU timing (§21): timestamps per frame-in-flight — geometry (start, end) and
-// post (start, end). Frame time is derived from geometry-start → post-end.
-const TIMESTAMPS_PER_FRAME: u32 = 4;
+// GPU timing (§21): timestamps per frame-in-flight — shadow (start, end),
+// geometry (start, end), post (start, end). Frame is shadow-start → post-end.
+const TIMESTAMPS_PER_FRAME: u32 = 6;
 
 /// A GPU buffer that frees itself (and its allocation) on drop.
 pub struct Buffer {
@@ -59,7 +64,10 @@ pub struct MappedBuffer {
 
 impl MappedBuffer {
     /// Copy `data` into the mapped buffer (clamped to its size). Host-coherent.
-    pub fn write(&mut self, data: &[u8]) {
+    /// Takes `&self`: the write goes through a raw pointer into persistently-mapped
+    /// memory, so no `&mut` is needed. The caller is responsible for not writing
+    /// while the GPU still reads this buffer (guarded by the per-frame fence).
+    pub fn write(&self, data: &[u8]) {
         let n = data.len().min(self.size as usize);
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr, n) };
     }
@@ -76,6 +84,7 @@ impl Drop for MappedBuffer {
 /// doesn't support timestamps.
 #[derive(Clone, Copy, Default)]
 pub struct GpuTimes {
+    pub shadow_ms: f32,
     pub geometry_ms: f32,
     pub post_ms: f32,
     pub frame_ms: f32,
@@ -126,6 +135,9 @@ pub struct Renderer {
     // on resize). Geometry renders here; the tonemap pass samples it.
     hdr: Option<Image>,
     hdr_sampler: vk::Sampler,
+    // Directional sun shadow map (§11): fixed-size, never recreated on resize.
+    shadow: Option<Image>,
+    shadow_sampler: vk::Sampler, // comparison sampler (sampler2DShadow)
     surface_format: vk::SurfaceFormatKHR,
     window_extent: vk::Extent2D,
 
@@ -262,6 +274,25 @@ impl Renderer {
             )?
         };
 
+        // Sun shadow map (§11) + its comparison sampler. CLAMP_TO_BORDER with an
+        // opaque-white border means samples outside the shadow frustum read the
+        // max depth (1.0), i.e. "not in shadow" — geometry past the map stays lit.
+        let shadow = create_shadow(&allocator, &device);
+        let shadow_sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                    .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
+                    .compare_enable(true)
+                    .compare_op(vk::CompareOp::LESS_OR_EQUAL),
+                None,
+            )?
+        };
+
         let command_pool = unsafe {
             device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -334,6 +365,8 @@ impl Renderer {
             depth: Some(depth),
             hdr: Some(hdr),
             hdr_sampler,
+            shadow: Some(shadow),
+            shadow_sampler,
             surface_format: sc.format,
             window_extent: sc.extent,
             command_pool,
@@ -405,12 +438,15 @@ impl Renderer {
         // Mask to valid bits and wrapping-subtract, so a counter wrap within the
         // valid range still yields the right delta. Then ns → ms.
         let to_ms = |start: u64, end: u64| (end & m).wrapping_sub(start & m) as f32 * period * 1e-6;
-        let geo = to_ms(data[0], data[1]);
-        let post = to_ms(data[2], data[3]);
-        let frame_ms = to_ms(data[0], data[3]);
+        // Slots: shadow (0,1), geometry (2,3), post (4,5); frame = shadow→post.
+        let shadow = to_ms(data[0], data[1]);
+        let geo = to_ms(data[2], data[3]);
+        let post = to_ms(data[4], data[5]);
+        let frame_ms = to_ms(data[0], data[5]);
 
         // Exponential moving average keeps the log line steady enough to read.
         let a = 0.1;
+        self.gpu_times.shadow_ms += (shadow - self.gpu_times.shadow_ms) * a;
         self.gpu_times.geometry_ms += (geo - self.gpu_times.geometry_ms) * a;
         self.gpu_times.post_ms += (post - self.gpu_times.post_ms) * a;
         self.gpu_times.frame_ms += (frame_ms - self.gpu_times.frame_ms) * a;
@@ -420,8 +456,8 @@ impl Renderer {
             self.ts_log_counter = 0;
             let t = self.gpu_times;
             eprintln!(
-                "[gpu] geo {:.2}ms  post {:.2}ms  frame {:.2}ms",
-                t.geometry_ms, t.post_ms, t.frame_ms
+                "[gpu] shadow {:.2}ms  geo {:.2}ms  post {:.2}ms  frame {:.2}ms",
+                t.shadow_ms, t.geometry_ms, t.post_ms, t.frame_ms
             );
         }
     }
@@ -435,6 +471,31 @@ impl Renderer {
     /// Shared sampler for reading the HDR target in the tonemap pass.
     pub fn hdr_sampler(&self) -> vk::Sampler {
         self.hdr_sampler
+    }
+
+    /// View of the sun shadow map (§11). Stable for the renderer's lifetime — the
+    /// shadow map is fixed-size and never recreated — so a descriptor bound to it
+    /// never needs refreshing.
+    pub fn shadow_view(&self) -> vk::ImageView {
+        self.shadow.as_ref().expect("shadow target alive").view
+    }
+
+    /// Comparison sampler (`sampler2DShadow`) for the shadow map.
+    pub fn shadow_sampler(&self) -> vk::Sampler {
+        self.shadow_sampler
+    }
+
+    /// Square dimension of the shadow map (viewport for the shadow pass).
+    pub fn shadow_extent(&self) -> vk::Extent2D {
+        vk::Extent2D {
+            width: SHADOW_DIM,
+            height: SHADOW_DIM,
+        }
+    }
+
+    /// Depth format of the shadow map (for the depth-only shadow pipeline).
+    pub fn shadow_format(&self) -> vk::Format {
+        SHADOW_FORMAT
     }
 
     pub fn wait_idle(&self) {
@@ -711,11 +772,14 @@ impl Renderer {
         self.recreate_swapchain();
     }
 
-    /// Records and submits one frame: `geometry` draws into the linear HDR
-    /// target, then `post` (the tonemap pass) samples it and writes the sRGB
-    /// swapchain. Both receive `(cmd, extent, frame_in_flight)`.
+    /// Records and submits one frame: `shadow` renders the sun depth map,
+    /// `geometry` draws into the linear HDR target (sampling that shadow map),
+    /// then `post` (the tonemap pass) samples the HDR and writes the sRGB
+    /// swapchain. `shadow` gets the shadow-map extent; `geometry`/`post` get the
+    /// window extent. All three receive `(cmd, extent, frame_in_flight)`.
     pub fn draw_frame(
         &mut self,
+        shadow: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         geometry: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         post: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
     ) {
@@ -763,7 +827,12 @@ impl Renderer {
         let swap_view = self.image_views[image_index as usize];
         let depth = self.depth.as_ref().unwrap();
         let hdr = self.hdr.as_ref().unwrap();
+        let shadow_img = self.shadow.as_ref().unwrap();
         let extent = self.window_extent;
+        let shadow_extent = vk::Extent2D {
+            width: SHADOW_DIM,
+            height: SHADOW_DIM,
+        };
         let color_range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
@@ -791,8 +860,8 @@ impl Renderer {
             .unwrap();
 
             // GPU timing: reset this frame's query slots (must be outside a render
-            // pass) and stamp the geometry-pass start. Bottom-of-pipe for all four,
-            // so each delta measures the work recorded between two write points.
+            // pass) and stamp the shadow-pass start. Bottom-of-pipe for all six, so
+            // each delta measures the work recorded between two write points.
             let ts_base = frame as u32 * TIMESTAMPS_PER_FRAME;
             if self.timestamps_supported {
                 dev.cmd_reset_query_pool(cmd, self.query_pool, ts_base, TIMESTAMPS_PER_FRAME);
@@ -801,6 +870,86 @@ impl Renderer {
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     self.query_pool,
                     ts_base,
+                );
+            }
+
+            // ---- Shadow pass: render the sun depth map (depth-only). ----
+
+            // Shadow: UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL (prior contents dropped).
+            let shadow_to_attach = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(shadow_img.handle)
+                .subresource_range(depth_range)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[shadow_to_attach],
+            );
+
+            let shadow_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(shadow_img.view)
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                });
+            let shadow_rendering = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: shadow_extent,
+                })
+                .layer_count(1)
+                .depth_attachment(&shadow_attachment);
+
+            dev.cmd_begin_rendering(cmd, &shadow_rendering);
+            shadow(cmd, shadow_extent, frame);
+            dev.cmd_end_rendering(cmd);
+
+            // Shadow: DEPTH_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY (geometry samples it).
+            let shadow_to_read = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(shadow_img.handle)
+                .subresource_range(depth_range)
+                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[shadow_to_read],
+            );
+            if self.timestamps_supported {
+                // shadow end, then geometry start.
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 1,
+                );
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 2,
                 );
             }
 
@@ -883,7 +1032,7 @@ impl Renderer {
                     cmd,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     self.query_pool,
-                    ts_base + 1,
+                    ts_base + 3,
                 );
             }
 
@@ -950,7 +1099,7 @@ impl Renderer {
                     cmd,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     self.query_pool,
-                    ts_base + 2,
+                    ts_base + 4,
                 );
             }
             dev.cmd_begin_rendering(cmd, &post_rendering);
@@ -961,7 +1110,7 @@ impl Renderer {
                     cmd,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     self.query_pool,
-                    ts_base + 3,
+                    ts_base + 5,
                 );
             }
 
@@ -1070,7 +1219,9 @@ impl Drop for Renderer {
             // Free VMA-backed resources while the device + allocator are alive.
             self.depth.take();
             self.hdr.take();
+            self.shadow.take();
             self.device.destroy_sampler(self.hdr_sampler, None);
+            self.device.destroy_sampler(self.shadow_sampler, None);
 
             for &v in &self.image_views {
                 self.device.destroy_image_view(v, None);
@@ -1246,6 +1397,58 @@ fn create_depth(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk:
         handle: image,
         view,
         format: DEPTH_FORMAT,
+    }
+}
+
+/// Fixed-size sun shadow map: a D32 depth image both rendered into (depth-only
+/// shadow pass) and sampled (comparison) by the mesh fragment shader (§11).
+fn create_shadow(allocator: &Arc<vk_mem::Allocator>, device: &Device) -> Image {
+    let image_ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(SHADOW_FORMAT)
+        .extent(vk::Extent3D {
+            width: SHADOW_DIM,
+            height: SHADOW_DIM,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let ai = vk_mem::AllocationCreateInfo {
+        usage: vk_mem::MemoryUsage::AutoPreferDevice,
+        ..Default::default()
+    };
+    let (image, allocation) =
+        unsafe { allocator.create_image(&image_ci, &ai).expect("shadow image") };
+
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(SHADOW_FORMAT)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::DEPTH,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let view = unsafe {
+        device
+            .create_image_view(&view_info, None)
+            .expect("shadow view")
+    };
+
+    Image {
+        allocator: allocator.clone(),
+        allocation,
+        device: device.clone(),
+        handle: image,
+        view,
+        format: SHADOW_FORMAT,
     }
 }
 

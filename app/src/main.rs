@@ -760,6 +760,16 @@ impl ApplicationHandler for App {
                 let light_dir = self.light_dir;
                 let camera_pos = eye;
 
+                // Sun shadow matrix (§11): a fixed ortho covering the playable area
+                // around the origin, looking along the sun direction. The light is
+                // static, so this never moves — no shimmer, no texel-snap needed yet.
+                let sun_dir = self.light_dir.truncate().normalize_or_zero();
+                let light_center = Vec3::ZERO;
+                let light_eye = light_center - sun_dir * 50.0;
+                let light_view = Mat4::look_at_rh(light_eye, light_center, Vec3::Y);
+                let light_proj = Mat4::orthographic_rh(-24.0, 24.0, -24.0, 24.0, 0.1, 100.0);
+                let light_view_proj = light_proj * light_view;
+
                 let exposure = self.exposure;
                 if let (Some(r), Some(m), Some(tm), Some(sky)) = (
                     self.renderer.as_mut(),
@@ -771,11 +781,17 @@ impl ApplicationHandler for App {
                     // before the mutable draw_frame borrow, refresh in `update`.
                     let hdr_view = r.hdr_view();
                     let hdr_sampler = r.hdr_sampler();
+                    // CPU prep once (sort + stage instances/globals); the shadow and
+                    // main passes then replay them. Uploads happen in draw_shadow,
+                    // after the frame fence.
+                    m.prepare_frame(&mut items, light_view_proj);
                     r.draw_frame(
+                        // Shadow pass: sun depth map (also flushes this frame's buffers).
+                        |cmd, extent, frame| m.draw_shadow(cmd, extent, frame),
+                        // Geometry: sky background (depth off), then lit + shadowed meshes.
                         |cmd, extent, frame| {
-                            // Background first (depth off), then meshes over it.
                             sky.draw(cmd, extent, inv_view_proj, camera_pos, light_dir);
-                            m.draw(cmd, extent, frame, view_proj, light_dir, camera_pos, &mut items)
+                            m.draw_main(cmd, extent, frame, view_proj, light_dir, camera_pos);
                         },
                         |cmd, extent, frame| {
                             tm.update(frame, hdr_view, hdr_sampler);

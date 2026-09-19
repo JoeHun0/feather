@@ -20,6 +20,13 @@ layout(set = 0, binding = 1) readonly buffer Materials {
 // Bindless-lite: slot 0 = white, slot 1 = flat normal. Base color _SRGB;
 // normal + MR are _UNORM. Must match render::MAX_TEXTURES.
 layout(set = 0, binding = 2) uniform sampler2D textures[64];
+// Sun shadow map (§11): comparison-sampled, 3x3 PCF below.
+layout(set = 0, binding = 3) uniform sampler2DShadow u_shadow;
+// Per-frame globals: the sun's light-space matrix + shadow params.
+layout(set = 0, binding = 4) uniform Globals {
+    mat4 light_view_proj;
+    vec4 shadow_params; // x = texel size (1/dim), y = depth bias
+} g;
 
 layout(location = 0) in vec3 v_normal;
 layout(location = 1) in flat uint v_material;
@@ -107,6 +114,28 @@ float geometry_smith(float ndv, float ndl, float rough) {
     return gv * gl;
 }
 
+// Sun visibility in [0,1] at a world position (3x3 PCF over the shadow map).
+// The light matrix uses orthographic_rh (depth already [0,1]); clip xy -> [0,1]
+// UV with no Y flip (shadow map rendered and sampled in the same convention).
+float sun_shadow(vec3 world_pos) {
+    vec4 lc = g.light_view_proj * vec4(world_pos, 1.0);
+    vec3 proj = lc.xyz / lc.w;
+    vec2 uv = proj.xy * 0.5 + 0.5;
+    // Outside the frustum or past the far plane: treat as fully lit.
+    if (proj.z > 1.0 || any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+        return 1.0;
+    }
+    float ref = proj.z - g.shadow_params.y; // constant depth bias
+    float texel = g.shadow_params.x;
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            sum += texture(u_shadow, vec3(uv + vec2(x, y) * texel, ref));
+        }
+    }
+    return sum / 9.0;
+}
+
 void main() {
     Material m = materials[v_material];
 
@@ -147,7 +176,9 @@ void main() {
     vec3 f = fresnel_schlick(hdv, f0);
     vec3 specular = (ndf * g * f) / (4.0 * ndv * ndl + 0.0001);
     vec3 kd = (vec3(1.0) - f) * (1.0 - metallic);
-    vec3 lo = (kd * albedo / PI + specular) * SUN_RADIANCE * ndl;
+    // Sun shadow occludes the direct term only; ambient/IBL stays unshadowed.
+    float shadow = sun_shadow(v_world_pos);
+    vec3 lo = (kd * albedo / PI + specular) * SUN_RADIANCE * ndl * shadow;
 
     // --- Ambient (analytic IBL: split-sum against the procedural sky) ---
     vec3 fr = fresnel_schlick_roughness(ndv, f0, roughness);

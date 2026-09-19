@@ -78,6 +78,28 @@ impl InstanceData {
 
 const INSTANCE_SIZE: u64 = std::mem::size_of::<InstanceData>() as u64; // 80
 
+/// Per-frame globals UBO (§9 groundwork). Carries the sun's light-space matrix
+/// and shadow sampling params — the mat4 won't fit the already-96 B push constant.
+/// Bound at set 0 binding 4 (fragment). std140-friendly: mat4 + vec4 = 80 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Globals {
+    light_view_proj: [f32; 16],
+    // x = shadow-map texel size (1/dim), y = depth bias (light-space depth), z/w -
+    shadow_params: [f32; 4],
+}
+
+/// A contiguous run of same-mesh instances. `upload_instances` sorts + records
+/// these once per frame; the shadow and main passes each replay them.
+#[derive(Clone, Copy)]
+struct Run {
+    first_index: u32,
+    index_count: u32,
+    vertex_offset: i32,
+    run_start: u32,
+    run_len: u32,
+}
+
 fn as_bytes<T>(slice: &[T]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice))
@@ -88,10 +110,14 @@ pub struct MeshRenderer {
     device: ash::Device,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    // Depth-only pipeline for the sun shadow pass (§11); reuses `layout`/`sets`.
+    shadow_pipeline: vk::Pipeline,
     set_layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
     sets: Vec<vk::DescriptorSet>,
     instance_buffers: Vec<MappedBuffer>,
+    // Per-frame globals UBO (light-space matrix + shadow params), binding 4.
+    globals_buffers: Vec<MappedBuffer>,
     vertex_buffer: Buffer,
     index_buffer: Buffer,
     // Held for its lifetime: the descriptor sets reference it. Freed on drop.
@@ -104,6 +130,12 @@ pub struct MeshRenderer {
     slices: Vec<MeshSlice>,
     // Reused each frame to gather sorted instances before the SSBO upload.
     scratch: Vec<InstanceData>,
+    // Per-mesh runs recorded by `prepare_frame`, replayed by both passes.
+    runs: Vec<Run>,
+    // This frame's globals (light matrix + shadow params), written in draw_shadow.
+    globals: Globals,
+    // Shadow-map texel size (1/dim), for the PCF offset in the globals UBO.
+    shadow_texel: f32,
     max_instances: u32,
 }
 
@@ -204,6 +236,20 @@ impl MeshRenderer {
                 )
             })
             .collect();
+        // Per-frame globals UBO (light-space matrix + shadow params).
+        let globals_buffers: Vec<MappedBuffer> = (0..FRAMES_IN_FLIGHT)
+            .map(|_| {
+                renderer.create_host_visible_buffer(
+                    std::mem::size_of::<Globals>() as u64,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                )
+            })
+            .collect();
+        // Shadow map view + comparison sampler are stable for the renderer's life
+        // (fixed-size, never recreated), so the binding is written once below.
+        let shadow_view = renderer.shadow_view();
+        let shadow_sampler = renderer.shadow_sampler();
+        let shadow_texel = 1.0 / renderer.shadow_extent().width as f32;
 
         let bindings = [
             // binding 0: per-frame instances (vertex stage).
@@ -224,6 +270,18 @@ impl MeshRenderer {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(MAX_TEXTURES as u32)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // binding 3: sun shadow map, comparison-sampled (fragment stage).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // binding 4: per-frame globals UBO — light matrix + shadow params.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let set_layout = unsafe {
             device
@@ -239,10 +297,14 @@ impl MeshRenderer {
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(2 * FRAMES_IN_FLIGHT as u32),
-            // the texture array, per set.
+            // the texture array + the shadow map, per set.
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count((MAX_TEXTURES * FRAMES_IN_FLIGHT) as u32),
+                .descriptor_count(((MAX_TEXTURES + 1) * FRAMES_IN_FLIGHT) as u32),
+            // the globals UBO, per set.
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(FRAMES_IN_FLIGHT as u32),
         ];
         let pool = unsafe {
             device
@@ -287,6 +349,15 @@ impl MeshRenderer {
                 .buffer(materials_buffer.handle)
                 .offset(0)
                 .range(vk::WHOLE_SIZE)];
+            // binding 3 -> the shared shadow map; binding 4 -> this frame's globals.
+            let shadow_info = [vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(shadow_view)
+                .sampler(shadow_sampler)];
+            let globals_info = [vk::DescriptorBufferInfo::default()
+                .buffer(globals_buffers[i].handle)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
@@ -304,6 +375,16 @@ impl MeshRenderer {
                     .dst_array_element(0)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&tex_infos),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&shadow_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&globals_info),
             ];
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
@@ -413,19 +494,82 @@ impl MeshRenderer {
                 .map_err(|(_, e)| e)
                 .expect("graphics pipeline")[0]
         };
+
+        // ---- Shadow (depth-only) pipeline: renders instances from the sun into
+        // the shadow map. Vertex-only, no color attachment; reuses `layout` (its
+        // vertex shader reads only the instance SSBO + a 64 B light-matrix push).
+        let shadow_vert = load_shader(&device, spv!("shadow.vert"));
+        let shadow_stages = [vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(shadow_vert)
+            .name(c"main")];
+        let shadow_dyn_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::DEPTH_BIAS,
+        ];
+        let shadow_dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&shadow_dyn_states);
+        // Front-face cull + slope-scaled depth bias (set dynamically per pass)
+        // reduce shadow acne and peter-panning.
+        let shadow_raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::FRONT)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .depth_bias_enable(true)
+            .line_width(1.0);
+        let shadow_ms = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let shadow_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let mut shadow_rendering = vk::PipelineRenderingCreateInfo::default()
+            .depth_attachment_format(renderer.shadow_format());
+        // shadow.vert consumes only position (location 0); describing just that
+        // attribute avoids "attribute not consumed" validation warnings.
+        let shadow_vattrs = [vk::VertexInputAttributeDescription::default()
+            .location(0)
+            .binding(0)
+            .format(vk::Format::R32G32B32_SFLOAT)
+            .offset(0)];
+        let shadow_vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vbindings)
+            .vertex_attribute_descriptions(&shadow_vattrs);
+        let shadow_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&shadow_stages)
+            .vertex_input_state(&shadow_vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&shadow_raster)
+            .multisample_state(&shadow_ms)
+            .depth_stencil_state(&shadow_depth)
+            .dynamic_state(&shadow_dynamic_state)
+            .layout(layout)
+            .push_next(&mut shadow_rendering);
+        let shadow_pipeline = unsafe {
+            device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[shadow_pipeline_info], None)
+                .map_err(|(_, e)| e)
+                .expect("shadow pipeline")[0]
+        };
+
         unsafe {
             device.destroy_shader_module(vert, None);
             device.destroy_shader_module(frag, None);
+            device.destroy_shader_module(shadow_vert, None);
         }
 
         let renderer = Self {
             device,
             layout,
             pipeline,
+            shadow_pipeline,
             set_layout,
             pool,
             sets,
             instance_buffers,
+            globals_buffers,
             vertex_buffer,
             index_buffer,
             materials_buffer,
@@ -433,34 +577,108 @@ impl MeshRenderer {
             sampler,
             slices,
             scratch: Vec::new(),
+            runs: Vec::new(),
+            globals: Globals::default(),
+            shadow_texel,
             max_instances,
         };
         (renderer, ids)
     }
 
-    /// Draws all `items` (mesh + instance). Sorts them by mesh in place, uploads
-    /// the instances in that order, then emits one `cmd_draw_indexed` per
-    /// contiguous same-mesh run.
-    pub fn draw(
-        &mut self,
+    /// CPU-only per-frame prep (call once, before `draw_frame`): sort `items` by
+    /// mesh, stage the sorted instances + per-mesh runs, and stash this frame's
+    /// globals (light matrix + shadow params). No GPU buffers are touched here —
+    /// the actual uploads happen in `draw_shadow`, after the frame fence, to avoid
+    /// racing the in-flight GPU read of the per-frame buffers.
+    pub fn prepare_frame(&mut self, items: &mut [(MeshId, InstanceData)], light_view_proj: Mat4) {
+        // Contiguous runs per mesh -> one draw each. Unstable sort is fine; draw
+        // order within a mesh doesn't matter (opaque + depth test).
+        items.sort_unstable_by_key(|(mesh, _)| mesh.0);
+
+        let count = items.len().min(self.max_instances as usize);
+        self.scratch.clear();
+        self.scratch
+            .extend(items[..count].iter().map(|(_, inst)| *inst));
+
+        self.runs.clear();
+        let mut first = 0usize;
+        while first < count {
+            let mesh = items[first].0;
+            let mut run = 1usize;
+            while first + run < count && items[first + run].0 == mesh {
+                run += 1;
+            }
+            if let Some(slice) = self.slices.get(mesh.0 as usize) {
+                self.runs.push(Run {
+                    first_index: slice.first_index,
+                    index_count: slice.index_count,
+                    vertex_offset: slice.vertex_offset,
+                    run_start: first as u32,
+                    run_len: run as u32,
+                });
+            }
+            first += run;
+        }
+
+        self.globals = Globals {
+            light_view_proj: light_view_proj.to_cols_array(),
+            shadow_params: [self.shadow_texel, SHADOW_DEPTH_BIAS, 0.0, 0.0],
+        };
+    }
+
+    /// Record the sun shadow pass: depth-only draws of the prepared runs from the
+    /// light's point of view. Runs first in the frame (after the fence wait), so
+    /// it also performs this frame's per-frame buffer uploads — the instance SSBO
+    /// and the globals UBO the main pass then consumes.
+    pub fn draw_shadow(&self, cmd: vk::CommandBuffer, extent: vk::Extent2D, frame: usize) {
+        // Safe to write now: draw_frame waited on this frame index's fence.
+        self.instance_buffers[frame].write(as_bytes(&self.scratch));
+        self.globals_buffers[frame].write(as_bytes(std::slice::from_ref(&self.globals)));
+
+        // shadow.vert reads the light matrix from the push constant (offset 0, 64 B).
+        let lvp = self.globals.light_view_proj;
+        let push_bytes = unsafe { std::slice::from_raw_parts(lvp.as_ptr() as *const u8, 64) };
+        unsafe {
+            self.device.cmd_push_constants(
+                cmd,
+                self.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                push_bytes,
+            );
+            self.device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.shadow_pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &[self.sets[frame]],
+                &[],
+            );
+            // Slope-scaled depth bias to push casters away from the light and kill
+            // acne. (constant_factor, clamp, slope_factor).
+            self.device.cmd_set_depth_bias(cmd, 2.0, 0.0, 3.0);
+            self.set_viewport_scissor(cmd, extent);
+            self.bind_geometry(cmd);
+            self.draw_runs(cmd);
+        }
+    }
+
+    /// Record the main lit pass. Sorts/uploads happen in `upload_instances`; this
+    /// replays the runs into the HDR target with the full PBR + shadow pipeline.
+    pub fn draw_main(
+        &self,
         cmd: vk::CommandBuffer,
         extent: vk::Extent2D,
         frame: usize,
         view_proj: Mat4,
         light_dir: Vec4,
         camera_pos: glam::Vec3,
-        items: &mut [(MeshId, InstanceData)],
     ) {
-        // Contiguous runs per mesh -> one draw each. Unstable sort is fine; draw
-        // order within a mesh doesn't matter (opaque + depth test).
-        items.sort_unstable_by_key(|(mesh, _)| mesh.0);
-
-        let count = (items.len()).min(self.max_instances as usize);
-        self.scratch.clear();
-        self.scratch
-            .extend(items[..count].iter().map(|(_, inst)| *inst));
-        self.instance_buffers[frame].write(as_bytes(&self.scratch));
-
         // Push constant (96 B): mat4 view_proj + vec4 light_dir + vec4 camera_pos.
         let mut push = [0f32; 24];
         push[..16].copy_from_slice(&view_proj.to_cols_array());
@@ -486,57 +704,63 @@ impl MeshRenderer {
                 &[self.sets[frame]],
                 &[],
             );
+            self.set_viewport_scissor(cmd, extent);
+            self.bind_geometry(cmd);
+            self.draw_runs(cmd);
+        }
+    }
 
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: extent.width as f32,
-                height: extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            let scissor = vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent,
-            };
-            self.device.cmd_set_viewport(cmd, 0, &[viewport]);
-            self.device.cmd_set_scissor(cmd, 0, &[scissor]);
+    unsafe fn set_viewport_scissor(&self, cmd: vk::CommandBuffer, extent: vk::Extent2D) {
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: extent.width as f32,
+            height: extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        self.device.cmd_set_viewport(cmd, 0, &[viewport]);
+        self.device.cmd_set_scissor(cmd, 0, &[scissor]);
+    }
 
-            self.device
-                .cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer.handle], &[0]);
-            self.device
-                .cmd_bind_index_buffer(cmd, self.index_buffer.handle, 0, vk::IndexType::UINT32);
+    unsafe fn bind_geometry(&self, cmd: vk::CommandBuffer) {
+        self.device
+            .cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer.handle], &[0]);
+        self.device
+            .cmd_bind_index_buffer(cmd, self.index_buffer.handle, 0, vk::IndexType::UINT32);
+    }
 
-            // One draw per contiguous run of the same mesh. firstInstance is the
-            // run's start, so gl_InstanceIndex indexes the sorted instance SSBO.
-            let mut first = 0usize;
-            while first < count {
-                let mesh = items[first].0;
-                let mut run = 1usize;
-                while first + run < count && items[first + run].0 == mesh {
-                    run += 1;
-                }
-                if let Some(slice) = self.slices.get(mesh.0 as usize) {
-                    self.device.cmd_draw_indexed(
-                        cmd,
-                        slice.index_count,
-                        run as u32,
-                        slice.first_index,
-                        slice.vertex_offset,
-                        first as u32,
-                    );
-                }
-                first += run;
-            }
+    /// One `cmd_draw_indexed` per contiguous same-mesh run recorded by
+    /// `upload_instances`. `firstInstance` = run start, so `gl_InstanceIndex`
+    /// indexes the sorted instance SSBO.
+    unsafe fn draw_runs(&self, cmd: vk::CommandBuffer) {
+        for r in &self.runs {
+            self.device.cmd_draw_indexed(
+                cmd,
+                r.index_count,
+                r.run_len,
+                r.first_index,
+                r.vertex_offset,
+                r.run_start,
+            );
         }
     }
 }
+
+/// Small constant bias in light-space depth, added in the shader on top of the
+/// rasterizer slope bias, to finish off shadow acne.
+const SHADOW_DEPTH_BIAS: f32 = 0.0015;
 
 impl Drop for MeshRenderer {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_sampler(self.sampler, None);
             self.device.destroy_pipeline(self.pipeline, None);
+            self.device.destroy_pipeline(self.shadow_pipeline, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_pool(self.pool, None);
             self.device
