@@ -15,6 +15,7 @@ winit             = "0.30"
 vk-mem            = "0.4"
 glam              = "0.29"
 bevy_ecs          = { version = "0.16", features = ["multi_threaded"] }
+rapier3d          = "=0.35.3"
 serde             = { version = "1", features = ["derive"] }
 shaderc           = "0.8"
 # internal (path deps, referenced as `<crate>.workspace = true`)

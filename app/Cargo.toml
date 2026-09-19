@@ -16,3 +16,4 @@ feather-assets.workspace = true
 feather-game.workspace = true
 bevy_ecs.workspace = true
 glam.workspace = true
+rapier3d.workspace = true

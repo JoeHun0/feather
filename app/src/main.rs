@@ -16,12 +16,13 @@
 //!
 //! Simulation runs on a **fixed timestep** (accumulator; `FIXED_DT`), decoupled
 //! from the render rate. Entity sim state (position + spin angle) and the
-//! **player** (a kinematic FPS controller — gravity, jump, box/ground collision)
-//! are double-buffered (`Prev*` / current); extract and the camera
-//! **interpolate** by `alpha = accumulator / FIXED_DT`, so motion is smooth at
-//! any framerate and sim speed no longer scales with it. The controller is
-//! hand-rolled groundwork for rapier (§15). The drifting orbs now hang above a
-//! ground plane with a few obstacle boxes to walk among.
+//! **player** (a rapier `KinematicCharacterController` — gravity, jump, capsule
+//! vs. static colliders) are double-buffered (`Prev*` / current); extract and the
+//! camera **interpolate** by `alpha = accumulator / FIXED_DT`, so motion is
+//! smooth at any framerate and sim speed no longer scales with it. rapier state
+//! lives in a raw ECS `Resource` (§15) and is stepped once per fixed tick. The
+//! drifting orbs now hang above a ground box with a few obstacle boxes to walk
+//! among.
 
 use std::time::Instant;
 
@@ -32,6 +33,12 @@ use feather_gfx::Renderer;
 use feather_platform::winit;
 use feather_render::{InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass};
 use glam::{Mat4, Vec3, Vec4};
+use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
+use rapier3d::prelude::{
+    BroadPhaseBvh, CCDSolver, ColliderBuilder, ColliderHandle, ColliderSet, ImpulseJointSet,
+    IntegrationParameters, IslandManager, MultibodyJointSet, NarrowPhase, PhysicsPipeline, Pose,
+    QueryFilter, RigidBodyBuilder, RigidBodyHandle, RigidBodySet, Vector,
+};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -51,12 +58,14 @@ const MAX_FRAME_TIME: f32 = 0.25;
 const MAX_STEPS: u32 = 8;
 
 // First-person controller (§15). The controller owns vertical velocity: gravity
-// each tick, zeroed when grounded, jump on the press edge when grounded. Look is
+// each tick, zeroed when grounded, jump on the press edge when grounded. rapier's
+// `KinematicCharacterController` applies no gravity of its own. Look is
 // render-rate; body position is fixed-step + interpolated.
-const GROUND_Y: f32 = -9.0; // top surface of the ground plane (base of the orb column)
+const GROUND_Y: f32 = -9.0; // top surface of the ground collider (base of the orb column)
 const EYE_HEIGHT: f32 = 1.6;
-const PLAYER_RADIUS: f32 = 0.35; // half-width of the collision box (x/z)
-const PLAYER_HEIGHT: f32 = 1.8;
+const PLAYER_RADIUS: f32 = 0.35; // capsule radius
+const PLAYER_HEIGHT: f32 = 1.8; // total height, feet to crown (capsule caps included)
+const CAPSULE_HALF_HEIGHT: f32 = (PLAYER_HEIGHT - 2.0 * PLAYER_RADIUS) * 0.5; // `capsule_y` arg: half the straight section
 const MOVE_SPEED: f32 = 8.0; // target ground speed, units/s
 const MOVE_ACCEL: f32 = 14.0; // how fast horizontal velocity chases the target
 const GRAVITY: f32 = 26.0;
@@ -155,29 +164,91 @@ fn rand01(seed: u32) -> f32 {
     (h & 0x00ff_ffff) as f32 / 0x0100_0000 as f32
 }
 
-// ---- First-person player + input ----
+// ---- Physics (rapier, §15) ----
 
-/// Axis-aligned box collider for static level geometry.
-#[derive(Clone, Copy)]
-struct Aabb {
-    min: Vec3,
-    max: Vec3,
+/// The workspace pins glam 0.29 but rapier 0.35 builds on its own (newer) glam, so
+/// `Vec3` and rapier's `Vector` are distinct types. Convert at the boundary.
+fn to_rapier(v: Vec3) -> Vector {
+    Vector::new(v.x, v.y, v.z)
 }
 
-impl Aabb {
-    fn from_center_size(center: Vec3, size: Vec3) -> Self {
-        let h = size * 0.5;
+fn from_rapier(v: Vector) -> Vec3 {
+    Vec3::new(v.x, v.y, v.z)
+}
+
+/// All rapier state as one raw ECS resource (§15: raw rapier, not bevy_rapier).
+/// There is no gravity here — the character controller is kinematic and the
+/// player owns its vertical velocity — so the world only ever holds fixed level
+/// colliders plus the player's position-based kinematic body.
+#[derive(Resource)]
+struct Physics {
+    pipeline: PhysicsPipeline,
+    params: IntegrationParameters,
+    islands: IslandManager,
+    broad_phase: BroadPhaseBvh,
+    narrow_phase: NarrowPhase,
+    bodies: RigidBodySet,
+    colliders: ColliderSet,
+    impulse_joints: ImpulseJointSet,
+    multibody_joints: MultibodyJointSet,
+    ccd: CCDSolver,
+}
+
+impl Physics {
+    fn new() -> Self {
         Self {
-            min: center - h,
-            max: center + h,
+            pipeline: PhysicsPipeline::new(),
+            params: IntegrationParameters {
+                dt: FIXED_DT,
+                ..Default::default()
+            },
+            islands: IslandManager::new(),
+            broad_phase: BroadPhaseBvh::new(),
+            narrow_phase: NarrowPhase::new(),
+            bodies: RigidBodySet::new(),
+            colliders: ColliderSet::new(),
+            impulse_joints: ImpulseJointSet::new(),
+            multibody_joints: MultibodyJointSet::new(),
+            ccd: CCDSolver::new(),
         }
     }
+
+    /// Advance the rapier world by one `FIXED_DT`. This is also what refreshes the
+    /// broad-phase BVH the character controller's shape-casts query, so colliders
+    /// added since the last step are invisible to the controller until this runs.
+    fn step(&mut self) {
+        self.pipeline.step(
+            Vector::ZERO,
+            &self.params,
+            &mut self.islands,
+            &mut self.broad_phase,
+            &mut self.narrow_phase,
+            &mut self.bodies,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            &mut self.ccd,
+            &(),
+            &(),
+        );
+    }
+
+    /// A fixed axis-aligned box collider (static level geometry).
+    fn add_static_box(&mut self, center: Vec3, size: Vec3) -> ColliderHandle {
+        let h = size * 0.5;
+        self.colliders
+            .insert(ColliderBuilder::cuboid(h.x, h.y, h.z).translation(to_rapier(center)))
+    }
 }
+
+// ---- First-person player + input ----
 
 /// The player. `pos` is the feet position — simulated at the fixed step, then
 /// interpolated for the camera. `yaw`/`pitch` are look angles updated at render
 /// rate (responsive aim, §15). `vel` is owned by the controller: gravity and
-/// jump live here, not in a physics solver.
+/// jump live here, not in a physics solver. The body is a position-based
+/// kinematic rigid body with a capsule collider in `Physics`; `controller`
+/// resolves each tick's desired motion against the level.
 struct Player {
     pos: Vec3,
     prev_pos: Vec3,
@@ -185,9 +256,48 @@ struct Player {
     yaw: f32,
     pitch: f32,
     on_ground: bool,
+    body: RigidBodyHandle,
+    collider: ColliderHandle,
+    controller: KinematicCharacterController,
 }
 
 impl Player {
+    /// Create the player with its feet at `feet`, registering the kinematic body
+    /// and capsule in `physics`.
+    fn new(physics: &mut Physics, feet: Vec3) -> Self {
+        let body = physics.bodies.insert(
+            RigidBodyBuilder::kinematic_position_based()
+                .translation(to_rapier(feet + Self::CENTER)),
+        );
+        let collider = physics.colliders.insert_with_parent(
+            ColliderBuilder::capsule_y(CAPSULE_HALF_HEIGHT, PLAYER_RADIUS),
+            body,
+            &mut physics.bodies,
+        );
+        Self {
+            pos: feet,
+            prev_pos: feet,
+            vel: Vec3::ZERO,
+            yaw: -std::f32::consts::FRAC_PI_2, // looking -Z
+            pitch: 0.0,
+            on_ground: true, // feet start resting on the ground
+            body,
+            collider,
+            controller: KinematicCharacterController {
+                // Step over lips up to 0.4 units while grounded.
+                autostep: Some(CharacterAutostep {
+                    max_height: CharacterLength::Absolute(0.4),
+                    min_width: CharacterLength::Absolute(0.2),
+                    include_dynamic_bodies: false,
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Feet → capsule center (the body's origin).
+    const CENTER: Vec3 = Vec3::new(0.0, PLAYER_HEIGHT * 0.5, 0.0);
+
     /// Full look direction (yaw + pitch), for the view matrix.
     fn forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
@@ -211,84 +321,85 @@ impl Player {
     }
 }
 
-/// Advance the player one fixed step (§15's `step_gameplay` + `physics.step`,
-/// hand-rolled until rapier lands). `wish` is the desired horizontal move
-/// direction (unit or zero); `vgo` is the noclip vertical axis (+up/-down).
-fn step_player(p: &mut Player, wish: Vec3, jump: bool, vgo: f32, noclip: bool, colliders: &[Aabb]) {
+/// Advance the player one fixed step (§15's `step_gameplay` + `physics.step`).
+/// `wish` is the desired horizontal move direction (unit or zero); `vgo` is the
+/// noclip vertical axis (+up/-down).
+///
+/// Snapshot `pos` for interpolation, work out this tick's desired motion (the
+/// controller owns velocity: chase the target speed, gravity, jump on the press
+/// edge), let the `KinematicCharacterController` shape-cast it against the level,
+/// hand the result to rapier as the kinematic body's next position, step the
+/// world, then read the body's position back.
+fn step_player(
+    p: &mut Player,
+    physics: &mut Physics,
+    wish: Vec3,
+    jump: bool,
+    vgo: f32,
+    noclip: bool,
+) {
     p.prev_pos = p.pos;
 
-    if noclip {
+    let motion = if noclip {
         // Free flight: velocity follows input directly, no gravity or collision.
         let dir = wish + Vec3::new(0.0, vgo, 0.0);
         p.vel = dir.normalize_or_zero() * FLY_SPEED;
-        p.pos += p.vel * FIXED_DT;
         p.on_ground = false;
-        return;
-    }
-
-    // Horizontal velocity chases the target speed; vertical is gravity + jump.
-    let target = wish * MOVE_SPEED;
-    let t = (MOVE_ACCEL * FIXED_DT).min(1.0);
-    p.vel.x += (target.x - p.vel.x) * t;
-    p.vel.z += (target.z - p.vel.z) * t;
-    p.vel.y -= GRAVITY * FIXED_DT;
-    if jump && p.on_ground {
-        p.vel.y = JUMP_SPEED;
-        p.on_ground = false;
-    }
-
-    p.pos += p.vel * FIXED_DT;
-    resolve_collisions(p, colliders);
-}
-
-/// Ground-plane clamp + push-out against each static box along its axis of least
-/// penetration. Sets `on_ground` and zeroes the blocked velocity component. A
-/// discrete (non-swept) resolver — fine at fixed 60 Hz and modest speeds; rapier
-/// replaces it later.
-fn resolve_collisions(p: &mut Player, colliders: &[Aabb]) {
-    p.on_ground = false;
-
-    // Ground plane.
-    if p.pos.y <= GROUND_Y {
-        p.pos.y = GROUND_Y;
-        if p.vel.y < 0.0 {
+        p.vel * FIXED_DT
+    } else {
+        // Horizontal velocity chases the target speed; vertical is gravity + jump.
+        let target = wish * MOVE_SPEED;
+        let t = (MOVE_ACCEL * FIXED_DT).min(1.0);
+        p.vel.x += (target.x - p.vel.x) * t;
+        p.vel.z += (target.z - p.vel.z) * t;
+        if p.on_ground {
+            // Grounded: no fall speed, and no gravity either. Feeding a grounded
+            // capsule a downward push each tick presses it into the controller's
+            // contact offset and makes the slide step intermittently return zero
+            // horizontal motion; `snap_to_ground` keeps it planted instead.
             p.vel.y = 0.0;
-        }
-        p.on_ground = true;
-    }
-
-    // Static boxes. Recompute the player box each iteration (pos mutates).
-    for c in colliders {
-        let pmin = p.pos + Vec3::new(-PLAYER_RADIUS, 0.0, -PLAYER_RADIUS);
-        let pmax = p.pos + Vec3::new(PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_RADIUS);
-        let ox = pmax.x.min(c.max.x) - pmin.x.max(c.min.x);
-        let oy = pmax.y.min(c.max.y) - pmin.y.max(c.min.y);
-        let oz = pmax.z.min(c.max.z) - pmin.z.max(c.min.z);
-        if ox <= 0.0 || oy <= 0.0 || oz <= 0.0 {
-            continue; // separated on some axis
-        }
-        if ox <= oy && ox <= oz {
-            let pc = (pmin.x + pmax.x) * 0.5;
-            let cc = (c.min.x + c.max.x) * 0.5;
-            p.pos.x += if pc < cc { -ox } else { ox };
-            p.vel.x = 0.0;
-        } else if oz <= oy {
-            let pc = (pmin.z + pmax.z) * 0.5;
-            let cc = (c.min.z + c.max.z) * 0.5;
-            p.pos.z += if pc < cc { -oz } else { oz };
-            p.vel.z = 0.0;
         } else {
-            let pc = (pmin.y + pmax.y) * 0.5;
-            let cc = (c.min.y + c.max.y) * 0.5;
-            if pc < cc {
-                p.pos.y -= oy; // clipped head on an underside
-            } else {
-                p.pos.y += oy; // landed on top
-                p.on_ground = true;
-            }
+            p.vel.y -= GRAVITY * FIXED_DT;
+        }
+        if jump && p.on_ground {
+            p.vel.y = JUMP_SPEED;
+        }
+
+        let desired = p.vel * FIXED_DT;
+        let queries = physics.broad_phase.as_query_pipeline(
+            physics.narrow_phase.query_dispatcher(),
+            &physics.bodies,
+            &physics.colliders,
+            QueryFilter::default().exclude_rigid_body(p.body), // don't collide with ourselves
+        );
+        let moved = p.controller.move_shape(
+            FIXED_DT,
+            &queries,
+            physics.colliders[p.collider].shape(),
+            &Pose::from_translation(to_rapier(p.pos + Player::CENTER)),
+            to_rapier(desired),
+            |_| {},
+        );
+        let actual = from_rapier(moved.translation);
+
+        // Velocity follows what actually happened, so a blocked axis loses its
+        // speed instead of pushing into the obstacle every tick. The controller
+        // applies no gravity, so vertical stays ours: zero it when grounded or
+        // when the head hit something on the way up.
+        p.on_ground = moved.grounded;
+        p.vel.x = actual.x / FIXED_DT;
+        p.vel.z = actual.z / FIXED_DT;
+        if p.on_ground || (desired.y > 0.0 && actual.y < desired.y - 1e-4) {
             p.vel.y = 0.0;
         }
-    }
+        actual
+    };
+
+    // ECS -> rapier: push the kinematic target; step; rapier -> player: read back.
+    physics.bodies[p.body]
+        .set_next_kinematic_translation(to_rapier(p.pos + Player::CENTER + motion));
+    physics.step();
+    p.pos = from_rapier(physics.bodies[p.body].translation()) - Player::CENTER;
 }
 
 #[derive(Default)]
@@ -315,8 +426,6 @@ struct App {
     player: Player,
     input: Input,
     noclip: bool,
-    // Static level colliders (boxes); the ground is a plane at GROUND_Y.
-    colliders: Vec<Aabb>,
     light_dir: Vec4,
     exposure: f32,
     // Meshes to register (decided up front); index == MeshId.
@@ -333,6 +442,10 @@ impl App {
     fn new(sources: Vec<MeshSource>) -> Self {
         let mut world = World::new();
         world.insert_resource(FrameCount::default());
+        let mut physics = Physics::new();
+        // Feet on the ground, looking -Z.
+        let player = Player::new(&mut physics, Vec3::new(0.0, GROUND_Y, 8.0));
+        world.insert_resource(physics);
 
         let mesh_count = sources.len().max(1) as u32;
         let half = (GRID as f32 - 1.0) / 2.0;
@@ -382,17 +495,9 @@ impl App {
             window: None,
             world,
             schedule,
-            player: Player {
-                pos: Vec3::new(0.0, GROUND_Y, 8.0), // feet on the ground, looking -Z
-                prev_pos: Vec3::new(0.0, GROUND_Y, 8.0),
-                vel: Vec3::ZERO,
-                yaw: -std::f32::consts::FRAC_PI_2,
-                pitch: 0.0,
-                on_ground: true,
-            },
+            player,
             input: Input::default(),
             noclip: false,
-            colliders: Vec::new(),
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             exposure: 1.0,
             sources,
@@ -476,10 +581,10 @@ impl ApplicationHandler for App {
         let box_mat = materials.len() as u32;
         materials.push(level_material([0.45, 0.22, 0.14], 0.7));
 
-        // Static level. The ground is rendered as a wide flat box but collided as
-        // the GROUND_Y plane (jitter-free resting); the obstacle boxes are both
-        // rendered and added as AABB colliders. Level pieces carry no Velocity/
-        // Spin, so `integrate` skips them and they never wrap.
+        // Static level. The ground and the obstacle boxes are each rendered as a
+        // scaled unit cube and given a matching cuboid collider (`spawn_static`).
+        // Level pieces carry no Velocity/Spin, so `integrate` skips them and they
+        // never wrap.
         spawn_static(
             &mut self.world,
             Vec3::new(0.0, GROUND_Y - 0.5, 0.0),
@@ -499,8 +604,10 @@ impl ApplicationHandler for App {
         for (offset, size) in boxes {
             let center = Vec3::new(offset.x, GROUND_Y + offset.y, offset.z);
             spawn_static(&mut self.world, center, size, level_cube_id, box_mat);
-            self.colliders.push(Aabb::from_center_size(center, size));
         }
+        // One step so the broad-phase BVH the character controller shape-casts
+        // against contains the level before the first fixed tick.
+        self.world.resource_mut::<Physics>().step();
 
         let (mesh, _ids) = MeshRenderer::new(&renderer, &meshes, &materials, MAX_INSTANCES);
         let tonemap = TonemapPass::new(&renderer);
@@ -592,7 +699,7 @@ impl ApplicationHandler for App {
 
                 // Fixed-timestep sim: consume the accumulator in whole FIXED_DT
                 // steps. Each step advances the ECS schedule and the player
-                // controller together (snapshot -> step_gameplay -> resolve, §15).
+                // controller together (snapshot -> step_gameplay -> physics.step, §15).
                 // The frame delta is clamped and MAX_STEPS caps catch-up per frame
                 // (spiral-of-death guard); leftover beyond the cap is dropped.
                 self.accumulator += dt.min(MAX_FRAME_TIME);
@@ -601,11 +708,11 @@ impl ApplicationHandler for App {
                     self.schedule.run(&mut self.world);
                     step_player(
                         &mut self.player,
+                        &mut self.world.resource_mut::<Physics>(),
                         wish,
                         self.input.jump,
                         vgo,
                         self.noclip,
-                        &self.colliders,
                     );
                     self.input.jump = false; // consumed by this step
                     self.accumulator -= FIXED_DT;
@@ -688,10 +795,13 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Spawn one static level entity: rendered through the normal instanced path but
+/// Spawn one static level piece: rendered through the normal instanced path but
 /// carrying no `Velocity`/`Spin`, so `integrate` skips it (it never moves or
-/// wraps). `prev == curr` makes it a no-op through the interpolation path.
+/// wraps). `prev == curr` makes it a no-op through the interpolation path. Also
+/// registers a matching fixed cuboid collider with `Physics` (it must already be
+/// a resource).
 fn spawn_static(world: &mut World, center: Vec3, size: Vec3, mesh: u32, material: u32) {
+    world.resource_mut::<Physics>().add_static_box(center, size);
     world.spawn((
         Position(center),
         PrevPosition(center),
@@ -767,4 +877,184 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(sources);
     event_loop.run_app(&mut app).expect("run app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ground (same 80x80x1 box as the app) plus `boxes` as `(center, size)`, and a
+    /// player standing at `start`. Mirrors the app's setup, including the warm-up
+    /// step that publishes the level to the broad-phase BVH.
+    fn setup(boxes: &[(Vec3, Vec3)], start: Vec3) -> (Physics, Player) {
+        let mut physics = Physics::new();
+        let player = Player::new(&mut physics, start);
+        physics.add_static_box(
+            Vec3::new(0.0, GROUND_Y - 0.5, 0.0),
+            Vec3::new(80.0, 1.0, 80.0),
+        );
+        for &(c, s) in boxes {
+            physics.add_static_box(c, s);
+        }
+        physics.step();
+        (physics, player)
+    }
+
+    fn run(p: &mut Player, ph: &mut Physics, ticks: u32, wish: Vec3) {
+        for _ in 0..ticks {
+            step_player(p, ph, wish, false, 0.0, false);
+        }
+    }
+
+    const START: Vec3 = Vec3::new(0.0, GROUND_Y, 8.0);
+
+    #[test]
+    fn settles_on_ground() {
+        let (mut ph, mut p) = setup(&[], START);
+        run(&mut p, &mut ph, 90, Vec3::ZERO);
+        assert!(p.on_ground);
+        assert!((p.pos.y - GROUND_Y).abs() < 0.03, "y = {}", p.pos.y);
+        assert_eq!(p.vel.y, 0.0);
+    }
+
+    #[test]
+    fn walks_at_target_speed() {
+        let (mut ph, mut p) = setup(&[], START);
+        run(&mut p, &mut ph, 90, -Vec3::Z);
+        assert!(p.on_ground);
+        assert!((p.vel.z + MOVE_SPEED).abs() < 0.1, "vz = {}", p.vel.z);
+        assert!(p.pos.z < 8.0 - 8.0, "z = {}", p.pos.z); // > 8 units covered in 1.5 s
+        assert!((p.pos.y - GROUND_Y).abs() < 0.03);
+        // The controller leaves a few mm of sideways drift; anything visible is a bug.
+        assert!(p.pos.x.abs() < 0.02, "x = {}", p.pos.x);
+    }
+
+    #[test]
+    fn stopped_by_box() {
+        // 2-wide box centered on z=0 spans z in [-1, 1]; player walks -Z from z=8.
+        let b = (Vec3::new(0.0, GROUND_Y + 1.0, 0.0), Vec3::splat(2.0));
+        let (mut ph, mut p) = setup(&[b], START);
+        run(&mut p, &mut ph, 240, -Vec3::Z);
+        let gap = p.pos.z - (1.0 + PLAYER_RADIUS);
+        assert!((0.0..0.05).contains(&gap), "gap = {gap}, z = {}", p.pos.z);
+        assert!(p.vel.z.abs() < 0.5, "vz = {}", p.vel.z);
+        assert!((p.pos.y - GROUND_Y).abs() < 0.03);
+    }
+
+    #[test]
+    fn slides_along_box_face() {
+        // Walk diagonally into the box's +Z face: -Z is blocked, +X slides.
+        let b = (Vec3::new(0.0, GROUND_Y + 1.0, 0.0), Vec3::splat(2.0));
+        let (mut ph, mut p) = setup(&[b], Vec3::new(-0.5, GROUND_Y, 1.6));
+        let wish = Vec3::new(1.0, 0.0, -1.0).normalize();
+        run(&mut p, &mut ph, 12, wish);
+        // Held off the face, but slid along it.
+        assert!(p.pos.z >= 1.0 + PLAYER_RADIUS - 0.01, "z = {}", p.pos.z);
+        assert!(p.pos.x > 0.3, "x = {}", p.pos.x);
+        // Once clear of the +X edge the -Z half of the input is free again.
+        run(&mut p, &mut ph, 108, wish);
+        assert!(
+            p.pos.x > 1.0 + PLAYER_RADIUS && p.pos.z < -1.0,
+            "{:?}",
+            p.pos
+        );
+    }
+
+    fn jump_trace(jump_ticks: &[u32], total: u32) -> (f32, Player) {
+        let (mut ph, mut p) = setup(&[], START);
+        run(&mut p, &mut ph, 5, Vec3::ZERO);
+        let mut apex = 0.0f32;
+        for t in 0..total {
+            step_player(
+                &mut p,
+                &mut ph,
+                Vec3::ZERO,
+                jump_ticks.contains(&t),
+                0.0,
+                false,
+            );
+            apex = apex.max(p.pos.y - GROUND_Y);
+        }
+        (apex, p)
+    }
+
+    #[test]
+    fn jump_reaches_apex_and_lands() {
+        let (apex, p) = jump_trace(&[0], 120);
+        // v^2 / 2g = 1.56, plus a little from discrete integration.
+        assert!((1.4..1.75).contains(&apex), "apex = {apex}");
+        assert!(p.on_ground);
+        assert!((p.pos.y - GROUND_Y).abs() < 0.03, "y = {}", p.pos.y);
+    }
+
+    #[test]
+    fn no_air_jump() {
+        let (single, _) = jump_trace(&[0], 120);
+        let (double, _) = jump_trace(&[0, 12, 20], 120);
+        assert!((single - double).abs() < 1e-4, "{single} vs {double}");
+    }
+
+    #[test]
+    fn jumps_onto_box() {
+        // 1.0-high, 12-deep box (z in [-10, 2]): apex (1.6) clears it, so jumping
+        // into its face lands on top. Deep enough not to walk off the far side.
+        let b = (
+            Vec3::new(0.0, GROUND_Y + 0.5, -4.0),
+            Vec3::new(3.0, 1.0, 12.0),
+        );
+        let (mut ph, mut p) = setup(&[b], Vec3::new(0.0, GROUND_Y, 2.7));
+        run(&mut p, &mut ph, 5, Vec3::ZERO);
+        step_player(&mut p, &mut ph, -Vec3::Z, true, 0.0, false);
+        run(&mut p, &mut ph, 60, -Vec3::Z);
+        assert!(p.on_ground);
+        assert!((p.pos.y - (GROUND_Y + 1.0)).abs() < 0.03, "y = {}", p.pos.y);
+        assert!(p.pos.z < 1.6, "z = {}", p.pos.z); // actually on the box, not beside it
+    }
+
+    #[test]
+    fn head_bump_cancels_upward_velocity() {
+        // Slab whose underside is 2.0 above the ground; jump apex would reach 1.6+1.8.
+        let slab = (
+            Vec3::new(0.0, GROUND_Y + 2.25, 8.0),
+            Vec3::new(4.0, 0.5, 4.0),
+        );
+        let (mut ph, mut p) = setup(&[slab], START);
+        run(&mut p, &mut ph, 5, Vec3::ZERO);
+        let mut crown = f32::MIN; // height of the head above the ground
+        for t in 0..120 {
+            step_player(&mut p, &mut ph, Vec3::ZERO, t == 0, 0.0, false);
+            crown = crown.max(p.pos.y + PLAYER_HEIGHT - GROUND_Y);
+        }
+        assert!(crown <= 2.0 + 1e-3, "crown = {crown}");
+        assert!(p.on_ground);
+        assert!((p.pos.y - GROUND_Y).abs() < 0.03);
+    }
+
+    #[test]
+    fn steps_over_low_lip_but_not_tall_wall() {
+        // 0.3-high lip at z in [-0.5, 0.5]: auto-stepped, no jump needed.
+        let lip = (
+            Vec3::new(0.0, GROUND_Y + 0.15, 0.0),
+            Vec3::new(6.0, 0.3, 1.0),
+        );
+        let (mut ph, mut p) = setup(&[lip], START);
+        run(&mut p, &mut ph, 150, -Vec3::Z);
+        assert!(p.pos.z < -1.5, "stuck at z = {}", p.pos.z);
+        assert!((p.pos.y - GROUND_Y).abs() < 0.03, "y = {}", p.pos.y);
+    }
+
+    #[test]
+    fn noclip_flies_through_geometry_then_resumes() {
+        let b = (Vec3::new(0.0, GROUND_Y + 1.0, 0.0), Vec3::splat(2.0));
+        let (mut ph, mut p) = setup(&[b], START);
+        for _ in 0..90 {
+            step_player(&mut p, &mut ph, -Vec3::Z, false, 0.0, true);
+        }
+        // Straight through the box.
+        assert!(p.pos.z < 0.0, "z = {}", p.pos.z);
+        // Leaving noclip in the open: gravity takes over and it settles.
+        run(&mut p, &mut ph, 120, Vec3::ZERO);
+        assert!(p.on_ground);
+        assert!((p.pos.y - GROUND_Y).abs() < 0.05, "y = {}", p.pos.y);
+    }
 }
