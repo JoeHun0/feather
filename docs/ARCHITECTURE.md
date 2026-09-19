@@ -612,7 +612,7 @@ Snapshot of what's actually built vs. the design above. The design sections are
 unchanged targets; this records reality so the doc doesn't drift. Update as
 milestones land.
 
-### Done (milestones 0–2 + textured PBR + analytic IBL + sky)
+### Done (milestones 0–2 + textured PBR + analytic IBL + sky + fixed-step rapier controller)
 
 - **Workspace/toolchain**: 6 crates, `rust-toolchain.toml` (stable), GLSL→SPIR-V
   at build time via `shaderc` in `render/build.rs`, embedded from `OUT_DIR`.
@@ -621,7 +621,9 @@ milestones land.
   pin; default features). rapier 0.35 builds on its own newer glam (0.33, via
   `glamx`) rather than nalgebra, so its `Vector`/`Pose` are *not* the workspace's
   glam 0.29 `Vec3` — `app` converts at the boundary (`to_rapier`/`from_rapier`)
-  until the workspace glam is bumped to match. Not yet added: kira, egui, tracy.
+  until the workspace glam is bumped to match. Also `gltf 1` (`import` + `utils`
+  features, pulling in the `image` crate) in `assets`. Not yet added: kira, egui,
+  tracy.
 - **gfx**: instance/debug messenger/surface/device/queues; VK 1.3 **dynamic
   rendering** (feature enabled); swapchain + image views + resize; **depth**
   (D32_SFLOAT) created with the swapchain; **vk-mem** allocator held as
@@ -644,7 +646,8 @@ milestones land.
   — base color, metallic, roughness, emissive, normal_scale, `tex` = base /
   normal / MR slots) at binding1 (fragment); and a **bindless-lite texture
   array** — fixed `sampler2D textures[64]` at binding2, non-uniformly indexed by
-  material (slot 0 = white, slot 1 = flat normal; unused slots point at those).
+  material (slot 0 = white, slot 1 = flat normal; every *unused* slot points at
+  white/slot 0, not the flat-normal default).
   Vertex is pos+normal+uv. `view_proj` + `light_dir` + `camera_pos` in a push
   constant (96 B), **linear-space** Cook-Torrance **PBR** (metallic-roughness)
   directional light with **base-color + normal + metallic-roughness textures**
@@ -687,8 +690,10 @@ milestones land.
   each entity assigned a mesh + `material_id` at random (glTF meshes use their
   file material; procedural meshes use a shared generated palette).
 - **Build order (§23)**: step 1 done; step 2 done; step 3 partially — PBR direct
-  lighting + full textures + analytic-sky IBL, *not* CSM/GTAO or cubemap IBL.
-  Steps 4+ not started.
+  lighting + full textures + analytic-sky IBL, *not* CSM/GTAO or cubemap IBL;
+  step 4 mostly landed — fixed timestep + interpolation and the rapier kinematic
+  FPS controller against static colliders (ECS↔rapier sync systems and dynamic
+  bodies still pending, see below). Steps 5+ not started.
 
 ### Current simplifications to revisit
 
@@ -781,4 +786,6 @@ spawning / save; rapier beyond the player (kinematic FPS controller + static
 colliders landed — ECS↔rapier sync systems, dynamic bodies, collision layers
 pending);
 skinning; UI/HUD; audio; debug/profiling tooling (Tracy/RenderDoc/timestamp
-queries); GPU-driven culling; streaming; stage pipelining.
+queries); GPU-driven culling; streaming; stage pipelining; **anti-aliasing**
+(the design assumes MSAA on geometry per §3/§10 and SMAA post per §13, but the
+renderer is single-sample everywhere — no MSAA, no resolve, no post-AA yet).
