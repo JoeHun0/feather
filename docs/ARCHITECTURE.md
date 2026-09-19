@@ -252,6 +252,19 @@ Sits between sim and extract; turns "every entity" into "visible set, per view."
 struct VisibleItem { mesh_id: MeshId, material_id: u32, model: Mat4, depth: f32, bucket: Bucket }
 ```
 
+**Landed (§26):** the per-view **narrow** step — a `Frustum` (six Gribb–Hartmann
+planes from any `viewProj`) tests each entity's conservative bounding **sphere**
+(center = interpolated position, radius = `√3/2 · max(scale)` from the unit-cube
+fit). Run inline in the app's extract loop, **per view**: the camera frustum trims
+the main pass and the sun light ortho trims the shadow pass, each producing its own
+instance set. Still **single-threaded** (no rayon fold-reduce), **sphere-only** (no
+AABB refinement), and with **no broad phase / chunk culling or LOD** yet. Note the
+observed behavior: at a dense fragment-bound view the *frame time* barely moves
+(the culled objects were already off-screen — zero pixels), so the win is in
+vertex/draw work and shows up when the view is sparse or geometry/overdraw-bound;
+the shadow pass (vertex-bound) would benefit most but its casters are all inside
+the fixed light frustum today.
+
 ## 9. GPU resource layer
 
 ### Per-frame memory (three classes)
@@ -818,7 +831,9 @@ milestones land.
 
 ### Not yet started
 
-Culling; mips + MikkTSpace vertex tangents; pipeline buckets (PBR BRDF +
+Culling (per-view bounding-sphere frustum cull landed for the camera + shadow
+views, §8 — broad-phase/chunk cull, rayon parallelism, AABB refinement, and LOD
+still pending); mips + MikkTSpace vertex tangents; pipeline buckets (PBR BRDF +
 base-color/normal/MR textures landed); clustered lighting;
 precomputed cubemap/HDR IBL (analytic-sky IBL landed);
 shadows: **single static directional shadow map + 3×3 PCF landed** (§11) —

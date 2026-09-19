@@ -130,8 +130,11 @@ pub struct MeshRenderer {
     slices: Vec<MeshSlice>,
     // Reused each frame to gather sorted instances before the SSBO upload.
     scratch: Vec<InstanceData>,
-    // Per-mesh runs recorded by `prepare_frame`, replayed by both passes.
-    runs: Vec<Run>,
+    // Per-mesh runs recorded by `prepare_frame`, replayed by each pass. Both index
+    // one instance SSBO laid out as [main instances | shadow instances]; the run
+    // `run_start` is the firstInstance offset into that concatenation.
+    main_runs: Vec<Run>,
+    shadow_runs: Vec<Run>,
     // This frame's globals (light matrix + shadow params), written in draw_shadow.
     globals: Globals,
     // Shadow-map texel size (1/dim), for the PCF offset in the globals UBO.
@@ -577,7 +580,8 @@ impl MeshRenderer {
             sampler,
             slices,
             scratch: Vec::new(),
-            runs: Vec::new(),
+            main_runs: Vec::new(),
+            shadow_runs: Vec::new(),
             globals: Globals::default(),
             shadow_texel,
             max_instances,
@@ -585,39 +589,50 @@ impl MeshRenderer {
         (renderer, ids)
     }
 
-    /// CPU-only per-frame prep (call once, before `draw_frame`): sort `items` by
-    /// mesh, stage the sorted instances + per-mesh runs, and stash this frame's
-    /// globals (light matrix + shadow params). No GPU buffers are touched here —
-    /// the actual uploads happen in `draw_shadow`, after the frame fence, to avoid
-    /// racing the in-flight GPU read of the per-frame buffers.
-    pub fn prepare_frame(&mut self, items: &mut [(MeshId, InstanceData)], light_view_proj: Mat4) {
-        // Contiguous runs per mesh -> one draw each. Unstable sort is fine; draw
-        // order within a mesh doesn't matter (opaque + depth test).
-        items.sort_unstable_by_key(|(mesh, _)| mesh.0);
-
-        let count = items.len().min(self.max_instances as usize);
+    /// CPU-only per-frame prep (call once, before `draw_frame`): sort each culled
+    /// list by mesh, stage them into one instance array as `[main | shadow]`,
+    /// record each pass's per-mesh runs, and stash this frame's globals (light
+    /// matrix + shadow params). No GPU buffers are touched here — the actual upload
+    /// happens in `draw_shadow`, after the frame fence, to avoid racing the
+    /// in-flight GPU read of the per-frame buffers.
+    ///
+    /// `main` is the camera-visible set, `shadow` the light-frustum set (§8); an
+    /// entity visible to both appears once in each region.
+    pub fn prepare_frame(
+        &mut self,
+        main: &mut [(MeshId, InstanceData)],
+        shadow: &mut [(MeshId, InstanceData)],
+        light_view_proj: Mat4,
+    ) {
         self.scratch.clear();
-        self.scratch
-            .extend(items[..count].iter().map(|(_, inst)| *inst));
+        self.main_runs.clear();
+        self.shadow_runs.clear();
 
-        self.runs.clear();
-        let mut first = 0usize;
-        while first < count {
-            let mesh = items[first].0;
-            let mut run = 1usize;
-            while first + run < count && items[first + run].0 == mesh {
-                run += 1;
-            }
-            if let Some(slice) = self.slices.get(mesh.0 as usize) {
-                self.runs.push(Run {
-                    first_index: slice.first_index,
-                    index_count: slice.index_count,
-                    vertex_offset: slice.vertex_offset,
-                    run_start: first as u32,
-                    run_len: run as u32,
-                });
-            }
-            first += run;
+        let cap = self.max_instances as usize;
+        // main region at offset 0, shadow region right after it. `run_start` is the
+        // firstInstance base into the concatenated SSBO.
+        let main_count = build_runs(
+            main,
+            &self.slices,
+            &mut self.scratch,
+            &mut self.main_runs,
+            0,
+        );
+        build_runs(
+            shadow,
+            &self.slices,
+            &mut self.scratch,
+            &mut self.shadow_runs,
+            main_count,
+        );
+        // Guard the shared buffer's capacity (main + shadow could, worst case,
+        // exceed it); drop the tail of scratch and any runs past the cap.
+        if self.scratch.len() > cap {
+            self.scratch.truncate(cap);
+            self.main_runs
+                .retain(|r| r.run_start + r.run_len <= cap as u32);
+            self.shadow_runs
+                .retain(|r| r.run_start + r.run_len <= cap as u32);
         }
 
         self.globals = Globals {
@@ -664,7 +679,7 @@ impl MeshRenderer {
             self.device.cmd_set_depth_bias(cmd, 2.0, 0.0, 3.0);
             self.set_viewport_scissor(cmd, extent);
             self.bind_geometry(cmd);
-            self.draw_runs(cmd);
+            self.draw_runs(cmd, &self.shadow_runs);
         }
     }
 
@@ -706,7 +721,7 @@ impl MeshRenderer {
             );
             self.set_viewport_scissor(cmd, extent);
             self.bind_geometry(cmd);
-            self.draw_runs(cmd);
+            self.draw_runs(cmd, &self.main_runs);
         }
     }
 
@@ -734,11 +749,10 @@ impl MeshRenderer {
             .cmd_bind_index_buffer(cmd, self.index_buffer.handle, 0, vk::IndexType::UINT32);
     }
 
-    /// One `cmd_draw_indexed` per contiguous same-mesh run recorded by
-    /// `upload_instances`. `firstInstance` = run start, so `gl_InstanceIndex`
-    /// indexes the sorted instance SSBO.
-    unsafe fn draw_runs(&self, cmd: vk::CommandBuffer) {
-        for r in &self.runs {
+    /// One `cmd_draw_indexed` per contiguous same-mesh run. `firstInstance` =
+    /// `run_start`, so `gl_InstanceIndex` indexes the concatenated instance SSBO.
+    unsafe fn draw_runs(&self, cmd: vk::CommandBuffer, runs: &[Run]) {
+        for r in runs {
             self.device.cmd_draw_indexed(
                 cmd,
                 r.index_count,
@@ -749,6 +763,43 @@ impl MeshRenderer {
             );
         }
     }
+}
+
+/// Sort one culled list by mesh, append its instances to `scratch`, and record the
+/// contiguous per-mesh runs with `firstInstance = base + local_start`. Returns the
+/// number of instances appended. `base` must equal `scratch.len()` at entry.
+fn build_runs(
+    items: &mut [(MeshId, InstanceData)],
+    slices: &[MeshSlice],
+    scratch: &mut Vec<InstanceData>,
+    runs: &mut Vec<Run>,
+    base: u32,
+) -> u32 {
+    // Contiguous runs per mesh -> one draw each. Unstable sort is fine; draw order
+    // within a mesh doesn't matter (opaque + depth test).
+    items.sort_unstable_by_key(|(mesh, _)| mesh.0);
+    scratch.extend(items.iter().map(|(_, inst)| *inst));
+
+    let count = items.len();
+    let mut first = 0usize;
+    while first < count {
+        let mesh = items[first].0;
+        let mut run = 1usize;
+        while first + run < count && items[first + run].0 == mesh {
+            run += 1;
+        }
+        if let Some(slice) = slices.get(mesh.0 as usize) {
+            runs.push(Run {
+                first_index: slice.first_index,
+                index_count: slice.index_count,
+                vertex_offset: slice.vertex_offset,
+                run_start: base + first as u32,
+                run_len: run as u32,
+            });
+        }
+        first += run;
+    }
+    count as u32
 }
 
 /// Small constant bias in light-space depth, added in the shader on top of the

@@ -72,6 +72,10 @@ const GRAVITY: f32 = 26.0;
 const JUMP_SPEED: f32 = 9.0; // ~1.5 units apex
 const FLY_SPEED: f32 = 14.0; // noclip movement speed
 
+// Frustum culling (§8). A fitted mesh lives in a unit cube (sphere radius ≤
+// √3/2 ≈ 0.87), scaled by the entity's Scale — a conservative cull radius.
+const CULL_SPHERE_K: f32 = 0.87;
+
 // ---- ECS data ----
 
 #[derive(Component)]
@@ -721,35 +725,7 @@ impl ApplicationHandler for App {
                 // How far we are into the next step, in [0,1): the render alpha.
                 let alpha = (self.accumulator / FIXED_DT).clamp(0.0, 1.0);
 
-                // Extract: interpolate each entity's sim state (prev -> curr) by
-                // alpha, then build its model matrix. This is the sim<->render
-                // seam; interpolation lives here per §4. Static level pieces lack
-                // Velocity/Spin so `integrate` skips them; prev == curr keeps them
-                // fixed through the same interpolation path.
-                let fits = &self.fits;
-                let mesh_max = fits.len().saturating_sub(1);
-                let mut items: Vec<(MeshId, InstanceData)> =
-                    Vec::with_capacity((GRID * GRID * GRID) as usize + 8);
-                let mut q = self.world.query::<(
-                    &Position,
-                    &PrevPosition,
-                    &Rotation,
-                    &PrevRotation,
-                    &Scale,
-                    &Mesh,
-                    &Material,
-                )>();
-                for (p, pp, r, pr, scale, mesh, material) in q.iter(&self.world) {
-                    let id = (mesh.0 .0 as usize).min(mesh_max);
-                    let pos = pp.0.lerp(p.0, alpha);
-                    let angle = pr.0 + (r.0 - pr.0) * alpha;
-                    let model = Mat4::from_translation(pos)
-                        * Mat4::from_rotation_y(angle)
-                        * Mat4::from_scale(scale.0)
-                        * fits[id];
-                    items.push((MeshId(id as u32), InstanceData::new(model, material.0)));
-                }
-
+                // Camera + sun matrices first — the extract loop culls against them.
                 // Camera: interpolate the player's body, offset to eye height.
                 let eye = self.player.prev_pos.lerp(self.player.pos, alpha)
                     + Vec3::new(0.0, EYE_HEIGHT, 0.0);
@@ -768,10 +744,56 @@ impl ApplicationHandler for App {
                 let light_eye = light_center - sun_dir * 40.0;
                 let light_view = Mat4::look_at_rh(light_eye, light_center, Vec3::Y);
                 // Tight ortho: the casters (orbs, boxes) sit within ~±10 of origin,
-                // so a ±16 half-extent keeps shadow-map texels dense (2048² over
-                // 32 units ≈ 0.016 u/texel) — coarser coverage looks pixelated.
+                // so a ±16 half-extent keeps shadow-map texels dense; a wider
+                // frustum looks pixelated.
                 let light_proj = Mat4::orthographic_rh(-16.0, 16.0, -16.0, 16.0, 0.1, 80.0);
                 let light_view_proj = light_proj * light_view;
+
+                // Per-view frustum culling (§8): bounding sphere vs six planes, once
+                // per view. Camera frustum trims the main pass; the light ortho trims
+                // the shadow pass (groundwork — everything is inside it today).
+                let camera_frustum = Frustum::from_view_proj(&view_proj);
+                let light_frustum = Frustum::from_view_proj(&light_view_proj);
+
+                // Extract: interpolate each entity's sim state (prev -> curr) by
+                // alpha, build its model matrix, and route it to the camera-visible
+                // set (main pass) and/or the light-visible set (shadow pass). This is
+                // the sim<->render seam; interpolation lives here per §4. Static level
+                // pieces lack Velocity/Spin so `integrate` skips them; prev == curr.
+                let fits = &self.fits;
+                let mesh_max = fits.len().saturating_sub(1);
+                let cap = (GRID * GRID * GRID) as usize + 8;
+                let mut main_items: Vec<(MeshId, InstanceData)> = Vec::with_capacity(cap);
+                let mut shadow_items: Vec<(MeshId, InstanceData)> = Vec::with_capacity(cap);
+                let mut q = self.world.query::<(
+                    &Position,
+                    &PrevPosition,
+                    &Rotation,
+                    &PrevRotation,
+                    &Scale,
+                    &Mesh,
+                    &Material,
+                )>();
+                for (p, pp, r, pr, scale, mesh, material) in q.iter(&self.world) {
+                    let id = (mesh.0 .0 as usize).min(mesh_max);
+                    let pos = pp.0.lerp(p.0, alpha);
+                    let angle = pr.0 + (r.0 - pr.0) * alpha;
+                    let model = Mat4::from_translation(pos)
+                        * Mat4::from_rotation_y(angle)
+                        * Mat4::from_scale(scale.0)
+                        * fits[id];
+                    let item = (MeshId(id as u32), InstanceData::new(model, material.0));
+                    // Conservative world bounding sphere: `fit_transform` normalizes
+                    // the mesh into a unit cube (sphere <= sqrt(3)/2), then Scale sizes
+                    // it. Over-inclusive by design — never culls a visible object.
+                    let radius = CULL_SPHERE_K * scale.0.max_element();
+                    if camera_frustum.contains_sphere(pos, radius) {
+                        main_items.push(item);
+                    }
+                    if light_frustum.contains_sphere(pos, radius) {
+                        shadow_items.push(item);
+                    }
+                }
 
                 let exposure = self.exposure;
                 if let (Some(r), Some(m), Some(tm), Some(sky)) = (
@@ -787,7 +809,7 @@ impl ApplicationHandler for App {
                     // CPU prep once (sort + stage instances/globals); the shadow and
                     // main passes then replay them. Uploads happen in draw_shadow,
                     // after the frame fence.
-                    m.prepare_frame(&mut items, light_view_proj);
+                    m.prepare_frame(&mut main_items, &mut shadow_items, light_view_proj);
                     r.draw_frame(
                         // Shadow pass: sun depth map (also flushes this frame's buffers).
                         |cmd, extent, frame| m.draw_shadow(cmd, extent, frame),
@@ -844,6 +866,45 @@ fn level_material(base_linear: [f32; 3], roughness: f32) -> feather_assets::Mate
         base_color_texture: None,
         normal_texture: None,
         metallic_roughness_texture: None,
+    }
+}
+
+/// View frustum as six inward-facing planes (Gribb–Hartmann, from a view-proj
+/// matrix). Used per view (§8): the camera for the main pass, the sun light ortho
+/// for the shadow pass. Matrix-agnostic, so it works for the camera's y-flipped
+/// projection and the light ortho alike.
+struct Frustum {
+    planes: [Vec4; 6],
+}
+
+impl Frustum {
+    fn from_view_proj(m: &Mat4) -> Self {
+        // glam is column-major: element (row r, col c) = cols[c * 4 + r].
+        let c = m.to_cols_array();
+        let row = |r: usize| Vec4::new(c[r], c[4 + r], c[8 + r], c[12 + r]);
+        let (r0, r1, r2, r3) = (row(0), row(1), row(2), row(3));
+        // Vulkan clip z ∈ [0,1]: the near plane is r2 (not r3 + r2).
+        let raw = [
+            r3 + r0, // left
+            r3 - r0, // right
+            r3 + r1, // bottom
+            r3 - r1, // top
+            r2,      // near
+            r3 - r2, // far
+        ];
+        let mut planes = [Vec4::ZERO; 6];
+        for (i, p) in raw.into_iter().enumerate() {
+            let len = p.truncate().length();
+            planes[i] = if len > 0.0 { p / len } else { p };
+        }
+        Self { planes }
+    }
+
+    /// True unless the sphere is entirely behind some plane (i.e. culled).
+    fn contains_sphere(&self, center: Vec3, radius: f32) -> bool {
+        self.planes
+            .iter()
+            .all(|p| p.x * center.x + p.y * center.y + p.z * center.z + p.w >= -radius)
     }
 }
 
