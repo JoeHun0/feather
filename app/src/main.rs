@@ -29,7 +29,7 @@ use std::time::Instant;
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::ExecutorKind;
 use feather_assets::MeshData;
-use feather_gfx::Renderer;
+use feather_gfx::{Renderer, SHADOW_DIM};
 use feather_platform::winit;
 use feather_render::{InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass};
 use glam::{Mat4, Vec3, Vec4};
@@ -75,6 +75,14 @@ const FLY_SPEED: f32 = 14.0; // noclip movement speed
 // Frustum culling (§8). A fitted mesh lives in a unit cube (sphere radius ≤
 // √3/2 ≈ 0.87), scaled by the entity's Scale — a conservative cull radius.
 const CULL_SPHERE_K: f32 = 0.87;
+
+// Sun shadow frustum (§11). The ortho follows the player, so these are relative
+// to them: half-extent of the covered square, how far back along the sun the
+// light "eye" sits, and the ortho's depth range. A tighter radius means denser
+// shadow texels (sharper) but less coverage around the player.
+const SHADOW_RADIUS: f32 = 16.0;
+const SHADOW_BACK: f32 = 40.0;
+const SHADOW_DEPTH: f32 = 80.0;
 
 // ---- ECS data ----
 
@@ -736,17 +744,36 @@ impl ApplicationHandler for App {
                 let light_dir = self.light_dir;
                 let camera_pos = eye;
 
-                // Sun shadow matrix (§11): a fixed ortho covering the playable area
-                // around the origin, looking along the sun direction. The light is
-                // static, so this never moves — no shimmer, no texel-snap needed yet.
+                // Sun shadow matrix (§11): a tight ortho that **follows the player**,
+                // so shadows exist wherever you walk instead of only near the origin.
+                // It is centered on the player's body, not the view direction, so
+                // turning never disturbs the shadow map — only walking moves it, and
+                // the texel snap below keeps that from crawling.
                 let sun_dir = self.light_dir.truncate().normalize_or_zero();
-                let light_center = Vec3::ZERO;
-                let light_eye = light_center - sun_dir * 40.0;
+                let body = eye - Vec3::Y * EYE_HEIGHT;
+                // Rotation-only light basis (world -> light space), for the snap.
+                let light_basis = Mat4::look_at_rh(Vec3::ZERO, sun_dir, Vec3::Y);
+                // Texel-snap the ortho center to whole shadow-map texels — §11 calls
+                // this non-negotiable: without it the shadow edges crawl every frame
+                // as the center slides a fraction of a texel.
+                let world_per_texel = (2.0 * SHADOW_RADIUS) / SHADOW_DIM as f32;
+                let c = light_basis.transform_point3(body);
+                let snapped = Vec3::new(
+                    (c.x / world_per_texel).round() * world_per_texel,
+                    (c.y / world_per_texel).round() * world_per_texel,
+                    c.z, // depth along the light needs no snap (no edge crawl)
+                );
+                let light_center = light_basis.inverse().transform_point3(snapped);
+                let light_eye = light_center - sun_dir * SHADOW_BACK;
                 let light_view = Mat4::look_at_rh(light_eye, light_center, Vec3::Y);
-                // Tight ortho: the casters (orbs, boxes) sit within ~±10 of origin,
-                // so a ±16 half-extent keeps shadow-map texels dense; a wider
-                // frustum looks pixelated.
-                let light_proj = Mat4::orthographic_rh(-16.0, 16.0, -16.0, 16.0, 0.1, 80.0);
+                let light_proj = Mat4::orthographic_rh(
+                    -SHADOW_RADIUS,
+                    SHADOW_RADIUS,
+                    -SHADOW_RADIUS,
+                    SHADOW_RADIUS,
+                    0.1,
+                    SHADOW_DEPTH,
+                );
                 let light_view_proj = light_proj * light_view;
 
                 // Per-view frustum culling (§8): bounding sphere vs six planes, once

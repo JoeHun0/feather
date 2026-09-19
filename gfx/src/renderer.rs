@@ -26,7 +26,9 @@ const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 // Directional sun shadow map (§11): fixed-size D32 depth target, rendered
 // depth-only from the light and sampled (comparison) in the mesh fragment shader.
 // Independent of the window — never recreated on resize.
-const SHADOW_DIM: u32 = 4096;
+/// Square dimension of the sun shadow map. Public because the app needs it to
+/// texel-snap the light ortho (§11) — the snap grid is one shadow-map texel.
+pub const SHADOW_DIM: u32 = 4096;
 const SHADOW_FORMAT: vk::Format = DEPTH_FORMAT;
 // Single source of truth for the geometry pass's MSAA sample count (HDR + depth
 // targets and the mesh/sky pipelines all read it via `Renderer::samples`).

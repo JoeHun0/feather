@@ -359,16 +359,22 @@ size.
 
 **Landed (§26):** a **single, static directional shadow map** — the first step of
 the above, not the full CSM. One 4096² D32 depth target, engine-owned and fixed
-size, covering a tight ±16-unit ortho around the origin (dense texels — a wider
-frustum or lower res looks pixelated); a depth-only shadow pass (`shadow.vert`,
+size, covering a tight ±16-unit ortho that **follows the player** and is
+**texel-snapped** (the ortho center is quantized to whole shadow-map texels in
+light space, so edges don't crawl as you walk; the along-light depth needs no
+snap). Centering on the player rather than the view direction means turning the
+camera never disturbs the map. Dense texels matter — a wider frustum or lower
+resolution looks pixelated. A depth-only shadow pass (`shadow.vert`,
 front-face cull + slope-scaled
 `vkCmdSetDepthBias`) renders all instances from a **fixed** scene-covering ortho
 along the sun; the mesh fragment shader samples it with a comparison sampler and
 **3×3 PCF**, occluding the **direct sun term only** (ambient/IBL stays lit). The
 light-space matrix rides a per-frame globals UBO (set 0 binding 4) since it won't
-fit the 96 B push constant. **Pending:** cascade splits + selection/blend,
-texel-snapping, per-cascade cull + caster pancaking, the array atlas, normal-offset
-bias, PCSS, and a player-following (non-static) frustum.
+fit the 96 B push constant. Casters are frustum-culled against the light ortho
+(§8), which only bites once the moving frustum leaves them behind. **Pending:**
+cascade splits + selection/blend, caster pancaking, the array atlas,
+normal-offset bias, and PCSS. Being one cascade, shadows exist only within
+`SHADOW_RADIUS` of the player — distant geometry is unshadowed until cascades land.
 
 ## 12. Clustered lighting
 
@@ -837,7 +843,9 @@ still pending); mips + MikkTSpace vertex tangents; pipeline buckets (PBR BRDF +
 base-color/normal/MR textures landed); clustered lighting;
 precomputed cubemap/HDR IBL (analytic-sky IBL landed);
 shadows: **single static directional shadow map + 3×3 PCF landed** (§11) —
-CSM cascades / splits / texel-snap / atlas / player-follow still pending;
+player-following + texel-snapped, so shadows track you and don't crawl; CSM
+cascades / splits / atlas / pancaking still pending, so only a
+`SHADOW_RADIUS` box around the player is shadowed;
 bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
 bake pipeline (runtime glTF + multi-mesh registry landed); scene format /
 spawning / save; rapier beyond the player (kinematic FPS controller + static
