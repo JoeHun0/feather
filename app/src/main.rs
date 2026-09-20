@@ -610,6 +610,10 @@ struct App {
     player: Entity,
     input: Input,
     settings: GraphicsSettings,
+    /// Paused by Esc: the fixed step stops, the cursor is released for the menu,
+    /// and look/movement input is ignored. Rendering continues so the frozen
+    /// scene stays on screen behind the overlay (§14's UI focus flag).
+    paused: bool,
     noclip: bool,
     light_dir: Vec4,
     exposure: f32,
@@ -698,6 +702,7 @@ impl App {
             player,
             input: Input::default(),
             settings,
+            paused: false,
             noclip: false,
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             exposure: 1.0,
@@ -719,6 +724,38 @@ impl Drop for App {
 }
 
 impl App {
+    /// Grab and hide the cursor for mouselook, or release it for the menu.
+    /// Falls back to `Confined` where `Locked` is unsupported, as at startup.
+    fn set_cursor_captured(&self, captured: bool) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        if captured {
+            let _ = window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+        }
+        window.set_cursor_visible(!captured);
+    }
+
+    /// Enter or leave the pause menu.
+    fn set_paused(&mut self, paused: bool) {
+        if self.paused == paused {
+            return;
+        }
+        self.paused = paused;
+        self.set_cursor_captured(!paused);
+        if !paused {
+            // Resuming: the wall-clock gap while paused is not simulation time.
+            // Without this the accumulator sees the whole pause as one frame
+            // delta (clamped by MAX_FRAME_TIME, but still a visible jump).
+            self.last_frame = Instant::now();
+            self.input.jump = false;
+        }
+    }
+
     /// Cycle the shadow-quality preset and apply it live (§13).
     ///
     /// Resizing the shadow map frees an image an in-flight frame could still be
@@ -943,7 +980,7 @@ impl ApplicationHandler for App {
                         KeyCode::BracketRight if pressed => {
                             self.exposure = (self.exposure * 1.25).min(16.0);
                         }
-                        KeyCode::Escape if pressed => event_loop.exit(),
+                        KeyCode::Escape if pressed => self.set_paused(!self.paused),
                         _ => {}
                     }
                 }
@@ -953,8 +990,15 @@ impl ApplicationHandler for App {
                 let dt = (now - self.last_frame).as_secs_f32();
                 self.last_frame = now;
 
+                // Paused: swallow the accumulated look delta so releasing Esc
+                // does not snap the camera by the whole menu's worth of motion.
+                if self.paused {
+                    self.input.mouse_dx = 0.0;
+                    self.input.mouse_dy = 0.0;
+                }
+
                 // Look updates at render rate for responsive aim (§15).
-                let sens = 0.0025;
+                let sens = if self.paused { 0.0 } else { 0.0025 };
                 let look = {
                     let mut look = self
                         .world
@@ -1003,7 +1047,13 @@ impl ApplicationHandler for App {
                 // with the two sync systems (§15). The frame delta is clamped and
                 // MAX_STEPS caps catch-up per frame (spiral-of-death guard);
                 // leftover beyond the cap is dropped.
-                self.accumulator += dt.min(MAX_FRAME_TIME);
+                // Paused: no simulation advances, so prev == curr and the frozen
+                // scene keeps rendering behind the menu.
+                self.accumulator += if self.paused {
+                    0.0
+                } else {
+                    dt.min(MAX_FRAME_TIME)
+                };
                 let mut steps = 0;
                 while self.accumulator >= FIXED_DT && steps < MAX_STEPS {
                     self.schedule.run(&mut self.world);
