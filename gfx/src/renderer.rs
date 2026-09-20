@@ -26,9 +26,10 @@ const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 // Directional sun shadow map (§11): fixed-size D32 depth target, rendered
 // depth-only from the light and sampled (comparison) in the mesh fragment shader.
 // Independent of the window — never recreated on resize.
-/// Square dimension of the sun shadow map. Public because the app needs it to
-/// texel-snap the light ortho (§11) — the snap grid is one shadow-map texel.
-pub const SHADOW_DIM: u32 = 4096;
+/// Initial square dimension of the sun shadow map. The live value is a runtime
+/// setting (`Renderer::set_shadow_dim`) — shadow cost is dominated by texel
+/// count, so this is the main quality/perf knob (§13).
+const SHADOW_DIM: u32 = 4096;
 const SHADOW_FORMAT: vk::Format = DEPTH_FORMAT;
 // Single source of truth for the geometry pass's MSAA sample count (HDR + depth
 // targets and the mesh/sky pipelines all read it via `Renderer::samples`).
@@ -140,6 +141,7 @@ pub struct Renderer {
     // Directional sun shadow map (§11): fixed-size, never recreated on resize.
     shadow: Option<Image>,
     shadow_sampler: vk::Sampler, // comparison sampler (sampler2DShadow)
+    shadow_dim: u32,             // live shadow-map dimension (quality setting)
     surface_format: vk::SurfaceFormatKHR,
     window_extent: vk::Extent2D,
 
@@ -279,7 +281,7 @@ impl Renderer {
         // Sun shadow map (§11) + its comparison sampler. CLAMP_TO_BORDER with an
         // opaque-white border means samples outside the shadow frustum read the
         // max depth (1.0), i.e. "not in shadow" — geometry past the map stays lit.
-        let shadow = create_shadow(&allocator, &device);
+        let shadow = create_shadow(&allocator, &device, SHADOW_DIM);
         let shadow_sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -369,6 +371,7 @@ impl Renderer {
             hdr_sampler,
             shadow: Some(shadow),
             shadow_sampler,
+            shadow_dim: SHADOW_DIM,
             surface_format: sc.format,
             window_extent: sc.extent,
             command_pool,
@@ -490,9 +493,26 @@ impl Renderer {
     /// Square dimension of the shadow map (viewport for the shadow pass).
     pub fn shadow_extent(&self) -> vk::Extent2D {
         vk::Extent2D {
-            width: SHADOW_DIM,
-            height: SHADOW_DIM,
+            width: self.shadow_dim,
+            height: self.shadow_dim,
         }
+    }
+
+    /// Resize the sun shadow map — the shadow quality setting (§13). Shadow cost
+    /// tracks texel count, so this is the knob that actually moves that pass.
+    ///
+    /// **The caller must have waited for the device to go idle**: this frees the
+    /// image any in-flight frame could still be sampling, and whoever holds a
+    /// descriptor pointing at it (the mesh renderer) must re-point it afterwards
+    /// via the new `shadow_view`.
+    pub fn set_shadow_dim(&mut self, dim: u32) {
+        if dim == self.shadow_dim {
+            return;
+        }
+        self.shadow_dim = dim;
+        // Drops the old image (freeing view + allocation) before the new one.
+        self.shadow = None;
+        self.shadow = Some(create_shadow(self.allocator(), &self.device, dim));
     }
 
     /// Depth format of the shadow map (for the depth-only shadow pipeline).
@@ -832,8 +852,8 @@ impl Renderer {
         let shadow_img = self.shadow.as_ref().unwrap();
         let extent = self.window_extent;
         let shadow_extent = vk::Extent2D {
-            width: SHADOW_DIM,
-            height: SHADOW_DIM,
+            width: self.shadow_dim,
+            height: self.shadow_dim,
         };
         let color_range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -1404,13 +1424,13 @@ fn create_depth(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk:
 
 /// Fixed-size sun shadow map: a D32 depth image both rendered into (depth-only
 /// shadow pass) and sampled (comparison) by the mesh fragment shader (§11).
-fn create_shadow(allocator: &Arc<vk_mem::Allocator>, device: &Device) -> Image {
+fn create_shadow(allocator: &Arc<vk_mem::Allocator>, device: &Device, dim: u32) -> Image {
     let image_ci = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(SHADOW_FORMAT)
         .extent(vk::Extent3D {
-            width: SHADOW_DIM,
-            height: SHADOW_DIM,
+            width: dim,
+            height: dim,
             depth: 1,
         })
         .mip_levels(1)

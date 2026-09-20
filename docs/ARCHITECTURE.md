@@ -457,6 +457,28 @@ normal-offset bias, and PCSS. Being one cascade, shadows exist only within
    linear).
 5. **OETF/gamma** — let the `_SRGB` swapchain encode; do **not** also gamma in
    shader (no double-correction).
+**Landed (§26):** a **graphics settings layer** with a live **shadow-quality**
+preset (`F1` cycles; `GraphicsSettings` on `App`, deliberately not an ECS resource
+since §1 scopes the `World` to simulation). Measured on the orb demo at one window
+size, one run:
+
+| preset | shadow map | shadow pass | frame |
+|--------|-----------|-------------|-------|
+| Off    | 512² (no casters) | 0.01 ms | 1.10 ms |
+| Low    | 1024²     | 0.47 ms | 1.72 ms |
+| Medium | 2048²     | 0.86 ms | 1.97 ms |
+| High   | 4096²     | 2.00 ms | 2.97 ms |
+
+`Off` needs no shader branch: extract stops feeding casters, so the (small) map is
+merely cleared and every fragment compares against 1.0 as lit. Switching happens
+with the device idle — the shadow image is freed and the mesh renderer's
+descriptor re-pointed, which is unsound mid-flight.
+
+**Anti-aliasing is *not* selectable yet**, and deliberately has no setting: MSAA
+needs a resolve attachment before the tonemap pass could sample a multisampled
+target, and SMAA does not exist — an `aa` field today would do nothing. It joins
+the layer when there is a second mode to choose between.
+
 6. **Anti-alias** — **user-selectable**: SMAA on LDR (post-tonemap) or MSAA
    2×/4× on geometry (the geometry sample count is already a single knob —
    `Renderer::samples`, see §26). SMAA is the cheaper default on bandwidth-bound
@@ -893,8 +915,11 @@ milestones land.
   is *not* sufficient on its own: a multisampled HDR target needs a **resolve
   attachment** (multisample → single-sample) before the tonemap pass can sample
   it. SMAA (the §13 post-AA alternative) would slot in as tonemap → LDR → SMAA →
-  swapchain. AA mode is left user-selectable (§13/§25); this seam is what keeps
-  either choice small.
+  swapchain. AA mode is *intended* to be user-selectable (§13/§25) and the
+  settings layer now exists to hold it — but there is deliberately **no AA
+  setting yet**, because with neither MSAA nor SMAA implemented it would be a
+  control that changes nothing. The `samples()` seam plus that layer are what keep
+  adding it small.
 - **Geometry / assets (§6, §7)**: a **mesh registry**, a **material table**, and a
   full **base-color + normal + metallic-roughness texture** path now exist —
   several meshes in shared vertex/index buffers drawn by sorted per-mesh runs; a

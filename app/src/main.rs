@@ -32,7 +32,7 @@ use std::time::Instant;
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::ExecutorKind;
 use feather_assets::MeshData;
-use feather_gfx::{Renderer, SHADOW_DIM};
+use feather_gfx::Renderer;
 use feather_platform::winit;
 use feather_render::{InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass};
 use glam::{Mat4, Vec3, Vec4};
@@ -82,6 +82,76 @@ const FLY_SPEED: f32 = 14.0; // noclip movement speed
 const SHADOW_RADIUS: f32 = 16.0;
 const SHADOW_BACK: f32 = 40.0;
 const SHADOW_DEPTH: f32 = 80.0;
+
+/// Shadow-quality preset (§13). Shadow cost is dominated by shadow-map texel
+/// count, so resolution is the knob. `Off` additionally stops feeding casters,
+/// which leaves the map cleared so every fragment compares as lit — no shader
+/// branch needed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShadowQuality {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl ShadowQuality {
+    fn dim(self) -> u32 {
+        match self {
+            // Small but non-zero: the pass still clears, and a 512² clear is noise
+            // next to the ~0.6 ms a 4096² clear costs.
+            Self::Off => 512,
+            Self::Low => 1024,
+            Self::Medium => 2048,
+            Self::High => 4096,
+        }
+    }
+
+    fn casts(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Steps quality *down* and wraps, so repeatedly pressing the key reads as a
+    /// ramp (High → Medium → Low → Off → High). Cycling upward from the High
+    /// default would drop straight to Off on the first press, which looks like a
+    /// flicker rather than a setting.
+    fn next(self) -> Self {
+        match self {
+            Self::High => Self::Medium,
+            Self::Medium => Self::Low,
+            Self::Low => Self::Off,
+            Self::Off => Self::High,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low (1024)",
+            Self::Medium => "medium (2048)",
+            Self::High => "high (4096)",
+        }
+    }
+}
+
+/// Runtime graphics settings (§13). Render configuration, deliberately *not* an
+/// ECS resource — §1 scopes the `World` to simulation state.
+///
+/// Anti-aliasing will join this when there is a second AA mode to choose between:
+/// MSAA still needs a resolve attachment before the tonemap pass could sample a
+/// multisampled target, and SMAA does not exist yet, so an `aa` field today would
+/// be a setting that does nothing.
+struct GraphicsSettings {
+    shadows: ShadowQuality,
+}
+
+impl Default for GraphicsSettings {
+    fn default() -> Self {
+        Self {
+            shadows: ShadowQuality::High,
+        }
+    }
+}
 
 // ---- ECS data ----
 
@@ -528,6 +598,7 @@ struct App {
     /// its look angles the `Look` component (§1: the World owns simulation state).
     player: Entity,
     input: Input,
+    settings: GraphicsSettings,
     noclip: bool,
     light_dir: Vec4,
     exposure: f32,
@@ -614,6 +685,7 @@ impl App {
             schedule,
             player,
             input: Input::default(),
+            settings: GraphicsSettings::default(),
             noclip: false,
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             exposure: 1.0,
@@ -631,6 +703,25 @@ impl Drop for App {
         if let Some(r) = &self.renderer {
             r.wait_idle();
         }
+    }
+}
+
+impl App {
+    /// Cycle the shadow-quality preset and apply it live (§13).
+    ///
+    /// Resizing the shadow map frees an image an in-flight frame could still be
+    /// sampling, and invalidates the mesh renderer's descriptor pointing at it —
+    /// so both happen with the device idle, and the descriptor is re-pointed
+    /// immediately afterwards.
+    fn cycle_shadow_quality(&mut self) {
+        self.settings.shadows = self.settings.shadows.next();
+        let dim = self.settings.shadows.dim();
+        if let (Some(r), Some(m)) = (self.renderer.as_mut(), self.mesh.as_mut()) {
+            r.wait_idle();
+            r.set_shadow_dim(dim);
+            m.set_shadow_map(r.shadow_view(), r.shadow_sampler());
+        }
+        eprintln!("[quality] shadows: {}", self.settings.shadows.label());
     }
 }
 
@@ -815,6 +906,8 @@ impl ApplicationHandler for App {
                             self.input.up = pressed;
                         }
                         KeyCode::ControlLeft => self.input.down = pressed,
+                        // F1 cycles the shadow-quality preset (§13).
+                        KeyCode::F1 if pressed => self.cycle_shadow_quality(),
                         // V toggles noclip (free flight) for inspecting the scene.
                         KeyCode::KeyV if pressed => self.noclip = !self.noclip,
                         // Exposure control (showcases the HDR/tonemap pipeline).
@@ -921,7 +1014,7 @@ impl ApplicationHandler for App {
                 // Texel-snap the ortho center to whole shadow-map texels — §11 calls
                 // this non-negotiable: without it the shadow edges crawl every frame
                 // as the center slides a fraction of a texel.
-                let world_per_texel = (2.0 * SHADOW_RADIUS) / SHADOW_DIM as f32;
+                let world_per_texel = (2.0 * SHADOW_RADIUS) / self.settings.shadows.dim() as f32;
                 let c = light_basis.transform_point3(body);
                 let snapped = Vec3::new(
                     (c.x / world_per_texel).round() * world_per_texel,
@@ -952,6 +1045,9 @@ impl ApplicationHandler for App {
                 // set (main pass) and/or the light-visible set (shadow pass). This is
                 // the sim<->render seam; interpolation lives here per §4. Static level
                 // pieces lack Velocity/Spin so `integrate` skips them; prev == curr.
+                // `Off` simply stops feeding casters: the map is then only cleared,
+                // so every fragment compares against 1.0 and reads as lit.
+                let casts = self.settings.shadows.casts();
                 let fits = &self.fits;
                 let spheres = &self.mesh_spheres;
                 let mesh_max = fits.len().saturating_sub(1);
@@ -981,7 +1077,7 @@ impl ApplicationHandler for App {
                     if camera_frustum.contains_sphere(c, radius) {
                         main_items.push(item);
                     }
-                    if no_cast.is_none() && light_frustum.contains_sphere(c, radius) {
+                    if casts && no_cast.is_none() && light_frustum.contains_sphere(c, radius) {
                         shadow_items.push(item);
                     }
                 }
@@ -1000,7 +1096,7 @@ impl ApplicationHandler for App {
                     if camera_frustum.contains_sphere(c, radius) {
                         main_items.push(item);
                     }
-                    if no_cast.is_none() && light_frustum.contains_sphere(c, radius) {
+                    if casts && no_cast.is_none() && light_frustum.contains_sphere(c, radius) {
                         shadow_items.push(item);
                     }
                 }

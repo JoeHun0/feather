@@ -643,6 +643,28 @@ impl MeshRenderer {
         (renderer, ids)
     }
 
+    /// Re-point every frame's shadow-map descriptor (binding 3) at a new view —
+    /// used after the shadow map is resized by the quality setting (§13).
+    ///
+    /// **The caller must have waited for the device to go idle.** Unlike
+    /// `TonemapPass::update`, which refreshes one frame's descriptor after that
+    /// frame's fence, this rewrites *all* of them at once; that is only sound
+    /// when nothing is in flight. It is a rare, settings-change-only path.
+    pub fn set_shadow_map(&mut self, view: vk::ImageView, sampler: vk::Sampler) {
+        for &set in &self.sets {
+            let info = [vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(view)
+                .sampler(sampler)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info);
+            unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+        }
+    }
+
     /// CPU-only per-frame prep (call once, before `draw_frame`): sort each culled
     /// list by mesh, stage them into one instance array as `[main | shadow]`,
     /// record each pass's per-mesh runs, and stash this frame's globals (light
