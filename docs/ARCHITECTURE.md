@@ -1,7 +1,9 @@
 # Feather — Engine Architecture
 
-Status: in active implementation — a textured-PBR forward renderer with IBL is
-up; see §26 for exactly what's built vs. still designed.
+Status: in active implementation — a textured-PBR forward renderer with IBL,
+sun shadows, a depth prepass, per-view frustum culling, MSAA/FXAA, GPU per-pass
+timing, a rapier FPS controller in the ECS, glTF scene loading and a minimal UI
+is up; see §26 for exactly what's built vs. still designed.
 Scope: a from-scratch Rust + Vulkan engine for a minimalist open-world FPS.
 Visual floor is a 2010-era look; the baseline actually targets ~2016 image
 quality where it costs little. Long-term goal: an original Zone-flavored
@@ -750,12 +752,16 @@ app        thin binary wiring it together
    (validates buffers, descriptors, depth).
 2. ECS-driven scene: extract stage + instanced draw of many meshes from `World`.
 3. Lighting: CSM sun + GTAO + a few clustered lights + IBL ambient (the "better
-   than 2010" look lands here).
+   than 2010" look lands here). (Landed: PBR + textures, analytic-sky IBL, and a
+   single player-following shadow map with 3×3 PCF. Remaining: CSM cascades,
+   GTAO, clustered lights, cubemap IBL.)
 4. Physics + FPS controller (rapier), fixed timestep + interpolation → walkable.
    (Landed: fixed timestep + interpolation, the rapier kinematic FPS controller
    against static colliders, and the ECS↔rapier sync systems with the player as an
    ECS entity. Remaining: dynamic bodies — see §26.)
 5. Bounded arena content, chunked culling, bindless materials, PBR bake path.
+   (Landed: per-view frustum culling, bindless-lite materials, and glTF scene
+   loading. Remaining: chunked/broad-phase culling, LOD, and the offline bake.)
 6. Deferred-by-design items as needed: streaming, stage pipelining, GPU-driven
    indirect culling, SSR/volumetrics, probes.
 
@@ -1018,9 +1024,11 @@ spawn as static entities; the prefab registry and `extras` gameplay data are
 pending) / save; rapier beyond the player (kinematic FPS controller, static
 colliders and the ECS↔rapier sync systems landed — dynamic bodies and collision
 layers pending);
-skinning; UI/HUD; audio; debug/profiling tooling (per-pass GPU timestamp timing
+skinning; UI/HUD (§19's lightweight quad/text renderer + the Esc pause menu
+landed — egui dev UI, SDF text, lower-case/punctuation and mouse hit-testing
+pending); audio; debug/profiling tooling (per-pass GPU timestamp timing
 landed — stderr log + `Renderer::gpu_times`; Tracy / RenderDoc / egui overlay and
 CPU-side zones pending); GPU-driven culling; streaming; stage pipelining;
-**anti-aliasing**
-(the design assumes MSAA on geometry per §3/§10 and SMAA post per §13, but the
-renderer is single-sample everywhere — no MSAA, no resolve, no post-AA yet).
+anti-aliasing (**MSAA** `--msaa N` at startup and **FXAA** on `F2` both landed,
+§13 — **SMAA** is still absent, as are live MSAA switching and a tonemapped
+resolve to stop bright HDR edges sparkling).
