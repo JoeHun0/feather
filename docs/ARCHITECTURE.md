@@ -686,15 +686,42 @@ scaled glyphs stay crisp and cannot bleed into their neighbours. Colours are
 specified **linear**, since the `_SRGB` swapchain encodes on store and Vulkan
 blends `_SRGB` attachments in linear space.
 
-Its first consumer is the **Esc pause menu** (CONTINUE / OPTIONS / EXIT,
-arrow keys + Enter). `OPTIONS` is deliberately inert — the knobs it would hold
-are on F1/F2 until there is a real options screen. Pausing stops the fixed step,
-releases the cursor and ignores mouselook (§14's focus flag), while rendering
-continues so the frozen scene shows behind the overlay.
+Its first consumer is the **Esc pause menu**, now a small screen tree: root
+(CONTINUE / OPTIONS / EXIT) → OPTIONS (GRAPHICS / SOUND / GAMEPLAY) → each
+submenu. **GRAPHICS carries real settings** — shadow quality cycles and FXAA
+toggles live, both sharing the exact code path F1/F2 use, so the two cannot
+drift. MSAA is shown with its current sample count and a RESTART note but is
+**inert**: the count is baked into every geometry pipeline, so changing it live
+means rebuilding them all. Showing the value honestly beats offering a control
+that silently does nothing. SOUND and GAMEPLAY are placeholder rows — §20 audio
+is unstarted and there are no gameplay settings to bind to yet.
+
+Navigation state lives in a `Menu` struct that depends on **neither the renderer
+nor the event loop**: it mutates settings and returns a `MenuOutcome` the app
+acts on. That keeps the whole thing unit-testable without a GPU, which is how
+the screen tree, wrap-around, BACK-restores-selection and the inert rows are all
+covered. Esc walks back one screen at a time and only unpauses from the root.
+
+Row labels use **A-Z, 0-9 and spaces only** — the 5x7 font renders anything else
+blank, so a colon would silently become whitespace; a test guards this.
+
+Pausing stops the fixed step, releases the cursor and ignores mouselook (§14's
+focus flag), while rendering continues so the frozen scene shows behind the
+overlay.
+
+The menu is driven by **keyboard and mouse**: arrows/Enter, or hover to select
+and left-click to activate. Both share one `menu_index` — hover moves the same
+selection the arrows do, so the two are interchangeable mid-interaction rather
+than fighting over two notions of "current". Entry rectangles come from a single
+pure function of the framebuffer size that the renderer draws and the hit-test
+queries, so the visible highlight and the clickable target cannot drift apart;
+being pure, it is also unit-tested without a GPU. A click off the entries does
+nothing, and hovering off them leaves the selection alone so Enter always has a
+target.
 
 Still pending: **egui** for the dev UI (this is the *game* HUD path, not a
-replacement for it), SDF/MSDF text for scale-independent glyphs, lower-case and
-punctuation, and mouse hit-testing — navigation is keyboard-only.
+replacement for it), SDF/MSDF text for scale-independent glyphs, and lower-case
+and punctuation.
 
 ## 20. Audio
 
@@ -1051,8 +1078,10 @@ pending) / save; rapier beyond the player (kinematic FPS controller, static
 colliders and the ECS↔rapier sync systems landed — dynamic bodies and collision
 layers pending);
 skinning; UI/HUD (§19's lightweight quad/text renderer + the Esc pause menu
-landed — egui dev UI, SDF text, lower-case/punctuation and mouse hit-testing
-pending); audio; debug/profiling tooling (per-pass GPU timestamp timing
+landed, with keyboard *and* mouse navigation, an OPTIONS screen tree, and live
+shadow-quality/FXAA controls under GRAPHICS — MSAA is shown there but stays
+restart-only until pipelines can be rebuilt live; egui dev UI, SDF text and
+lower-case/punctuation pending); audio; debug/profiling tooling (per-pass GPU timestamp timing
 landed — stderr log + `Renderer::gpu_times`; Tracy / RenderDoc / egui overlay and
 CPU-side zones pending); GPU-driven culling; streaming; stage pipelining;
 anti-aliasing (**MSAA** `--msaa N` at startup and **FXAA** on `F2` both landed,

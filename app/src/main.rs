@@ -43,7 +43,7 @@ use rapier3d::prelude::{
     QueryFilter, RigidBodyBuilder, RigidBodyHandle, RigidBodySet, Vector,
 };
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
@@ -87,7 +87,7 @@ const SHADOW_DEPTH: f32 = 80.0;
 /// count, so resolution is the knob. `Off` additionally stops feeding casters,
 /// which leaves the map cleared so every fragment compares as lit — no shader
 /// branch needed.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ShadowQuality {
     Off,
     Low,
@@ -132,6 +132,16 @@ impl ShadowQuality {
             Self::High => "high (4096)",
         }
     }
+
+    /// Menu form: the UI font is A-Z/0-9 only, so no lower case or brackets.
+    fn menu_label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Low => "LOW",
+            Self::Medium => "MEDIUM",
+            Self::High => "HIGH",
+        }
+    }
 }
 
 /// Runtime graphics settings (§13). Render configuration, deliberately *not* an
@@ -163,26 +173,263 @@ impl Default for GraphicsSettings {
     }
 }
 
-/// Pause-menu entries. `Options` is intentionally inert for now — the settings
-/// it would expose (shadow quality, FXAA) are on F1/F2 until there is a real
-/// options screen to move them into.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MenuItem {
-    Continue,
+/// One screen of the pause menu (§19). Screens form a tree rooted at `Root`;
+/// `Menu` walks it with an explicit stack.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuScreen {
+    Root,
     Options,
-    Exit,
+    Graphics,
+    Sound,
+    Gameplay,
 }
 
-impl MenuItem {
-    const ALL: [MenuItem; 3] = [MenuItem::Continue, MenuItem::Options, MenuItem::Exit];
-
-    fn label(self) -> &'static str {
+impl MenuScreen {
+    fn title(self) -> &'static str {
         match self {
-            MenuItem::Continue => "CONTINUE",
-            MenuItem::Options => "OPTIONS",
-            MenuItem::Exit => "EXIT",
+            Self::Root => "PAUSED",
+            Self::Options => "OPTIONS",
+            Self::Graphics => "GRAPHICS",
+            Self::Sound => "SOUND",
+            Self::Gameplay => "GAMEPLAY",
         }
     }
+}
+
+/// What activating a row does. `Inert` is a row that exists to *show* something
+/// (or to mark a planned setting) but cannot be changed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuAction {
+    Resume,
+    Enter(MenuScreen),
+    Back,
+    Quit,
+    ToggleFxaa,
+    CycleShadows,
+    Inert,
+}
+
+/// A single drawn row. Labels are built fresh from the live settings each time,
+/// so a value shown here cannot go stale — pressing F2 with the graphics screen
+/// open updates the row immediately.
+///
+/// Labels use **A-Z, 0-9 and spaces only**: the 5x7 UI font covers exactly that
+/// and renders anything else as a blank (`render/src/ui.rs:68`), so a colon or
+/// a bracket would silently turn into whitespace.
+struct MenuRow {
+    label: String,
+    action: MenuAction,
+}
+
+impl MenuRow {
+    fn new(label: impl Into<String>, action: MenuAction) -> Self {
+        Self {
+            label: label.into(),
+            action,
+        }
+    }
+
+    /// Inert rows draw dimmer. They stay *selectable* so arrow navigation does
+    /// not silently skip the information they carry.
+    fn enabled(&self) -> bool {
+        !matches!(self.action, MenuAction::Inert)
+    }
+}
+
+/// What the caller must do after the menu handled an input. Returning this
+/// rather than acting directly is what keeps `Menu` free of any dependency on
+/// the renderer or the event loop — and therefore unit-testable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuOutcome {
+    Stay,
+    Resume,
+    Quit,
+    ApplyShadows,
+    ApplyFxaa,
+}
+
+/// The rows of one screen, given the settings they display.
+fn screen_rows(screen: MenuScreen, s: &GraphicsSettings) -> Vec<MenuRow> {
+    match screen {
+        MenuScreen::Root => vec![
+            MenuRow::new("CONTINUE", MenuAction::Resume),
+            MenuRow::new("OPTIONS", MenuAction::Enter(MenuScreen::Options)),
+            MenuRow::new("EXIT", MenuAction::Quit),
+        ],
+        MenuScreen::Options => vec![
+            MenuRow::new("GRAPHICS", MenuAction::Enter(MenuScreen::Graphics)),
+            MenuRow::new("SOUND", MenuAction::Enter(MenuScreen::Sound)),
+            MenuRow::new("GAMEPLAY", MenuAction::Enter(MenuScreen::Gameplay)),
+            MenuRow::new("BACK", MenuAction::Back),
+        ],
+        MenuScreen::Graphics => vec![
+            MenuRow::new(
+                format!("SHADOWS  {}", s.shadows.menu_label()),
+                MenuAction::CycleShadows,
+            ),
+            MenuRow::new(
+                format!("FXAA  {}", if s.fxaa { "ON" } else { "OFF" }),
+                MenuAction::ToggleFxaa,
+            ),
+            // Inert on purpose: the sample count is baked into every geometry
+            // pipeline, so changing it live means rebuilding them all (§26).
+            // Showing the value with a RESTART note is honest; offering a
+            // control that silently does nothing is not.
+            MenuRow::new(format!("MSAA  {}X  RESTART", s.msaa), MenuAction::Inert),
+            MenuRow::new("BACK", MenuAction::Back),
+        ],
+        // Placeholders: §20 audio is unstarted, and there are no gameplay
+        // settings to bind to yet.
+        MenuScreen::Sound => vec![
+            MenuRow::new("MASTER VOLUME", MenuAction::Inert),
+            MenuRow::new("MUSIC", MenuAction::Inert),
+            MenuRow::new("SFX", MenuAction::Inert),
+            MenuRow::new("BACK", MenuAction::Back),
+        ],
+        MenuScreen::Gameplay => vec![
+            MenuRow::new("SENSITIVITY", MenuAction::Inert),
+            MenuRow::new("FIELD OF VIEW", MenuAction::Inert),
+            MenuRow::new("INVERT Y", MenuAction::Inert),
+            MenuRow::new("BACK", MenuAction::Back),
+        ],
+    }
+}
+
+/// Pause-menu navigation state. Deliberately knows nothing about the renderer
+/// or the window: it mutates `GraphicsSettings` and reports a `MenuOutcome`.
+struct Menu {
+    screen: MenuScreen,
+    index: usize,
+    /// `(screen, index)` of each ancestor, so BACK restores the row you
+    /// descended from instead of snapping to the top.
+    stack: Vec<(MenuScreen, usize)>,
+}
+
+impl Menu {
+    fn new() -> Self {
+        Self {
+            screen: MenuScreen::Root,
+            index: 0,
+            stack: Vec::new(),
+        }
+    }
+
+    /// Back to the top level. Called on unpause so re-opening always starts at
+    /// the root rather than wherever you happened to leave off.
+    fn reset(&mut self) {
+        self.screen = MenuScreen::Root;
+        self.index = 0;
+        self.stack.clear();
+    }
+
+    fn rows(&self, s: &GraphicsSettings) -> Vec<MenuRow> {
+        screen_rows(self.screen, s)
+    }
+
+    /// Move the selection, wrapping at both ends.
+    fn move_by(&mut self, delta: isize, s: &GraphicsSettings) {
+        let n = self.rows(s).len() as isize;
+        if n > 0 {
+            self.index = (self.index as isize + delta).rem_euclid(n) as usize;
+        }
+    }
+
+    /// Point the selection at `index` if it is a real row (used by the mouse).
+    fn hover(&mut self, index: usize, s: &GraphicsSettings) {
+        if index < self.rows(s).len() {
+            self.index = index;
+        }
+    }
+
+    fn descend(&mut self, screen: MenuScreen) {
+        self.stack.push((self.screen, self.index));
+        self.screen = screen;
+        self.index = 0;
+    }
+
+    /// Up one level, or `Resume` when already at the root — which is what makes
+    /// Esc walk back out of the menu one screen at a time.
+    fn back(&mut self) -> MenuOutcome {
+        match self.stack.pop() {
+            Some((screen, index)) => {
+                self.screen = screen;
+                self.index = index;
+                MenuOutcome::Stay
+            }
+            None => MenuOutcome::Resume,
+        }
+    }
+
+    fn activate(&mut self, s: &mut GraphicsSettings) -> MenuOutcome {
+        let action = match self.rows(s).get(self.index) {
+            Some(row) => row.action,
+            None => return MenuOutcome::Stay,
+        };
+        match action {
+            MenuAction::Resume => MenuOutcome::Resume,
+            MenuAction::Quit => MenuOutcome::Quit,
+            MenuAction::Enter(screen) => {
+                self.descend(screen);
+                MenuOutcome::Stay
+            }
+            MenuAction::Back => self.back(),
+            MenuAction::ToggleFxaa => {
+                s.fxaa = !s.fxaa;
+                MenuOutcome::ApplyFxaa
+            }
+            MenuAction::CycleShadows => {
+                s.shadows = s.shadows.next();
+                MenuOutcome::ApplyShadows
+            }
+            MenuAction::Inert => MenuOutcome::Stay,
+        }
+    }
+}
+
+/// Font pixel size for the menu at a given framebuffer height. One place, so
+/// the layout and the renderer cannot disagree about how big the text is.
+fn menu_font_px(h: f32) -> f32 {
+    (h / 220.0).max(2.0).floor()
+}
+
+/// Screen-space rect `(x, y, w, h)` of each row, in **physical** pixels.
+///
+/// Single source of truth: the redraw handler draws the highlight bar from
+/// these and the mouse hit-tests against them, so the visible target and the
+/// clickable target can never drift apart. This is the padded bar rather than
+/// the tight text box, which also makes a comfortably larger click target than
+/// the glyphs alone.
+///
+/// The block is centred vertically rather than pinned to a fixed fraction,
+/// because row counts now vary per screen — that keeps every screen balanced
+/// and keeps a four-row screen on-screen at small window sizes.
+fn menu_item_rects(w: f32, h: f32, rows: &[MenuRow]) -> Vec<(f32, f32, f32, f32)> {
+    let px = menu_font_px(h);
+    let line = UiPass::text_height(px) * 2.2;
+    let pad = px * 4.0;
+    let top = (h - line * rows.len() as f32) * 0.5;
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let tw = UiPass::text_width(&row.label, px);
+            let x = (w - tw) * 0.5;
+            let y = top + line * i as f32;
+            (
+                x - pad,
+                y - pad * 0.5,
+                tw + pad * 2.0,
+                UiPass::text_height(px) + pad,
+            )
+        })
+        .collect()
+}
+
+/// Index of the row under `(cx, cy)`, if any. Physical pixels, matching both
+/// `Window::inner_size` and winit's `CursorMoved` position.
+fn menu_hit(w: f32, h: f32, rows: &[MenuRow], cx: f32, cy: f32) -> Option<usize> {
+    menu_item_rects(w, h, rows)
+        .iter()
+        .position(|&(x, y, rw, rh)| cx >= x && cx < x + rw && cy >= y && cy < y + rh)
 }
 
 // ---- ECS data ----
@@ -637,8 +884,12 @@ struct App {
     /// and look/movement input is ignored. Rendering continues so the frozen
     /// scene stays on screen behind the overlay (§14's UI focus flag).
     paused: bool,
-    /// Index into `MenuItem::ALL` while paused.
-    menu_index: usize,
+    /// Pause-menu navigation state (screen + selection + ancestor stack).
+    menu: Menu,
+    /// Last known cursor position in physical pixels, for menu hit-testing.
+    /// `None` until the pointer first moves — winit reports no position before
+    /// that, so there is genuinely nothing to hit-test against.
+    cursor: Option<(f32, f32)>,
     noclip: bool,
     light_dir: Vec4,
     exposure: f32,
@@ -729,7 +980,8 @@ impl App {
             input: Input::default(),
             settings,
             paused: false,
-            menu_index: 0,
+            menu: Menu::new(),
+            cursor: None,
             noclip: false,
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             exposure: 1.0,
@@ -775,6 +1027,9 @@ impl App {
         self.paused = paused;
         self.set_cursor_captured(!paused);
         if !paused {
+            // Re-opening should always start at the root, not wherever the
+            // player happened to leave the menu.
+            self.menu.reset();
             // Resuming: the wall-clock gap while paused is not simulation time.
             // Without this the accumulator sees the whole pause as one frame
             // delta (clamped by MAX_FRAME_TIME, but still a visible jump).
@@ -791,6 +1046,36 @@ impl App {
     /// immediately afterwards.
     fn cycle_shadow_quality(&mut self) {
         self.settings.shadows = self.settings.shadows.next();
+        self.apply_shadow_quality();
+    }
+
+    /// Push `settings.fxaa` into the renderer. Cheap: just a flag, since the
+    /// LDR intermediate is always allocated.
+    fn apply_fxaa(&mut self) {
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_fxaa(self.settings.fxaa);
+        }
+        eprintln!(
+            "[quality] fxaa: {}",
+            if self.settings.fxaa { "on" } else { "off" }
+        );
+    }
+
+    /// Act on what the menu decided. Keeps the renderer and event loop out of
+    /// `Menu` itself, so its logic stays pure and testable.
+    fn handle_menu_outcome(&mut self, outcome: MenuOutcome, event_loop: &ActiveEventLoop) {
+        match outcome {
+            MenuOutcome::Stay => {}
+            MenuOutcome::Resume => self.set_paused(false),
+            MenuOutcome::Quit => event_loop.exit(),
+            MenuOutcome::ApplyShadows => self.apply_shadow_quality(),
+            MenuOutcome::ApplyFxaa => self.apply_fxaa(),
+        }
+    }
+
+    /// Apply whatever `settings.shadows` currently is. Separate from cycling so
+    /// F1 and the menu row drive the same path and cannot drift.
+    fn apply_shadow_quality(&mut self) {
         let dim = self.settings.shadows.dim();
         if let (Some(r), Some(m)) = (self.renderer.as_mut(), self.mesh.as_mut()) {
             r.wait_idle();
@@ -992,13 +1277,7 @@ impl ApplicationHandler for App {
                         // F2 toggles FXAA (§13).
                         KeyCode::F2 if pressed => {
                             self.settings.fxaa = !self.settings.fxaa;
-                            if let Some(r) = self.renderer.as_mut() {
-                                r.set_fxaa(self.settings.fxaa);
-                            }
-                            eprintln!(
-                                "[quality] fxaa: {}",
-                                if self.settings.fxaa { "on" } else { "off" }
-                            );
+                            self.apply_fxaa();
                         }
                         // V toggles noclip (free flight) for inspecting the scene.
                         KeyCode::KeyV if pressed => self.noclip = !self.noclip,
@@ -1009,23 +1288,70 @@ impl ApplicationHandler for App {
                         KeyCode::BracketRight if pressed => {
                             self.exposure = (self.exposure * 1.25).min(16.0);
                         }
-                        KeyCode::Escape if pressed => self.set_paused(!self.paused),
-                        KeyCode::ArrowUp if pressed && self.paused => {
-                            self.menu_index =
-                                (self.menu_index + MenuItem::ALL.len() - 1) % MenuItem::ALL.len();
-                        }
-                        KeyCode::ArrowDown if pressed && self.paused => {
-                            self.menu_index = (self.menu_index + 1) % MenuItem::ALL.len();
-                        }
-                        KeyCode::Enter if pressed && self.paused => {
-                            match MenuItem::ALL[self.menu_index] {
-                                MenuItem::Continue => self.set_paused(false),
-                                // Placeholder: the knobs live on F1/F2 for now.
-                                MenuItem::Options => eprintln!("[menu] options: not implemented"),
-                                MenuItem::Exit => event_loop.exit(),
+                        // Esc walks back out one screen at a time, and only
+                        // unpauses from the root — so leaving a submenu does not
+                        // dump you straight into the game.
+                        KeyCode::Escape if pressed => {
+                            if self.paused {
+                                let outcome = self.menu.back();
+                                self.handle_menu_outcome(outcome, event_loop);
+                            } else {
+                                self.set_paused(true);
                             }
                         }
+                        KeyCode::ArrowUp if pressed && self.paused => {
+                            self.menu.move_by(-1, &self.settings);
+                        }
+                        KeyCode::ArrowDown if pressed && self.paused => {
+                            self.menu.move_by(1, &self.settings);
+                        }
+                        KeyCode::Enter if pressed && self.paused => {
+                            let outcome = self.menu.activate(&mut self.settings);
+                            self.handle_menu_outcome(outcome, event_loop);
+                        }
                         _ => {}
+                    }
+                }
+            }
+            // Mouse in the pause menu (§19). Only while paused: mouselook is a
+            // DeviceEvent on a separate path, so gameplay is untouched.
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = Some((position.x as f32, position.y as f32));
+                if self.paused {
+                    if let Some(window) = self.window.as_ref() {
+                        let size = window.inner_size();
+                        // Hover drives the *existing* selection rather than a
+                        // second highlight state, so keyboard and mouse stay
+                        // interchangeable mid-interaction. Off the entries the
+                        // selection is left alone, so something is always
+                        // selected for Enter.
+                        let rows = self.menu.rows(&self.settings);
+                        if let Some(i) = menu_hit(
+                            size.width as f32,
+                            size.height as f32,
+                            &rows,
+                            position.x as f32,
+                            position.y as f32,
+                        ) {
+                            self.menu.hover(i, &self.settings);
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if self.paused && button == MouseButton::Left && state == ElementState::Pressed {
+                    if let (Some(window), Some((cx, cy))) = (self.window.as_ref(), self.cursor) {
+                        let size = window.inner_size();
+                        // Activate only when actually over an entry: a stray
+                        // click on the dimmed backdrop should do nothing.
+                        let rows = self.menu.rows(&self.settings);
+                        if let Some(i) =
+                            menu_hit(size.width as f32, size.height as f32, &rows, cx, cy)
+                        {
+                            self.menu.hover(i, &self.settings);
+                            let outcome = self.menu.activate(&mut self.settings);
+                            self.handle_menu_outcome(outcome, event_loop);
+                        }
                     }
                 }
             }
@@ -1232,10 +1558,11 @@ impl ApplicationHandler for App {
                         // into the _SRGB swapchain, which encodes on store.
                         ui.rect(0.0, 0.0, w, h, [0.0, 0.0, 0.0, 0.55]);
 
-                        let px = (h / 220.0).max(2.0).floor(); // font pixel size
-                        let line = UiPass::text_height(px) * 2.2;
+                        let px = menu_font_px(h);
                         let title_px = px * 1.6;
-                        let title = "PAUSED";
+                        // Title names the current screen, so a submenu is
+                        // self-identifying.
+                        let title = self.menu.screen.title();
                         ui.text(
                             (w - UiPass::text_width(title, title_px)) * 0.5,
                             h * 0.28,
@@ -1244,30 +1571,29 @@ impl ApplicationHandler for App {
                             title,
                         );
 
-                        let top = h * 0.44;
-                        for (i, item) in MenuItem::ALL.iter().enumerate() {
-                            let selected = i == self.menu_index;
-                            let label = item.label();
-                            let tw = UiPass::text_width(label, px);
-                            let x = (w - tw) * 0.5;
-                            let y = top + line * i as f32;
+                        // Rows and rects come from the same functions the mouse
+                        // hit-tests against, so highlight and click target match.
+                        let rows = self.menu.rows(&self.settings);
+                        let rects = menu_item_rects(w, h, &rows);
+                        let pad = px * 4.0;
+                        for (i, row) in rows.iter().enumerate() {
+                            let selected = i == self.menu.index;
+                            let (rx, ry, rw, rh) = rects[i];
                             if selected {
                                 // Highlight bar behind the current entry.
-                                let pad = px * 4.0;
-                                ui.rect(
-                                    x - pad,
-                                    y - pad * 0.5,
-                                    tw + pad * 2.0,
-                                    UiPass::text_height(px) + pad,
-                                    [0.25, 0.45, 0.85, 0.85],
-                                );
+                                ui.rect(rx, ry, rw, rh, [0.25, 0.45, 0.85, 0.85]);
                             }
-                            let color = if selected {
-                                [1.0, 1.0, 1.0, 1.0]
-                            } else {
-                                [0.65, 0.65, 0.65, 1.0]
+                            // Inert rows read dimmer: they are information or a
+                            // planned setting, not something you can change.
+                            let color = match (selected, row.enabled()) {
+                                (true, true) => [1.0, 1.0, 1.0, 1.0],
+                                (true, false) => [0.72, 0.72, 0.72, 1.0],
+                                (false, true) => [0.65, 0.65, 0.65, 1.0],
+                                (false, false) => [0.40, 0.40, 0.40, 1.0],
                             };
-                            ui.text(x, y, px, color, label);
+                            // Text sits inset from the bar by the same padding
+                            // the rect was grown by.
+                            ui.text(rx + pad, ry + pad * 0.5, px, color, &row.label);
                         }
                     }
                 }
@@ -1676,5 +2002,232 @@ mod tests {
         run(&mut p, &mut ph, 120, Vec3::ZERO);
         assert!(p.on_ground);
         assert!((p.pos.y - GROUND_Y).abs() < 0.05, "y = {}", p.pos.y);
+    }
+
+    // ---- Pause menu: layout, hit-testing and navigation (§19) ----
+    //
+    // `Menu` deliberately depends on neither the renderer nor the event loop,
+    // and the layout is a pure function of the framebuffer size, so all of this
+    // runs without a GPU or a window.
+
+    /// A few sizes worth covering: a typical window, a wide one, and one small
+    /// enough that `menu_font_px` clamps to its 2.0 floor.
+    const SIZES: [(f32, f32); 3] = [(1280.0, 720.0), (2560.0, 1440.0), (320.0, 200.0)];
+
+    const SCREENS: [MenuScreen; 5] = [
+        MenuScreen::Root,
+        MenuScreen::Options,
+        MenuScreen::Graphics,
+        MenuScreen::Sound,
+        MenuScreen::Gameplay,
+    ];
+
+    #[test]
+    fn menu_rect_centres_hit_their_own_row() {
+        let s = GraphicsSettings::default();
+        for screen in SCREENS {
+            let rows = screen_rows(screen, &s);
+            assert!(!rows.is_empty(), "{screen:?} has no rows");
+            for (w, h) in SIZES {
+                for (i, &(x, y, rw, rh)) in menu_item_rects(w, h, &rows).iter().enumerate() {
+                    let (cx, cy) = (x + rw * 0.5, y + rh * 0.5);
+                    assert_eq!(
+                        menu_hit(w, h, &rows, cx, cy),
+                        Some(i),
+                        "{screen:?} row {i} at {w}x{h} did not hit itself"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn menu_rows_are_ordered_disjoint_and_onscreen() {
+        let s = GraphicsSettings::default();
+        for screen in SCREENS {
+            let rows = screen_rows(screen, &s);
+            for (w, h) in SIZES {
+                let rects = menu_item_rects(w, h, &rows);
+                for pair in rects.windows(2) {
+                    let (_, y0, _, h0) = pair[0];
+                    let (_, y1, _, _) = pair[1];
+                    assert!(y1 > y0, "{screen:?} rows out of order at {w}x{h}");
+                    assert!(y1 >= y0 + h0, "{screen:?} rows overlap at {w}x{h}");
+                }
+                // Vertical centring must keep even the longest screen on screen.
+                for (x, y, rw, rh) in rects {
+                    assert!(
+                        y >= 0.0 && y + rh <= h,
+                        "{screen:?} row off screen at {w}x{h}"
+                    );
+                    assert!(
+                        ((x + rw * 0.5) - w * 0.5).abs() < 0.001,
+                        "{screen:?} not centred"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn menu_misses_gaps_and_backdrop() {
+        let s = GraphicsSettings::default();
+        let rows = screen_rows(MenuScreen::Root, &s);
+        let (w, h) = (1280.0, 720.0);
+        let rects = menu_item_rects(w, h, &rows);
+        let gap_y = (rects[0].1 + rects[0].3 + rects[1].1) * 0.5;
+        assert_eq!(menu_hit(w, h, &rows, w * 0.5, gap_y), None, "gap hit");
+        assert_eq!(menu_hit(w, h, &rows, w * 0.5, 0.0), None, "top hit");
+        assert_eq!(menu_hit(w, h, &rows, w * 0.5, h - 1.0), None, "bottom hit");
+        assert_eq!(
+            menu_hit(w, h, &rows, 0.0, rects[0].1 + 1.0),
+            None,
+            "left hit"
+        );
+        assert_eq!(
+            menu_hit(w, h, &rows, w - 1.0, rects[0].1 + 1.0),
+            None,
+            "right hit"
+        );
+    }
+
+    /// Select the row whose action matches, then activate it.
+    fn activate(m: &mut Menu, s: &mut GraphicsSettings, want: MenuAction) -> MenuOutcome {
+        let i = m
+            .rows(s)
+            .iter()
+            .position(|r| r.action == want)
+            .unwrap_or_else(|| panic!("no {want:?} row on {:?}", m.screen));
+        m.index = i;
+        m.activate(s)
+    }
+
+    #[test]
+    fn back_restores_the_row_you_descended_from() {
+        let mut s = GraphicsSettings::default();
+        let mut m = Menu::new();
+        activate(&mut m, &mut s, MenuAction::Enter(MenuScreen::Options));
+        assert_eq!(m.screen, MenuScreen::Options);
+        // Descend from GAMEPLAY specifically, not the first row, so a restored
+        // index is distinguishable from a reset one.
+        activate(&mut m, &mut s, MenuAction::Enter(MenuScreen::Gameplay));
+        assert_eq!(m.screen, MenuScreen::Gameplay);
+        assert_eq!(m.index, 0, "entering a screen starts at the top");
+
+        assert_eq!(m.back(), MenuOutcome::Stay);
+        assert_eq!(m.screen, MenuScreen::Options);
+        let gameplay_row = screen_rows(MenuScreen::Options, &s)
+            .iter()
+            .position(|r| r.action == MenuAction::Enter(MenuScreen::Gameplay))
+            .unwrap();
+        assert_eq!(m.index, gameplay_row, "BACK did not restore the selection");
+
+        assert_eq!(m.back(), MenuOutcome::Stay);
+        assert_eq!(m.screen, MenuScreen::Root);
+        // Root has no ancestor, so backing out again leaves the menu entirely.
+        assert_eq!(m.back(), MenuOutcome::Resume);
+    }
+
+    #[test]
+    fn graphics_rows_change_the_settings() {
+        let mut s = GraphicsSettings::default();
+        let mut m = Menu::new();
+        m.screen = MenuScreen::Graphics;
+
+        let before = s.fxaa;
+        assert_eq!(
+            activate(&mut m, &mut s, MenuAction::ToggleFxaa),
+            MenuOutcome::ApplyFxaa
+        );
+        assert_eq!(s.fxaa, !before, "FXAA row did not toggle the setting");
+
+        // Cycling steps down and wraps: High -> Medium -> Low -> Off -> High.
+        s.shadows = ShadowQuality::High;
+        for want in [
+            ShadowQuality::Medium,
+            ShadowQuality::Low,
+            ShadowQuality::Off,
+            ShadowQuality::High,
+        ] {
+            assert_eq!(
+                activate(&mut m, &mut s, MenuAction::CycleShadows),
+                MenuOutcome::ApplyShadows
+            );
+            assert!(s.shadows == want, "unexpected shadow step");
+        }
+    }
+
+    #[test]
+    fn inert_rows_change_nothing() {
+        let mut m = Menu::new();
+        for screen in [
+            MenuScreen::Graphics,
+            MenuScreen::Sound,
+            MenuScreen::Gameplay,
+        ] {
+            let mut s = GraphicsSettings::default();
+            m.screen = screen;
+            m.stack.clear();
+            let inert: Vec<usize> = screen_rows(screen, &s)
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !r.enabled())
+                .map(|(i, _)| i)
+                .collect();
+            assert!(!inert.is_empty(), "{screen:?} has no inert row to check");
+            for i in inert {
+                m.index = i;
+                assert_eq!(m.activate(&mut s), MenuOutcome::Stay);
+                // The MSAA row in particular must not quietly mutate anything.
+                assert_eq!(s.shadows, ShadowQuality::High);
+                assert!(!s.fxaa);
+                assert_eq!(s.msaa, 1);
+                assert_eq!(m.screen, screen, "inert row navigated away");
+            }
+        }
+    }
+
+    #[test]
+    fn selection_wraps_in_both_directions() {
+        let s = GraphicsSettings::default();
+        let mut m = Menu::new();
+        m.screen = MenuScreen::Graphics;
+        let n = m.rows(&s).len();
+        m.index = 0;
+        m.move_by(-1, &s);
+        assert_eq!(m.index, n - 1, "up from the top did not wrap");
+        m.move_by(1, &s);
+        assert_eq!(m.index, 0, "down from the bottom did not wrap");
+    }
+
+    #[test]
+    fn unpausing_resets_to_the_root_screen() {
+        let mut s = GraphicsSettings::default();
+        let mut m = Menu::new();
+        activate(&mut m, &mut s, MenuAction::Enter(MenuScreen::Options));
+        activate(&mut m, &mut s, MenuAction::Enter(MenuScreen::Graphics));
+        m.reset();
+        assert_eq!(m.screen, MenuScreen::Root);
+        assert_eq!(m.index, 0);
+        assert!(m.stack.is_empty());
+    }
+
+    /// Menu labels must stay inside what the 5x7 UI font can draw (A-Z, 0-9 and
+    /// space); anything else renders as a blank, which would silently mangle a
+    /// row. Guards against someone adding a colon or brackets later.
+    #[test]
+    fn menu_labels_are_drawable() {
+        let s = GraphicsSettings::default();
+        for screen in SCREENS {
+            for row in screen_rows(screen, &s) {
+                for c in row.label.chars() {
+                    assert!(
+                        c.is_ascii_uppercase() || c.is_ascii_digit() || c == ' ',
+                        "{screen:?} label {:?} has undrawable {c:?}",
+                        row.label
+                    );
+                }
+            }
+        }
     }
 }
