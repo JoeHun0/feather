@@ -29,7 +29,15 @@ const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Initial square dimension of the sun shadow map. The live value is a runtime
 /// setting (`Renderer::set_shadow_dim`) — shadow cost is dominated by texel
 /// count, so this is the main quality/perf knob (§13).
-const SHADOW_DIM: u32 = 4096;
+/// Cascades in the sun shadow map (§11). 4 is the design target; several array
+/// sizes downstream key off this, so it is public.
+pub const SHADOW_CASCADES: usize = 4;
+
+/// Per-cascade shadow-map dimension at the High preset. 4 x 2048² is exactly
+/// the same texel count *and* the same 64 MiB as the single 4096² map it
+/// replaces — the pass is fill-bound (§11), so cascades redistribute resolution
+/// rather than costing more.
+const SHADOW_DIM: u32 = 2048;
 const SHADOW_FORMAT: vk::Format = DEPTH_FORMAT;
 // Single source of truth for the geometry pass's MSAA sample count (HDR + depth
 // targets and the mesh/sky pipelines all read it via `Renderer::samples`).
@@ -130,6 +138,32 @@ impl Drop for Image {
     }
 }
 
+/// The cascaded sun shadow map (§11): one depth image with `SHADOW_CASCADES`
+/// array layers.
+///
+/// Two kinds of view, because the two uses are incompatible: the shader samples
+/// all layers at once through a `TYPE_2D_ARRAY` view (`sampler2DArrayShadow`),
+/// while each cascade pass renders into a single layer, which dynamic rendering
+/// needs as its own `TYPE_2D` view.
+struct ShadowMap {
+    /// Owns the image and the array view used for sampling.
+    image: Image,
+    /// One single-layer attachment view per cascade.
+    layer_views: Vec<vk::ImageView>,
+    device: Device,
+}
+
+impl Drop for ShadowMap {
+    fn drop(&mut self) {
+        // Before `image` drops and takes the allocation with it.
+        unsafe {
+            for &v in &self.layer_views {
+                self.device.destroy_image_view(v, None);
+            }
+        }
+    }
+}
+
 pub struct Renderer {
     _entry: Entry,
     instance: Instance,
@@ -165,8 +199,10 @@ pub struct Renderer {
     // allocated (~8 MB at 1080p) so the toggle needs no resource churn.
     ldr: Option<Image>,
     fxaa: bool,
+    /// False when nothing will be drawn into the shadow map this frame.
+    shadow_casters: bool,
     samples: vk::SampleCountFlags, // geometry-pass sample count (MSAA setting)
-    shadow: Option<Image>,
+    shadow: Option<ShadowMap>,
     shadow_sampler: vk::Sampler, // comparison sampler (sampler2DShadow)
     shadow_dim: u32,             // live shadow-map dimension (quality setting)
     surface_format: vk::SurfaceFormatKHR,
@@ -409,6 +445,7 @@ impl Renderer {
             hdr_resolve,
             ldr: Some(ldr),
             fxaa: false,
+            shadow_casters: true,
             samples,
             hdr_sampler,
             shadow: Some(shadow),
@@ -534,16 +571,27 @@ impl Renderer {
         self.fxaa = on;
     }
 
+    /// Tell the renderer whether anything will actually cast this frame.
+    ///
+    /// When nothing will, the four per-cascade passes collapse to a single
+    /// layered clear. That matters because the passes are not free: with no
+    /// casters at all, four passes measured 0.87 ms against 0.48 ms for one,
+    /// clearing the identical number of texels — the difference is per-pass
+    /// overhead, not fill. Without this the `Off` shadow preset still paid it.
+    pub fn set_shadow_casters(&mut self, casters: bool) {
+        self.shadow_casters = casters;
+    }
+
     /// Shared sampler for reading the HDR target in the tonemap pass.
     pub fn hdr_sampler(&self) -> vk::Sampler {
         self.hdr_sampler
     }
 
-    /// View of the sun shadow map (§11). Stable for the renderer's lifetime — the
-    /// shadow map is fixed-size and never recreated — so a descriptor bound to it
-    /// never needs refreshing.
+    /// Array view of the sun shadow map (§11), covering every cascade — this is
+    /// what `mesh.frag` binds as `sampler2DArrayShadow`. Changes when the
+    /// shadow-quality preset resizes the map, so the holder must re-point then.
     pub fn shadow_view(&self) -> vk::ImageView {
-        self.shadow.as_ref().expect("shadow target alive").view
+        self.shadow.as_ref().expect("shadow target alive").image.view
     }
 
     /// Comparison sampler (`sampler2DShadow`) for the shadow map.
@@ -551,7 +599,12 @@ impl Renderer {
         self.shadow_sampler
     }
 
-    /// Square dimension of the shadow map (viewport for the shadow pass).
+    /// Number of cascades the shadow pass renders.
+    pub fn shadow_cascades(&self) -> usize {
+        SHADOW_CASCADES
+    }
+
+    /// Square dimension of one cascade (viewport for the shadow pass).
     pub fn shadow_extent(&self) -> vk::Extent2D {
         vk::Extent2D {
             width: self.shadow_dim,
@@ -855,14 +908,16 @@ impl Renderer {
         self.recreate_swapchain();
     }
 
-    /// Records and submits one frame: `shadow` renders the sun depth map,
+    /// Records and submits one frame: `shadow` renders the sun depth map — once
+    /// per cascade, into its own array layer (§11) —
     /// `geometry` draws into the linear HDR target (sampling that shadow map),
     /// then `post` (the tonemap pass) samples the HDR and writes the sRGB
     /// swapchain. `shadow` gets the shadow-map extent; `geometry`/`post` get the
     /// window extent. All three receive `(cmd, extent, frame_in_flight)`.
     pub fn draw_frame(
         &mut self,
-        shadow: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
+        // Called once per cascade with its index — hence `Fn`, not `FnOnce`.
+        shadow: impl Fn(vk::CommandBuffer, vk::Extent2D, usize, usize),
         geometry: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         post: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         aa: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
@@ -944,6 +999,16 @@ impl Renderer {
             layer_count: 1,
         };
 
+        // The shadow image is layered; `depth_range` above describes the
+        // single-layer geometry depth buffer and must not be reused for it.
+        let shadow_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::DEPTH,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: SHADOW_CASCADES as u32,
+        };
+
         let dev = &self.device;
         unsafe {
             dev.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
@@ -977,8 +1042,8 @@ impl Renderer {
                 .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(shadow_img.handle)
-                .subresource_range(depth_range)
+                .image(shadow_img.image.handle)
+                .subresource_range(shadow_range)
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
             dev.cmd_pipeline_barrier(
@@ -991,28 +1056,48 @@ impl Renderer {
                 &[shadow_to_attach],
             );
 
-            let shadow_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(shadow_img.view)
-                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                });
-            let shadow_rendering = vk::RenderingInfo::default()
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: shadow_extent,
-                })
-                .layer_count(1)
-                .depth_attachment(&shadow_attachment);
+            // Nothing casts: one *layered* pass clears every cascade to "far",
+            // so the receiver compares as fully lit, at the cost of a single
+            // pass instead of four. The callback still runs once, because the
+            // mesh renderer uses it to upload this frame's buffers.
+            let cascade_views: &[vk::ImageView] = if self.shadow_casters {
+                &shadow_img.layer_views
+            } else {
+                std::slice::from_ref(&shadow_img.image.view)
+            };
+            let pass_layers = if self.shadow_casters {
+                1
+            } else {
+                SHADOW_CASCADES as u32
+            };
 
-            dev.cmd_begin_rendering(cmd, &shadow_rendering);
-            shadow(cmd, shadow_extent, frame);
-            dev.cmd_end_rendering(cmd);
+            // One depth-only pass per cascade, each into its own array layer.
+            // The layout transitions above and below cover all layers at once,
+            // so only the attachment view changes inside the loop.
+            for (cascade, &layer_view) in cascade_views.iter().enumerate() {
+                let shadow_attachment = vk::RenderingAttachmentInfo::default()
+                    .image_view(layer_view)
+                    .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .clear_value(vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue {
+                            depth: 1.0,
+                            stencil: 0,
+                        },
+                    });
+                let shadow_rendering = vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: shadow_extent,
+                    })
+                    .layer_count(pass_layers)
+                    .depth_attachment(&shadow_attachment);
+
+                dev.cmd_begin_rendering(cmd, &shadow_rendering);
+                shadow(cmd, shadow_extent, frame, cascade);
+                dev.cmd_end_rendering(cmd);
+            }
 
             // Shadow: DEPTH_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY (geometry samples it).
             let shadow_to_read = vk::ImageMemoryBarrier::default()
@@ -1020,8 +1105,8 @@ impl Renderer {
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(shadow_img.handle)
-                .subresource_range(depth_range)
+                .image(shadow_img.image.handle)
+                .subresource_range(shadow_range)
                 .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ);
             dev.cmd_pipeline_barrier(
@@ -1686,7 +1771,8 @@ fn create_depth(
 
 /// Fixed-size sun shadow map: a D32 depth image both rendered into (depth-only
 /// shadow pass) and sampled (comparison) by the mesh fragment shader (§11).
-fn create_shadow(allocator: &Arc<vk_mem::Allocator>, device: &Device, dim: u32) -> Image {
+fn create_shadow(allocator: &Arc<vk_mem::Allocator>, device: &Device, dim: u32) -> ShadowMap {
+    let layers = SHADOW_CASCADES as u32;
     let image_ci = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(SHADOW_FORMAT)
@@ -1696,7 +1782,10 @@ fn create_shadow(allocator: &Arc<vk_mem::Allocator>, device: &Device, dim: u32) 
             depth: 1,
         })
         .mip_levels(1)
-        .array_layers(1)
+        // One layer per cascade. Array layers must share an extent, so every
+        // cascade is the same resolution; §11's sphere fit is what gives the far
+        // cascades more world per texel.
+        .array_layers(layers)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
         .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
@@ -1706,33 +1795,65 @@ fn create_shadow(allocator: &Arc<vk_mem::Allocator>, device: &Device, dim: u32) 
         usage: vk_mem::MemoryUsage::AutoPreferDevice,
         ..Default::default()
     };
-    let (image, allocation) =
-        unsafe { allocator.create_image(&image_ci, &ai).expect("shadow image") };
-
-    let view_info = vk::ImageViewCreateInfo::default()
-        .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
-        .format(SHADOW_FORMAT)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::DEPTH,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        });
-    let view = unsafe {
-        device
-            .create_image_view(&view_info, None)
-            .expect("shadow view")
+    let (image, allocation) = unsafe {
+        allocator
+            .create_image(&image_ci, &ai)
+            .expect("shadow image")
     };
 
-    Image {
-        allocator: allocator.clone(),
-        allocation,
+    // Sampling view: every cascade, as a 2D array.
+    let array_view = unsafe {
+        device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
+                    .format(SHADOW_FORMAT)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::DEPTH,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: layers,
+                    }),
+                None,
+            )
+            .expect("shadow array view")
+    };
+
+    // Attachment views: one per cascade, single-layer.
+    let layer_views = (0..layers)
+        .map(|layer| unsafe {
+            device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(SHADOW_FORMAT)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::DEPTH,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: layer,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+                .expect("shadow layer view")
+        })
+        .collect();
+
+    ShadowMap {
+        image: Image {
+            allocator: allocator.clone(),
+            allocation,
+            device: device.clone(),
+            handle: image,
+            view: array_view,
+            format: SHADOW_FORMAT,
+        },
+        layer_views,
         device: device.clone(),
-        handle: image,
-        view,
-        format: SHADOW_FORMAT,
     }
 }
 

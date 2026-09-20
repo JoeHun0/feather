@@ -32,9 +32,11 @@ use std::time::Instant;
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::ExecutorKind;
 use feather_assets::MeshData;
-use feather_gfx::Renderer;
+use feather_gfx::{Renderer, SHADOW_CASCADES};
 use feather_platform::winit;
-use feather_render::{FxaaPass, InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass, UiPass};
+use feather_render::{
+    CascadeSetup, FxaaPass, InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass, UiPass,
+};
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
 use rapier3d::prelude::{
@@ -79,9 +81,20 @@ const FLY_SPEED: f32 = 14.0; // noclip movement speed
 // to them: half-extent of the covered square, how far back along the sun the
 // light "eye" sits, and the ortho's depth range. A tighter radius means denser
 // shadow texels (sharper) but less coverage around the player.
-const SHADOW_RADIUS: f32 = 16.0;
+/// How far from the camera shadows reach, across all cascades. Past this,
+/// distance fog carries the transition (camera far is 200).
+///
+/// 60 rather than something larger because the cascade budget is fixed: 4x2048²
+/// is the same texel count as the single 4096² map it replaces, so range is paid
+/// for in sharpness. The demo ground is 80x80, i.e. 56 units corner-to-centre,
+/// so 60 covers the world without spending two cascades on empty space. A larger
+/// world raises this and either accepts softer shadows or raises the per-cascade
+/// dimension with it — §11 is explicit that shadow resolution is a quality knob.
+const SHADOW_DISTANCE: f32 = 60.0;
+/// Practical-split weighting (§11): 0 = uniform, 1 = logarithmic. 0.75 keeps
+/// near cascades tight without starving the far one.
+const SHADOW_LAMBDA: f32 = 0.75;
 const SHADOW_BACK: f32 = 40.0;
-const SHADOW_DEPTH: f32 = 80.0;
 
 /// Shadow-quality preset (§13). Shadow cost is dominated by shadow-map texel
 /// count, so resolution is the knob. `Off` additionally stops feeding casters,
@@ -96,14 +109,19 @@ enum ShadowQuality {
 }
 
 impl ShadowQuality {
+    /// Dimension of **one cascade**; there are `SHADOW_CASCADES` of them, so the
+    /// texel count is 4x this squared. High is 4x2048², exactly the texel count
+    /// and the memory of the single 4096² map cascades replaced — the pass is
+    /// fill-bound (§11), so this redistributes resolution rather than adding
+    /// cost.
     fn dim(self) -> u32 {
         match self {
             // Small but non-zero: the pass still clears, and a 512² clear is noise
-            // next to the ~0.6 ms a 4096² clear costs.
+            // next to what a full-resolution clear costs.
             Self::Off => 512,
-            Self::Low => 1024,
-            Self::Medium => 2048,
-            Self::High => 4096,
+            Self::Low => 512,
+            Self::Medium => 1024,
+            Self::High => 2048,
         }
     }
 
@@ -127,9 +145,9 @@ impl ShadowQuality {
     fn label(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Low => "low (1024)",
-            Self::Medium => "medium (2048)",
-            Self::High => "high (4096)",
+            Self::Low => "low (4x512)",
+            Self::Medium => "medium (4x1024)",
+            Self::High => "high (4x2048)",
         }
     }
 
@@ -734,6 +752,14 @@ impl Look {
         (fwd, right)
     }
 
+    /// Full camera basis (forward, right, up) — the frame the view frustum's
+    /// corners are built in, for fitting shadow cascades.
+    fn camera_basis(&self) -> (Vec3, Vec3, Vec3) {
+        let fwd = self.forward();
+        let right = fwd.cross(Vec3::Y).normalize_or_zero();
+        (fwd, right, right.cross(fwd).normalize_or_zero())
+    }
+
     fn view_proj(&self, eye: Vec3, aspect: f32) -> Mat4 {
         let view = Mat4::look_to_rh(eye, self.forward(), Vec3::Y);
         let mut proj = Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 200.0);
@@ -1312,7 +1338,8 @@ impl App {
             // no world loaded a fresh `MeshRenderer` will bind the new map when
             // the next session starts.
             if let Some(s) = self.session.as_mut() {
-                s.mesh.set_shadow_map(r.shadow_view(), r.shadow_sampler());
+                s.mesh
+                    .set_shadow_map(r.shadow_view(), r.shadow_sampler(), dim);
             }
         }
         eprintln!("[quality] shadows: {}", self.settings.shadows.label());
@@ -1617,38 +1644,41 @@ impl ApplicationHandler for App {
                     // turning never disturbs the shadow map — only walking moves it, and
                     // the texel snap below keeps that from crawling.
                     let sun_dir = self.light_dir.truncate().normalize_or_zero();
-                    let body = eye - Vec3::Y * EYE_HEIGHT;
-                    // Rotation-only light basis (world -> light space), for the snap.
-                    let light_basis = Mat4::look_at_rh(Vec3::ZERO, sun_dir, Vec3::Y);
-                    // Texel-snap the ortho center to whole shadow-map texels — §11 calls
-                    // this non-negotiable: without it the shadow edges crawl every frame
-                    // as the center slides a fraction of a texel.
-                    let world_per_texel =
-                        (2.0 * SHADOW_RADIUS) / self.settings.shadows.dim() as f32;
-                    let c = light_basis.transform_point3(body);
-                    let snapped = Vec3::new(
-                        (c.x / world_per_texel).round() * world_per_texel,
-                        (c.y / world_per_texel).round() * world_per_texel,
-                        c.z, // depth along the light needs no snap (no edge crawl)
-                    );
-                    let light_center = light_basis.inverse().transform_point3(snapped);
-                    let light_eye = light_center - sun_dir * SHADOW_BACK;
-                    let light_view = Mat4::look_at_rh(light_eye, light_center, Vec3::Y);
-                    let light_proj = Mat4::orthographic_rh(
-                        -SHADOW_RADIUS,
-                        SHADOW_RADIUS,
-                        -SHADOW_RADIUS,
-                        SHADOW_RADIUS,
-                        0.1,
-                        SHADOW_DEPTH,
-                    );
-                    let light_view_proj = light_proj * light_view;
+                    // One ortho per cascade, each fitted to the bounding sphere of
+                    // its slice of the view frustum and texel-snapped.
+                    let dim = self.settings.shadows.dim();
+                    let splits = cascade_splits(0.1, SHADOW_DISTANCE, SHADOW_LAMBDA);
+                    let (fwd, right_v, up_v) = look.camera_basis();
+                    let mut cascades = [CascadeSetup {
+                        view_proj: Mat4::IDENTITY,
+                        texel_world: 0.0,
+                    }; SHADOW_CASCADES];
+                    let mut near = 0.1f32;
+                    for (i, far) in splits.iter().copied().enumerate() {
+                        let (centre, radius) = slice_sphere(
+                            eye,
+                            fwd,
+                            right_v,
+                            up_v,
+                            60f32.to_radians(),
+                            aspect,
+                            near,
+                            far,
+                        );
+                        let (view_proj, texel_world) = fit_cascade(centre, radius, sun_dir, dim);
+                        cascades[i] = CascadeSetup {
+                            view_proj,
+                            texel_world,
+                        };
+                        near = far;
+                    }
 
                     // Per-view frustum culling (§8): bounding sphere vs six planes, once
-                    // per view. Camera frustum trims the main pass; the light ortho trims
-                    // the shadow pass (groundwork — everything is inside it today).
+                    // per view. Camera frustum trims the main pass; each cascade's ortho
+                    // trims its own caster set.
                     let camera_frustum = Frustum::from_view_proj(&view_proj);
-                    let light_frustum = Frustum::from_view_proj(&light_view_proj);
+                    let light_frusta: [Frustum; SHADOW_CASCADES] =
+                        std::array::from_fn(|i| Frustum::from_view_proj(&cascades[i].view_proj));
 
                     // Extract: interpolate each entity's sim state (prev -> curr) by
                     // alpha, build its model matrix, and route it to the camera-visible
@@ -1663,7 +1693,11 @@ impl ApplicationHandler for App {
                     let mesh_max = fits.len().saturating_sub(1);
                     let cap = (GRID * GRID * GRID) as usize + 8;
                     let mut main_items: Vec<(MeshId, InstanceData)> = Vec::with_capacity(cap);
-                    let mut shadow_items: Vec<(MeshId, InstanceData)> = Vec::with_capacity(cap);
+                    // One caster list per cascade: a caster can be in several,
+                    // since the cascades overlap in world space.
+                    let mut shadow_items: Vec<Vec<(MeshId, InstanceData)>> = (0..SHADOW_CASCADES)
+                        .map(|_| Vec::with_capacity(cap))
+                        .collect();
                     let mut q = s.world.query::<(
                         &Position,
                         &PrevPosition,
@@ -1687,8 +1721,12 @@ impl ApplicationHandler for App {
                         if camera_frustum.contains_sphere(c, radius) {
                             main_items.push(item);
                         }
-                        if casts && no_cast.is_none() && light_frustum.contains_sphere(c, radius) {
-                            shadow_items.push(item);
+                        if casts && no_cast.is_none() {
+                            for (ci, f) in light_frusta.iter().enumerate() {
+                                if f.contains_sphere(c, radius) {
+                                    shadow_items[ci].push(item);
+                                }
+                            }
                         }
                     }
 
@@ -1706,8 +1744,12 @@ impl ApplicationHandler for App {
                         if camera_frustum.contains_sphere(c, radius) {
                             main_items.push(item);
                         }
-                        if casts && no_cast.is_none() && light_frustum.contains_sphere(c, radius) {
-                            shadow_items.push(item);
+                        if casts && no_cast.is_none() {
+                            for (ci, f) in light_frusta.iter().enumerate() {
+                                if f.contains_sphere(c, radius) {
+                                    shadow_items[ci].push(item);
+                                }
+                            }
                         }
                     }
 
@@ -1715,7 +1757,7 @@ impl ApplicationHandler for App {
                     // and main passes then replay them. Uploads happen in
                     // draw_shadow, after the frame fence.
                     s.mesh
-                        .prepare_frame(&mut main_items, &mut shadow_items, light_view_proj);
+                        .prepare_frame(&mut main_items, &mut shadow_items, &cascades);
                     frame_view = Some(FrameView {
                         view_proj,
                         inv_view_proj,
@@ -1786,6 +1828,9 @@ impl ApplicationHandler for App {
                 ) {
                     // HDR view/sampler are stable except across resize; capture
                     // before the mutable draw_frame borrow, refresh in `update`.
+                    // No session, or shadows off: the cascade passes collapse to
+                    // one layered clear rather than four empty passes.
+                    r.set_shadow_casters(self.session.is_some() && self.settings.shadows.casts());
                     let hdr_view = r.hdr_view();
                     let ldr_view = r.ldr_view();
                     let hdr_sampler = r.hdr_sampler();
@@ -1797,9 +1842,9 @@ impl ApplicationHandler for App {
                         // Shadow pass: sun depth map (also flushes this frame's
                         // buffers). No session means no casters and no buffers —
                         // the pass still clears, so every fragment reads as lit.
-                        |cmd, extent, frame| {
+                        |cmd, extent, frame, cascade| {
                             if let Some(s) = session {
-                                s.mesh.draw_shadow(cmd, extent, frame);
+                                s.mesh.draw_shadow(cmd, extent, frame, cascade);
                             }
                         },
                         // Geometry (§10): depth prepass, then the lit opaque pass
@@ -1852,6 +1897,84 @@ impl ApplicationHandler for App {
             w.request_redraw();
         }
     }
+}
+
+/// Practical/parallel-split scheme (§11): the far depth of each cascade, blending
+/// a logarithmic and a uniform distribution by `lambda`.
+///
+/// Logarithmic alone starves the far cascade; uniform alone wastes most of the
+/// resolution on distance nobody looks at. `lambda` picks between them.
+fn cascade_splits(near: f32, far: f32, lambda: f32) -> [f32; SHADOW_CASCADES] {
+    let mut out = [0.0; SHADOW_CASCADES];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let p = (i + 1) as f32 / SHADOW_CASCADES as f32;
+        let log = near * (far / near).powf(p);
+        let uniform = near + (far - near) * p;
+        *slot = lambda * log + (1.0 - lambda) * uniform;
+    }
+    out
+}
+
+/// Bounding sphere of the view-frustum slice between `near` and `far`.
+///
+/// A sphere rather than a box **on purpose** (§11): centroid and radius are
+/// invariant under rigid motion, so turning the camera cannot change the world
+/// size a cascade covers. A box fit would change size as you rotate, and the
+/// shadow texels would shimmer with it.
+fn slice_sphere(
+    eye: Vec3,
+    fwd: Vec3,
+    right: Vec3,
+    up: Vec3,
+    fov_y: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+) -> (Vec3, f32) {
+    let tan_v = (fov_y * 0.5).tan();
+    let tan_h = tan_v * aspect;
+    let mut corners = [Vec3::ZERO; 8];
+    let mut n = 0;
+    for d in [near, far] {
+        let centre = eye + fwd * d;
+        let (h, v) = (right * (tan_h * d), up * (tan_v * d));
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                corners[n] = centre + h * sx + v * sy;
+                n += 1;
+            }
+        }
+    }
+    let centre = corners.iter().fold(Vec3::ZERO, |a, c| a + *c) / 8.0;
+    let radius = corners
+        .iter()
+        .fold(0.0f32, |m, c| m.max(c.distance(centre)));
+    (centre, radius)
+}
+
+/// Light-space matrix for one cascade, texel-snapped.
+///
+/// Snapping the ortho centre to whole shadow-map texels is what stops shadow
+/// edges crawling as you walk (§11 calls it non-negotiable); depth along the
+/// light needs no snap, since sliding along it causes no edge crawl.
+fn fit_cascade(centre: Vec3, radius: f32, sun_dir: Vec3, dim: u32) -> (Mat4, f32) {
+    let texel_world = (2.0 * radius) / dim as f32;
+    let basis = Mat4::look_at_rh(Vec3::ZERO, sun_dir, Vec3::Y);
+    let c = basis.transform_point3(centre);
+    let snapped = Vec3::new(
+        (c.x / texel_world).round() * texel_world,
+        (c.y / texel_world).round() * texel_world,
+        c.z,
+    );
+    let centre = basis.inverse().transform_point3(snapped);
+    // Pull the light back past the sphere so casters above it are still inside
+    // the depth range. Without pancaking (§11, not yet implemented) a caster
+    // further than this toward the light is clipped and stops casting.
+    let back = radius + SHADOW_BACK;
+    let light_eye = centre - sun_dir * back;
+    let view = Mat4::look_at_rh(light_eye, centre, Vec3::Y);
+    let proj = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.0, back + radius);
+    (proj * view, texel_world)
 }
 
 /// Spawn one static level piece: rendered through the normal instanced path but
@@ -2526,6 +2649,180 @@ mod tests {
             // And back returns to the root it came from, not a hardcoded one.
             assert_eq!(m.back(), MenuOutcome::Stay);
             assert_eq!(m.screen, root);
+        }
+    }
+
+    // ---- Shadow cascades (§11) ----
+    //
+    // All pure maths, so it runs with no GPU. These cover the properties that
+    // are easy to break and hard to see: a bad split distribution looks like
+    // "shadows are blurry somewhere", and a fit that is not rotation-invariant
+    // looks like shimmer while turning, which is easy to blame on something else.
+
+    #[test]
+    fn splits_are_increasing_and_span_the_range() {
+        for lambda in [0.0, 0.5, 0.75, 1.0] {
+            let s = cascade_splits(0.1, SHADOW_DISTANCE, lambda);
+            for pair in s.windows(2) {
+                assert!(
+                    pair[1] > pair[0],
+                    "splits not increasing at lambda {lambda}"
+                );
+            }
+            assert!(s[0] > 0.1, "first split must be past the near plane");
+            assert!(
+                (s[SHADOW_CASCADES - 1] - SHADOW_DISTANCE).abs() < 0.01,
+                "last split must reach SHADOW_DISTANCE, got {}",
+                s[SHADOW_CASCADES - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn lambda_selects_between_uniform_and_logarithmic() {
+        let (near, far) = (0.1f32, SHADOW_DISTANCE);
+        let uniform = cascade_splits(near, far, 0.0);
+        let log = cascade_splits(near, far, 1.0);
+        for i in 0..SHADOW_CASCADES {
+            let p = (i + 1) as f32 / SHADOW_CASCADES as f32;
+            assert!((uniform[i] - (near + (far - near) * p)).abs() < 0.01);
+            assert!((log[i] - near * (far / near).powf(p)).abs() < 0.01);
+        }
+        // Logarithmic keeps the near cascades much tighter; that is the point.
+        assert!(log[0] < uniform[0]);
+    }
+
+    #[test]
+    fn slice_sphere_radius_is_rotation_invariant() {
+        // §11 fits a sphere rather than a box precisely so that turning cannot
+        // change the world size a cascade covers. If this regresses, shadows
+        // shimmer while you look around.
+        let eye = Vec3::new(3.0, 1.5, -2.0);
+        let mut reference = None;
+        for step in 0..48 {
+            let yaw = step as f32 * std::f32::consts::TAU / 48.0;
+            for pitch in [-1.2f32, -0.3, 0.0, 0.5, 1.2] {
+                let look = Look { yaw, pitch };
+                let (fwd, right, up) = look.camera_basis();
+                let (_, radius) = slice_sphere(
+                    eye,
+                    fwd,
+                    right,
+                    up,
+                    60f32.to_radians(),
+                    16.0 / 9.0,
+                    4.0,
+                    20.0,
+                );
+                match reference {
+                    None => reference = Some(radius),
+                    Some(r) => assert!(
+                        (radius - r).abs() < 1e-3,
+                        "radius moved with orientation: {radius} vs {r}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slice_sphere_contains_its_frustum_corners() {
+        let eye = Vec3::new(-1.0, 2.0, 5.0);
+        let look = Look {
+            yaw: 0.7,
+            pitch: -0.2,
+        };
+        let (fwd, right, up) = look.camera_basis();
+        let (fov, aspect, near, far) = (60f32.to_radians(), 1.6, 2.0, 30.0);
+        let (centre, radius) = slice_sphere(eye, fwd, right, up, fov, aspect, near, far);
+        let tan_v = (fov * 0.5).tan();
+        let tan_h = tan_v * aspect;
+        for d in [near, far] {
+            let c = eye + fwd * d;
+            for sx in [-1.0f32, 1.0] {
+                for sy in [-1.0f32, 1.0] {
+                    let corner = c + right * (tan_h * d) * sx + up * (tan_v * d) * sy;
+                    assert!(
+                        corner.distance(centre) <= radius + 1e-3,
+                        "corner outside the fitted sphere"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cascade_fit_snaps_to_texels_and_is_idempotent() {
+        let sun = Vec3::new(-0.4, -1.0, -0.3).normalize();
+        let dim = 2048;
+        let radius = 24.0f32;
+        let texel = (2.0 * radius) / dim as f32;
+        let basis = Mat4::look_at_rh(Vec3::ZERO, sun, Vec3::Y);
+
+        // Sweep sub-texel centre offsets: each must land on the texel grid, and
+        // must not move by as much as a whole texel.
+        for k in 0..16 {
+            let centre = Vec3::new(1.0, 2.0, 3.0) + Vec3::X * (texel * k as f32 / 16.0);
+            let (vp, tw) = fit_cascade(centre, radius, sun, dim);
+            assert!((tw - texel).abs() < 1e-6);
+
+            // Recover the snapped centre from the matrix by re-running the snap;
+            // snapping something already snapped must be a no-op.
+            let c = basis.transform_point3(centre);
+            let snapped = Vec3::new(
+                (c.x / texel).round() * texel,
+                (c.y / texel).round() * texel,
+                c.z,
+            );
+            let resnapped = Vec3::new(
+                (snapped.x / texel).round() * texel,
+                (snapped.y / texel).round() * texel,
+                snapped.z,
+            );
+            assert!(
+                (snapped - resnapped).length() < 1e-4,
+                "snap is not idempotent"
+            );
+            assert!(
+                (snapped.x - c.x).abs() <= texel * 0.5 + 1e-4
+                    && (snapped.y - c.y).abs() <= texel * 0.5 + 1e-4,
+                "snap moved the centre more than half a texel"
+            );
+            assert!(vp.is_finite(), "cascade matrix is not finite");
+        }
+    }
+
+    #[test]
+    fn every_cascade_sees_the_player_position() {
+        // The chain splits -> sphere fit -> ortho must actually cover the view.
+        // A point just inside each split must project inside that cascade's box.
+        let eye = Vec3::new(0.0, GROUND_Y + EYE_HEIGHT, 8.0);
+        let look = Look::new();
+        let (fwd, right, up) = look.camera_basis();
+        let sun = Vec3::new(-0.4, -1.0, -0.3).normalize();
+        let splits = cascade_splits(0.1, SHADOW_DISTANCE, SHADOW_LAMBDA);
+        let mut near = 0.1f32;
+        for (i, far) in splits.iter().copied().enumerate() {
+            let (centre, radius) = slice_sphere(
+                eye,
+                fwd,
+                right,
+                up,
+                60f32.to_radians(),
+                16.0 / 9.0,
+                near,
+                far,
+            );
+            let (vp, _) = fit_cascade(centre, radius, sun, 2048);
+            // A point in the middle of this slice, on the view axis.
+            let probe = eye + fwd * (near + (far - near) * 0.5);
+            let clip = vp * probe.extend(1.0);
+            let ndc = clip.truncate() / clip.w;
+            assert!(
+                ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0 && (0.0..=1.0).contains(&ndc.z),
+                "cascade {i} does not cover the middle of its own slice: {ndc:?}"
+            );
+            near = far;
         }
     }
 }

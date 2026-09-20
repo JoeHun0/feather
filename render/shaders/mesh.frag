@@ -20,11 +20,23 @@ layout(set = 0, binding = 1) readonly buffer Materials {
 // Bindless-lite: slot 0 = white, slot 1 = flat normal. Base color _SRGB;
 // normal + MR are _UNORM. Must match render::MAX_TEXTURES.
 layout(set = 0, binding = 2) uniform sampler2D textures[64];
-// Sun shadow map (§11): comparison-sampled, 3x3 PCF below.
-layout(set = 0, binding = 3) uniform sampler2DShadow u_shadow;
-// Per-frame globals: the sun's light-space matrix + shadow params.
+// Cascades in the sun shadow map. MUST match feather_gfx::SHADOW_CASCADES.
+const int SHADOW_CASCADES = 4;
+// How far to push the sample along the surface normal, in shadow texels (§11's
+// normal-offset bias). Scaled per cascade by its world-texel size, so it stays
+// one texel wide whatever that cascade covers.
+const float NORMAL_OFFSET_TEXELS = 1.5;
+// Where the fade into the next cascade begins, as a fraction toward the edge of
+// the current cascade's box.
+const float BLEND_START = 0.85;
+
+// Cascaded sun shadow map (§11): one array layer per cascade, comparison-
+// sampled, 3x3 PCF below.
+layout(set = 0, binding = 3) uniform sampler2DArrayShadow u_shadow;
+// Per-frame globals: a light-space matrix per cascade + shadow params.
 layout(set = 0, binding = 4) uniform Globals {
-    mat4 light_view_proj;
+    mat4 light_view_proj[SHADOW_CASCADES];
+    vec4 texel_world;   // world units per shadow texel, per cascade
     vec4 shadow_params; // x = texel size (1/dim), y = depth bias
 } g;
 
@@ -114,26 +126,64 @@ float geometry_smith(float ndv, float ndl, float rough) {
     return gv * gl;
 }
 
-// Sun visibility in [0,1] at a world position (3x3 PCF over the shadow map).
-// The light matrix uses orthographic_rh (depth already [0,1]); clip xy -> [0,1]
-// UV with no Y flip (shadow map rendered and sampled in the same convention).
-float sun_shadow(vec3 world_pos) {
-    vec4 lc = g.light_view_proj * vec4(world_pos, 1.0);
-    vec3 proj = lc.xyz / lc.w;
-    vec2 uv = proj.xy * 0.5 + 0.5;
-    // Outside the frustum or past the far plane: treat as fully lit.
-    if (proj.z > 1.0 || any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
-        return 1.0;
-    }
-    float ref = proj.z - g.shadow_params.y; // constant depth bias
+// 3x3 PCF in one cascade's layer. `uvz` is (uv, biased reference depth).
+float pcf(vec3 uvz, int cascade) {
     float texel = g.shadow_params.x;
     float sum = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
-            sum += texture(u_shadow, vec3(uv + vec2(x, y) * texel, ref));
+            sum += texture(u_shadow, vec4(uvz.xy + vec2(x, y) * texel, float(cascade), uvz.z));
         }
     }
     return sum / 9.0;
+}
+
+// Project a world position into cascade `i`, applying the normal-offset bias.
+// False when it falls outside that cascade's box.
+//
+// The light matrix uses orthographic_rh (depth already [0,1]); clip xy -> [0,1]
+// UV with no Y flip (shadow map rendered and sampled in the same convention).
+bool project_cascade(vec3 world_pos, vec3 ng, int i, out vec3 uvz) {
+    // Normal-offset bias: stepping along the surface, rather than only along
+    // depth, is what lets the constant bias stay small enough that contact
+    // shadows do not detach (§11).
+    vec3 p = world_pos + ng * (g.texel_world[i] * NORMAL_OFFSET_TEXELS);
+    vec4 lc = g.light_view_proj[i] * vec4(p, 1.0);
+    vec3 proj = lc.xyz / lc.w;
+    vec2 uv = proj.xy * 0.5 + 0.5;
+    uvz = vec3(uv, proj.z - g.shadow_params.y);
+    return proj.z <= 1.0
+        && all(greaterThanEqual(uv, vec2(0.0)))
+        && all(lessThanEqual(uv, vec2(1.0)));
+}
+
+// Sun visibility in [0,1], from the tightest cascade that contains this point.
+//
+// Selection is by **projection containment**, not by view-space depth against
+// split distances: the fragment shader has no view matrix, and the push constant
+// is already 96 B (adding one would pass the 128 B floor Vulkan guarantees).
+// Testing containment needs neither, and is correct by construction — cascade 0
+// is the tightest, so the first box that contains the point is the best one.
+float sun_shadow(vec3 world_pos, vec3 ng) {
+    for (int i = 0; i < SHADOW_CASCADES; ++i) {
+        vec3 uvz;
+        if (!project_cascade(world_pos, ng, i, uvz)) {
+            continue;
+        }
+        float s = pcf(uvz, i);
+        // Near this cascade's edge, fade into the next one so the change in
+        // resolution reads as a gradient instead of a line across the ground.
+        float edge = max(abs(uvz.x * 2.0 - 1.0), abs(uvz.y * 2.0 - 1.0));
+        if (i + 1 < SHADOW_CASCADES && edge > BLEND_START) {
+            vec3 next;
+            if (project_cascade(world_pos, ng, i + 1, next)) {
+                s = mix(s, pcf(next, i + 1), smoothstep(BLEND_START, 1.0, edge));
+            }
+        }
+        return s;
+    }
+    // Past the last cascade: unshadowed. Distance fog covers the transition.
+    return 1.0;
 }
 
 void main() {
@@ -177,7 +227,7 @@ void main() {
     vec3 specular = (ndf * g * f) / (4.0 * ndv * ndl + 0.0001);
     vec3 kd = (vec3(1.0) - f) * (1.0 - metallic);
     // Sun shadow occludes the direct term only; ambient/IBL stays unshadowed.
-    float shadow = sun_shadow(v_world_pos);
+    float shadow = sun_shadow(v_world_pos, ng);
     vec3 lo = (kd * albedo / PI + specular) * SUN_RADIANCE * ndl * shadow;
 
     // --- Ambient (analytic IBL: split-sum against the procedural sky) ---

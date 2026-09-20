@@ -6,7 +6,7 @@ mod sky;
 mod tonemap;
 mod ui;
 pub use fxaa::FxaaPass;
-pub use mesh::{InstanceData, MeshId, MeshRenderer};
+pub use mesh::{CascadeSetup, InstanceData, MeshId, MeshRenderer};
 pub use sky::SkyPass;
 pub use tonemap::TonemapPass;
 pub use ui::UiPass;

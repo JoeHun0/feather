@@ -379,17 +379,18 @@ profiling shows a bubble to fill.
 Set 2 carries per-cascade light-space `viewProj`, split depths, world-texel
 size.
 
-**Landed (§26):** a **single, static directional shadow map** — the first step of
-the above, not the full CSM. One 4096² D32 depth target, engine-owned and fixed
-size, covering a tight ±16-unit ortho that **follows the player** and is
-**texel-snapped** (the ortho center is quantized to whole shadow-map texels in
+**Landed (§26):** **4 cascades**, the design above less pancaking and PCSS. One
+D32 depth image with one **array layer per cascade** (`SHADOW_CASCADES = 4`),
+`gfx` rendering a depth-only pass per layer and `mesh.frag` sampling all of them
+through a `sampler2DArrayShadow`. Splits use the practical scheme (λ = 0.75) over
+`[0.1, SHADOW_DISTANCE]`, each cascade **fitted to the bounding sphere** of its
+frustum slice and **texel-snapped** (the ortho center is quantized to whole shadow-map texels in
 light space, so edges don't crawl as you walk; the along-light depth needs no
 snap). Centering on the player rather than the view direction means turning the
 camera never disturbs the map. Dense texels matter — a wider frustum or lower
 resolution looks pixelated. A depth-only shadow pass (`shadow.vert`,
 front-face cull + slope-scaled
-`vkCmdSetDepthBias`) renders all instances from a **fixed** scene-covering ortho
-along the sun; the mesh fragment shader samples it with a comparison sampler and
+`vkCmdSetDepthBias`) renders each cascade's own culled caster set; the mesh fragment shader samples it with a comparison sampler and
 **3×3 PCF**, occluding the **direct sun term only** (ambient/IBL stays lit). The
 light-space matrix rides a per-frame globals UBO (set 0 binding 4) since it won't
 fit the 96 B push constant. Casters are frustum-culled against the light ortho
@@ -399,12 +400,55 @@ flat ground carries it: a flat slab casts nothing useful but rasterizes the whol
 shadow map — measured at **~1.9 ms, 29 % of the shadow pass**. This is per-entity
 by design; terrain with relief must cast (hills shadow valleys) and simply omits
 the marker, which also means that cost returns then. Note the shadow pass is
-largely **fill-bound** (cost tracks shadow-map texels, not caster count), so
-cascades will *redistribute* resolution rather than reduce it — shadow resolution
-is a quality knob, like AA (§13). **Pending:**
-cascade splits + selection/blend, caster pancaking, the array atlas,
-normal-offset bias, and PCSS. Being one cascade, shadows exist only within
-`SHADOW_RADIUS` of the player — distant geometry is unshadowed until cascades land.
+substantially but **not purely fill-bound** — see the measured breakdown under
+the cascade notes below, which corrects an earlier claim here that cost tracks
+texels alone. Shadow resolution is still a quality knob, like AA (§13). Three implementation notes worth keeping.
+
+**Selection is by projection containment**, not by view-space depth against the
+splits: the fragment shader has no view matrix, and the push constant is already
+96 B, so adding one would pass the 128 B floor Vulkan guarantees. Testing each
+cascade's box in order needs neither and is correct by construction, since
+cascade 0 is the tightest. A small band at each cascade's edge blends into the
+next so the resolution change is a gradient, not a line.
+
+**The sphere fit is what stops shimmer.** Centroid and radius are invariant
+under rigid motion, so turning cannot change the world size a cascade covers; a
+box fit would resize as you rotate and the texels would crawl with it. A unit
+test sweeps a full turn and asserts the radius holds.
+
+**Measured cost, and a corrected assumption.** 4×2048² is exactly the texel count
+*and* the 64 MiB of the single 4096² map it replaced, so on the old "fill-bound"
+assumption the pass should have cost the same. It did not: **0.78 ms → 1.48 ms**
+(1.89×) on the test scene at near-full-screen, with `geo` 1.73 → 2.19 ms and the
+frame 3.02 → 4.10 ms.
+
+The main menu isolates why. With **no casters at all**, both configurations clear
+the identical 16.78 M texels, yet four passes cost 0.87 ms against one pass at
+0.48 ms. That +0.39 ms cannot be fill; it is **fixed per-pass overhead**, ~0.13 ms
+a pass. The remaining +0.31 ms is casters drawn into several overlapping
+cascades. So the pass is substantially fill-bound but per-pass cost is a third of
+it at this resolution — which is why `set_shadow_casters` collapses the four
+passes to a single layered clear when nothing will be drawn, and why
+**multiview** (one pass, `gl_ViewIndex` selecting the cascade) is the obvious
+follow-up. Multiview would trade away per-cascade culling, so it is worth
+measuring rather than assuming.
+
+**Range is paid for in sharpness.** The practical split scheme equalises texel
+density in *screen* space — every cascade lands at a similar texels-per-pixel
+ratio — so spreading a fixed budget over ~4x the distance makes the mid-field
+coarser than the old over-dense ±16 map: sharper than before inside 4 units,
+~1.4× coarser from 4–9, ~3.1× coarser from 9–20, and shadowed at all from 20–60
+where previously there was nothing. Shortening `SHADOW_DISTANCE` does **not**
+recover the mid-field (at 30 the 5–11 band comes out *worse*, 1.7×), because the
+scheme just re-shuffles which cascade covers where. **Per-cascade resolution is
+the only real lever**, and it costs fill linearly.
+
+**Pending:** **caster pancaking** — the cascade volume is not extended toward the
+light, so a caster further from the cascade sphere than `radius + SHADOW_BACK`
+is clipped and stops casting; PCSS; and per-cascade resolution variation (array
+layers must share an extent, so §11's "far cascade 1024²" is not expressible in
+a single array — the sphere fit already gives far cascades more world per texel,
+which is that line's intent).
 
 ## 12. Clustered lighting
 
@@ -1100,10 +1144,12 @@ views, §8 — broad-phase/chunk cull, rayon parallelism, AABB refinement, and L
 still pending); mips + MikkTSpace vertex tangents; pipeline buckets (PBR BRDF +
 base-color/normal/MR textures landed); clustered lighting;
 precomputed cubemap/HDR IBL (analytic-sky IBL landed);
-shadows: **single static directional shadow map + 3×3 PCF landed** (§11) —
-player-following + texel-snapped, so shadows track you and don't crawl; CSM
-cascades / splits / atlas / pancaking still pending, so only a
-`SHADOW_RADIUS` box around the player is shadowed;
+shadows: **4-cascade CSM + 3×3 PCF landed** (§11) — practical splits, sphere-fit
+and texel-snapped per cascade, a depth array layer each, per-cascade caster
+culling, projection-based selection with an edge blend, and normal-offset bias;
+**pancaking and PCSS still pending**, and since array layers share an extent all
+cascades are the same resolution. Shadows now reach `SHADOW_DISTANCE` (60) rather
+than a ±16 box;
 bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
 bake pipeline (runtime glTF scene loading + multi-mesh registry landed — the
 offline bake, runtime blob and handle tables are not); scene spawning (glTF nodes

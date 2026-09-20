@@ -8,7 +8,7 @@
 
 use ash::vk;
 use feather_assets::{Material, MeshData, Vertex};
-use feather_gfx::{Buffer, Image, MappedBuffer, Renderer, FRAMES_IN_FLIGHT};
+use feather_gfx::{Buffer, Image, MappedBuffer, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use glam::{Mat4, Vec4};
 
 macro_rules! spv {
@@ -84,9 +84,22 @@ const INSTANCE_SIZE: u64 = std::mem::size_of::<InstanceData>() as u64; // 80
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Globals {
-    light_view_proj: [f32; 16],
+    /// One light-space matrix per cascade (§11).
+    light_view_proj: [[f32; 16]; SHADOW_CASCADES],
+    /// World units per shadow texel, per cascade — scales the normal-offset
+    /// bias so it stays exactly one texel wide whatever the cascade covers.
+    texel_world: [f32; 4],
     // x = shadow-map texel size (1/dim), y = depth bias (light-space depth), z/w -
     shadow_params: [f32; 4],
+}
+
+/// Per-cascade setup the app computes and both passes consume.
+#[derive(Clone, Copy)]
+pub struct CascadeSetup {
+    /// Light-space view-projection for this cascade.
+    pub view_proj: Mat4,
+    /// World units covered by one shadow texel in this cascade.
+    pub texel_world: f32,
 }
 
 /// A contiguous run of same-mesh instances. `upload_instances` sorts + records
@@ -137,7 +150,8 @@ pub struct MeshRenderer {
     // one instance SSBO laid out as [main instances | shadow instances]; the run
     // `run_start` is the firstInstance offset into that concatenation.
     main_runs: Vec<Run>,
-    shadow_runs: Vec<Run>,
+    /// Caster runs per cascade — each cascade culls separately.
+    shadow_runs: Vec<Vec<Run>>,
     // This frame's globals (light matrix + shadow params), written in draw_shadow.
     globals: Globals,
     // Shadow-map texel size (1/dim), for the PCF offset in the globals UBO.
@@ -635,7 +649,7 @@ impl MeshRenderer {
             slices,
             scratch: Vec::new(),
             main_runs: Vec::new(),
-            shadow_runs: Vec::new(),
+            shadow_runs: (0..SHADOW_CASCADES).map(|_| Vec::new()).collect(),
             globals: Globals::default(),
             shadow_texel,
             max_instances,
@@ -650,7 +664,11 @@ impl MeshRenderer {
     /// `TonemapPass::update`, which refreshes one frame's descriptor after that
     /// frame's fence, this rewrites *all* of them at once; that is only sound
     /// when nothing is in flight. It is a rare, settings-change-only path.
-    pub fn set_shadow_map(&mut self, view: vk::ImageView, sampler: vk::Sampler) {
+    /// Re-point at a resized shadow map. `dim` matters: `shadow_params.x` is the
+    /// PCF tap offset in UV, so leaving it stale after a resize would collapse
+    /// the 3x3 taps into a single texel (too small) or smear them (too large).
+    pub fn set_shadow_map(&mut self, view: vk::ImageView, sampler: vk::Sampler, dim: u32) {
+        self.shadow_texel = 1.0 / dim as f32;
         for &set in &self.sets {
             let info = [vk::DescriptorImageInfo::default()
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -674,60 +692,89 @@ impl MeshRenderer {
     ///
     /// `main` is the camera-visible set, `shadow` the light-frustum set (§8); an
     /// entity visible to both appears once in each region.
+    /// Sort and stage this frame's instances. `shadows` carries one caster list
+    /// per cascade (each culled against its own ortho), so they land in the SSBO
+    /// as separate regions and each cascade replays only its own runs.
     pub fn prepare_frame(
         &mut self,
         main: &mut [(MeshId, InstanceData)],
-        shadow: &mut [(MeshId, InstanceData)],
-        light_view_proj: Mat4,
+        shadows: &mut [Vec<(MeshId, InstanceData)>],
+        cascades: &[CascadeSetup],
     ) {
         self.scratch.clear();
         self.main_runs.clear();
-        self.shadow_runs.clear();
+        for runs in &mut self.shadow_runs {
+            runs.clear();
+        }
 
         let cap = self.max_instances as usize;
-        // main region at offset 0, shadow region right after it. `run_start` is the
+        // main region at offset 0, then one region per cascade. `run_start` is the
         // firstInstance base into the concatenated SSBO.
-        let main_count = build_runs(
+        let mut base = build_runs(
             main,
             &self.slices,
             &mut self.scratch,
             &mut self.main_runs,
             0,
         );
-        build_runs(
-            shadow,
-            &self.slices,
-            &mut self.scratch,
-            &mut self.shadow_runs,
-            main_count,
-        );
-        // Guard the shared buffer's capacity (main + shadow could, worst case,
-        // exceed it); drop the tail of scratch and any runs past the cap.
+        for (cascade, casters) in shadows.iter_mut().enumerate().take(SHADOW_CASCADES) {
+            base += build_runs(
+                casters,
+                &self.slices,
+                &mut self.scratch,
+                &mut self.shadow_runs[cascade],
+                base,
+            );
+        }
+        // Guard the shared buffer's capacity (main + every cascade could, worst
+        // case, exceed it); drop the tail of scratch and any runs past the cap.
         if self.scratch.len() > cap {
             self.scratch.truncate(cap);
             self.main_runs
                 .retain(|r| r.run_start + r.run_len <= cap as u32);
-            self.shadow_runs
-                .retain(|r| r.run_start + r.run_len <= cap as u32);
+            for runs in &mut self.shadow_runs {
+                runs.retain(|r| r.run_start + r.run_len <= cap as u32);
+            }
         }
 
-        self.globals = Globals {
-            light_view_proj: light_view_proj.to_cols_array(),
+        let mut globals = Globals {
+            light_view_proj: [[0.0; 16]; SHADOW_CASCADES],
+            texel_world: [0.0; 4],
             shadow_params: [self.shadow_texel, SHADOW_DEPTH_BIAS, 0.0, 0.0],
         };
+        for (i, c) in cascades.iter().enumerate().take(SHADOW_CASCADES) {
+            globals.light_view_proj[i] = c.view_proj.to_cols_array();
+            globals.texel_world[i] = c.texel_world;
+        }
+        self.globals = globals;
     }
 
     /// Record the sun shadow pass: depth-only draws of the prepared runs from the
     /// light's point of view. Runs first in the frame (after the fence wait), so
     /// it also performs this frame's per-frame buffer uploads — the instance SSBO
     /// and the globals UBO the main pass then consumes.
-    pub fn draw_shadow(&self, cmd: vk::CommandBuffer, extent: vk::Extent2D, frame: usize) {
-        // Safe to write now: draw_frame waited on this frame index's fence.
-        self.instance_buffers[frame].write(as_bytes(&self.scratch));
-        self.globals_buffers[frame].write(as_bytes(std::slice::from_ref(&self.globals)));
+    pub fn draw_shadow(
+        &self,
+        cmd: vk::CommandBuffer,
+        extent: vk::Extent2D,
+        frame: usize,
+        cascade: usize,
+    ) {
+        // Uploads ride in the first cascade only. This is called once per
+        // cascade, and re-writing the buffers mid-pass would both waste
+        // bandwidth and race the draws already recording against them.
+        if cascade == 0 {
+            // Safe to write now: draw_frame waited on this frame index's fence.
+            self.instance_buffers[frame].write(as_bytes(&self.scratch));
+            self.globals_buffers[frame].write(as_bytes(std::slice::from_ref(&self.globals)));
+        }
+        let Some(runs) = self.shadow_runs.get(cascade) else {
+            return;
+        };
 
-        // shadow.vert reads the light matrix from the push constant (offset 0, 64 B).
-        let lvp = self.globals.light_view_proj;
+        // shadow.vert reads this cascade's light matrix from the push constant
+        // (offset 0, 64 B), so the shader itself needs no cascade awareness.
+        let lvp = self.globals.light_view_proj[cascade];
         let push_bytes = unsafe { std::slice::from_raw_parts(lvp.as_ptr() as *const u8, 64) };
         unsafe {
             self.device.cmd_push_constants(
@@ -755,7 +802,7 @@ impl MeshRenderer {
             self.device.cmd_set_depth_bias(cmd, 2.0, 0.0, 3.0);
             self.set_viewport_scissor(cmd, extent);
             self.bind_geometry(cmd);
-            self.draw_runs(cmd, &self.shadow_runs);
+            self.draw_runs(cmd, runs);
         }
     }
 
