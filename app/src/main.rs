@@ -36,7 +36,8 @@ use feather_assets::MeshData;
 use feather_gfx::{Renderer, SHADOW_CASCADES};
 use feather_platform::winit;
 use feather_render::{
-    CascadeSetup, FxaaPass, InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass, UiPass,
+    CascadeSetup, FxaaPass, GpuLight, InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass,
+    UiPass,
 };
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
@@ -970,6 +971,67 @@ struct App {
     last_frame: Instant,
 }
 
+/// A punctual light (§12). Position comes from the entity's `Transform`, so a
+/// light can ride on geometry (a lamp that emits) or on a bare marker node.
+#[derive(Component, Clone, Copy)]
+struct PointLight {
+    /// Linear colour.
+    color: Vec3,
+    intensity: f32,
+    /// Distance at which the light reaches exactly zero.
+    radius: f32,
+}
+
+impl Default for PointLight {
+    fn default() -> Self {
+        Self {
+            color: Vec3::ONE,
+            intensity: 12.0,
+            radius: 10.0,
+        }
+    }
+}
+
+/// Collect this frame's visible lights (§12).
+///
+/// Culled by **sphere**, not point: a light whose centre is off-screen still
+/// lights what is on-screen if its radius reaches in, which a naive point test
+/// gets wrong and which shows up as lights popping at the screen edge.
+fn extract_lights(world: &mut World, frustum: &Frustum) -> Vec<GpuLight> {
+    let mut out = Vec::new();
+    let mut q = world.query::<(&Transform, &PointLight)>();
+    for (t, l) in q.iter(world) {
+        let pos = t.0.transform_point3(Vec3::ZERO);
+        if !frustum.contains_sphere(pos, l.radius) {
+            continue;
+        }
+        out.push(GpuLight {
+            pos_radius: [pos.x, pos.y, pos.z, l.radius],
+            color_intensity: [l.color.x, l.color.y, l.color.z, l.intensity],
+        });
+    }
+    out
+}
+
+/// Windowed inverse-square falloff — a **reference copy** of what `mesh.frag`
+/// does. The window is what makes a light reach *exactly* zero at `radius`
+/// instead of being clipped mid-gradient, which would show as a visible sphere
+/// edge across the ground.
+///
+/// Test-only, and worth being clear about its limits: it pins the properties the
+/// curve must have (zero at and past the radius, monotonic, finite at d = 0),
+/// but it is a second implementation, so it cannot catch the shader drifting
+/// away from it. Shading itself is still only verifiable on screen.
+#[cfg(test)]
+fn light_attenuation(distance: f32, radius: f32) -> f32 {
+    if radius <= 0.0 || distance >= radius {
+        return 0.0;
+    }
+    let t = (distance / radius).powi(4);
+    let window = (1.0 - t).clamp(0.0, 1.0);
+    window * window / (distance * distance + 1.0)
+}
+
 /// What a prefab spawn function gets: the node's placement plus whatever
 /// geometry and parameters it carries.
 struct SpawnArgs<'a> {
@@ -1007,6 +1069,45 @@ fn spawn_prop(world: &mut World, args: &SpawnArgs) {
     let collide = args.flag("collide", true);
     let shadow = args.flag("shadow", true);
     spawn_scene_node(world, args, collide, !shadow);
+}
+
+/// A punctual light (§12), optionally attached to geometry. Params `color`
+/// (linear rgb), `intensity` and `radius`, each falling back to a sane default
+/// so a bare `{"prefab": "point_light"}` still lights something.
+///
+/// Also honours `prop`'s `collide` and `shadow` switches with the same defaults:
+/// a lamp with geometry is still a physical object, so it collides and casts a
+/// sun shadow unless the scene says otherwise. Special-casing it to never cast
+/// would make `point_light` the one prefab where `shadow` silently did nothing.
+///
+/// This is the payoff of §18's registry: a new kind of thing is one more
+/// function here, with no change to the scene format — the test scene has been
+/// carrying `point_light` nodes since before there was a light system.
+fn spawn_point_light(world: &mut World, args: &SpawnArgs) {
+    let d = PointLight::default();
+    let light = PointLight {
+        color: args.spec.and_then(|s| s.vec3("color")).unwrap_or(d.color),
+        intensity: args
+            .spec
+            .and_then(|s| s.f32("intensity"))
+            .unwrap_or(d.intensity),
+        radius: args.spec.and_then(|s| s.f32("radius")).unwrap_or(d.radius),
+    };
+    // Geometry is optional: a marker node lights without being visible, a mesh
+    // node is a lamp that both emits and renders.
+    match spawn_scene_node(
+        world,
+        args,
+        args.flag("collide", true),
+        !args.flag("shadow", true),
+    ) {
+        Some(e) => {
+            world.entity_mut(e).insert(light);
+        }
+        None => {
+            world.spawn((Transform(args.transform), light));
+        }
+    }
 }
 
 /// A node with no prefab at all: geometry that collides and casts, which is what
@@ -1060,6 +1161,7 @@ fn spawn_scene_node(
 fn prefab_registry() -> HashMap<&'static str, SpawnFn> {
     let mut r: HashMap<&'static str, SpawnFn> = HashMap::new();
     r.insert("prop", spawn_prop as SpawnFn);
+    r.insert("point_light", spawn_point_light as SpawnFn);
     r
 }
 
@@ -1819,6 +1921,7 @@ impl ApplicationHandler for App {
                     let camera_frustum = Frustum::from_view_proj(&view_proj);
                     let light_frusta: [Frustum; SHADOW_CASCADES] =
                         std::array::from_fn(|i| Frustum::from_view_proj(&cascades[i].view_proj));
+                    let lights = extract_lights(&mut s.world, &camera_frustum);
 
                     // Extract: interpolate each entity's sim state (prev -> curr) by
                     // alpha, build its model matrix, and route it to the camera-visible
@@ -1897,7 +2000,7 @@ impl ApplicationHandler for App {
                     // and main passes then replay them. Uploads happen in
                     // draw_shadow, after the frame fence.
                     s.mesh
-                        .prepare_frame(&mut main_items, &mut shadow_items, &cascades);
+                        .prepare_frame(&mut main_items, &mut shadow_items, &cascades, &lights);
                     frame_view = Some(FrameView {
                         view_proj,
                         inv_view_proj,
@@ -3044,10 +3147,13 @@ mod tests {
     #[test]
     fn unknown_prefab_falls_back_to_static_geometry() {
         let cube = MeshData::cube(1.0);
-        // point_light has no implementation yet (§12). It must still appear as
-        // geometry rather than vanishing or aborting the load.
-        let n = node(Some("point_light"), serde_json::json!({ "range": 8.0 }));
-        assert!(prefab_registry().get("point_light").is_none());
+        // `trigger` has no implementation yet (§18 lists it; nothing consumes it).
+        // It must still appear as geometry rather than vanishing or aborting the
+        // load. This deliberately names a prefab that does not exist — when one
+        // is added, point this at another unimplemented id rather than deleting
+        // the test, since the fallback is what keeps scenes forward-compatible.
+        let n = node(Some("trigger"), serde_json::json!({ "radius": 8.0 }));
+        assert!(prefab_registry().get("trigger").is_none());
         let mut w = prefab_world();
         spawn_one(&mut w, n.prefab.as_ref(), &cube);
         assert_eq!(w.query::<&Mesh>().iter(&w).count(), 1);
@@ -3079,5 +3185,132 @@ mod tests {
         m.prefab.as_mut().unwrap().params = serde_json::json!({});
         let (_, yaw) = player_start(std::slice::from_ref(&m));
         assert_eq!(yaw, None);
+    }
+
+    // ---- §12 punctual lights ----
+
+    #[test]
+    fn point_light_prefab_reads_params_with_defaults() {
+        let cube = MeshData::cube(1.0);
+        let spec = feather_assets::PrefabSpec {
+            id: "point_light".into(),
+            params: serde_json::json!({
+                "color": [1.0, 0.5, 0.25], "intensity": 7.5, "radius": 3.0
+            }),
+        };
+        let mut w = prefab_world();
+        spawn_one(&mut w, Some(&spec), &cube);
+        let l = *w.query::<&PointLight>().single(&w).unwrap();
+        assert_eq!(l.color, Vec3::new(1.0, 0.5, 0.25));
+        assert_eq!(l.intensity, 7.5);
+        assert_eq!(l.radius, 3.0);
+
+        // The geometry switches behave as they do on `prop`, rather than
+        // point_light being the one prefab where `shadow` silently does nothing.
+        let dark = feather_assets::PrefabSpec {
+            id: "point_light".into(),
+            params: serde_json::json!({ "shadow": false, "collide": false }),
+        };
+        let mut w = prefab_world();
+        spawn_one(&mut w, Some(&dark), &cube);
+        assert_eq!(w.query::<&NoShadowCast>().iter(&w).count(), 1);
+        assert_eq!(w.query::<&ColliderRef>().iter(&w).count(), 0);
+        assert_eq!(w.query::<&PointLight>().iter(&w).count(), 1);
+
+        // Defaults match `prop`: a lamp is still a physical object.
+        let plain = feather_assets::PrefabSpec {
+            id: "point_light".into(),
+            params: serde_json::json!({}),
+        };
+        let mut w = prefab_world();
+        spawn_one(&mut w, Some(&plain), &cube);
+        assert_eq!(w.query::<&NoShadowCast>().iter(&w).count(), 0);
+        assert_eq!(w.query::<&ColliderRef>().iter(&w).count(), 1);
+
+        // A bare prefab still lights something, rather than being a black light.
+        let bare = feather_assets::PrefabSpec {
+            id: "point_light".into(),
+            params: serde_json::json!({}),
+        };
+        let mut w = prefab_world();
+        spawn_one(&mut w, Some(&bare), &cube);
+        let l = *w.query::<&PointLight>().single(&w).unwrap();
+        let d = PointLight::default();
+        assert_eq!(
+            (l.color, l.intensity, l.radius),
+            (d.color, d.intensity, d.radius)
+        );
+        assert!(l.intensity > 0.0 && l.radius > 0.0);
+    }
+
+    #[test]
+    fn light_extract_culls_by_sphere_not_point() {
+        // Looking down -Z from the origin, matching Look::new().
+        let look = Look::new();
+        let eye = Vec3::ZERO;
+        let vp = look.view_proj(eye, 16.0 / 9.0);
+        let frustum = Frustum::from_view_proj(&vp);
+
+        let mut w = World::new();
+        // In view.
+        w.spawn((
+            Transform(Mat4::from_translation(Vec3::new(0.0, 0.0, -20.0))),
+            PointLight {
+                radius: 2.0,
+                ..Default::default()
+            },
+        ));
+        // Behind the camera, nowhere near.
+        w.spawn((
+            Transform(Mat4::from_translation(Vec3::new(0.0, 0.0, 60.0))),
+            PointLight {
+                radius: 2.0,
+                ..Default::default()
+            },
+        ));
+        // Centre outside the frustum, but its radius reaches in — the case a
+        // point test drops, showing up as lights popping at the screen edge.
+        w.spawn((
+            Transform(Mat4::from_translation(Vec3::new(40.0, 0.0, -20.0))),
+            PointLight {
+                radius: 28.0,
+                ..Default::default()
+            },
+        ));
+
+        let lights = extract_lights(&mut w, &frustum);
+        assert_eq!(
+            lights.len(),
+            2,
+            "expected the in-view and the overlapping one"
+        );
+        assert!(
+            lights.iter().all(|l| l.pos_radius[2] < 0.0),
+            "the light behind the camera should have been culled"
+        );
+    }
+
+    #[test]
+    fn attenuation_reaches_zero_at_the_radius() {
+        let r = 10.0f32;
+        // Exactly zero at and past the radius: otherwise the cutoff lands
+        // mid-gradient and reads as a sphere edge on the ground.
+        assert_eq!(light_attenuation(r, r), 0.0);
+        assert_eq!(light_attenuation(r + 1.0, r), 0.0);
+        assert_eq!(light_attenuation(100.0, r), 0.0);
+        // Finite at the centre rather than exploding.
+        assert!(light_attenuation(0.0, r).is_finite());
+        assert!(light_attenuation(0.0, r) > 0.0);
+        // Monotonically decreasing.
+        let mut prev = f32::INFINITY;
+        for i in 0..=100 {
+            let d = r * i as f32 / 100.0;
+            let a = light_attenuation(d, r);
+            assert!(a <= prev + 1e-6, "attenuation rose at d={d}");
+            assert!(a >= 0.0);
+            prev = a;
+        }
+        // A degenerate radius lights nothing instead of dividing by zero.
+        assert_eq!(light_attenuation(1.0, 0.0), 0.0);
     }
 }

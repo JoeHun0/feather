@@ -504,6 +504,24 @@ def zone_shadow(s, pal, extras_on):
             if not s.free(pal["box"], t, None, sc, margin=0.0):
                 continue
             s.place(pal["box"], t, scale=sc, extras=extras, name=f"pillar_{ri}_{ci}")
+    # A line of lights down the pillar rows. They overlap deliberately: the
+    # brute-force loop costs lights-in-frame, so overlap is what clustering has
+    # to beat later.
+    if extras_on:
+        for i, z in enumerate(rows[::2]):
+            s.g.add_marker(
+                (-19.0, GROUND_Y + 3.0, z),
+                {
+                    "prefab": "point_light",
+                    "params": {
+                        "color": [1.0, 0.85, 0.6],
+                        "intensity": 30.0,
+                        "radius": 12.0,
+                    },
+                },
+                f"lamp_{i}",
+            )
+
     # One large blocker: a big soft-edged shadow to contrast with the thin ones.
     s.place(pal["box"], (-6.0, GROUND_Y + 5.0, -20.0), scale=(7.0, 10.0, 1.5), name="blocker")
 
@@ -602,10 +620,17 @@ def zone_pbr(s, pal, extras_on):
         s.place(
             mesh, (12.0 + ei * 5.0, GROUND_Y + 1.6, -27.0),
             scale=(1.4, 1.4, 1.4),
-            # Deliberately an id the engine does not implement: exercises the
-            # unknown-prefab path, which warns once and falls back to static
-            # geometry rather than failing the load. Becomes real with §12.
-            extras={"prefab": "point_light", "params": {"color": [1.0, 0.6, 0.2]}}
+            # A lamp: geometry that also emits (§12). The emissive material
+            # makes the sphere itself glow; the prefab makes it light what is
+            # around it.
+            extras={
+                "prefab": "point_light",
+                "params": {
+                    "color": [1.0, 0.6, 0.2] if ei == 0 else [0.4, 0.7, 1.0],
+                    "intensity": 40.0,
+                    "radius": 14.0,
+                },
+            }
             if extras_on
             else None,
             name=f"emissive_{ei}",

@@ -37,8 +37,21 @@ layout(set = 0, binding = 3) uniform sampler2DArrayShadow u_shadow;
 layout(set = 0, binding = 4) uniform Globals {
     mat4 light_view_proj[SHADOW_CASCADES];
     vec4 texel_world;   // world units per shadow texel, per cascade
+    vec4 light_params;  // x = live light count
     vec4 shadow_params; // x = texel size (1/dim), y = depth bias
 } g;
+
+// Punctual lights (§12). Every visible light is tested per fragment with a
+// distance early-out: no cluster grid yet, so cost tracks lights-in-frame rather
+// than lights-touching-this-pixel. That is exactly what clustering will fix, and
+// this is the baseline it gets measured against.
+struct Light {
+    vec4 pos_radius;      // xyz = world position, w = radius
+    vec4 color_intensity; // rgb = linear colour, a = intensity
+};
+layout(set = 0, binding = 5) readonly buffer Lights {
+    Light lights[];
+};
 
 layout(location = 0) in vec3 v_normal;
 layout(location = 1) in flat uint v_material;
@@ -186,6 +199,49 @@ float sun_shadow(vec3 world_pos, vec3 ng) {
     return 1.0;
 }
 
+// Windowed inverse-square falloff. The window drives the light to *exactly*
+// zero at its radius; without it the cutoff lands mid-gradient and reads as a
+// visible sphere edge across the ground. Mirrors `light_attenuation` in the app,
+// which unit-tests the properties.
+float attenuation(float dist, float radius) {
+    if (radius <= 0.0 || dist >= radius) {
+        return 0.0;
+    }
+    float t = dist / radius;
+    float window = clamp(1.0 - t * t * t * t, 0.0, 1.0);
+    // +1 keeps it finite at d = 0 rather than exploding.
+    return window * window / (dist * dist + 1.0);
+}
+
+// Cook-Torrance for one punctual light, reusing the same BRDF terms as the sun
+// rather than a second lighting path.
+vec3 punctual(Light l, vec3 N, vec3 V, vec3 world_pos, vec3 albedo, vec3 f0,
+              float roughness, float metallic) {
+    vec3 delta = l.pos_radius.xyz - world_pos;
+    float dist = length(delta);
+    float att = attenuation(dist, l.pos_radius.w);
+    if (att <= 0.0) {
+        return vec3(0.0);
+    }
+    vec3 L = delta / max(dist, 1e-4);
+    float ndl = max(dot(N, L), 0.0);
+    if (ndl <= 0.0) {
+        return vec3(0.0);
+    }
+    vec3 H = normalize(V + L);
+    float ndv = max(dot(N, V), 1e-4);
+    float ndh = max(dot(N, H), 0.0);
+    float hdv = max(dot(H, V), 0.0);
+
+    float ndf = distribution_ggx(ndh, roughness);
+    float gs = geometry_smith(ndv, ndl, roughness);
+    vec3 f = fresnel_schlick(hdv, f0);
+    vec3 spec = (ndf * gs * f) / (4.0 * ndv * ndl + 0.0001);
+    vec3 kd = (vec3(1.0) - f) * (1.0 - metallic);
+    vec3 radiance = l.color_intensity.rgb * l.color_intensity.a * att;
+    return (kd * albedo / PI + spec) * radiance * ndl;
+}
+
 void main() {
     Material m = materials[v_material];
 
@@ -222,13 +278,20 @@ void main() {
 
     // --- Direct light (Cook-Torrance) ---
     float ndf = distribution_ggx(ndh, roughness);
-    float g = geometry_smith(ndv, ndl, roughness);
+    float gs = geometry_smith(ndv, ndl, roughness);
     vec3 f = fresnel_schlick(hdv, f0);
-    vec3 specular = (ndf * g * f) / (4.0 * ndv * ndl + 0.0001);
+    vec3 specular = (ndf * gs * f) / (4.0 * ndv * ndl + 0.0001);
     vec3 kd = (vec3(1.0) - f) * (1.0 - metallic);
     // Sun shadow occludes the direct term only; ambient/IBL stays unshadowed.
     float shadow = sun_shadow(v_world_pos, ng);
     vec3 lo = (kd * albedo / PI + specular) * SUN_RADIANCE * ndl * shadow;
+
+    // Punctual lights (§12), added to the same accumulator. Unshadowed: point
+    // shadows need cube maps, which is a feature of its own.
+    int light_count = int(g.light_params.x);
+    for (int i = 0; i < light_count; ++i) {
+        lo += punctual(lights[i], N, V, v_world_pos, albedo, f0, roughness, metallic);
+    }
 
     // --- Ambient (analytic IBL: split-sum against the procedural sky) ---
     vec3 fr = fresnel_schlick_roughness(ndv, f0, roughness);

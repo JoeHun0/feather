@@ -470,6 +470,33 @@ which is that line's intent).
   `clusterGrid` → loop `count` entries of `lightIndexList` → accumulate BRDF;
   then add the directional sun (with CSM) unconditionally.
 
+**Landed (§26): punctual lights, but _not yet clustered_.** Stage A of the above:
+a `PointLight` component placed by §18's `point_light` prefab (on a marker node,
+or on geometry so a lamp both emits and renders), extracted per frame into a
+`GpuLight[]` SSBO at set 0 binding 5, and shaded in `mesh.frag` with the same
+Cook-Torrance terms as the sun — reusing the BRDF rather than adding a second
+lighting path. Falloff is windowed inverse-square, the window driving the light
+to *exactly* zero at its radius so the cutoff is not a visible sphere edge.
+Lights are culled per frame against the camera frustum **by sphere, not point**,
+so one whose centre is off-screen still lights what is on-screen.
+
+**Every visible light is tested per fragment**, with a distance early-out. Cost
+therefore tracks lights-*in-frame*, not lights-touching-*this-pixel*: fine while
+they are sparse, and it degrades exactly where they overlap. That is the whole
+case for the grid above, and this is deliberately the baseline it gets measured
+against — the component, prefab, extract, SSBO and BRDF are all reused by the
+clustered version, where only the loop's source changes.
+
+`MAX_LIGHTS = 128`, clamped with a warning. `GpuLight` is 32 bytes and carries
+position/radius/colour/intensity only; §12's `dir_cone` and `type` are omitted
+rather than padded, since unused fields cost bandwidth every frame.
+
+**Pending:** everything that makes it *clustered* — the grid, both compute
+dispatches, `clusterGrid`/`lightIndexList` and the fragment lookup. **There is no
+compute support in the codebase at all**, and `pick_physical_device` selects a
+queue family on `GRAPHICS` alone without ever checking `COMPUTE`, so that comes
+first. Also pending: spot lights, and shadowed point lights (cube maps).
+
 ## 13. Image pipeline: IBL + post
 
 ### IBL bake (ambient/indirect term; split-sum)
@@ -721,11 +748,16 @@ Implemented prefabs are deliberately only those that do something today:
   `no_collide`/`no_shadow` pair, since the switches are independent and separate
   ids would need one per combination.
 
-**Unknown ids warn once and fall back to static geometry** rather than failing.
-That is what lets `point_light` be authored now and become real when §12 lands,
-with no dead component in between — the generated test scene carries two on
-purpose to keep that path exercised. Extras parsing is lenient for the same
-reason: malformed data costs one prop, not the level.
+- **`point_light`** — a §12 punctual light, with `color`, `intensity` and
+  `radius`, and `prop`'s `collide`/`shadow` switches on the same defaults: a
+  lamp with geometry is still a physical object. Special-casing it never to cast
+  would make it the one prefab where `shadow` silently did nothing. Added once
+  there was a light system to feed; it needed one new function and no change to
+  the scene format, which is this section's claim holding up in practice.
+
+**Unknown ids warn once and fall back to static geometry** rather than failing,
+which is what lets a scene be authored ahead of the engine. Extras parsing is
+lenient for the same reason: malformed data costs one prop, not the level.
 
 **Pending:** chunk membership; the bake path (§17), since glTF is still parsed
 at runtime; and prefabs for lights and triggers, both blocked on the systems
@@ -1170,7 +1202,9 @@ milestones land.
 Culling (per-view bounding-sphere frustum cull landed for the camera + shadow
 views, §8 — broad-phase/chunk cull, rayon parallelism, AABB refinement, and LOD
 still pending); mips + MikkTSpace vertex tangents; pipeline buckets (PBR BRDF +
-base-color/normal/MR textures landed); clustered lighting;
+base-color/normal/MR textures landed); clustered lighting (**punctual lights landed** — a `point_light` prefab, a
+lights SSBO and a per-fragment loop over every visible light; the cluster grid
+and its two compute dispatches are not, and no compute support exists yet);
 precomputed cubemap/HDR IBL (analytic-sky IBL landed);
 shadows: **4-cascade CSM + 3×3 PCF landed** (§11) — practical splits, sphere-fit
 and texel-snapped per cascade, a depth array layer each, per-cascade caster

@@ -20,6 +20,10 @@ macro_rules! spv {
 /// Fixed size of the bindless texture array (`textures[]` in the shader). Slot 0
 /// is a resident white default; unused slots also point at it.
 const MAX_TEXTURES: usize = 64;
+/// Cap on punctual lights visible in one frame (§12). Clamped rather than
+/// grown: the buffer is sized once, and silently dropping past the cap is
+/// better than a resize mid-frame.
+pub const MAX_LIGHTS: usize = 128;
 
 /// Handle to a mesh registered with the renderer, in `new`'s input order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,8 +93,24 @@ struct Globals {
     /// World units per shadow texel, per cascade — scales the normal-offset
     /// bias so it stays exactly one texel wide whatever the cascade covers.
     texel_world: [f32; 4],
+    /// x = number of live entries in the lights SSBO; y/z/w spare.
+    light_params: [f32; 4],
     // x = shadow-map texel size (1/dim), y = depth bias (light-space depth), z/w -
     shadow_params: [f32; 4],
+}
+
+/// One punctual light, std430, 32 bytes (§12).
+///
+/// §12's layout also reserves `dir_cone` and `type` for spot lights. Left out
+/// rather than padded in: unused fields cost bandwidth every frame, and adding
+/// them later is a struct plus a shader edit.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GpuLight {
+    /// xyz = world position, w = radius (the distance at which it reaches zero).
+    pub pos_radius: [f32; 4],
+    /// rgb = linear colour, a = intensity.
+    pub color_intensity: [f32; 4],
 }
 
 /// Per-cascade setup the app computes and both passes consume.
@@ -134,6 +154,7 @@ pub struct MeshRenderer {
     instance_buffers: Vec<MappedBuffer>,
     // Per-frame globals UBO (light-space matrix + shadow params), binding 4.
     globals_buffers: Vec<MappedBuffer>,
+    light_buffers: Vec<MappedBuffer>,
     vertex_buffer: Buffer,
     index_buffer: Buffer,
     // Held for its lifetime: the descriptor sets reference it. Freed on drop.
@@ -152,6 +173,8 @@ pub struct MeshRenderer {
     main_runs: Vec<Run>,
     /// Caster runs per cascade — each cascade culls separately.
     shadow_runs: Vec<Vec<Run>>,
+    /// This frame's visible lights, staged by `prepare_frame`.
+    lights: Vec<GpuLight>,
     // This frame's globals (light matrix + shadow params), written in draw_shadow.
     globals: Globals,
     // Shadow-map texel size (1/dim), for the PCF offset in the globals UBO.
@@ -257,6 +280,14 @@ impl MeshRenderer {
             })
             .collect();
         // Per-frame globals UBO (light-space matrix + shadow params).
+        let light_buffers: Vec<MappedBuffer> = (0..FRAMES_IN_FLIGHT)
+            .map(|_| {
+                renderer.create_host_visible_buffer(
+                    (MAX_LIGHTS * std::mem::size_of::<GpuLight>()) as vk::DeviceSize,
+                    vk::BufferUsageFlags::STORAGE_BUFFER,
+                )
+            })
+            .collect();
         let globals_buffers: Vec<MappedBuffer> = (0..FRAMES_IN_FLIGHT)
             .map(|_| {
                 renderer.create_host_visible_buffer(
@@ -302,6 +333,12 @@ impl MeshRenderer {
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // binding 5: per-frame punctual lights (§12, fragment stage).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let set_layout = unsafe {
             device
@@ -313,10 +350,10 @@ impl MeshRenderer {
         };
 
         let pool_sizes = [
-            // instances + materials.
+            // instances + materials + lights.
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(2 * FRAMES_IN_FLIGHT as u32),
+                .descriptor_count(3 * FRAMES_IN_FLIGHT as u32),
             // the texture array + the shadow map, per set.
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -378,6 +415,11 @@ impl MeshRenderer {
                 .buffer(globals_buffers[i].handle)
                 .offset(0)
                 .range(vk::WHOLE_SIZE)];
+            // binding 5 -> this frame's punctual lights.
+            let light_info = [vk::DescriptorBufferInfo::default()
+                .buffer(light_buffers[i].handle)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
@@ -405,6 +447,11 @@ impl MeshRenderer {
                     .dst_binding(4)
                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                     .buffer_info(&globals_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(5)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&light_info),
             ];
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
@@ -641,6 +688,7 @@ impl MeshRenderer {
             sets,
             instance_buffers,
             globals_buffers,
+            light_buffers,
             vertex_buffer,
             index_buffer,
             materials_buffer,
@@ -650,6 +698,7 @@ impl MeshRenderer {
             scratch: Vec::new(),
             main_runs: Vec::new(),
             shadow_runs: (0..SHADOW_CASCADES).map(|_| Vec::new()).collect(),
+            lights: Vec::new(),
             globals: Globals::default(),
             shadow_texel,
             max_instances,
@@ -700,7 +749,18 @@ impl MeshRenderer {
         main: &mut [(MeshId, InstanceData)],
         shadows: &mut [Vec<(MeshId, InstanceData)>],
         cascades: &[CascadeSetup],
+        lights: &[GpuLight],
     ) {
+        // Clamp rather than overflow: the buffer is sized once at startup.
+        self.lights.clear();
+        self.lights
+            .extend_from_slice(&lights[..lights.len().min(MAX_LIGHTS)]);
+        if lights.len() > MAX_LIGHTS {
+            eprintln!(
+                "[light] {} visible lights exceeds MAX_LIGHTS ({MAX_LIGHTS}); dropping the rest",
+                lights.len()
+            );
+        }
         self.scratch.clear();
         self.main_runs.clear();
         for runs in &mut self.shadow_runs {
@@ -740,6 +800,7 @@ impl MeshRenderer {
         let mut globals = Globals {
             light_view_proj: [[0.0; 16]; SHADOW_CASCADES],
             texel_world: [0.0; 4],
+            light_params: [self.lights.len() as f32, 0.0, 0.0, 0.0],
             shadow_params: [self.shadow_texel, SHADOW_DEPTH_BIAS, 0.0, 0.0],
         };
         for (i, c) in cascades.iter().enumerate().take(SHADOW_CASCADES) {
@@ -767,6 +828,7 @@ impl MeshRenderer {
             // Safe to write now: draw_frame waited on this frame index's fence.
             self.instance_buffers[frame].write(as_bytes(&self.scratch));
             self.globals_buffers[frame].write(as_bytes(std::slice::from_ref(&self.globals)));
+            self.light_buffers[frame].write(as_bytes(&self.lights));
         }
         let Some(runs) = self.shadow_runs.get(cascade) else {
             return;
