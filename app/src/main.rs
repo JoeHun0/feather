@@ -4,10 +4,13 @@
 //! reads a **material** per instance (`material_id` → a materials SSBO), whose
 //! base color can be a **texture** sampled from a bindless array: loaded glTF
 //! meshes use their file's base-color texture/factor, procedural sphere/cube
-//! instances use a shared palette. Meshes are a procedural sphere + cube by
-//! default, or one
-//! per glTF/GLB path on the CLI (`cargo run -- a.glb b.glb`), each auto-fitted
-//! to the grid. A directional light with a Cook-Torrance **PBR** BRDF plus
+//! instances use a shared palette.
+//!
+//! With no arguments this runs the procedural orb demo. Given glTF/GLB paths
+//! (`cargo run -- level.glb`) it instead loads them as **scenes**: every node
+//! becomes its own entity with that node's world transform and its primitive's
+//! own material, nodes sharing a mesh draw as instances, and each gets a trimesh
+//! collider so the level is walkable. A directional light with a Cook-Torrance **PBR** BRDF plus
 //! analytic environment ambient (IBL) shades in
 //! linear space into an HDR target, over a procedural **sky background**,
 //! which a tonemap pass resolves to the sRGB swapchain. **WASD + mouse** walk a
@@ -72,10 +75,6 @@ const GRAVITY: f32 = 26.0;
 const JUMP_SPEED: f32 = 9.0; // ~1.5 units apex
 const FLY_SPEED: f32 = 14.0; // noclip movement speed
 
-// Frustum culling (§8). A fitted mesh lives in a unit cube (sphere radius ≤
-// √3/2 ≈ 0.87), scaled by the entity's Scale — a conservative cull radius.
-const CULL_SPHERE_K: f32 = 0.87;
-
 // Sun shadow frustum (§11). The ortho follows the player, so these are relative
 // to them: half-extent of the covered square, how far back along the sun the
 // light "eye" sits, and the ortho's depth range. A tighter radius means denser
@@ -106,6 +105,12 @@ struct Spin(f32); // angular velocity, rad/s
 /// entities use a uniform scale; static level pieces use non-uniform sizes.
 #[derive(Component)]
 struct Scale(Vec3);
+/// World transform for **static** scene geometry loaded from glTF (§18). glTF
+/// nodes carry arbitrary rotations, which the demo's
+/// `Position`/`Rotation(yaw)`/`Scale` triple cannot express. Static, so there is
+/// no prev/curr pair — nothing to interpolate.
+#[derive(Component)]
+struct Transform(Mat4);
 #[derive(Component)]
 struct Mesh(MeshId);
 #[derive(Component)]
@@ -129,13 +134,13 @@ struct FrameCount(u64);
 /// Number of shared palette materials generated for procedural meshes.
 const PALETTE: u32 = 24;
 
-/// What to register with the renderer. Resolved into `MeshData` at startup; the
-/// index in the source list is the mesh's `MeshId`.
-enum MeshSource {
-    Sphere,
-    Cube,
-    Gltf(String),
-}
+/// Mesh registry slots that always exist, before any loaded scene's meshes.
+/// `App::new` spawns the orb demo against SPHERE/CUBE, and the level pieces use
+/// LEVEL_CUBE, so these indices must match the order they are registered in.
+const MESH_SPHERE: u32 = 0;
+const MESH_CUBE: u32 = 1;
+const MESH_LEVEL_CUBE: u32 = 2;
+const MESH_BUILTIN_COUNT: u32 = 3;
 
 /// One fixed step: snapshot the current state into `Prev*`, then advance
 /// position by velocity and the spin angle by angular velocity. Runs at
@@ -256,6 +261,25 @@ impl Physics {
             &(),
             &(),
         );
+    }
+
+    /// A fixed triangle-mesh collider for loaded scene geometry. `verts` must
+    /// already be in **world** space with the collider left at the identity: glTF
+    /// nodes routinely carry non-uniform scale, which a rapier `Pose` cannot
+    /// express. Returns `None` (and logs) for degenerate meshes rather than
+    /// bringing the level down.
+    fn add_static_trimesh(
+        &mut self,
+        verts: Vec<Vector>,
+        tris: Vec<[u32; 3]>,
+    ) -> Option<ColliderHandle> {
+        match ColliderBuilder::trimesh(verts, tris) {
+            Ok(b) => Some(self.colliders.insert(b)),
+            Err(e) => {
+                eprintln!("scene collider skipped: {e}");
+                None
+            }
+        }
     }
 
     /// A fixed axis-aligned box collider (static level geometry).
@@ -507,10 +531,13 @@ struct App {
     noclip: bool,
     light_dir: Vec4,
     exposure: f32,
-    // Meshes to register (decided up front); index == MeshId.
-    sources: Vec<MeshSource>,
+    // glTF scenes to load at startup (CLI paths). Empty = the procedural demo.
+    scenes: Vec<String>,
     // Per-mesh transform that centers + unit-scales it into the demo grid.
+    // Identity for scene meshes — a level must keep its authored size.
     fits: Vec<Mat4>,
+    // Per-mesh **local** (pre-fit) bounding sphere, for frustum culling (§8).
+    mesh_spheres: Vec<(Vec3, f32)>,
     last_frame: Instant,
     // Fixed-timestep accumulator: real time not yet consumed by a sim step,
     // carried across frames. Its fraction of FIXED_DT is the render alpha.
@@ -518,7 +545,7 @@ struct App {
 }
 
 impl App {
-    fn new(sources: Vec<MeshSource>) -> Self {
+    fn new(scenes: Vec<String>) -> Self {
         let mut world = World::new();
         world.insert_resource(FrameCount::default());
         let mut physics = Physics::new();
@@ -529,9 +556,15 @@ impl App {
         world.insert_resource(InputState::default());
         let player = world.spawn((body, Look::new())).id();
 
-        let mesh_count = sources.len().max(1) as u32;
+        // The drifting orb demo only runs when no scene was given — a loaded level
+        // is what you want to look at, and 1000 orbs would bury it.
         let half = (GRID as f32 - 1.0) / 2.0;
-        for i in 0..(GRID * GRID * GRID) {
+        let orb_count = if scenes.is_empty() {
+            GRID * GRID * GRID
+        } else {
+            0
+        };
+        for i in 0..orb_count {
             let (x, y, z) = (i % GRID, (i / GRID) % GRID, i / (GRID * GRID));
             let pos = Vec3::new(x as f32 - half, y as f32 - half, z as f32 - half) * 1.6;
             let u = i as u32;
@@ -541,15 +574,13 @@ impl App {
                 rand01(u * 3 + 2) - 0.5,
             ) * 1.5;
             let spin = (rand01(u * 7 + 11) - 0.5) * 3.0;
-            // Assign a mesh at random among those registered.
-            let mesh = ((rand01(u * 17 + 5) * mesh_count as f32) as u32).min(mesh_count - 1);
-            // glTF meshes use their own file material (id = PALETTE + mesh index);
-            // procedural meshes pick a random shared palette material.
-            let material = if matches!(sources.get(mesh as usize), Some(MeshSource::Gltf(_))) {
-                PALETTE + mesh
+            // Procedural sphere or cube, with a random shared palette material.
+            let mesh = if rand01(u * 17 + 5) < 0.5 {
+                MESH_SPHERE
             } else {
-                (rand01(u * 23 + 7) * PALETTE as f32) as u32 % PALETTE
+                MESH_CUBE
             };
+            let material = (rand01(u * 23 + 7) * PALETTE as f32) as u32 % PALETTE;
             world.spawn((
                 Position(pos),
                 PrevPosition(pos), // prev == curr on frame 0: first interp is a no-op
@@ -586,8 +617,9 @@ impl App {
             noclip: false,
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             exposure: 1.0,
-            sources,
+            scenes,
             fits: Vec::new(),
+            mesh_spheres: Vec::new(),
             last_frame: now,
             accumulator: 0.0,
         }
@@ -619,40 +651,51 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         let renderer = Renderer::new(&window, size.width, size.height).expect("create renderer");
 
-        // Resolve every source into MeshData (loading glTF, generating
-        // procedurals). A failed glTF is replaced with a sphere so mesh indices
-        // stay aligned with `sources` (and thus with spawned Mesh ids).
-        let mut meshes: Vec<MeshData> = Vec::with_capacity(self.sources.len());
-        for src in &self.sources {
-            let mesh = match src {
-                MeshSource::Sphere => MeshData::uv_sphere(16, 24, 0.5),
-                MeshSource::Cube => MeshData::cube(1.0),
-                MeshSource::Gltf(path) => match feather_assets::load_gltf(path) {
-                    Ok(m) => {
-                        eprintln!(
-                            "loaded {path}: {} vertices, {} indices",
-                            m.vertices.len(),
-                            m.indices.len()
-                        );
-                        m
-                    }
-                    Err(e) => {
-                        eprintln!("failed to load {path}: {e} (using sphere)");
-                        MeshData::uv_sphere(16, 24, 0.5)
-                    }
-                },
-            };
-            meshes.push(mesh);
+        // Built-in meshes first, at the fixed MESH_* slots: the demo sphere/cube,
+        // then the unit cube every static level piece is scaled from.
+        let mut meshes: Vec<MeshData> = vec![
+            MeshData::uv_sphere(16, 24, 0.5),
+            MeshData::cube(1.0),
+            MeshData::cube(1.0),
+        ];
+        // Then each CLI glTF scene's meshes. `scene_nodes` keeps the placements to
+        // spawn once the material ids are known; mesh indices are offset by however
+        // many meshes are already registered.
+        let mut scene_nodes: Vec<(usize, Mat4)> = Vec::new();
+        for path in &self.scenes {
+            match feather_assets::load_gltf_scene(path) {
+                Ok(scene) => {
+                    eprintln!(
+                        "loaded {path}: {} meshes, {} nodes",
+                        scene.meshes.len(),
+                        scene.nodes.len()
+                    );
+                    let base = meshes.len();
+                    meshes.extend(scene.meshes);
+                    scene_nodes.extend(
+                        scene
+                            .nodes
+                            .into_iter()
+                            .map(|n| (base + n.mesh, n.transform)),
+                    );
+                }
+                Err(e) => eprintln!("failed to load {path}: {e} (skipped)"),
+            }
         }
-        if meshes.is_empty() {
-            meshes.push(MeshData::uv_sphere(16, 24, 0.5));
-        }
-        // Append a unit cube used for all static level geometry (ground + boxes).
-        // Its MeshId is the last slot; `fits` below normalizes it to a unit cube
-        // centered at the origin, so a per-entity `Scale` yields exact box sizes.
-        let level_cube_id = meshes.len() as u32;
-        meshes.push(MeshData::cube(1.0));
-        self.fits = meshes.iter().map(fit_transform).collect();
+        // Built-ins get the demo fit (centre + unit-scale); scene meshes keep their
+        // authored transform, so identity.
+        self.fits = meshes
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                if (i as u32) < MESH_BUILTIN_COUNT {
+                    fit_transform(m)
+                } else {
+                    Mat4::IDENTITY
+                }
+            })
+            .collect();
+        self.mesh_spheres = meshes.iter().map(local_sphere).collect();
 
         // Material table: shared palette first (indices 0..PALETTE), then each
         // mesh's own material (index PALETTE + mesh_id) — matches the ids that
@@ -675,7 +718,7 @@ impl ApplicationHandler for App {
             &mut self.world,
             Vec3::new(0.0, GROUND_Y - 0.5, 0.0),
             Vec3::new(80.0, 1.0, 80.0),
-            level_cube_id,
+            MESH_LEVEL_CUBE,
             ground_mat,
         );
         // This ground is a flat slab: it casts nothing useful but would rasterize
@@ -693,8 +736,39 @@ impl ApplicationHandler for App {
         ];
         for (offset, size) in boxes {
             let center = Vec3::new(offset.x, GROUND_Y + offset.y, offset.z);
-            spawn_static(&mut self.world, center, size, level_cube_id, box_mat);
+            spawn_static(&mut self.world, center, size, MESH_LEVEL_CUBE, box_mat);
         }
+        // Scene geometry from the CLI glTF files (§18): one entity per node,
+        // carrying that node's world transform, so nodes sharing a mesh draw as
+        // instances. Each also gets a fixed trimesh collider so the level is
+        // walkable. Material ids follow the same `PALETTE + mesh index` rule the
+        // table below is built with.
+        for (mesh_idx, transform) in &scene_nodes {
+            let data = &meshes[*mesh_idx];
+            let verts: Vec<Vector> = data
+                .vertices
+                .iter()
+                .map(|v| to_rapier(transform.transform_point3(Vec3::from(v.pos))))
+                .collect();
+            let tris: Vec<[u32; 3]> = data
+                .indices
+                .chunks_exact(3)
+                .map(|t| [t[0], t[1], t[2]])
+                .collect();
+            let collider = self
+                .world
+                .resource_mut::<Physics>()
+                .add_static_trimesh(verts, tris);
+            let mut e = self.world.spawn((
+                Transform(*transform),
+                Mesh(MeshId(*mesh_idx as u32)),
+                Material(PALETTE + *mesh_idx as u32),
+            ));
+            if let Some(c) = collider {
+                e.insert(ColliderRef(c));
+            }
+        }
+
         // One step so the broad-phase BVH the character controller shape-casts
         // against contains the level before the first fixed tick.
         self.world.resource_mut::<Physics>().step();
@@ -879,6 +953,7 @@ impl ApplicationHandler for App {
                 // the sim<->render seam; interpolation lives here per §4. Static level
                 // pieces lack Velocity/Spin so `integrate` skips them; prev == curr.
                 let fits = &self.fits;
+                let spheres = &self.mesh_spheres;
                 let mesh_max = fits.len().saturating_sub(1);
                 let cap = (GRID * GRID * GRID) as usize + 8;
                 let mut main_items: Vec<(MeshId, InstanceData)> = Vec::with_capacity(cap);
@@ -902,14 +977,30 @@ impl ApplicationHandler for App {
                         * Mat4::from_scale(scale.0)
                         * fits[id];
                     let item = (MeshId(id as u32), InstanceData::new(model, material.0));
-                    // Conservative world bounding sphere: `fit_transform` normalizes
-                    // the mesh into a unit cube (sphere <= sqrt(3)/2), then Scale sizes
-                    // it. Over-inclusive by design — never culls a visible object.
-                    let radius = CULL_SPHERE_K * scale.0.max_element();
-                    if camera_frustum.contains_sphere(pos, radius) {
+                    let (c, radius) = world_sphere(&model, spheres[id]);
+                    if camera_frustum.contains_sphere(c, radius) {
                         main_items.push(item);
                     }
-                    if no_cast.is_none() && light_frustum.contains_sphere(pos, radius) {
+                    if no_cast.is_none() && light_frustum.contains_sphere(c, radius) {
+                        shadow_items.push(item);
+                    }
+                }
+
+                // Static scene geometry (§18): the node matrix *is* the transform,
+                // so there is nothing to interpolate. Separate query rather than an
+                // Option<> branch, to keep the two archetypes clean.
+                let mut qs = self
+                    .world
+                    .query::<(&Transform, &Mesh, &Material, Option<&NoShadowCast>)>();
+                for (t, mesh, material, no_cast) in qs.iter(&self.world) {
+                    let id = (mesh.0 .0 as usize).min(mesh_max);
+                    let model = t.0 * fits[id];
+                    let item = (MeshId(id as u32), InstanceData::new(model, material.0));
+                    let (c, radius) = world_sphere(&model, spheres[id]);
+                    if camera_frustum.contains_sphere(c, radius) {
+                        main_items.push(item);
+                    }
+                    if no_cast.is_none() && light_frustum.contains_sphere(c, radius) {
                         shadow_items.push(item);
                     }
                 }
@@ -1035,6 +1126,28 @@ impl Frustum {
     }
 }
 
+/// A mesh's **local** (pre-fit) bounding sphere `(centre, radius)`. Extract maps
+/// it through the model matrix — which already includes the fit — to get the
+/// world sphere the frustum test uses (§8).
+fn local_sphere(mesh: &MeshData) -> (Vec3, f32) {
+    let (min, max) = mesh.bounds();
+    let c = (min + max) * 0.5;
+    (c, (max - c).length())
+}
+
+/// World bounding sphere of `local` under `model`: the centre transforms with it,
+/// and the radius scales by the model's largest axis scale — conservative under
+/// non-uniform scale, which is what culling wants.
+fn world_sphere(model: &Mat4, local: (Vec3, f32)) -> (Vec3, f32) {
+    let s = model
+        .x_axis
+        .truncate()
+        .length()
+        .max(model.y_axis.truncate().length())
+        .max(model.z_axis.truncate().length());
+    (model.transform_point3(local.0), local.1 * s)
+}
+
 /// Center the mesh at the origin and scale its largest extent to ~1 unit, so an
 /// arbitrarily-sized glTF drops into the demo grid at the same scale as the
 /// sphere. Applied as the innermost factor of each instance's model matrix.
@@ -1071,18 +1184,14 @@ fn palette_material(k: u32) -> feather_assets::Material {
 }
 
 fn main() {
-    // One MeshId per CLI path (`cargo run -- a.glb b.glb`). With no args, a
-    // procedural sphere + cube so multi-mesh batching is visible out of the box.
-    let paths: Vec<String> = std::env::args().skip(1).collect();
-    let sources = if paths.is_empty() {
-        vec![MeshSource::Sphere, MeshSource::Cube]
-    } else {
-        paths.into_iter().map(MeshSource::Gltf).collect()
-    };
+    // CLI paths are glTF *scenes* to load and walk around
+    // (`cargo run -- level.glb`); each node becomes its own entity. With no args,
+    // the procedural drifting-orb demo runs instead.
+    let scenes: Vec<String> = std::env::args().skip(1).collect();
 
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(sources);
+    let mut app = App::new(scenes);
     event_loop.run_app(&mut app).expect("run app");
 }
 

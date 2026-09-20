@@ -581,6 +581,15 @@ bindings table; no gamepad, no UI focus flag.
   walk nodes → resolve handles → look up prefab → spawn archetype. New types =
   new spawn fn, not a format change. Chunk membership computed at bake, written
   into the blob.
+**Landed (§26):** the first half of data-driven spawning — `load_gltf_scene`
+returns meshes in local space plus one `SceneNode` per placement, and the app
+spawns an entity per node (`Transform` + mesh/material handles + a trimesh
+`ColliderRef`). Primitives are deduplicated by `(mesh, primitive)`, so a mesh
+referenced by many nodes is stored once and drawn as instances. **Pending:** the
+prefab registry and `extras`/sidecar gameplay data — nodes currently spawn as
+static geometry only; chunk membership; and the bake path (§17), since glTF is
+still parsed at runtime.
+
 - **Save/load is separate from scene loading.** Do **not** serialize the whole
   `World` (GPU/physics handles aren't serializable). Mark a **saveable subset**:
   `serde` on plain-data gameplay components + a `Saveable` marker; save queries
@@ -755,11 +764,15 @@ milestones land.
   (CPU sort/stage) + `draw_shadow`/`draw_main` replaying the same instance runs.
 - **assets**: Vulkan-free CPU mesh types (`Vertex` = pos+normal+uv, `MeshData` +
   bounds + `Material` with optional decoded base-color / normal / MR textures),
-  procedural `uv_sphere` + `cube`, and a **glTF/GLB loader** (`load_gltf`, via
-  `gltf::import`) — merges all triangle primitives across the node hierarchy with
-  transforms, reads UVs, computes normals when absent, reads the first
-  primitive's material (factors + base-color/normal/MR textures decoded to
-  RGBA8, normal scale), resolves .glb / external / data-URI buffers and images.
+  procedural `uv_sphere` + `cube`, and a **glTF/GLB scene loader**
+  (`load_gltf_scene`, via `gltf::import`) returning `SceneData { meshes, nodes }`
+  — one `MeshData` per referenced (mesh, primitive) pair in **local** space with
+  **its own material**, plus one `SceneNode` per placement carrying that node's
+  world transform. Primitives are deduplicated, so a mesh used by N nodes is
+  stored once and drawn as N instances. Reads UVs, computes normals when absent,
+  decodes base-color/normal/MR textures to RGBA8, and resolves .glb / external /
+  data-URI buffers and images. Covered by the crate's first unit tests (a
+  synthesized glTF fixture asserting dedup and transform inheritance).
 - **app**: winit loop; bevy_ecs world + multi-threaded schedule (`integrate`,
   `tick`) driven on a **fixed timestep** (accumulator + `FIXED_DT`, frame delta
   clamped and steps capped as a spiral-of-death guard) so sim speed no longer
@@ -779,11 +792,21 @@ milestones land.
   through the same instanced path; a **depth prepass** (§10) ahead of the opaque
   draws, which then run depth-write-off + `LESS_OR_EQUAL` (−42% on the geometry
   pass);
-  `[`/`]` adjust tonemap exposure at runtime; meshes are a procedural sphere +
-  cube by default or one per glTF path on the CLI (each auto-fitted to the grid),
-  plus a unit cube appended for level geometry;
-  each entity assigned a mesh + `material_id` at random (glTF meshes use their
-  file material; procedural meshes use a shared generated palette).
+  `[`/`]` adjust tonemap exposure at runtime; the mesh registry always begins with
+  three built-ins (demo sphere, demo cube, and the unit cube every static level
+  piece is scaled from, auto-fitted to the grid), and **glTF paths on the CLI are
+  loaded as scenes** appended after them — one entity per node with a `Transform`,
+  its primitive's own material, and a trimesh `ColliderRef`, so a loaded level is
+  walkable. Giving a scene suppresses the orb demo (1000 orbs would bury it);
+  with no arguments the orb demo runs as before, each orb taking a random built-in
+  mesh + palette material. Culling uses a **per-mesh local bounding sphere**
+  mapped through the model matrix, rather than a blanket radius — required because
+  scene meshes are not unit-fitted. Limits: `MAX_TEXTURES = 64` (scenes past that
+  fall back to the default textures), a trimesh collider is built per node at load
+  (no convex decomposition, no per-node opt-out), scenes land at their authored
+  coordinates so a model authored around the origin floats above the demo ground
+  at `GROUND_Y`, and there is still no broad-phase/LOD, so a large scene leans on
+  the per-entity cull.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 partially — PBR direct
   lighting + full textures + analytic-sky IBL, *not* CSM/GTAO or cubemap IBL;
   step 4 mostly landed — fixed timestep + interpolation and the rapier kinematic
@@ -896,8 +919,10 @@ player-following + texel-snapped, so shadows track you and don't crawl; CSM
 cascades / splits / atlas / pancaking still pending, so only a
 `SHADOW_RADIUS` box around the player is shadowed;
 bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
-bake pipeline (runtime glTF + multi-mesh registry landed); scene format /
-spawning / save; rapier beyond the player (kinematic FPS controller, static
+bake pipeline (runtime glTF scene loading + multi-mesh registry landed — the
+offline bake, runtime blob and handle tables are not); scene spawning (glTF nodes
+spawn as static entities; the prefab registry and `extras` gameplay data are
+pending) / save; rapier beyond the player (kinematic FPS controller, static
 colliders and the ECS↔rapier sync systems landed — dynamic bodies and collision
 layers pending);
 skinning; UI/HUD; audio; debug/profiling tooling (per-pass GPU timestamp timing

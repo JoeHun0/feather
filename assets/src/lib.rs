@@ -5,10 +5,11 @@
 //! Everything here is Vulkan-free by design (§22) — the renderer uploads these
 //! buffers to the GPU.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
 
-use glam::{Mat3, Mat4, Vec3};
+use glam::{Mat4, Vec3};
 
 /// Interleaved static vertex. Matches the renderer's vertex attribute layout
 /// (position at offset 0, normal at offset 12, uv at offset 24). `#[repr(C)]` so
@@ -145,42 +146,83 @@ impl MeshData {
     }
 }
 
-/// Load a glTF / GLB file and merge every mesh primitive (across the node
-/// hierarchy, node transforms applied) into a single `MeshData` with UVs and the
-/// first primitive's material (factors + base-color texture, decoded to RGBA8).
+/// One placement in a loaded scene: which mesh to draw and where. Several nodes
+/// referencing the same mesh is the common case (props repeated across a level),
+/// and is exactly what the renderer's instanced path wants.
+pub struct SceneNode {
+    /// Index into [`SceneData::meshes`].
+    pub mesh: usize,
+    /// The node's world transform, with the whole parent chain applied.
+    pub transform: Mat4,
+}
+
+/// A glTF scene decomposed for the ECS: meshes in **local** space, plus one node
+/// per placement. Deliberately *not* merged into a single mesh — per-primitive
+/// materials survive, and repeated meshes instance instead of being duplicated.
+pub struct SceneData {
+    /// One entry per (glTF mesh, primitive) pair actually referenced, each with
+    /// its own `material`. Local space: the node transform is on the node.
+    pub meshes: Vec<MeshData>,
+    pub nodes: Vec<SceneNode>,
+}
+
+/// Load a glTF / GLB **scene**: every referenced mesh primitive becomes its own
+/// `MeshData` (keeping its own material), and every node referencing one becomes a
+/// [`SceneNode`] carrying that node's world transform.
+///
+/// Primitives are deduplicated by `(mesh index, primitive index)`, so a mesh used
+/// by many nodes is stored once and drawn as many instances.
 ///
 /// Handled: positions (required), normals (computed if absent), UVs (0 if
-/// absent), indices (generated if absent), node transforms, triangle primitives,
-/// .glb / external / data: URI buffers and images, and the first primitive's
-/// base-color + normal + metallic-roughness textures (with factors + normal scale).
+/// absent), indices (generated if absent), the node hierarchy and its transforms,
+/// triangle primitives, .glb / external / data: URI buffers and images, and each
+/// primitive's base-color + normal + metallic-roughness textures (with factors +
+/// normal scale).
 ///
-/// Deferred: per-primitive materials (first wins), tangents, skinning, animation,
-/// morph targets, non-triangle primitives, 16-/32-bit image formats.
-pub fn load_gltf(path: impl AsRef<Path>) -> Result<MeshData, Box<dyn Error>> {
+/// Deferred: tangents, skinning, animation, morph targets, non-triangle
+/// primitives, 16-/32-bit image formats, and `extras` gameplay data (§18).
+pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<SceneData, Box<dyn Error>> {
     // import resolves all buffers (blob / external / data URI) and decodes images.
     let (doc, buffers, images) = gltf::import(path)?;
 
-    let mut out = MeshData::default();
-    let mut material: Option<Material> = None;
+    let mut out = SceneData {
+        meshes: Vec::new(),
+        nodes: Vec::new(),
+    };
+    // (gltf mesh index, primitive index) -> index into out.meshes.
+    let mut seen: HashMap<(usize, usize), usize> = HashMap::new();
+
     match doc.default_scene().or_else(|| doc.scenes().next()) {
         Some(scene) => {
             for node in scene.nodes() {
-                accumulate_node(&node, Mat4::IDENTITY, &buffers, &images, &mut out, &mut material);
+                walk_node(
+                    &node,
+                    Mat4::IDENTITY,
+                    &buffers,
+                    &images,
+                    &mut seen,
+                    &mut out,
+                );
             }
         }
-        // No scene graph: take mesh geometry directly, untransformed.
+        // No scene graph: place every mesh at the origin.
         None => {
             for mesh in doc.meshes() {
-                append_mesh(&mesh, Mat4::IDENTITY, &buffers, &images, &mut out, &mut material);
+                add_mesh_nodes(
+                    &mesh,
+                    Mat4::IDENTITY,
+                    &buffers,
+                    &images,
+                    &mut seen,
+                    &mut out,
+                );
             }
         }
     }
 
-    if out.vertices.is_empty() {
+    if out.nodes.is_empty() {
         return Err("glTF contained no triangle mesh geometry".into());
     }
-    // First primitive's material wins (merging is single-material for now).
-    out.material = material.unwrap_or_default();
     Ok(out)
 }
 
@@ -248,70 +290,94 @@ fn to_rgba8(img: &gltf::image::Data) -> Option<TextureData> {
     })
 }
 
-fn accumulate_node(
+fn walk_node(
     node: &gltf::Node,
     parent: Mat4,
     buffers: &[gltf::buffer::Data],
     images: &[gltf::image::Data],
-    out: &mut MeshData,
-    material: &mut Option<Material>,
+    seen: &mut HashMap<(usize, usize), usize>,
+    out: &mut SceneData,
 ) {
     let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
     if let Some(mesh) = node.mesh() {
-        append_mesh(&mesh, world, buffers, images, out, material);
+        add_mesh_nodes(&mesh, world, buffers, images, seen, out);
     }
     for child in node.children() {
-        accumulate_node(&child, world, buffers, images, out, material);
+        walk_node(&child, world, buffers, images, seen, out);
     }
 }
 
-fn append_mesh(
+/// Emit one [`SceneNode`] per triangle primitive of `mesh` at `world`, registering
+/// each primitive's geometry once (subsequent references reuse the same index, so
+/// repeated props instance rather than duplicating vertices).
+fn add_mesh_nodes(
     mesh: &gltf::Mesh,
     world: Mat4,
     buffers: &[gltf::buffer::Data],
     images: &[gltf::image::Data],
-    out: &mut MeshData,
-    material: &mut Option<Material>,
+    seen: &mut HashMap<(usize, usize), usize>,
+    out: &mut SceneData,
 ) {
-    // Normals transform by the inverse-transpose (correct under non-uniform scale).
-    let normal_mat = Mat3::from_mat4(world).inverse().transpose();
     for prim in mesh.primitives() {
         if prim.mode() != gltf::mesh::Mode::Triangles {
             continue;
         }
-        if material.is_none() {
-            *material = Some(read_material(&prim.material(), images));
-        }
-        let reader = prim.reader(|b| Some(&buffers[b.index()][..]));
-        let positions: Vec<[f32; 3]> = match reader.read_positions() {
-            Some(p) => p.collect(),
-            None => continue,
+        let key = (mesh.index(), prim.index());
+        let slot = match seen.get(&key) {
+            Some(&i) => i,
+            None => {
+                let Some(data) = primitive_mesh(&prim, buffers, images) else {
+                    continue; // no positions
+                };
+                out.meshes.push(data);
+                let i = out.meshes.len() - 1;
+                seen.insert(key, i);
+                i
+            }
         };
-        let indices: Vec<u32> = match reader.read_indices() {
-            Some(idx) => idx.into_u32().collect(),
-            None => (0..positions.len() as u32).collect(),
-        };
-        let normals: Vec<[f32; 3]> = match reader.read_normals() {
-            Some(n) => n.collect(),
-            None => compute_normals(&positions, &indices),
-        };
-        let uvs: Option<Vec<[f32; 2]>> =
-            reader.read_tex_coords(0).map(|t| t.into_f32().collect());
-
-        let base = out.vertices.len() as u32;
-        for (i, p) in positions.iter().enumerate() {
-            let wp = world.transform_point3(Vec3::from(*p));
-            let n = normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
-            let wn = (normal_mat * Vec3::from(n)).normalize_or_zero();
-            let uv = uvs.as_ref().and_then(|u| u.get(i).copied()).unwrap_or([0.0, 0.0]);
-            out.vertices.push(Vertex {
-                pos: wp.to_array(),
-                normal: wn.to_array(),
-                uv,
-            });
-        }
-        out.indices.extend(indices.iter().map(|i| base + *i));
+        out.nodes.push(SceneNode {
+            mesh: slot,
+            transform: world,
+        });
     }
+}
+
+/// Read one primitive into a local-space `MeshData` with its own material.
+fn primitive_mesh(
+    prim: &gltf::Primitive,
+    buffers: &[gltf::buffer::Data],
+    images: &[gltf::image::Data],
+) -> Option<MeshData> {
+    let reader = prim.reader(|b| Some(&buffers[b.index()][..]));
+    let positions: Vec<[f32; 3]> = reader.read_positions()?.collect();
+    let indices: Vec<u32> = match reader.read_indices() {
+        Some(idx) => idx.into_u32().collect(),
+        None => (0..positions.len() as u32).collect(),
+    };
+    let normals: Vec<[f32; 3]> = match reader.read_normals() {
+        Some(n) => n.collect(),
+        None => compute_normals(&positions, &indices),
+    };
+    let uvs: Option<Vec<[f32; 2]>> = reader.read_tex_coords(0).map(|t| t.into_f32().collect());
+
+    let vertices = positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Vertex {
+            pos: *p,
+            normal: normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
+            uv: uvs
+                .as_ref()
+                .and_then(|u| u.get(i).copied())
+                .unwrap_or([0.0, 0.0]),
+        })
+        .collect();
+
+    Some(MeshData {
+        vertices,
+        indices,
+        material: read_material(&prim.material(), images),
+    })
 }
 
 /// Area-weighted per-vertex normals from a triangle list (used when a primitive
@@ -332,4 +398,96 @@ fn compute_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
         acc[ic] += face;
     }
     acc.iter().map(|v| v.normalize_or_zero().to_array()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal glTF fixture: one triangle mesh referenced by three nodes, one of
+    /// which is a child, so a single file covers per-primitive meshes, mesh
+    /// deduplication and transform inheritance. Written to disk rather than
+    /// committed as a binary, since `scratch/` is gitignored.
+    fn write_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let positions: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let mut bin = Vec::new();
+        for f in positions {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+        std::fs::write(dir.join("tri.bin"), &bin).unwrap();
+
+        // node 1 parents node 2, so node 2's world translation is (0, 2, 3).
+        let gltf = r#"{
+  "asset": { "version": "2.0" },
+  "scene": 0,
+  "scenes": [ { "nodes": [0, 1] } ],
+  "nodes": [
+    { "mesh": 0, "translation": [1, 0, 0] },
+    { "mesh": 0, "translation": [0, 2, 0], "children": [2] },
+    { "mesh": 0, "translation": [0, 0, 3] }
+  ],
+  "meshes": [ { "primitives": [ { "attributes": { "POSITION": 0 } } ] } ],
+  "accessors": [ {
+    "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+    "min": [0, 0, 0], "max": [1, 1, 0]
+  } ],
+  "bufferViews": [ { "buffer": 0, "byteOffset": 0, "byteLength": 36 } ],
+  "buffers": [ { "byteLength": 36, "uri": "tri.bin" } ]
+}"#;
+        let path = dir.join("tri.gltf");
+        std::fs::write(&path, gltf).unwrap();
+        path
+    }
+
+    fn fixture_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("feather_gltf_{}_{}", name, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn scene_dedups_meshes_and_accumulates_transforms() {
+        let dir = fixture_dir("scene");
+        let scene = load_gltf_scene(write_fixture(&dir)).unwrap();
+
+        // Three nodes reference ONE primitive: it must be stored once and placed
+        // three times, which is what lets the renderer instance it.
+        assert_eq!(scene.meshes.len(), 1, "primitive should be deduplicated");
+        assert_eq!(scene.nodes.len(), 3, "one placement per referencing node");
+        assert!(scene.nodes.iter().all(|n| n.mesh == 0));
+
+        let origins: Vec<Vec3> = scene
+            .nodes
+            .iter()
+            .map(|n| n.transform.transform_point3(Vec3::ZERO))
+            .collect();
+        assert!(origins.contains(&Vec3::new(1.0, 0.0, 0.0)));
+        assert!(origins.contains(&Vec3::new(0.0, 2.0, 0.0)));
+        // The child's transform is its parent's composed with its own.
+        assert!(
+            origins.contains(&Vec3::new(0.0, 2.0, 3.0)),
+            "child should inherit the parent transform, got {origins:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scene_meshes_stay_in_local_space() {
+        let dir = fixture_dir("local");
+        let scene = load_gltf_scene(write_fixture(&dir)).unwrap();
+
+        // Geometry must NOT have the node transforms baked in — that is precisely
+        // what would break instancing of a mesh used at several places.
+        let verts: Vec<[f32; 3]> = scene.meshes[0].vertices.iter().map(|v| v.pos).collect();
+        assert_eq!(
+            verts,
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        );
+        // Indices are generated when the primitive ships none.
+        assert_eq!(scene.meshes[0].indices, vec![0, 1, 2]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
