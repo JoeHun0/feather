@@ -34,7 +34,7 @@ use bevy_ecs::schedule::ExecutorKind;
 use feather_assets::MeshData;
 use feather_gfx::Renderer;
 use feather_platform::winit;
-use feather_render::{InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass};
+use feather_render::{FxaaPass, InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass};
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
 use rapier3d::prelude::{
@@ -148,6 +148,9 @@ struct GraphicsSettings {
     /// geometry pipeline, so changing it means rebuilding them all — the usual
     /// "applies on restart" trade. `gfx` clamps this to what the device supports.
     msaa: u32,
+    /// FXAA post-AA (§13). Unlike MSAA this is live-toggleable (`F2`): it bakes
+    /// nothing into pipelines, and the LDR intermediate is always allocated.
+    fxaa: bool,
 }
 
 impl Default for GraphicsSettings {
@@ -155,6 +158,7 @@ impl Default for GraphicsSettings {
         Self {
             shadows: ShadowQuality::High,
             msaa: 1,
+            fxaa: false,
         }
     }
 }
@@ -595,6 +599,7 @@ struct Input {
 struct App {
     mesh: Option<MeshRenderer>,
     tonemap: Option<TonemapPass>,
+    fxaa: Option<FxaaPass>,
     sky: Option<SkyPass>,
     renderer: Option<Renderer>,
     window: Option<Window>,
@@ -684,6 +689,7 @@ impl App {
         Self {
             mesh: None,
             tonemap: None,
+            fxaa: None,
             sky: None,
             renderer: None,
             window: None,
@@ -873,10 +879,12 @@ impl ApplicationHandler for App {
 
         let (mesh, _ids) = MeshRenderer::new(&renderer, &meshes, &materials, MAX_INSTANCES);
         let tonemap = TonemapPass::new(&renderer);
+        let fxaa = FxaaPass::new(&renderer);
         let sky = SkyPass::new(&renderer);
 
         self.mesh = Some(mesh);
         self.tonemap = Some(tonemap);
+        self.fxaa = Some(fxaa);
         self.sky = Some(sky);
         self.renderer = Some(renderer);
         self.window = Some(window);
@@ -915,6 +923,17 @@ impl ApplicationHandler for App {
                         KeyCode::ControlLeft => self.input.down = pressed,
                         // F1 cycles the shadow-quality preset (§13).
                         KeyCode::F1 if pressed => self.cycle_shadow_quality(),
+                        // F2 toggles FXAA (§13).
+                        KeyCode::F2 if pressed => {
+                            self.settings.fxaa = !self.settings.fxaa;
+                            if let Some(r) = self.renderer.as_mut() {
+                                r.set_fxaa(self.settings.fxaa);
+                            }
+                            eprintln!(
+                                "[quality] fxaa: {}",
+                                if self.settings.fxaa { "on" } else { "off" }
+                            );
+                        }
                         // V toggles noclip (free flight) for inspecting the scene.
                         KeyCode::KeyV if pressed => self.noclip = !self.noclip,
                         // Exposure control (showcases the HDR/tonemap pipeline).
@@ -1109,15 +1128,17 @@ impl ApplicationHandler for App {
                 }
 
                 let exposure = self.exposure;
-                if let (Some(r), Some(m), Some(tm), Some(sky)) = (
+                if let (Some(r), Some(m), Some(tm), Some(fx), Some(sky)) = (
                     self.renderer.as_mut(),
                     self.mesh.as_mut(),
                     self.tonemap.as_mut(),
+                    self.fxaa.as_mut(),
                     self.sky.as_ref(),
                 ) {
                     // HDR view/sampler are stable except across resize; capture
                     // before the mutable draw_frame borrow, refresh in `update`.
                     let hdr_view = r.hdr_view();
+                    let ldr_view = r.ldr_view();
                     let hdr_sampler = r.hdr_sampler();
                     // CPU prep once (sort + stage instances/globals); the shadow and
                     // main passes then replay them. Uploads happen in draw_shadow,
@@ -1139,6 +1160,11 @@ impl ApplicationHandler for App {
                         |cmd, extent, frame| {
                             tm.update(frame, hdr_view, hdr_sampler);
                             tm.draw(cmd, extent, frame, exposure);
+                        },
+                        // Only invoked when FXAA is enabled.
+                        |cmd, extent, frame| {
+                            fx.update(frame, ldr_view, hdr_sampler);
+                            fx.draw(cmd, extent, frame);
                         },
                     );
                 }

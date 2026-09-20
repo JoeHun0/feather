@@ -503,8 +503,29 @@ tonemap runs afterwards, which is not the same as tonemapping then averaging. Wi
 sparkle even as geometry edges smooth out. The fix is a custom tonemapped resolve
 (a small fullscreen/compute pass replacing the hardware one); not done here.
 
-SMAA still does not exist, so there is no *choice* of AA mode yet — `--msaa`
-is the only control.
+**FXAA landed too** (`F2` toggles it live, default off), so there is now a real
+choice of AA mode. The chain becomes `HDR → tonemap → LDR → FXAA → swapchain`;
+without it the tonemap writes the swapchain directly as before. Measured cost:
+the `post` pass goes **0.12 ms → 0.24 ms**, i.e. ~0.12 ms for FXAA, and unlike
+MSAA that is **flat with scene complexity** — it tracks resolution only. For
+comparison, 4× MSAA cost ~0.8 ms of geometry on the same scene, so FXAA is
+roughly 6× cheaper here at lower edge quality: it softens edges but slightly
+blurs fine detail, and cannot recover subpixel geometry the way multisampling
+can. That is the trade, and it is why the weaker machine wants FXAA.
+
+Implementation notes: the LDR intermediate uses the **swapchain's `_SRGB`
+format**, so one tonemap pipeline serves both targets (dynamic rendering requires
+the pipeline's colour format to match the attachment, so a UNORM intermediate
+would have forced a second pipeline). Sampling an `_SRGB` image hands back
+**linear**, so FXAA blends in linear — physically the right place to average —
+and only its edge *thresholds* need perceptual luma, approximated with `sqrt()`
+(gamma 2.0) at one instruction per tap rather than a full OETF. The `[gpu] post`
+timer now spans tonemap *and* FXAA. Unlike MSAA this toggles live, because
+nothing about it is baked into a pipeline; the LDR intermediate is always
+allocated (~8 MB at 1080p) so the toggle needs no resource churn.
+
+SMAA is still the higher-quality target (§13) and still absent: it needs
+precomputed `AreaTex`/`SearchTex` lookup data that would have to be vendored.
 
 6. **Anti-alias** — **user-selectable**: SMAA on LDR (post-tonemap) or MSAA
    2×/4× on geometry (the geometry sample count is already a single knob —

@@ -1,8 +1,9 @@
 #version 450
 
-// Resolve the linear HDR scene into the sRGB swapchain: exposure -> tonemap.
-// Output stays linear; the _SRGB swapchain applies the OETF on store, so we do
-// NOT gamma-encode here (no double correction).
+// Resolve the linear HDR scene into an _SRGB target: exposure -> tonemap.
+// Output stays linear; the _SRGB target applies the OETF on store, so we do NOT
+// gamma-encode here (no double correction). The target is the swapchain, or the
+// LDR intermediate when FXAA is enabled — both _SRGB, so one pipeline serves.
 
 layout(set = 0, binding = 0) uniform sampler2D u_hdr;
 

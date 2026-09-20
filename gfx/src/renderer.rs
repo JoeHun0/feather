@@ -160,6 +160,11 @@ pub struct Renderer {
     // Single-sample resolve of `hdr`, allocated only when MSAA is on. This is what
     // the tonemap pass samples — a multisampled image cannot be sampled directly.
     hdr_resolve: Option<Image>,
+    // Tonemapped LDR intermediate for the FXAA pass (§13). Same _SRGB format as
+    // the swapchain, so one tonemap pipeline serves both targets. Always
+    // allocated (~8 MB at 1080p) so the toggle needs no resource churn.
+    ldr: Option<Image>,
+    fxaa: bool,
     samples: vk::SampleCountFlags, // geometry-pass sample count (MSAA setting)
     shadow: Option<Image>,
     shadow_sampler: vk::Sampler, // comparison sampler (sampler2DShadow)
@@ -298,6 +303,7 @@ impl Renderer {
         // Only needed when multisampling: the resolve target the tonemap samples.
         let hdr_resolve = (samples != vk::SampleCountFlags::TYPE_1)
             .then(|| create_hdr(&allocator, &device, sc.extent, vk::SampleCountFlags::TYPE_1));
+        let ldr = create_ldr(&allocator, &device, sc.extent, sc.format.format);
         let hdr_sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -401,6 +407,8 @@ impl Renderer {
             depth: Some(depth),
             hdr: Some(hdr),
             hdr_resolve,
+            ldr: Some(ldr),
+            fxaa: false,
             samples,
             hdr_sampler,
             shadow: Some(shadow),
@@ -512,6 +520,18 @@ impl Renderer {
             .as_ref()
             .unwrap_or_else(|| self.hdr.as_ref().expect("hdr target alive"))
             .view
+    }
+
+    /// View of the tonemapped LDR intermediate, sampled by the FXAA pass. Changes
+    /// on resize, so the consumer must refresh its descriptor when it does.
+    pub fn ldr_view(&self) -> vk::ImageView {
+        self.ldr.as_ref().expect("ldr target alive").view
+    }
+
+    /// Enable/disable the FXAA pass (§13). Just a flag — the intermediate is
+    /// always allocated, so toggling costs nothing and needs no idling.
+    pub fn set_fxaa(&mut self, on: bool) {
+        self.fxaa = on;
     }
 
     /// Shared sampler for reading the HDR target in the tonemap pass.
@@ -845,6 +865,7 @@ impl Renderer {
         shadow: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         geometry: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         post: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
+        aa: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
     ) {
         if self.window_extent.width == 0 || self.window_extent.height == 0 {
             return;
@@ -896,6 +917,12 @@ impl Renderer {
         // actually holds the single-sample result.
         let hdr_resolve = self.hdr_resolve.as_ref();
         let sampled = hdr_resolve.unwrap_or(hdr);
+        // With FXAA the tonemap renders into the LDR intermediate and the AA pass
+        // writes the swapchain; without it the tonemap writes the swapchain directly.
+        let ldr = self.ldr.as_ref().expect("ldr target alive");
+        let fxaa = self.fxaa;
+        let post_view = if fxaa { ldr.view } else { swap_view };
+        let post_image = if fxaa { ldr.handle } else { image };
         let extent = self.window_extent;
         let shadow_extent = vk::Extent2D {
             width: self.shadow_dim,
@@ -1163,7 +1190,7 @@ impl Renderer {
                 .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
+                .image(post_image)
                 .subresource_range(color_range)
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
@@ -1180,7 +1207,7 @@ impl Renderer {
             // The fullscreen tonemap covers every pixel, so the swapchain load
             // op is DONT_CARE (no clear needed).
             let swap_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(swap_view)
+                .image_view(post_view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .store_op(vk::AttachmentStoreOp::STORE);
@@ -1204,6 +1231,56 @@ impl Renderer {
             dev.cmd_begin_rendering(cmd, &post_rendering);
             post(cmd, extent, frame);
             dev.cmd_end_rendering(cmd);
+
+            if fxaa {
+                // LDR: COLOR_ATTACHMENT -> SHADER_READ_ONLY, then swapchain
+                // UNDEFINED -> COLOR_ATTACHMENT, and run FXAA into it.
+                let ldr_to_read = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(ldr.handle)
+                    .subresource_range(color_range)
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                let swap_to_color = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(color_range)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER
+                        | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[ldr_to_read, swap_to_color],
+                );
+
+                let aa_attachment = vk::RenderingAttachmentInfo::default()
+                    .image_view(swap_view)
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE);
+                let aa_attachments = [aa_attachment];
+                let aa_rendering = vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent,
+                    })
+                    .layer_count(1)
+                    .color_attachments(&aa_attachments);
+                dev.cmd_begin_rendering(cmd, &aa_rendering);
+                aa(cmd, extent, frame);
+                dev.cmd_end_rendering(cmd);
+            }
             if self.timestamps_supported {
                 dev.cmd_write_timestamp(
                     cmd,
@@ -1311,6 +1388,12 @@ impl Renderer {
             sc.extent,
             samples,
         ));
+        self.ldr = Some(create_ldr(
+            self.allocator(),
+            &self.device,
+            sc.extent,
+            sc.format.format,
+        ));
         self.hdr_resolve = (samples != vk::SampleCountFlags::TYPE_1).then(|| {
             create_hdr(
                 self.allocator(),
@@ -1338,6 +1421,7 @@ impl Drop for Renderer {
             self.depth.take();
             self.hdr.take();
             self.hdr_resolve.take();
+            self.ldr.take();
             self.shadow.take();
             self.device.destroy_sampler(self.hdr_sampler, None);
             self.device.destroy_sampler(self.shadow_sampler, None);
@@ -1573,6 +1657,57 @@ fn create_shadow(allocator: &Arc<vk_mem::Allocator>, device: &Device, dim: u32) 
         handle: image,
         view,
         format: SHADOW_FORMAT,
+    }
+}
+
+/// Tonemapped LDR intermediate (§13): rendered into by the tonemap pass and
+/// sampled by FXAA. Uses the swapchain's `_SRGB` format, so the tonemap pipeline
+/// needs no second variant and sampling hands FXAA linear values as usual.
+fn create_ldr(
+    allocator: &Arc<vk_mem::Allocator>,
+    device: &Device,
+    extent: vk::Extent2D,
+    format: vk::Format,
+) -> Image {
+    let image_ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width: extent.width.max(1),
+            height: extent.height.max(1),
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let ai = vk_mem::AllocationCreateInfo {
+        usage: vk_mem::MemoryUsage::AutoPreferDevice,
+        ..Default::default()
+    };
+    let (image, allocation) = unsafe { allocator.create_image(&image_ci, &ai).expect("ldr image") };
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let view = unsafe { device.create_image_view(&view_info, None).expect("ldr view") };
+    Image {
+        allocator: allocator.clone(),
+        allocation,
+        device: device.clone(),
+        handle: image,
+        view,
+        format,
     }
 }
 
