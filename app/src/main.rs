@@ -177,6 +177,8 @@ impl Default for GraphicsSettings {
 /// `Menu` walks it with an explicit stack.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MenuScreen {
+    /// Pre-game menu, shown when nothing is loaded.
+    MainRoot,
     Root,
     Options,
     Graphics,
@@ -187,6 +189,7 @@ enum MenuScreen {
 impl MenuScreen {
     fn title(self) -> &'static str {
         match self {
+            Self::MainRoot => "FEATHER",
             Self::Root => "PAUSED",
             Self::Options => "OPTIONS",
             Self::Graphics => "GRAPHICS",
@@ -206,6 +209,9 @@ enum MenuAction {
     Quit,
     ToggleFxaa,
     CycleShadows,
+    CycleMsaa,
+    NewGame,
+    ToMainMenu,
     Inert,
 }
 
@@ -246,14 +252,28 @@ enum MenuOutcome {
     Quit,
     ApplyShadows,
     ApplyFxaa,
+    ApplyMsaa,
+    StartSession,
+    EndSession,
 }
 
-/// The rows of one screen, given the settings they display.
-fn screen_rows(screen: MenuScreen, s: &GraphicsSettings) -> Vec<MenuRow> {
+/// The rows of one screen, given the settings they display and whether a world
+/// is currently loaded.
+///
+/// `in_session` is not cosmetic: it decides whether MSAA is changeable. The
+/// sample count is baked into the mesh and sky pipelines at creation, so it can
+/// only move while no session owns them.
+fn screen_rows(screen: MenuScreen, s: &GraphicsSettings, in_session: bool) -> Vec<MenuRow> {
     match screen {
+        MenuScreen::MainRoot => vec![
+            MenuRow::new("NEW GAME", MenuAction::NewGame),
+            MenuRow::new("OPTIONS", MenuAction::Enter(MenuScreen::Options)),
+            MenuRow::new("QUIT", MenuAction::Quit),
+        ],
         MenuScreen::Root => vec![
             MenuRow::new("CONTINUE", MenuAction::Resume),
             MenuRow::new("OPTIONS", MenuAction::Enter(MenuScreen::Options)),
+            MenuRow::new("MAIN MENU", MenuAction::ToMainMenu),
             MenuRow::new("EXIT", MenuAction::Quit),
         ],
         MenuScreen::Options => vec![
@@ -271,11 +291,15 @@ fn screen_rows(screen: MenuScreen, s: &GraphicsSettings) -> Vec<MenuRow> {
                 format!("FXAA  {}", if s.fxaa { "ON" } else { "OFF" }),
                 MenuAction::ToggleFxaa,
             ),
-            // Inert on purpose: the sample count is baked into every geometry
-            // pipeline, so changing it live means rebuilding them all (§26).
-            // Showing the value with a RESTART note is honest; offering a
-            // control that silently does nothing is not.
-            MenuRow::new(format!("MSAA  {}X  RESTART", s.msaa), MenuAction::Inert),
+            // Changeable only from the main menu: the mesh and sky pipelines
+            // bake the sample count, so it can move only while no session owns
+            // them. In game the value is shown but locked — and unlike the old
+            // "RESTART" note, MAIN MENU is somewhere you can actually get to.
+            if in_session {
+                MenuRow::new(format!("MSAA  {}X  MENU ONLY", s.msaa), MenuAction::Inert)
+            } else {
+                MenuRow::new(format!("MSAA  {}X", s.msaa), MenuAction::CycleMsaa)
+            },
             MenuRow::new("BACK", MenuAction::Back),
         ],
         // Placeholders: §20 audio is unstarted, and there are no gameplay
@@ -308,35 +332,36 @@ struct Menu {
 impl Menu {
     fn new() -> Self {
         Self {
-            screen: MenuScreen::Root,
+            screen: MenuScreen::MainRoot,
             index: 0,
             stack: Vec::new(),
         }
     }
 
-    /// Back to the top level. Called on unpause so re-opening always starts at
-    /// the root rather than wherever you happened to leave off.
-    fn reset(&mut self) {
-        self.screen = MenuScreen::Root;
+    /// Return to a given top level, discarding history. Called when a session
+    /// starts (→ `Root`) or ends (→ `MainRoot`), and on unpause, so the menu
+    /// always reopens at a sensible place rather than wherever it was left.
+    fn reset(&mut self, root: MenuScreen) {
+        self.screen = root;
         self.index = 0;
         self.stack.clear();
     }
 
-    fn rows(&self, s: &GraphicsSettings) -> Vec<MenuRow> {
-        screen_rows(self.screen, s)
+    fn rows(&self, s: &GraphicsSettings, in_session: bool) -> Vec<MenuRow> {
+        screen_rows(self.screen, s, in_session)
     }
 
     /// Move the selection, wrapping at both ends.
-    fn move_by(&mut self, delta: isize, s: &GraphicsSettings) {
-        let n = self.rows(s).len() as isize;
+    fn move_by(&mut self, delta: isize, s: &GraphicsSettings, in_session: bool) {
+        let n = self.rows(s, in_session).len() as isize;
         if n > 0 {
             self.index = (self.index as isize + delta).rem_euclid(n) as usize;
         }
     }
 
     /// Point the selection at `index` if it is a real row (used by the mouse).
-    fn hover(&mut self, index: usize, s: &GraphicsSettings) {
-        if index < self.rows(s).len() {
+    fn hover(&mut self, index: usize, s: &GraphicsSettings, in_session: bool) {
+        if index < self.rows(s, in_session).len() {
             self.index = index;
         }
     }
@@ -347,8 +372,9 @@ impl Menu {
         self.index = 0;
     }
 
-    /// Up one level, or `Resume` when already at the root — which is what makes
-    /// Esc walk back out of the menu one screen at a time.
+    /// Up one level. At the pause root that means resuming; at the *main* root
+    /// there is nothing to resume into, so it stays put. This is what makes Esc
+    /// walk back out one screen at a time.
     fn back(&mut self) -> MenuOutcome {
         match self.stack.pop() {
             Some((screen, index)) => {
@@ -356,12 +382,13 @@ impl Menu {
                 self.index = index;
                 MenuOutcome::Stay
             }
+            None if self.screen == MenuScreen::MainRoot => MenuOutcome::Stay,
             None => MenuOutcome::Resume,
         }
     }
 
-    fn activate(&mut self, s: &mut GraphicsSettings) -> MenuOutcome {
-        let action = match self.rows(s).get(self.index) {
+    fn activate(&mut self, s: &mut GraphicsSettings, in_session: bool) -> MenuOutcome {
+        let action = match self.rows(s, in_session).get(self.index) {
             Some(row) => row.action,
             None => return MenuOutcome::Stay,
         };
@@ -381,6 +408,20 @@ impl Menu {
                 s.shadows = s.shadows.next();
                 MenuOutcome::ApplyShadows
             }
+            MenuAction::CycleMsaa => {
+                // 1 -> 2 -> 4 -> 8 -> 1. `Renderer::set_msaa` clamps to what the
+                // device actually supports, so an unsupported step lands on the
+                // nearest legal count rather than failing.
+                s.msaa = match s.msaa {
+                    1 => 2,
+                    2 => 4,
+                    4 => 8,
+                    _ => 1,
+                };
+                MenuOutcome::ApplyMsaa
+            }
+            MenuAction::NewGame => MenuOutcome::StartSession,
+            MenuAction::ToMainMenu => MenuOutcome::EndSession,
             MenuAction::Inert => MenuOutcome::Stay,
         }
     }
@@ -866,18 +907,22 @@ struct Input {
 }
 
 struct App {
-    mesh: Option<MeshRenderer>,
+    // FIELD ORDER IS LOAD-BEARING. Rust drops fields in declaration order, and
+    // everything above `renderer` owns GPU resources that must be freed while
+    // the device and allocator are still alive — §26's "resources → allocator →
+    // device" teardown. `session` therefore comes first: it holds the mesh and
+    // sky passes, and freeing those after the device is a use-after-free that
+    // only shows up on quit.
+    /// The loaded world, or `None` in the main menu. Its presence *is* the app
+    /// state: `None` = main menu, `Some` + `paused` = pause menu, `Some` +
+    /// `!paused` = playing.
+    session: Option<Session>,
+    // ---- Engine lifetime: created once, survive every session ----
     tonemap: Option<TonemapPass>,
     fxaa: Option<FxaaPass>,
     ui: Option<UiPass>,
-    sky: Option<SkyPass>,
     renderer: Option<Renderer>,
     window: Option<Window>,
-    world: World,
-    schedule: Schedule,
-    /// The player entity in `world` — its sim state is the `Player` component,
-    /// its look angles the `Look` component (§1: the World owns simulation state).
-    player: Entity,
     input: Input,
     settings: GraphicsSettings,
     /// Paused by Esc: the fixed step stops, the cursor is released for the menu,
@@ -890,24 +935,58 @@ struct App {
     /// `None` until the pointer first moves — winit reports no position before
     /// that, so there is genuinely nothing to hit-test against.
     cursor: Option<(f32, f32)>,
-    noclip: bool,
     light_dir: Vec4,
     exposure: f32,
-    // glTF scenes to load at startup (CLI paths). Empty = the procedural demo.
+    /// glTF scenes NEW GAME loads (CLI paths). Empty = the procedural demo.
+    /// Kept on `App` rather than `Session` so it survives a teardown.
     scenes: Vec<String>,
-    // Per-mesh transform that centers + unit-scales it into the demo grid.
-    // Identity for scene meshes — a level must keep its authored size.
-    fits: Vec<Mat4>,
-    // Per-mesh **local** (pre-fit) bounding sphere, for frustum culling (§8).
-    mesh_spheres: Vec<(Vec3, f32)>,
     last_frame: Instant,
-    // Fixed-timestep accumulator: real time not yet consumed by a sim step,
-    // carried across frames. Its fraction of FIXED_DT is the render alpha.
-    accumulator: f32,
 }
 
-impl App {
-    fn new(scenes: Vec<String>, settings: GraphicsSettings) -> Self {
+/// Per-frame view data the render closures need. Carried as an `Option` so the
+/// main menu can skip the shadow and geometry passes entirely.
+#[derive(Clone, Copy)]
+struct FrameView {
+    view_proj: Mat4,
+    inv_view_proj: Mat4,
+    light_dir: Vec4,
+    camera_pos: Vec3,
+}
+
+/// Everything with **world lifetime**: the simulation and the GPU resources
+/// built from it. Split out from `App` so it can be absent — that is what makes
+/// a main menu with nothing loaded representable, and what gives the engine a
+/// teardown path it previously did not have.
+///
+/// Dropping a `Session` frees its GPU resources (`MeshRenderer` and `SkyPass`
+/// hold RAII buffers/images), so the device must be idle first — see
+/// `App::end_session`.
+struct Session {
+    world: World,
+    schedule: Schedule,
+    /// The player entity in `world` — sim state in `Player`, render-rate angles
+    /// in `Look` (§1: the World owns simulation state).
+    player: Entity,
+    mesh: MeshRenderer,
+    /// Session-scoped because it is **multisampled**: together with the mesh
+    /// pipelines it is the only thing that bakes `Renderer::samples()`, which is
+    /// precisely why MSAA can change while no session exists.
+    sky: SkyPass,
+    /// Per-mesh transform that centers + unit-scales it into the demo grid.
+    /// Identity for scene meshes — a level must keep its authored size.
+    fits: Vec<Mat4>,
+    /// Per-mesh **local** (pre-fit) bounding sphere, for frustum culling (§8).
+    mesh_spheres: Vec<(Vec3, f32)>,
+    /// Fixed-timestep accumulator: real time not yet consumed by a sim step,
+    /// carried across frames. Its fraction of FIXED_DT is the render alpha.
+    accumulator: f32,
+    noclip: bool,
+}
+
+impl Session {
+    /// Build a world and the GPU resources that serve it. `scenes` are the CLI
+    /// glTF paths; empty means the procedural orb demo, exactly as before.
+    fn new(renderer: &Renderer, scenes: &[String]) -> Self {
         let mut world = World::new();
         world.insert_resource(FrameCount::default());
         let mut physics = Physics::new();
@@ -964,32 +1043,165 @@ impl App {
         // would serialise them regardless).
         schedule.add_systems((player_target_sys, physics_step_sys, player_readback_sys).chain());
 
-        let light = Vec3::new(-0.4, -1.0, -0.3).normalize();
-        let now = Instant::now();
+        // Built-in meshes first, at the fixed MESH_* slots: the demo sphere/cube,
+        // then the unit cube every static level piece is scaled from.
+        let mut meshes: Vec<MeshData> = vec![
+            MeshData::uv_sphere(16, 24, 0.5),
+            MeshData::cube(1.0),
+            MeshData::cube(1.0),
+        ];
+        // Then each CLI glTF scene's meshes. `scene_nodes` keeps the placements to
+        // spawn once the material ids are known; mesh indices are offset by however
+        // many meshes are already registered.
+        let mut scene_nodes: Vec<(usize, Mat4)> = Vec::new();
+        for path in scenes {
+            match feather_assets::load_gltf_scene(path) {
+                Ok(scene) => {
+                    eprintln!(
+                        "loaded {path}: {} meshes, {} nodes",
+                        scene.meshes.len(),
+                        scene.nodes.len()
+                    );
+                    let base = meshes.len();
+                    meshes.extend(scene.meshes);
+                    scene_nodes.extend(
+                        scene
+                            .nodes
+                            .into_iter()
+                            .map(|n| (base + n.mesh, n.transform)),
+                    );
+                }
+                Err(e) => eprintln!("failed to load {path}: {e} (skipped)"),
+            }
+        }
+        // Built-ins get the demo fit (centre + unit-scale); scene meshes keep their
+        // authored transform, so identity.
+        let fits: Vec<Mat4> = meshes
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                if (i as u32) < MESH_BUILTIN_COUNT {
+                    fit_transform(m)
+                } else {
+                    Mat4::IDENTITY
+                }
+            })
+            .collect();
+        let mesh_spheres: Vec<(Vec3, f32)> = meshes.iter().map(local_sphere).collect();
+
+        // Material table: shared palette first (indices 0..PALETTE), then each
+        // mesh's own material (index PALETTE + mesh_id) — matches the ids that
+        // the world build above assigned to entities.
+        let mut materials: Vec<feather_assets::Material> =
+            (0..PALETTE).map(palette_material).collect();
+        materials.extend(meshes.iter().map(|m| m.material.clone()));
+
+        // Two dedicated level materials, appended after everything else.
+        let ground_mat = materials.len() as u32;
+        materials.push(level_material([0.20, 0.21, 0.23], 0.95));
+        let box_mat = materials.len() as u32;
+        materials.push(level_material([0.45, 0.22, 0.14], 0.7));
+
+        // Static level. The ground and the obstacle boxes are each rendered as a
+        // scaled unit cube and given a matching cuboid collider (`spawn_static`).
+        // Level pieces carry no Velocity/Spin, so `integrate` skips them and they
+        // never wrap.
+        let ground = spawn_static(
+            &mut world,
+            Vec3::new(0.0, GROUND_Y - 0.5, 0.0),
+            Vec3::new(80.0, 1.0, 80.0),
+            MESH_LEVEL_CUBE,
+            ground_mat,
+        );
+        // This ground is a flat slab: it casts nothing useful but would rasterize
+        // the whole shadow map. It still *receives* shadows (receiving is sampling
+        // the map, not being in it). Relief terrain would drop this marker.
+        world.entity_mut(ground).insert(NoShadowCast);
+        // (x, half-height as y, z), size — y offset keeps each box resting on the
+        // ground (center = GROUND_Y + size.y/2).
+        let boxes = [
+            (Vec3::new(-3.0, 0.75, 2.0), Vec3::new(1.5, 1.5, 1.5)),
+            (Vec3::new(3.5, 1.0, -1.0), Vec3::new(2.0, 2.0, 2.0)),
+            (Vec3::new(0.0, 0.5, -4.5), Vec3::new(3.0, 1.0, 1.0)),
+            (Vec3::new(-5.0, 1.5, -3.0), Vec3::new(1.0, 3.0, 1.0)),
+            (Vec3::new(5.0, 0.5, 4.0), Vec3::new(1.0, 1.0, 4.0)),
+        ];
+        for (offset, size) in boxes {
+            let center = Vec3::new(offset.x, GROUND_Y + offset.y, offset.z);
+            spawn_static(&mut world, center, size, MESH_LEVEL_CUBE, box_mat);
+        }
+        // Scene geometry from the CLI glTF files (§18): one entity per node,
+        // carrying that node's world transform, so nodes sharing a mesh draw as
+        // instances. Each also gets a fixed trimesh collider so the level is
+        // walkable. Material ids follow the same `PALETTE + mesh index` rule the
+        // table below is built with.
+        for (mesh_idx, transform) in &scene_nodes {
+            let data = &meshes[*mesh_idx];
+            let verts: Vec<Vector> = data
+                .vertices
+                .iter()
+                .map(|v| to_rapier(transform.transform_point3(Vec3::from(v.pos))))
+                .collect();
+            let tris: Vec<[u32; 3]> = data
+                .indices
+                .chunks_exact(3)
+                .map(|t| [t[0], t[1], t[2]])
+                .collect();
+            let collider = world
+                .resource_mut::<Physics>()
+                .add_static_trimesh(verts, tris);
+            let mut e = world.spawn((
+                Transform(*transform),
+                Mesh(MeshId(*mesh_idx as u32)),
+                Material(PALETTE + *mesh_idx as u32),
+            ));
+            if let Some(c) = collider {
+                e.insert(ColliderRef(c));
+            }
+        }
+
+        // One step so the broad-phase BVH the character controller shape-casts
+        // against contains the level before the first fixed tick.
+        world.resource_mut::<Physics>().step();
+
+        let (mesh, _ids) = MeshRenderer::new(renderer, &meshes, &materials, MAX_INSTANCES);
+        let sky = SkyPass::new(renderer);
+
         Self {
-            mesh: None,
-            tonemap: None,
-            fxaa: None,
-            ui: None,
-            sky: None,
-            renderer: None,
-            window: None,
             world,
             schedule,
             player,
+            mesh,
+            sky,
+            fits,
+            mesh_spheres,
+            accumulator: 0.0,
+            noclip: false,
+        }
+    }
+}
+
+impl App {
+    /// Starts with **no session**: the app opens on the main menu and only
+    /// builds a world when NEW GAME is chosen.
+    fn new(scenes: Vec<String>, settings: GraphicsSettings) -> Self {
+        let light = Vec3::new(-0.4, -1.0, -0.3).normalize();
+        Self {
+            session: None,
+            tonemap: None,
+            fxaa: None,
+            ui: None,
+            renderer: None,
+            window: None,
             input: Input::default(),
             settings,
             paused: false,
             menu: Menu::new(),
             cursor: None,
-            noclip: false,
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             exposure: 1.0,
             scenes,
-            fits: Vec::new(),
-            mesh_spheres: Vec::new(),
-            last_frame: now,
-            accumulator: 0.0,
+            last_frame: Instant::now(),
         }
     }
 }
@@ -1019,9 +1231,22 @@ impl App {
         window.set_cursor_visible(!captured);
     }
 
-    /// Enter or leave the pause menu.
+    /// Is the menu taking input? True while paused, and always in the main menu
+    /// (where there is no game to take it instead).
+    fn menu_active(&self) -> bool {
+        self.paused || self.session.is_none()
+    }
+
+    /// Whether MSAA is locked — i.e. whether a session owns the pipelines that
+    /// baked the sample count.
+    fn in_session(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Enter or leave the pause menu. No-op with no session: the main menu is
+    /// not a paused game.
     fn set_paused(&mut self, paused: bool) {
-        if self.paused == paused {
+        if self.paused == paused || self.session.is_none() {
             return;
         }
         self.paused = paused;
@@ -1029,7 +1254,7 @@ impl App {
         if !paused {
             // Re-opening should always start at the root, not wherever the
             // player happened to leave the menu.
-            self.menu.reset();
+            self.menu.reset(MenuScreen::Root);
             // Resuming: the wall-clock gap while paused is not simulation time.
             // Without this the accumulator sees the whole pause as one frame
             // delta (clamped by MAX_FRAME_TIME, but still a visible jump).
@@ -1070,6 +1295,9 @@ impl App {
             MenuOutcome::Quit => event_loop.exit(),
             MenuOutcome::ApplyShadows => self.apply_shadow_quality(),
             MenuOutcome::ApplyFxaa => self.apply_fxaa(),
+            MenuOutcome::ApplyMsaa => self.apply_msaa(),
+            MenuOutcome::StartSession => self.start_session(),
+            MenuOutcome::EndSession => self.end_session(),
         }
     }
 
@@ -1077,12 +1305,54 @@ impl App {
     /// F1 and the menu row drive the same path and cannot drift.
     fn apply_shadow_quality(&mut self) {
         let dim = self.settings.shadows.dim();
-        if let (Some(r), Some(m)) = (self.renderer.as_mut(), self.mesh.as_mut()) {
+        if let Some(r) = self.renderer.as_mut() {
             r.wait_idle();
             r.set_shadow_dim(dim);
-            m.set_shadow_map(r.shadow_view(), r.shadow_sampler());
+            // Re-point the descriptor only when a session is holding one; with
+            // no world loaded a fresh `MeshRenderer` will bind the new map when
+            // the next session starts.
+            if let Some(s) = self.session.as_mut() {
+                s.mesh.set_shadow_map(r.shadow_view(), r.shadow_sampler());
+            }
         }
         eprintln!("[quality] shadows: {}", self.settings.shadows.label());
+    }
+
+    /// Build a world from the CLI scenes and drop into it.
+    fn start_session(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let session = Session::new(renderer, &self.scenes);
+        self.session = Some(session);
+        self.paused = false;
+        self.menu.reset(MenuScreen::Root);
+        self.set_cursor_captured(true);
+        // The build took real wall-clock time that is not simulation time.
+        self.last_frame = Instant::now();
+    }
+
+    /// Tear the world down and return to the main menu.
+    ///
+    /// **Idle first.** `Session` owns GPU buffers and images that a queued frame
+    /// may still be reading; dropping them while in flight is a use-after-free
+    /// that validation catches. A hitch here is free — nothing is animating.
+    fn end_session(&mut self) {
+        if let Some(r) = self.renderer.as_ref() {
+            r.wait_idle();
+        }
+        self.session = None;
+        self.paused = false;
+        self.menu.reset(MenuScreen::MainRoot);
+        self.set_cursor_captured(false);
+    }
+
+    /// Apply `settings.msaa`. Only reachable with no session loaded, because the
+    /// mesh and sky pipelines bake the sample count at creation.
+    fn apply_msaa(&mut self) {
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_msaa(self.settings.msaa);
+        }
     }
 }
 
@@ -1094,149 +1364,23 @@ impl ApplicationHandler for App {
         let window = event_loop
             .create_window(feather_platform::window_attributes("feather — first person"))
             .expect("create window");
-        window
-            .set_cursor_grab(CursorGrabMode::Locked)
-            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
-            .ok();
-        window.set_cursor_visible(false);
+        // Opens on the main menu, so the cursor starts free rather than grabbed.
+        window.set_cursor_visible(true);
 
         let size = window.inner_size();
         let renderer = Renderer::new(&window, size.width, size.height, self.settings.msaa)
             .expect("create renderer");
 
-        // Built-in meshes first, at the fixed MESH_* slots: the demo sphere/cube,
-        // then the unit cube every static level piece is scaled from.
-        let mut meshes: Vec<MeshData> = vec![
-            MeshData::uv_sphere(16, 24, 0.5),
-            MeshData::cube(1.0),
-            MeshData::cube(1.0),
-        ];
-        // Then each CLI glTF scene's meshes. `scene_nodes` keeps the placements to
-        // spawn once the material ids are known; mesh indices are offset by however
-        // many meshes are already registered.
-        let mut scene_nodes: Vec<(usize, Mat4)> = Vec::new();
-        for path in &self.scenes {
-            match feather_assets::load_gltf_scene(path) {
-                Ok(scene) => {
-                    eprintln!(
-                        "loaded {path}: {} meshes, {} nodes",
-                        scene.meshes.len(),
-                        scene.nodes.len()
-                    );
-                    let base = meshes.len();
-                    meshes.extend(scene.meshes);
-                    scene_nodes.extend(
-                        scene
-                            .nodes
-                            .into_iter()
-                            .map(|n| (base + n.mesh, n.transform)),
-                    );
-                }
-                Err(e) => eprintln!("failed to load {path}: {e} (skipped)"),
-            }
-        }
-        // Built-ins get the demo fit (centre + unit-scale); scene meshes keep their
-        // authored transform, so identity.
-        self.fits = meshes
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                if (i as u32) < MESH_BUILTIN_COUNT {
-                    fit_transform(m)
-                } else {
-                    Mat4::IDENTITY
-                }
-            })
-            .collect();
-        self.mesh_spheres = meshes.iter().map(local_sphere).collect();
-
-        // Material table: shared palette first (indices 0..PALETTE), then each
-        // mesh's own material (index PALETTE + mesh_id) — matches the ids that
-        // App::new assigned to entities.
-        let mut materials: Vec<feather_assets::Material> =
-            (0..PALETTE).map(palette_material).collect();
-        materials.extend(meshes.iter().map(|m| m.material.clone()));
-
-        // Two dedicated level materials, appended after everything else.
-        let ground_mat = materials.len() as u32;
-        materials.push(level_material([0.20, 0.21, 0.23], 0.95));
-        let box_mat = materials.len() as u32;
-        materials.push(level_material([0.45, 0.22, 0.14], 0.7));
-
-        // Static level. The ground and the obstacle boxes are each rendered as a
-        // scaled unit cube and given a matching cuboid collider (`spawn_static`).
-        // Level pieces carry no Velocity/Spin, so `integrate` skips them and they
-        // never wrap.
-        let ground = spawn_static(
-            &mut self.world,
-            Vec3::new(0.0, GROUND_Y - 0.5, 0.0),
-            Vec3::new(80.0, 1.0, 80.0),
-            MESH_LEVEL_CUBE,
-            ground_mat,
-        );
-        // This ground is a flat slab: it casts nothing useful but would rasterize
-        // the whole shadow map. It still *receives* shadows (receiving is sampling
-        // the map, not being in it). Relief terrain would drop this marker.
-        self.world.entity_mut(ground).insert(NoShadowCast);
-        // (x, half-height as y, z), size — y offset keeps each box resting on the
-        // ground (center = GROUND_Y + size.y/2).
-        let boxes = [
-            (Vec3::new(-3.0, 0.75, 2.0), Vec3::new(1.5, 1.5, 1.5)),
-            (Vec3::new(3.5, 1.0, -1.0), Vec3::new(2.0, 2.0, 2.0)),
-            (Vec3::new(0.0, 0.5, -4.5), Vec3::new(3.0, 1.0, 1.0)),
-            (Vec3::new(-5.0, 1.5, -3.0), Vec3::new(1.0, 3.0, 1.0)),
-            (Vec3::new(5.0, 0.5, 4.0), Vec3::new(1.0, 1.0, 4.0)),
-        ];
-        for (offset, size) in boxes {
-            let center = Vec3::new(offset.x, GROUND_Y + offset.y, offset.z);
-            spawn_static(&mut self.world, center, size, MESH_LEVEL_CUBE, box_mat);
-        }
-        // Scene geometry from the CLI glTF files (§18): one entity per node,
-        // carrying that node's world transform, so nodes sharing a mesh draw as
-        // instances. Each also gets a fixed trimesh collider so the level is
-        // walkable. Material ids follow the same `PALETTE + mesh index` rule the
-        // table below is built with.
-        for (mesh_idx, transform) in &scene_nodes {
-            let data = &meshes[*mesh_idx];
-            let verts: Vec<Vector> = data
-                .vertices
-                .iter()
-                .map(|v| to_rapier(transform.transform_point3(Vec3::from(v.pos))))
-                .collect();
-            let tris: Vec<[u32; 3]> = data
-                .indices
-                .chunks_exact(3)
-                .map(|t| [t[0], t[1], t[2]])
-                .collect();
-            let collider = self
-                .world
-                .resource_mut::<Physics>()
-                .add_static_trimesh(verts, tris);
-            let mut e = self.world.spawn((
-                Transform(*transform),
-                Mesh(MeshId(*mesh_idx as u32)),
-                Material(PALETTE + *mesh_idx as u32),
-            ));
-            if let Some(c) = collider {
-                e.insert(ColliderRef(c));
-            }
-        }
-
-        // One step so the broad-phase BVH the character controller shape-casts
-        // against contains the level before the first fixed tick.
-        self.world.resource_mut::<Physics>().step();
-
-        let (mesh, _ids) = MeshRenderer::new(&renderer, &meshes, &materials, MAX_INSTANCES);
+        // Engine-lifetime passes only. All three are single-sample by design, so
+        // none of them cares about the MSAA setting; the two that do (mesh, sky)
+        // belong to a `Session` and are built when one starts.
         let tonemap = TonemapPass::new(&renderer);
         let fxaa = FxaaPass::new(&renderer);
         let ui = UiPass::new(&renderer);
-        let sky = SkyPass::new(&renderer);
 
-        self.mesh = Some(mesh);
         self.tonemap = Some(tonemap);
         self.fxaa = Some(fxaa);
         self.ui = Some(ui);
-        self.sky = Some(sky);
         self.renderer = Some(renderer);
         self.window = Some(window);
     }
@@ -1280,7 +1424,11 @@ impl ApplicationHandler for App {
                             self.apply_fxaa();
                         }
                         // V toggles noclip (free flight) for inspecting the scene.
-                        KeyCode::KeyV if pressed => self.noclip = !self.noclip,
+                        KeyCode::KeyV if pressed => {
+                            if let Some(s) = self.session.as_mut() {
+                                s.noclip = !s.noclip;
+                            }
+                        }
                         // Exposure control (showcases the HDR/tonemap pipeline).
                         KeyCode::BracketLeft if pressed => {
                             self.exposure = (self.exposure * 0.8).max(0.05);
@@ -1292,21 +1440,27 @@ impl ApplicationHandler for App {
                         // unpauses from the root — so leaving a submenu does not
                         // dump you straight into the game.
                         KeyCode::Escape if pressed => {
-                            if self.paused {
+                            if self.session.is_some() && !self.paused {
+                                self.set_paused(true);
+                            } else {
+                                // In a menu: step back one screen. At the main
+                                // root that is a no-op — there is nothing to
+                                // resume into.
                                 let outcome = self.menu.back();
                                 self.handle_menu_outcome(outcome, event_loop);
-                            } else {
-                                self.set_paused(true);
                             }
                         }
-                        KeyCode::ArrowUp if pressed && self.paused => {
-                            self.menu.move_by(-1, &self.settings);
+                        KeyCode::ArrowUp if pressed && self.menu_active() => {
+                            let in_session = self.in_session();
+                            self.menu.move_by(-1, &self.settings, in_session);
                         }
-                        KeyCode::ArrowDown if pressed && self.paused => {
-                            self.menu.move_by(1, &self.settings);
+                        KeyCode::ArrowDown if pressed && self.menu_active() => {
+                            let in_session = self.in_session();
+                            self.menu.move_by(1, &self.settings, in_session);
                         }
-                        KeyCode::Enter if pressed && self.paused => {
-                            let outcome = self.menu.activate(&mut self.settings);
+                        KeyCode::Enter if pressed && self.menu_active() => {
+                            let in_session = self.in_session();
+                            let outcome = self.menu.activate(&mut self.settings, in_session);
                             self.handle_menu_outcome(outcome, event_loop);
                         }
                         _ => {}
@@ -1317,15 +1471,16 @@ impl ApplicationHandler for App {
             // DeviceEvent on a separate path, so gameplay is untouched.
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = Some((position.x as f32, position.y as f32));
-                if self.paused {
+                if self.menu_active() {
                     if let Some(window) = self.window.as_ref() {
                         let size = window.inner_size();
+                        let in_session = self.session.is_some();
                         // Hover drives the *existing* selection rather than a
                         // second highlight state, so keyboard and mouse stay
                         // interchangeable mid-interaction. Off the entries the
                         // selection is left alone, so something is always
                         // selected for Enter.
-                        let rows = self.menu.rows(&self.settings);
+                        let rows = self.menu.rows(&self.settings, in_session);
                         if let Some(i) = menu_hit(
                             size.width as f32,
                             size.height as f32,
@@ -1333,23 +1488,27 @@ impl ApplicationHandler for App {
                             position.x as f32,
                             position.y as f32,
                         ) {
-                            self.menu.hover(i, &self.settings);
+                            self.menu.hover(i, &self.settings, in_session);
                         }
                     }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if self.paused && button == MouseButton::Left && state == ElementState::Pressed {
+                if self.menu_active()
+                    && button == MouseButton::Left
+                    && state == ElementState::Pressed
+                {
                     if let (Some(window), Some((cx, cy))) = (self.window.as_ref(), self.cursor) {
                         let size = window.inner_size();
                         // Activate only when actually over an entry: a stray
                         // click on the dimmed backdrop should do nothing.
-                        let rows = self.menu.rows(&self.settings);
+                        let in_session = self.session.is_some();
+                        let rows = self.menu.rows(&self.settings, in_session);
                         if let Some(i) =
                             menu_hit(size.width as f32, size.height as f32, &rows, cx, cy)
                         {
-                            self.menu.hover(i, &self.settings);
-                            let outcome = self.menu.activate(&mut self.settings);
+                            self.menu.hover(i, &self.settings, in_session);
+                            let outcome = self.menu.activate(&mut self.settings, in_session);
                             self.handle_menu_outcome(outcome, event_loop);
                         }
                     }
@@ -1367,184 +1526,202 @@ impl ApplicationHandler for App {
                     self.input.mouse_dy = 0.0;
                 }
 
-                // Look updates at render rate for responsive aim (§15).
-                let sens = if self.paused { 0.0 } else { 0.0025 };
-                let look = {
-                    let mut look = self
+                // Simulation, camera and extract all belong to a loaded world.
+                // With no session this is skipped entirely and the frame becomes
+                // "clear the HDR target, tonemap it, draw the menu over it" —
+                // the geometry pass already clears, so the main menu needs no
+                // background path of its own.
+                let mut frame_view: Option<FrameView> = None;
+                if let Some(s) = self.session.as_mut() {
+                    // Look updates at render rate for responsive aim (§15).
+                    let sens = if self.paused { 0.0 } else { 0.0025 };
+                    let look = {
+                        let mut look = s.world.get_mut::<Look>(s.player).expect("player has Look");
+                        look.yaw += self.input.mouse_dx * sens;
+                        look.pitch = (look.pitch - self.input.mouse_dy * sens).clamp(-1.54, 1.54);
+                        *look
+                    };
+                    self.input.mouse_dx = 0.0;
+                    self.input.mouse_dy = 0.0;
+
+                    // Desired horizontal move direction from WASD, in the yaw plane.
+                    let (fwd, right) = look.ground_basis();
+                    let mut wish = Vec3::ZERO;
+                    if self.input.forward {
+                        wish += fwd;
+                    }
+                    if self.input.back {
+                        wish -= fwd;
+                    }
+                    if self.input.right {
+                        wish += right;
+                    }
+                    if self.input.left {
+                        wish -= right;
+                    }
+                    let wish = wish.normalize_or_zero();
+                    // Noclip vertical axis (Space up / Ctrl down); ignored when grounded.
+                    let vgo = (self.input.up as i32 - self.input.down as i32) as f32;
+
+                    // Publish this frame's abstract input (§14); the fixed step consumes
+                    // it. The jump edge is latched here and cleared by the controller
+                    // system, so a press still feeds exactly one tick.
+                    {
+                        let mut state = s.world.resource_mut::<InputState>();
+                        state.wish = wish;
+                        state.vertical = vgo;
+                        state.noclip = s.noclip;
+                        state.jump |= self.input.jump;
+                    }
+                    self.input.jump = false;
+
+                    // Fixed-timestep sim: consume the accumulator in whole FIXED_DT
+                    // steps. The schedule advances gameplay and brackets the rapier step
+                    // with the two sync systems (§15). The frame delta is clamped and
+                    // MAX_STEPS caps catch-up per frame (spiral-of-death guard);
+                    // leftover beyond the cap is dropped.
+                    // Paused: no simulation advances, so prev == curr and the frozen
+                    // scene keeps rendering behind the menu.
+                    s.accumulator += if self.paused {
+                        0.0
+                    } else {
+                        dt.min(MAX_FRAME_TIME)
+                    };
+                    let mut steps = 0;
+                    while s.accumulator >= FIXED_DT && steps < MAX_STEPS {
+                        s.schedule.run(&mut s.world);
+                        s.accumulator -= FIXED_DT;
+                        steps += 1;
+                    }
+                    // How far we are into the next step, in [0,1): the render alpha.
+                    let alpha = (s.accumulator / FIXED_DT).clamp(0.0, 1.0);
+
+                    // Camera + sun matrices first — the extract loop culls against them.
+                    // Camera: interpolate the player's body, offset to eye height.
+                    // Copy the pair out before the extract query re-borrows the World.
+                    let (p_prev, p_pos) = {
+                        let p = s.world.get::<Player>(s.player).expect("player body");
+                        (p.prev_pos, p.pos)
+                    };
+                    let eye = p_prev.lerp(p_pos, alpha) + Vec3::new(0.0, EYE_HEIGHT, 0.0);
+                    let size = self.window.as_ref().unwrap().inner_size();
+                    let aspect = size.width as f32 / size.height.max(1) as f32;
+                    let view_proj = look.view_proj(eye, aspect);
+                    let inv_view_proj = view_proj.inverse();
+                    let light_dir = self.light_dir;
+                    let camera_pos = eye;
+
+                    // Sun shadow matrix (§11): a tight ortho that **follows the player**,
+                    // so shadows exist wherever you walk instead of only near the origin.
+                    // It is centered on the player's body, not the view direction, so
+                    // turning never disturbs the shadow map — only walking moves it, and
+                    // the texel snap below keeps that from crawling.
+                    let sun_dir = self.light_dir.truncate().normalize_or_zero();
+                    let body = eye - Vec3::Y * EYE_HEIGHT;
+                    // Rotation-only light basis (world -> light space), for the snap.
+                    let light_basis = Mat4::look_at_rh(Vec3::ZERO, sun_dir, Vec3::Y);
+                    // Texel-snap the ortho center to whole shadow-map texels — §11 calls
+                    // this non-negotiable: without it the shadow edges crawl every frame
+                    // as the center slides a fraction of a texel.
+                    let world_per_texel =
+                        (2.0 * SHADOW_RADIUS) / self.settings.shadows.dim() as f32;
+                    let c = light_basis.transform_point3(body);
+                    let snapped = Vec3::new(
+                        (c.x / world_per_texel).round() * world_per_texel,
+                        (c.y / world_per_texel).round() * world_per_texel,
+                        c.z, // depth along the light needs no snap (no edge crawl)
+                    );
+                    let light_center = light_basis.inverse().transform_point3(snapped);
+                    let light_eye = light_center - sun_dir * SHADOW_BACK;
+                    let light_view = Mat4::look_at_rh(light_eye, light_center, Vec3::Y);
+                    let light_proj = Mat4::orthographic_rh(
+                        -SHADOW_RADIUS,
+                        SHADOW_RADIUS,
+                        -SHADOW_RADIUS,
+                        SHADOW_RADIUS,
+                        0.1,
+                        SHADOW_DEPTH,
+                    );
+                    let light_view_proj = light_proj * light_view;
+
+                    // Per-view frustum culling (§8): bounding sphere vs six planes, once
+                    // per view. Camera frustum trims the main pass; the light ortho trims
+                    // the shadow pass (groundwork — everything is inside it today).
+                    let camera_frustum = Frustum::from_view_proj(&view_proj);
+                    let light_frustum = Frustum::from_view_proj(&light_view_proj);
+
+                    // Extract: interpolate each entity's sim state (prev -> curr) by
+                    // alpha, build its model matrix, and route it to the camera-visible
+                    // set (main pass) and/or the light-visible set (shadow pass). This is
+                    // the sim<->render seam; interpolation lives here per §4. Static level
+                    // pieces lack Velocity/Spin so `integrate` skips them; prev == curr.
+                    // `Off` simply stops feeding casters: the map is then only cleared,
+                    // so every fragment compares against 1.0 and reads as lit.
+                    let casts = self.settings.shadows.casts();
+                    let fits = &s.fits;
+                    let spheres = &s.mesh_spheres;
+                    let mesh_max = fits.len().saturating_sub(1);
+                    let cap = (GRID * GRID * GRID) as usize + 8;
+                    let mut main_items: Vec<(MeshId, InstanceData)> = Vec::with_capacity(cap);
+                    let mut shadow_items: Vec<(MeshId, InstanceData)> = Vec::with_capacity(cap);
+                    let mut q = s.world.query::<(
+                        &Position,
+                        &PrevPosition,
+                        &Rotation,
+                        &PrevRotation,
+                        &Scale,
+                        &Mesh,
+                        &Material,
+                        Option<&NoShadowCast>,
+                    )>();
+                    for (p, pp, r, pr, scale, mesh, material, no_cast) in q.iter(&s.world) {
+                        let id = (mesh.0 .0 as usize).min(mesh_max);
+                        let pos = pp.0.lerp(p.0, alpha);
+                        let angle = pr.0 + (r.0 - pr.0) * alpha;
+                        let model = Mat4::from_translation(pos)
+                            * Mat4::from_rotation_y(angle)
+                            * Mat4::from_scale(scale.0)
+                            * fits[id];
+                        let item = (MeshId(id as u32), InstanceData::new(model, material.0));
+                        let (c, radius) = world_sphere(&model, spheres[id]);
+                        if camera_frustum.contains_sphere(c, radius) {
+                            main_items.push(item);
+                        }
+                        if casts && no_cast.is_none() && light_frustum.contains_sphere(c, radius) {
+                            shadow_items.push(item);
+                        }
+                    }
+
+                    // Static scene geometry (§18): the node matrix *is* the transform,
+                    // so there is nothing to interpolate. Separate query rather than an
+                    // Option<> branch, to keep the two archetypes clean.
+                    let mut qs = s
                         .world
-                        .get_mut::<Look>(self.player)
-                        .expect("player has Look");
-                    look.yaw += self.input.mouse_dx * sens;
-                    look.pitch = (look.pitch - self.input.mouse_dy * sens).clamp(-1.54, 1.54);
-                    *look
-                };
-                self.input.mouse_dx = 0.0;
-                self.input.mouse_dy = 0.0;
-
-                // Desired horizontal move direction from WASD, in the yaw plane.
-                let (fwd, right) = look.ground_basis();
-                let mut wish = Vec3::ZERO;
-                if self.input.forward {
-                    wish += fwd;
-                }
-                if self.input.back {
-                    wish -= fwd;
-                }
-                if self.input.right {
-                    wish += right;
-                }
-                if self.input.left {
-                    wish -= right;
-                }
-                let wish = wish.normalize_or_zero();
-                // Noclip vertical axis (Space up / Ctrl down); ignored when grounded.
-                let vgo = (self.input.up as i32 - self.input.down as i32) as f32;
-
-                // Publish this frame's abstract input (§14); the fixed step consumes
-                // it. The jump edge is latched here and cleared by the controller
-                // system, so a press still feeds exactly one tick.
-                {
-                    let mut state = self.world.resource_mut::<InputState>();
-                    state.wish = wish;
-                    state.vertical = vgo;
-                    state.noclip = self.noclip;
-                    state.jump |= self.input.jump;
-                }
-                self.input.jump = false;
-
-                // Fixed-timestep sim: consume the accumulator in whole FIXED_DT
-                // steps. The schedule advances gameplay and brackets the rapier step
-                // with the two sync systems (§15). The frame delta is clamped and
-                // MAX_STEPS caps catch-up per frame (spiral-of-death guard);
-                // leftover beyond the cap is dropped.
-                // Paused: no simulation advances, so prev == curr and the frozen
-                // scene keeps rendering behind the menu.
-                self.accumulator += if self.paused {
-                    0.0
-                } else {
-                    dt.min(MAX_FRAME_TIME)
-                };
-                let mut steps = 0;
-                while self.accumulator >= FIXED_DT && steps < MAX_STEPS {
-                    self.schedule.run(&mut self.world);
-                    self.accumulator -= FIXED_DT;
-                    steps += 1;
-                }
-                // How far we are into the next step, in [0,1): the render alpha.
-                let alpha = (self.accumulator / FIXED_DT).clamp(0.0, 1.0);
-
-                // Camera + sun matrices first — the extract loop culls against them.
-                // Camera: interpolate the player's body, offset to eye height.
-                // Copy the pair out before the extract query re-borrows the World.
-                let (p_prev, p_pos) = {
-                    let p = self.world.get::<Player>(self.player).expect("player body");
-                    (p.prev_pos, p.pos)
-                };
-                let eye = p_prev.lerp(p_pos, alpha) + Vec3::new(0.0, EYE_HEIGHT, 0.0);
-                let size = self.window.as_ref().unwrap().inner_size();
-                let aspect = size.width as f32 / size.height.max(1) as f32;
-                let view_proj = look.view_proj(eye, aspect);
-                let inv_view_proj = view_proj.inverse();
-                let light_dir = self.light_dir;
-                let camera_pos = eye;
-
-                // Sun shadow matrix (§11): a tight ortho that **follows the player**,
-                // so shadows exist wherever you walk instead of only near the origin.
-                // It is centered on the player's body, not the view direction, so
-                // turning never disturbs the shadow map — only walking moves it, and
-                // the texel snap below keeps that from crawling.
-                let sun_dir = self.light_dir.truncate().normalize_or_zero();
-                let body = eye - Vec3::Y * EYE_HEIGHT;
-                // Rotation-only light basis (world -> light space), for the snap.
-                let light_basis = Mat4::look_at_rh(Vec3::ZERO, sun_dir, Vec3::Y);
-                // Texel-snap the ortho center to whole shadow-map texels — §11 calls
-                // this non-negotiable: without it the shadow edges crawl every frame
-                // as the center slides a fraction of a texel.
-                let world_per_texel = (2.0 * SHADOW_RADIUS) / self.settings.shadows.dim() as f32;
-                let c = light_basis.transform_point3(body);
-                let snapped = Vec3::new(
-                    (c.x / world_per_texel).round() * world_per_texel,
-                    (c.y / world_per_texel).round() * world_per_texel,
-                    c.z, // depth along the light needs no snap (no edge crawl)
-                );
-                let light_center = light_basis.inverse().transform_point3(snapped);
-                let light_eye = light_center - sun_dir * SHADOW_BACK;
-                let light_view = Mat4::look_at_rh(light_eye, light_center, Vec3::Y);
-                let light_proj = Mat4::orthographic_rh(
-                    -SHADOW_RADIUS,
-                    SHADOW_RADIUS,
-                    -SHADOW_RADIUS,
-                    SHADOW_RADIUS,
-                    0.1,
-                    SHADOW_DEPTH,
-                );
-                let light_view_proj = light_proj * light_view;
-
-                // Per-view frustum culling (§8): bounding sphere vs six planes, once
-                // per view. Camera frustum trims the main pass; the light ortho trims
-                // the shadow pass (groundwork — everything is inside it today).
-                let camera_frustum = Frustum::from_view_proj(&view_proj);
-                let light_frustum = Frustum::from_view_proj(&light_view_proj);
-
-                // Extract: interpolate each entity's sim state (prev -> curr) by
-                // alpha, build its model matrix, and route it to the camera-visible
-                // set (main pass) and/or the light-visible set (shadow pass). This is
-                // the sim<->render seam; interpolation lives here per §4. Static level
-                // pieces lack Velocity/Spin so `integrate` skips them; prev == curr.
-                // `Off` simply stops feeding casters: the map is then only cleared,
-                // so every fragment compares against 1.0 and reads as lit.
-                let casts = self.settings.shadows.casts();
-                let fits = &self.fits;
-                let spheres = &self.mesh_spheres;
-                let mesh_max = fits.len().saturating_sub(1);
-                let cap = (GRID * GRID * GRID) as usize + 8;
-                let mut main_items: Vec<(MeshId, InstanceData)> = Vec::with_capacity(cap);
-                let mut shadow_items: Vec<(MeshId, InstanceData)> = Vec::with_capacity(cap);
-                let mut q = self.world.query::<(
-                    &Position,
-                    &PrevPosition,
-                    &Rotation,
-                    &PrevRotation,
-                    &Scale,
-                    &Mesh,
-                    &Material,
-                    Option<&NoShadowCast>,
-                )>();
-                for (p, pp, r, pr, scale, mesh, material, no_cast) in q.iter(&self.world) {
-                    let id = (mesh.0 .0 as usize).min(mesh_max);
-                    let pos = pp.0.lerp(p.0, alpha);
-                    let angle = pr.0 + (r.0 - pr.0) * alpha;
-                    let model = Mat4::from_translation(pos)
-                        * Mat4::from_rotation_y(angle)
-                        * Mat4::from_scale(scale.0)
-                        * fits[id];
-                    let item = (MeshId(id as u32), InstanceData::new(model, material.0));
-                    let (c, radius) = world_sphere(&model, spheres[id]);
-                    if camera_frustum.contains_sphere(c, radius) {
-                        main_items.push(item);
+                        .query::<(&Transform, &Mesh, &Material, Option<&NoShadowCast>)>();
+                    for (t, mesh, material, no_cast) in qs.iter(&s.world) {
+                        let id = (mesh.0 .0 as usize).min(mesh_max);
+                        let model = t.0 * fits[id];
+                        let item = (MeshId(id as u32), InstanceData::new(model, material.0));
+                        let (c, radius) = world_sphere(&model, spheres[id]);
+                        if camera_frustum.contains_sphere(c, radius) {
+                            main_items.push(item);
+                        }
+                        if casts && no_cast.is_none() && light_frustum.contains_sphere(c, radius) {
+                            shadow_items.push(item);
+                        }
                     }
-                    if casts && no_cast.is_none() && light_frustum.contains_sphere(c, radius) {
-                        shadow_items.push(item);
-                    }
-                }
 
-                // Static scene geometry (§18): the node matrix *is* the transform,
-                // so there is nothing to interpolate. Separate query rather than an
-                // Option<> branch, to keep the two archetypes clean.
-                let mut qs = self
-                    .world
-                    .query::<(&Transform, &Mesh, &Material, Option<&NoShadowCast>)>();
-                for (t, mesh, material, no_cast) in qs.iter(&self.world) {
-                    let id = (mesh.0 .0 as usize).min(mesh_max);
-                    let model = t.0 * fits[id];
-                    let item = (MeshId(id as u32), InstanceData::new(model, material.0));
-                    let (c, radius) = world_sphere(&model, spheres[id]);
-                    if camera_frustum.contains_sphere(c, radius) {
-                        main_items.push(item);
-                    }
-                    if casts && no_cast.is_none() && light_frustum.contains_sphere(c, radius) {
-                        shadow_items.push(item);
-                    }
+                    // CPU prep once (sort + stage instances/globals); the shadow
+                    // and main passes then replay them. Uploads happen in
+                    // draw_shadow, after the frame fence.
+                    s.mesh
+                        .prepare_frame(&mut main_items, &mut shadow_items, light_view_proj);
+                    frame_view = Some(FrameView {
+                        view_proj,
+                        inv_view_proj,
+                        light_dir,
+                        camera_pos,
+                    });
                 }
 
                 // Overlay geometry is built on the CPU here; the upload and draw
@@ -1552,10 +1729,12 @@ impl ApplicationHandler for App {
                 if let Some(ui) = self.ui.as_mut() {
                     let size = self.window.as_ref().unwrap().inner_size();
                     ui.begin(size.width, size.height);
-                    if self.paused {
+                    if self.paused || self.session.is_none() {
                         let (w, h) = (size.width as f32, size.height as f32);
                         // Dim the frozen scene. Colours are linear: this is drawn
-                        // into the _SRGB swapchain, which encodes on store.
+                        // into the _SRGB swapchain, which encodes on store. In the
+                        // main menu there is no scene behind it, just the geometry
+                        // pass's clear — the same rect darkens it to a backdrop.
                         ui.rect(0.0, 0.0, w, h, [0.0, 0.0, 0.0, 0.55]);
 
                         let px = menu_font_px(h);
@@ -1573,7 +1752,7 @@ impl ApplicationHandler for App {
 
                         // Rows and rects come from the same functions the mouse
                         // hit-tests against, so highlight and click target match.
-                        let rows = self.menu.rows(&self.settings);
+                        let rows = self.menu.rows(&self.settings, self.session.is_some());
                         let rects = menu_item_rects(w, h, &rows);
                         let pad = px * 4.0;
                         for (i, row) in rows.iter().enumerate() {
@@ -1599,35 +1778,55 @@ impl ApplicationHandler for App {
                 }
 
                 let exposure = self.exposure;
-                if let (Some(r), Some(m), Some(tm), Some(fx), Some(ui), Some(sky)) = (
+                if let (Some(r), Some(tm), Some(fx), Some(ui)) = (
                     self.renderer.as_mut(),
-                    self.mesh.as_mut(),
                     self.tonemap.as_mut(),
                     self.fxaa.as_mut(),
                     self.ui.as_ref(),
-                    self.sky.as_ref(),
                 ) {
                     // HDR view/sampler are stable except across resize; capture
                     // before the mutable draw_frame borrow, refresh in `update`.
                     let hdr_view = r.hdr_view();
                     let ldr_view = r.ldr_view();
                     let hdr_sampler = r.hdr_sampler();
-                    // CPU prep once (sort + stage instances/globals); the shadow and
-                    // main passes then replay them. Uploads happen in draw_shadow,
-                    // after the frame fence.
-                    m.prepare_frame(&mut main_items, &mut shadow_items, light_view_proj);
+                    // Shared immutably by the shadow and geometry closures — the
+                    // draw methods take &self, only `prepare_frame` above needed
+                    // &mut, and that already ran.
+                    let session = self.session.as_ref();
                     r.draw_frame(
-                        // Shadow pass: sun depth map (also flushes this frame's buffers).
-                        |cmd, extent, frame| m.draw_shadow(cmd, extent, frame),
+                        // Shadow pass: sun depth map (also flushes this frame's
+                        // buffers). No session means no casters and no buffers —
+                        // the pass still clears, so every fragment reads as lit.
+                        |cmd, extent, frame| {
+                            if let Some(s) = session {
+                                s.mesh.draw_shadow(cmd, extent, frame);
+                            }
+                        },
                         // Geometry (§10): depth prepass, then the lit opaque pass
                         // (each pixel shaded once), then the sky depth-tested into
-                        // whatever background is left.
+                        // whatever background is left. Skipped wholesale in the
+                        // main menu, leaving the attachment's clear colour.
                         |cmd, extent, frame| {
-                            m.draw_depth_prepass(
-                                cmd, extent, frame, view_proj, light_dir, camera_pos,
-                            );
-                            m.draw_main(cmd, extent, frame, view_proj, light_dir, camera_pos);
-                            sky.draw(cmd, extent, inv_view_proj, camera_pos, light_dir);
+                            if let (Some(s), Some(v)) = (session, frame_view) {
+                                s.mesh.draw_depth_prepass(
+                                    cmd,
+                                    extent,
+                                    frame,
+                                    v.view_proj,
+                                    v.light_dir,
+                                    v.camera_pos,
+                                );
+                                s.mesh.draw_main(
+                                    cmd,
+                                    extent,
+                                    frame,
+                                    v.view_proj,
+                                    v.light_dir,
+                                    v.camera_pos,
+                                );
+                                s.sky
+                                    .draw(cmd, extent, v.inv_view_proj, v.camera_pos, v.light_dir);
+                            }
                         },
                         |cmd, extent, frame| {
                             tm.update(frame, hdr_view, hdr_sampler);
@@ -2014,7 +2213,8 @@ mod tests {
     /// enough that `menu_font_px` clamps to its 2.0 floor.
     const SIZES: [(f32, f32); 3] = [(1280.0, 720.0), (2560.0, 1440.0), (320.0, 200.0)];
 
-    const SCREENS: [MenuScreen; 5] = [
+    const SCREENS: [MenuScreen; 6] = [
+        MenuScreen::MainRoot,
         MenuScreen::Root,
         MenuScreen::Options,
         MenuScreen::Graphics,
@@ -2026,7 +2226,7 @@ mod tests {
     fn menu_rect_centres_hit_their_own_row() {
         let s = GraphicsSettings::default();
         for screen in SCREENS {
-            let rows = screen_rows(screen, &s);
+            let rows = screen_rows(screen, &s, true);
             assert!(!rows.is_empty(), "{screen:?} has no rows");
             for (w, h) in SIZES {
                 for (i, &(x, y, rw, rh)) in menu_item_rects(w, h, &rows).iter().enumerate() {
@@ -2045,7 +2245,7 @@ mod tests {
     fn menu_rows_are_ordered_disjoint_and_onscreen() {
         let s = GraphicsSettings::default();
         for screen in SCREENS {
-            let rows = screen_rows(screen, &s);
+            let rows = screen_rows(screen, &s, true);
             for (w, h) in SIZES {
                 let rects = menu_item_rects(w, h, &rows);
                 for pair in rects.windows(2) {
@@ -2072,7 +2272,7 @@ mod tests {
     #[test]
     fn menu_misses_gaps_and_backdrop() {
         let s = GraphicsSettings::default();
-        let rows = screen_rows(MenuScreen::Root, &s);
+        let rows = screen_rows(MenuScreen::Root, &s, true);
         let (w, h) = (1280.0, 720.0);
         let rects = menu_item_rects(w, h, &rows);
         let gap_y = (rects[0].1 + rects[0].3 + rects[1].1) * 0.5;
@@ -2091,21 +2291,29 @@ mod tests {
         );
     }
 
+    /// A menu as it exists with a world loaded: the app resets to `Root` when a
+    /// session starts, so these tests begin where the pause menu does.
+    fn in_game_menu() -> Menu {
+        let mut m = Menu::new();
+        m.reset(MenuScreen::Root);
+        m
+    }
+
     /// Select the row whose action matches, then activate it.
     fn activate(m: &mut Menu, s: &mut GraphicsSettings, want: MenuAction) -> MenuOutcome {
         let i = m
-            .rows(s)
+            .rows(s, true)
             .iter()
             .position(|r| r.action == want)
             .unwrap_or_else(|| panic!("no {want:?} row on {:?}", m.screen));
         m.index = i;
-        m.activate(s)
+        m.activate(s, true)
     }
 
     #[test]
     fn back_restores_the_row_you_descended_from() {
         let mut s = GraphicsSettings::default();
-        let mut m = Menu::new();
+        let mut m = in_game_menu();
         activate(&mut m, &mut s, MenuAction::Enter(MenuScreen::Options));
         assert_eq!(m.screen, MenuScreen::Options);
         // Descend from GAMEPLAY specifically, not the first row, so a restored
@@ -2116,7 +2324,7 @@ mod tests {
 
         assert_eq!(m.back(), MenuOutcome::Stay);
         assert_eq!(m.screen, MenuScreen::Options);
-        let gameplay_row = screen_rows(MenuScreen::Options, &s)
+        let gameplay_row = screen_rows(MenuScreen::Options, &s, true)
             .iter()
             .position(|r| r.action == MenuAction::Enter(MenuScreen::Gameplay))
             .unwrap();
@@ -2131,7 +2339,7 @@ mod tests {
     #[test]
     fn graphics_rows_change_the_settings() {
         let mut s = GraphicsSettings::default();
-        let mut m = Menu::new();
+        let mut m = in_game_menu();
         m.screen = MenuScreen::Graphics;
 
         let before = s.fxaa;
@@ -2159,7 +2367,7 @@ mod tests {
 
     #[test]
     fn inert_rows_change_nothing() {
-        let mut m = Menu::new();
+        let mut m = in_game_menu();
         for screen in [
             MenuScreen::Graphics,
             MenuScreen::Sound,
@@ -2168,7 +2376,7 @@ mod tests {
             let mut s = GraphicsSettings::default();
             m.screen = screen;
             m.stack.clear();
-            let inert: Vec<usize> = screen_rows(screen, &s)
+            let inert: Vec<usize> = screen_rows(screen, &s, true)
                 .iter()
                 .enumerate()
                 .filter(|(_, r)| !r.enabled())
@@ -2177,7 +2385,7 @@ mod tests {
             assert!(!inert.is_empty(), "{screen:?} has no inert row to check");
             for i in inert {
                 m.index = i;
-                assert_eq!(m.activate(&mut s), MenuOutcome::Stay);
+                assert_eq!(m.activate(&mut s, true), MenuOutcome::Stay);
                 // The MSAA row in particular must not quietly mutate anything.
                 assert_eq!(s.shadows, ShadowQuality::High);
                 assert!(!s.fxaa);
@@ -2190,23 +2398,23 @@ mod tests {
     #[test]
     fn selection_wraps_in_both_directions() {
         let s = GraphicsSettings::default();
-        let mut m = Menu::new();
+        let mut m = in_game_menu();
         m.screen = MenuScreen::Graphics;
-        let n = m.rows(&s).len();
+        let n = m.rows(&s, true).len();
         m.index = 0;
-        m.move_by(-1, &s);
+        m.move_by(-1, &s, true);
         assert_eq!(m.index, n - 1, "up from the top did not wrap");
-        m.move_by(1, &s);
+        m.move_by(1, &s, true);
         assert_eq!(m.index, 0, "down from the bottom did not wrap");
     }
 
     #[test]
     fn unpausing_resets_to_the_root_screen() {
         let mut s = GraphicsSettings::default();
-        let mut m = Menu::new();
+        let mut m = in_game_menu();
         activate(&mut m, &mut s, MenuAction::Enter(MenuScreen::Options));
         activate(&mut m, &mut s, MenuAction::Enter(MenuScreen::Graphics));
-        m.reset();
+        m.reset(MenuScreen::Root);
         assert_eq!(m.screen, MenuScreen::Root);
         assert_eq!(m.index, 0);
         assert!(m.stack.is_empty());
@@ -2219,7 +2427,7 @@ mod tests {
     fn menu_labels_are_drawable() {
         let s = GraphicsSettings::default();
         for screen in SCREENS {
-            for row in screen_rows(screen, &s) {
+            for row in screen_rows(screen, &s, true) {
                 for c in row.label.chars() {
                     assert!(
                         c.is_ascii_uppercase() || c.is_ascii_digit() || c == ' ',
@@ -2228,6 +2436,96 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // ---- Session lifetime and the main menu ----
+
+    #[test]
+    fn msaa_is_changeable_only_outside_a_session() {
+        let s = GraphicsSettings::default();
+        let row_action = |in_session: bool| {
+            screen_rows(MenuScreen::Graphics, &s, in_session)
+                .into_iter()
+                .find(|r| r.label.starts_with("MSAA"))
+                .expect("graphics has an MSAA row")
+                .action
+        };
+        // In game the pipelines have baked the sample count, so the row must be
+        // inert — this is the guard that stops MSAA changing under live pipelines.
+        assert_eq!(row_action(true), MenuAction::Inert);
+        assert_eq!(row_action(false), MenuAction::CycleMsaa);
+    }
+
+    #[test]
+    fn msaa_row_cycles_supported_counts() {
+        let mut s = GraphicsSettings::default();
+        let mut m = Menu::new();
+        m.screen = MenuScreen::Graphics;
+        assert_eq!(s.msaa, 1);
+        for want in [2, 4, 8, 1] {
+            let i = m
+                .rows(&s, false)
+                .iter()
+                .position(|r| r.action == MenuAction::CycleMsaa)
+                .expect("msaa row");
+            m.index = i;
+            assert_eq!(m.activate(&mut s, false), MenuOutcome::ApplyMsaa);
+            assert_eq!(s.msaa, want);
+        }
+    }
+
+    #[test]
+    fn main_menu_starts_a_session_and_pause_menu_ends_it() {
+        let mut s = GraphicsSettings::default();
+        let mut m = Menu::new();
+        assert_eq!(m.screen, MenuScreen::MainRoot, "app opens on the main menu");
+
+        let i = m
+            .rows(&s, false)
+            .iter()
+            .position(|r| r.action == MenuAction::NewGame)
+            .expect("new game row");
+        m.index = i;
+        assert_eq!(m.activate(&mut s, false), MenuOutcome::StartSession);
+
+        // The app resets to Root when the session starts.
+        m.reset(MenuScreen::Root);
+        let i = m
+            .rows(&s, true)
+            .iter()
+            .position(|r| r.action == MenuAction::ToMainMenu)
+            .expect("main menu row");
+        m.index = i;
+        assert_eq!(m.activate(&mut s, true), MenuOutcome::EndSession);
+    }
+
+    #[test]
+    fn esc_at_the_main_root_has_nowhere_to_go() {
+        let mut m = Menu::new();
+        // No session to resume into, so backing out must stay put rather than
+        // reporting Resume and dropping the app into a world that isn't loaded.
+        assert_eq!(m.back(), MenuOutcome::Stay);
+        assert_eq!(m.screen, MenuScreen::MainRoot);
+    }
+
+    #[test]
+    fn options_is_reachable_from_both_roots() {
+        let mut s = GraphicsSettings::default();
+        for (root, in_session) in [(MenuScreen::MainRoot, false), (MenuScreen::Root, true)] {
+            let mut m = Menu::new();
+            m.reset(root);
+            let i = m
+                .rows(&s, in_session)
+                .iter()
+                .position(|r| r.action == MenuAction::Enter(MenuScreen::Options))
+                .unwrap_or_else(|| panic!("{root:?} has no OPTIONS row"));
+            m.index = i;
+            assert_eq!(m.activate(&mut s, in_session), MenuOutcome::Stay);
+            assert_eq!(m.screen, MenuScreen::Options);
+            // And back returns to the root it came from, not a hardcoded one.
+            assert_eq!(m.back(), MenuOutcome::Stay);
+            assert_eq!(m.screen, root);
         }
     }
 }

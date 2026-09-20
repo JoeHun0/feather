@@ -709,6 +709,33 @@ Pausing stops the fixed step, releases the cursor and ignores mouselook (§14's
 focus flag), while rendering continues so the frozen scene shows behind the
 overlay.
 
+**Main menu and session lifetime.** The app now opens on a pre-game menu with
+**nothing loaded** (NEW GAME / OPTIONS / QUIT); the pause root gains MAIN MENU
+alongside EXIT, so leaving a level and quitting are separate actions. Esc pauses
+from play and otherwise walks back one screen, stopping at the main root where
+there is nothing to resume into.
+
+Everything world-scoped lives in a `Session` — the ECS `World`, the schedule,
+the player, the `MeshRenderer`, the `SkyPass`, the mesh fits and bounding
+spheres, the accumulator — which `App` holds as an `Option`. Its presence *is*
+the app state, so there is no second state enum to keep in sync, and **"no world
+loaded" is representable** for the first time. Dropping it is the engine's first
+real teardown path.
+
+Two consequences fall out. The main menu needs **no background path**: with no
+session the shadow and geometry passes are skipped, and the geometry
+attachment's existing clear flows through the normal tonemap with the UI over
+it. And **MSAA becomes changeable** — `MeshRenderer` and `SkyPass` are the only
+things that bake `Renderer::samples()`, and both are session-scoped, so a sample
+count picked in the main menu simply applies when a session starts. No live
+pipeline rebuild, which is why the GRAPHICS row is active out of session and
+locked (`MENU ONLY`) in it.
+
+Teardown idles the device before dropping the session, since a queued frame may
+still be reading those buffers. Relatedly, `App`'s **field order is
+load-bearing**: Rust drops fields in declaration order, so `session` is declared
+before `renderer` to preserve §26's resources → allocator → device teardown.
+
 The menu is driven by **keyboard and mouse**: arrows/Enter, or hover to select
 and left-click to activate. Both share one `menu_index` — hover moves the same
 selection the arrows do, so the two are interchangeable mid-interaction rather
@@ -1043,10 +1070,15 @@ milestones land.
   swapchain. **MSAA now exists** (§13): `--msaa N` at startup, clamped to device
   support, with a multisampled HDR/depth pair resolved into a single-sample image
   by dynamic rendering. The `samples()` seam did its job — the `render` crate
-  needed no edits, since its pipelines already read it. Still pending: **SMAA**
-  (so there is no AA *mode choice* yet, only a sample count), live switching
-  (pipelines bake the sample count), and a **tonemapped resolve** to stop bright
-  HDR edges sparkling through the averaging resolve.
+  needed no edits, since its pipelines already read it. **Switchable from the
+  main menu** (§19): the two pipelines that bake the sample count belong to a
+  `Session`, so changing it with no world loaded needs only
+  `Renderer::set_msaa` (idle, clamp, recreate the depth/HDR/resolve targets) —
+  the tonemap re-binds itself, since it refreshes per frame and early-outs when
+  the view is unchanged. Still pending: **SMAA** (so there is no AA *mode
+  choice* yet, only a sample count), switching *during* a session, and a
+  **tonemapped resolve** to stop bright HDR edges sparkling through the
+  averaging resolve.
 - **Geometry / assets (§6, §7)**: a **mesh registry**, a **material table**, and a
   full **base-color + normal + metallic-roughness texture** path now exist —
   several meshes in shared vertex/index buffers drawn by sorted per-mesh runs; a
@@ -1056,7 +1088,9 @@ milestones land.
   vertex tangents (normal mapping is derivative-based), pipeline buckets (one
   pipeline for everything), skinning/animation, and the offline **bake** path
   (runtime blob, handle tables, load-time allocator). glTF loads directly each
-  run; nothing is freed/streamed; one material per merged glTF (first primitive
+  run; a session's meshes/materials/textures are now **freed on returning to the
+  main menu** (§19) — the first teardown path — but nothing is *streamed*, and
+  freeing is still all-or-nothing per session; one material per merged glTF (first primitive
   wins).
 
 ### Not yet started

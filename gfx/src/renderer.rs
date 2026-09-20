@@ -1390,6 +1390,65 @@ impl Renderer {
         self.current_frame = (frame + 1) % FRAMES_IN_FLIGHT;
     }
 
+    /// (Re)create the render targets that depend on the window extent and the
+    /// sample count: depth, HDR, the LDR intermediate, and the single-sample
+    /// resolve target that only exists above 1x.
+    ///
+    /// Assigning frees the previous images (RAII), so **the device must already
+    /// be idle** when this runs — both callers ensure that.
+    fn recreate_targets(&mut self, extent: vk::Extent2D, ldr_format: vk::Format) {
+        let samples = self.samples;
+        self.depth = Some(create_depth(
+            self.allocator(),
+            &self.device,
+            extent,
+            samples,
+        ));
+        self.hdr = Some(create_hdr(self.allocator(), &self.device, extent, samples));
+        self.ldr = Some(create_ldr(
+            self.allocator(),
+            &self.device,
+            extent,
+            ldr_format,
+        ));
+        self.hdr_resolve = (samples != vk::SampleCountFlags::TYPE_1).then(|| {
+            create_hdr(
+                self.allocator(),
+                &self.device,
+                extent,
+                vk::SampleCountFlags::TYPE_1,
+            )
+        });
+    }
+
+    /// Change the geometry-pass sample count, recreating the targets that carry
+    /// it. Clamped to device support, and a no-op when it lands on the current
+    /// value.
+    ///
+    /// **Only safe while no multisampled pipeline exists.** `mesh` and `sky`
+    /// bake the sample count at creation, so the caller must have torn down the
+    /// session first — which is why MSAA is settable from the main menu and not
+    /// in game. Nothing else needs re-pointing: the tonemap pass re-binds itself
+    /// when `hdr_view()` changes, since it refreshes per frame and early-outs
+    /// when the view is unchanged.
+    pub fn set_msaa(&mut self, msaa: u32) {
+        let limits = unsafe {
+            self.instance
+                .get_physical_device_properties(self.physical_device)
+        }
+        .limits;
+        let samples = clamp_samples(&limits, msaa);
+        if samples == self.samples {
+            return;
+        }
+        unsafe { self.device.device_wait_idle().unwrap() };
+        self.samples = samples;
+        let extent = self.window_extent;
+        let format = self.surface_format.format;
+        self.recreate_targets(extent, format);
+        eprintln!("[gfx] MSAA: now {:?}", self.samples);
+    }
+
     fn recreate_swapchain(&mut self) {
         if self.window_extent.width == 0 || self.window_extent.height == 0 {
             return;
@@ -1418,34 +1477,7 @@ impl Renderer {
             self.swapchain_loader.destroy_swapchain(old, None);
         }
 
-        // Drops the old depth/HDR images (frees view+image) before reassigning.
-        let samples = self.samples;
-        self.depth = Some(create_depth(
-            self.allocator(),
-            &self.device,
-            sc.extent,
-            samples,
-        ));
-        self.hdr = Some(create_hdr(
-            self.allocator(),
-            &self.device,
-            sc.extent,
-            samples,
-        ));
-        self.ldr = Some(create_ldr(
-            self.allocator(),
-            &self.device,
-            sc.extent,
-            sc.format.format,
-        ));
-        self.hdr_resolve = (samples != vk::SampleCountFlags::TYPE_1).then(|| {
-            create_hdr(
-                self.allocator(),
-                &self.device,
-                sc.extent,
-                vk::SampleCountFlags::TYPE_1,
-            )
-        });
+        self.recreate_targets(sc.extent, sc.format.format);
         self.swapchain = sc.swapchain;
         self.images = sc.images;
         self.image_views = sc.image_views;
