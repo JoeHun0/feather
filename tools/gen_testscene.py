@@ -637,6 +637,34 @@ def zone_pbr(s, pal, extras_on):
         )
 
 
+def scatter_lights(s, count):
+    """Extra punctual lights spread over the walkable area (§12).
+
+    Marker nodes with no geometry, so they add lighting cost and nothing else —
+    which is what makes them a clean independent variable when measuring the
+    per-fragment light loop. Radii deliberately overlap: the brute-force loop
+    costs lights-in-frame, so overlap is the case clustering has to beat.
+    """
+    for i in range(count):
+        x = s.rng.uniform(-36.0, 36.0)
+        z = s.rng.uniform(-34.0, 34.0)
+        h = s.rng.uniform(1.5, 5.0)
+        # Warm-to-cool spread so it is obvious which light lit what.
+        t = i / max(1, count - 1)
+        s.g.add_marker(
+            (x, GROUND_Y + h, z),
+            {
+                "prefab": "point_light",
+                "params": {
+                    "color": [1.0, 0.55 + 0.35 * t, 0.3 + 0.6 * t],
+                    "intensity": 18.0,
+                    "radius": 14.0,
+                },
+            },
+            f"scatter_light_{i}",
+        )
+
+
 def zone_field(s, pal, count):
     """West (-X). Many nodes over few meshes, spread to the ground edge.
 
@@ -865,6 +893,9 @@ def main():
     ap.add_argument("--density", choices=sorted(DENSITY), default="med",
                     help="scales the culling/instancing field only")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--lights", type=int, default=0, metavar="N",
+                    help="extra scattered point lights, for measuring the §12 "
+                         "per-fragment light loop (engine caps at 128 visible)")
     ap.add_argument("--textures", action="store_true",
                     help="procedural base-color/normal/MR textures (off by default "
                          "to stay well clear of MAX_TEXTURES)")
@@ -898,6 +929,10 @@ def main():
         if n < DENSITY[args.density]:
             print(f"note: field placed {n}/{DENSITY[args.density]} "
                   "(ran out of free space)", file=sys.stderr)
+    if args.lights > 0:
+        if not extras_on:
+            ap.error("--lights needs extras; drop --no-extras")
+        scatter_lights(s, args.lights)
     if extras_on:
         g.add_marker(SPAWN, {"prefab": "player_start", "params": {"yaw": 180.0}}, "player_start")
 
