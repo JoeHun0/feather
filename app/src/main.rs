@@ -143,12 +143,18 @@ impl ShadowQuality {
 /// be a setting that does nothing.
 struct GraphicsSettings {
     shadows: ShadowQuality,
+    /// MSAA sample count for the geometry pass (§13), `--msaa N` at startup.
+    /// Startup-only rather than live: the sample count is baked into every
+    /// geometry pipeline, so changing it means rebuilding them all — the usual
+    /// "applies on restart" trade. `gfx` clamps this to what the device supports.
+    msaa: u32,
 }
 
 impl Default for GraphicsSettings {
     fn default() -> Self {
         Self {
             shadows: ShadowQuality::High,
+            msaa: 1,
         }
     }
 }
@@ -616,7 +622,7 @@ struct App {
 }
 
 impl App {
-    fn new(scenes: Vec<String>) -> Self {
+    fn new(scenes: Vec<String>, settings: GraphicsSettings) -> Self {
         let mut world = World::new();
         world.insert_resource(FrameCount::default());
         let mut physics = Physics::new();
@@ -685,7 +691,7 @@ impl App {
             schedule,
             player,
             input: Input::default(),
-            settings: GraphicsSettings::default(),
+            settings,
             noclip: false,
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             exposure: 1.0,
@@ -740,7 +746,8 @@ impl ApplicationHandler for App {
         window.set_cursor_visible(false);
 
         let size = window.inner_size();
-        let renderer = Renderer::new(&window, size.width, size.height).expect("create renderer");
+        let renderer = Renderer::new(&window, size.width, size.height, self.settings.msaa)
+            .expect("create renderer");
 
         // Built-in meshes first, at the fixed MESH_* slots: the demo sphere/cube,
         // then the unit cube every static level piece is scaled from.
@@ -1282,12 +1289,24 @@ fn palette_material(k: u32) -> feather_assets::Material {
 fn main() {
     // CLI paths are glTF *scenes* to load and walk around
     // (`cargo run -- level.glb`); each node becomes its own entity. With no args,
-    // the procedural drifting-orb demo runs instead.
-    let scenes: Vec<String> = std::env::args().skip(1).collect();
+    // the procedural drifting-orb demo runs instead. `--msaa N` (1/2/4/8) picks
+    // the geometry-pass sample count, clamped to device support.
+    let mut settings = GraphicsSettings::default();
+    let mut scenes: Vec<String> = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--msaa" => match args.next().and_then(|v| v.parse::<u32>().ok()) {
+                Some(n) => settings.msaa = n,
+                None => eprintln!("--msaa needs a sample count (1/2/4/8); ignoring"),
+            },
+            _ => scenes.push(a),
+        }
+    }
 
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(scenes);
+    let mut app = App::new(scenes, settings);
     event_loop.run_app(&mut app).expect("run app");
 }
 

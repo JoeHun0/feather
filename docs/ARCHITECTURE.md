@@ -474,10 +474,37 @@ merely cleared and every fragment compares against 1.0 as lit. Switching happens
 with the device idle — the shadow image is freed and the mesh renderer's
 descriptor re-pointed, which is unsound mid-flight.
 
-**Anti-aliasing is *not* selectable yet**, and deliberately has no setting: MSAA
-needs a resolve attachment before the tonemap pass could sample a multisampled
-target, and SMAA does not exist — an `aa` field today would do nothing. It joins
-the layer when there is a second mode to choose between.
+**MSAA landed** and is selected at startup with `--msaa N` (1/2/4/8), clamped to
+device support. The geometry pass renders into a multisampled HDR + depth pair and
+dynamic rendering resolves (`AVERAGE`) into a single-sample image at
+`cmd_end_rendering`; `Renderer::hdr_view` hands that resolve out, so the tonemap
+pass needed no changes — `TonemapPass::update` already re-points when the handle
+changes. The `render` crate needed **no changes at all**, because the mesh, sky and
+prepass pipelines already read `Renderer::samples()`. Measured on the orb demo at
+one window size:
+
+| MSAA | geometry pass | frame |
+|------|---------------|-------|
+| 1×   | 0.80 ms | 2.88 ms |
+| 2×   | 1.33 ms | 3.38 ms |
+| 4×   | 1.59 ms | 3.64 ms |
+| 8×   | 2.20 ms | 4.03 ms |
+
+The shadow (~1.9 ms) and tonemap (~0.11 ms) passes are unchanged across all four,
+confirming the shadow map stays single-sample and the tonemap stays 1×.
+
+**Startup-only, not live:** the sample count is baked into every geometry
+pipeline, so changing it means rebuilding them all — the usual "applies on
+restart". Live switching is a follow-up.
+
+**Known caveat — HDR resolve.** The hardware resolve averages *radiance* and the
+tonemap runs afterwards, which is not the same as tonemapping then averaging. With
+`SUN_RADIANCE = 8.0` and a `pow(s, 4000) * 60` sky disk, very bright edges can
+sparkle even as geometry edges smooth out. The fix is a custom tonemapped resolve
+(a small fullscreen/compute pass replacing the hardware one); not done here.
+
+SMAA still does not exist, so there is no *choice* of AA mode yet — `--msaa`
+is the only control.
 
 6. **Anti-alias** — **user-selectable**: SMAA on LDR (post-tonemap) or MSAA
    2×/4× on geometry (the geometry sample count is already a single knob —
@@ -915,11 +942,13 @@ milestones land.
   is *not* sufficient on its own: a multisampled HDR target needs a **resolve
   attachment** (multisample → single-sample) before the tonemap pass can sample
   it. SMAA (the §13 post-AA alternative) would slot in as tonemap → LDR → SMAA →
-  swapchain. AA mode is *intended* to be user-selectable (§13/§25) and the
-  settings layer now exists to hold it — but there is deliberately **no AA
-  setting yet**, because with neither MSAA nor SMAA implemented it would be a
-  control that changes nothing. The `samples()` seam plus that layer are what keep
-  adding it small.
+  swapchain. **MSAA now exists** (§13): `--msaa N` at startup, clamped to device
+  support, with a multisampled HDR/depth pair resolved into a single-sample image
+  by dynamic rendering. The `samples()` seam did its job — the `render` crate
+  needed no edits, since its pipelines already read it. Still pending: **SMAA**
+  (so there is no AA *mode choice* yet, only a sample count), live switching
+  (pipelines bake the sample count), and a **tonemapped resolve** to stop bright
+  HDR edges sparkling through the averaging resolve.
 - **Geometry / assets (§6, §7)**: a **mesh registry**, a **material table**, and a
   full **base-color + normal + metallic-roughness texture** path now exist —
   several meshes in shared vertex/index buffers drawn by sorted per-mesh runs; a

@@ -37,7 +37,25 @@ const SHADOW_FORMAT: vk::Format = DEPTH_FORMAT;
 // multisampled HDR target can't be sampled directly by the tonemap pass, so a
 // resolve attachment (multisample HDR -> single-sample resolve image) must be
 // added first. This is the seam that makes that change small; see §26.
-const MSAA_SAMPLES: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
+/// Fallback sample count when the caller asks for something the device cannot do.
+const MSAA_FALLBACK: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_1;
+
+/// Highest supported sample count that is <= `want`, from the intersection of the
+/// colour and depth framebuffer limits. Lets an unsupported request degrade
+/// visibly instead of failing validation at pipeline creation.
+fn clamp_samples(limits: &vk::PhysicalDeviceLimits, want: u32) -> vk::SampleCountFlags {
+    let supported = limits.framebuffer_color_sample_counts & limits.framebuffer_depth_sample_counts;
+    for (n, flag) in [
+        (8, vk::SampleCountFlags::TYPE_8),
+        (4, vk::SampleCountFlags::TYPE_4),
+        (2, vk::SampleCountFlags::TYPE_2),
+    ] {
+        if want >= n && supported.contains(flag) {
+            return flag;
+        }
+    }
+    MSAA_FALLBACK
+}
 // GPU timing (§21): timestamps per frame-in-flight — shadow (start, end),
 // geometry (start, end), post (start, end). Frame is shadow-start → post-end.
 const TIMESTAMPS_PER_FRAME: u32 = 6;
@@ -139,6 +157,10 @@ pub struct Renderer {
     hdr: Option<Image>,
     hdr_sampler: vk::Sampler,
     // Directional sun shadow map (§11): fixed-size, never recreated on resize.
+    // Single-sample resolve of `hdr`, allocated only when MSAA is on. This is what
+    // the tonemap pass samples — a multisampled image cannot be sampled directly.
+    hdr_resolve: Option<Image>,
+    samples: vk::SampleCountFlags, // geometry-pass sample count (MSAA setting)
     shadow: Option<Image>,
     shadow_sampler: vk::Sampler, // comparison sampler (sampler2DShadow)
     shadow_dim: u32,             // live shadow-map dimension (quality setting)
@@ -168,6 +190,7 @@ impl Renderer {
         window: &W,
         width: u32,
         height: u32,
+        msaa: u32,
     ) -> Result<Self, Box<dyn Error>> {
         let entry = unsafe { Entry::load()? };
 
@@ -264,8 +287,17 @@ impl Renderer {
             hint,
             vk::SwapchainKHR::null(),
         )?;
-        let depth = create_depth(&allocator, &device, sc.extent);
-        let hdr = create_hdr(&allocator, &device, sc.extent);
+        // MSAA (§13): clamp the request to what this device actually supports.
+        let limits = unsafe { instance.get_physical_device_properties(physical_device) }.limits;
+        let samples = clamp_samples(&limits, msaa);
+        if samples != MSAA_FALLBACK || msaa > 1 {
+            eprintln!("[gfx] MSAA: requested {msaa}x, using {:?}", samples);
+        }
+        let depth = create_depth(&allocator, &device, sc.extent, samples);
+        let hdr = create_hdr(&allocator, &device, sc.extent, samples);
+        // Only needed when multisampling: the resolve target the tonemap samples.
+        let hdr_resolve = (samples != vk::SampleCountFlags::TYPE_1)
+            .then(|| create_hdr(&allocator, &device, sc.extent, vk::SampleCountFlags::TYPE_1));
         let hdr_sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -368,6 +400,8 @@ impl Renderer {
             image_views: sc.image_views,
             depth: Some(depth),
             hdr: Some(hdr),
+            hdr_resolve,
+            samples,
             hdr_sampler,
             shadow: Some(shadow),
             shadow_sampler,
@@ -409,9 +443,10 @@ impl Renderer {
 
     /// Geometry-pass MSAA sample count. The HDR + depth targets and the mesh/sky
     /// pipelines must all agree on this; the tonemap pass to the swapchain stays
-    /// single-sample regardless. One knob for future MSAA (see `MSAA_SAMPLES`).
+    /// single-sample regardless. Chosen at startup (§13) and clamped to device
+    /// support; every geometry-pass pipeline must be built with this.
     pub fn samples(&self) -> vk::SampleCountFlags {
-        MSAA_SAMPLES
+        self.samples
     }
 
     /// Latest smoothed per-pass GPU times (§21). All zero until a few frames have
@@ -470,7 +505,13 @@ impl Renderer {
     /// View of the current HDR target. Changes on resize, so consumers that hold
     /// a descriptor pointing at it must refresh when the handle changes.
     pub fn hdr_view(&self) -> vk::ImageView {
-        self.hdr.as_ref().expect("hdr target alive").view
+        // With MSAA the multisampled image cannot be sampled — hand out the
+        // resolve target instead. TonemapPass::update re-points its descriptor
+        // when this handle changes, so nothing else needs to know.
+        self.hdr_resolve
+            .as_ref()
+            .unwrap_or_else(|| self.hdr.as_ref().expect("hdr target alive"))
+            .view
     }
 
     /// Shared sampler for reading the HDR target in the tonemap pass.
@@ -850,6 +891,11 @@ impl Renderer {
         let depth = self.depth.as_ref().unwrap();
         let hdr = self.hdr.as_ref().unwrap();
         let shadow_img = self.shadow.as_ref().unwrap();
+        // With MSAA the geometry pass renders into the multisampled `hdr` and
+        // resolves into `hdr_resolve`; the tonemap pass reads whichever image
+        // actually holds the single-sample result.
+        let hdr_resolve = self.hdr_resolve.as_ref();
+        let sampled = hdr_resolve.unwrap_or(hdr);
         let extent = self.window_extent;
         let shadow_extent = vk::Extent2D {
             width: self.shadow_dim,
@@ -997,6 +1043,29 @@ impl Renderer {
                 &[to_hdr],
             );
 
+            // Same transition for the resolve target when MSAA is on — it is
+            // written by the resolve at end_rendering.
+            if let Some(r) = hdr_resolve {
+                let to_resolve = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(r.handle)
+                    .subresource_range(color_range)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_resolve],
+                );
+            }
+
             // Depth: UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL
             let to_depth = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
@@ -1036,6 +1105,14 @@ impl Renderer {
                         stencil: 0,
                     },
                 });
+            // Dynamic rendering resolves at cmd_end_rendering, so no manual blit.
+            let hdr_attachment = match hdr_resolve {
+                Some(r) => hdr_attachment
+                    .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                    .resolve_image_view(r.view)
+                    .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                None => hdr_attachment,
+            };
             let hdr_attachments = [hdr_attachment];
             let geo_rendering = vk::RenderingInfo::default()
                 .render_area(vk::Rect2D {
@@ -1066,7 +1143,7 @@ impl Renderer {
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(hdr.handle)
+                .image(sampled.handle)
                 .subresource_range(color_range)
                 .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ);
@@ -1221,8 +1298,27 @@ impl Renderer {
         }
 
         // Drops the old depth/HDR images (frees view+image) before reassigning.
-        self.depth = Some(create_depth(self.allocator(), &self.device, sc.extent));
-        self.hdr = Some(create_hdr(self.allocator(), &self.device, sc.extent));
+        let samples = self.samples;
+        self.depth = Some(create_depth(
+            self.allocator(),
+            &self.device,
+            sc.extent,
+            samples,
+        ));
+        self.hdr = Some(create_hdr(
+            self.allocator(),
+            &self.device,
+            sc.extent,
+            samples,
+        ));
+        self.hdr_resolve = (samples != vk::SampleCountFlags::TYPE_1).then(|| {
+            create_hdr(
+                self.allocator(),
+                &self.device,
+                sc.extent,
+                vk::SampleCountFlags::TYPE_1,
+            )
+        });
         self.swapchain = sc.swapchain;
         self.images = sc.images;
         self.image_views = sc.image_views;
@@ -1241,6 +1337,7 @@ impl Drop for Renderer {
             // Free VMA-backed resources while the device + allocator are alive.
             self.depth.take();
             self.hdr.take();
+            self.hdr_resolve.take();
             self.shadow.take();
             self.device.destroy_sampler(self.hdr_sampler, None);
             self.device.destroy_sampler(self.shadow_sampler, None);
@@ -1376,7 +1473,12 @@ fn create_swapchain_resources(
     })
 }
 
-fn create_depth(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::Extent2D) -> Image {
+fn create_depth(
+    allocator: &Arc<vk_mem::Allocator>,
+    device: &Device,
+    extent: vk::Extent2D,
+    samples: vk::SampleCountFlags,
+) -> Image {
     let image_ci = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(DEPTH_FORMAT)
@@ -1387,7 +1489,7 @@ fn create_depth(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk:
         })
         .mip_levels(1)
         .array_layers(1)
-        .samples(MSAA_SAMPLES)
+        .samples(samples)
         .tiling(vk::ImageTiling::OPTIMAL)
         .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -1474,7 +1576,12 @@ fn create_shadow(allocator: &Arc<vk_mem::Allocator>, device: &Device, dim: u32) 
     }
 }
 
-fn create_hdr(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::Extent2D) -> Image {
+fn create_hdr(
+    allocator: &Arc<vk_mem::Allocator>,
+    device: &Device,
+    extent: vk::Extent2D,
+    samples: vk::SampleCountFlags,
+) -> Image {
     let image_ci = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(HDR_FORMAT)
@@ -1485,7 +1592,7 @@ fn create_hdr(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::E
         })
         .mip_levels(1)
         .array_layers(1)
-        .samples(MSAA_SAMPLES)
+        .samples(samples)
         .tiling(vk::ImageTiling::OPTIMAL)
         // Rendered into as a color attachment, then sampled by the tonemap pass.
         .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
