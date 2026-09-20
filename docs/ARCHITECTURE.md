@@ -676,6 +676,24 @@ still parsed at runtime.
 - **Text → SDF/MSDF atlas** (crisp at any scale, one atlas; baked in the tool).
 - **Input routing:** UI consumes input before gameplay via the focus flag.
 
+**Landed (§26):** the **lightweight custom renderer**, as a `UiPass` drawing
+alpha-blended textured quads into the swapchain *after* tonemap/FXAA (LDR/sRGB,
+where §13 and §19 both place UI). One pipeline serves both rectangles and text:
+the atlas is a **5×7 pixel font** plus a single solid texel, sampled NEAREST so
+scaled glyphs stay crisp and cannot bleed into their neighbours. Colours are
+specified **linear**, since the `_SRGB` swapchain encodes on store and Vulkan
+blends `_SRGB` attachments in linear space.
+
+Its first consumer is the **Esc pause menu** (CONTINUE / OPTIONS / EXIT,
+arrow keys + Enter). `OPTIONS` is deliberately inert — the knobs it would hold
+are on F1/F2 until there is a real options screen. Pausing stops the fixed step,
+releases the cursor and ignores mouselook (§14's focus flag), while rendering
+continues so the frozen scene shows behind the overlay.
+
+Still pending: **egui** for the dev UI (this is the *game* HUD path, not a
+replacement for it), SDF/MSDF text for scale-independent glyphs, lower-case and
+punctuation, and mouse hit-testing — navigation is keyboard-only.
+
 ## 20. Audio
 
 - **`kira`** — game-oriented mixer (tweens, spatial, streaming); above `rodio`,

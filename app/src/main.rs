@@ -34,7 +34,7 @@ use bevy_ecs::schedule::ExecutorKind;
 use feather_assets::MeshData;
 use feather_gfx::Renderer;
 use feather_platform::winit;
-use feather_render::{FxaaPass, InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass};
+use feather_render::{FxaaPass, InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass, UiPass};
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
 use rapier3d::prelude::{
@@ -159,6 +159,28 @@ impl Default for GraphicsSettings {
             shadows: ShadowQuality::High,
             msaa: 1,
             fxaa: false,
+        }
+    }
+}
+
+/// Pause-menu entries. `Options` is intentionally inert for now — the settings
+/// it would expose (shadow quality, FXAA) are on F1/F2 until there is a real
+/// options screen to move them into.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuItem {
+    Continue,
+    Options,
+    Exit,
+}
+
+impl MenuItem {
+    const ALL: [MenuItem; 3] = [MenuItem::Continue, MenuItem::Options, MenuItem::Exit];
+
+    fn label(self) -> &'static str {
+        match self {
+            MenuItem::Continue => "CONTINUE",
+            MenuItem::Options => "OPTIONS",
+            MenuItem::Exit => "EXIT",
         }
     }
 }
@@ -600,6 +622,7 @@ struct App {
     mesh: Option<MeshRenderer>,
     tonemap: Option<TonemapPass>,
     fxaa: Option<FxaaPass>,
+    ui: Option<UiPass>,
     sky: Option<SkyPass>,
     renderer: Option<Renderer>,
     window: Option<Window>,
@@ -614,6 +637,8 @@ struct App {
     /// and look/movement input is ignored. Rendering continues so the frozen
     /// scene stays on screen behind the overlay (§14's UI focus flag).
     paused: bool,
+    /// Index into `MenuItem::ALL` while paused.
+    menu_index: usize,
     noclip: bool,
     light_dir: Vec4,
     exposure: f32,
@@ -694,6 +719,7 @@ impl App {
             mesh: None,
             tonemap: None,
             fxaa: None,
+            ui: None,
             sky: None,
             renderer: None,
             window: None,
@@ -703,6 +729,7 @@ impl App {
             input: Input::default(),
             settings,
             paused: false,
+            menu_index: 0,
             noclip: false,
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             exposure: 1.0,
@@ -917,11 +944,13 @@ impl ApplicationHandler for App {
         let (mesh, _ids) = MeshRenderer::new(&renderer, &meshes, &materials, MAX_INSTANCES);
         let tonemap = TonemapPass::new(&renderer);
         let fxaa = FxaaPass::new(&renderer);
+        let ui = UiPass::new(&renderer);
         let sky = SkyPass::new(&renderer);
 
         self.mesh = Some(mesh);
         self.tonemap = Some(tonemap);
         self.fxaa = Some(fxaa);
+        self.ui = Some(ui);
         self.sky = Some(sky);
         self.renderer = Some(renderer);
         self.window = Some(window);
@@ -981,6 +1010,21 @@ impl ApplicationHandler for App {
                             self.exposure = (self.exposure * 1.25).min(16.0);
                         }
                         KeyCode::Escape if pressed => self.set_paused(!self.paused),
+                        KeyCode::ArrowUp if pressed && self.paused => {
+                            self.menu_index =
+                                (self.menu_index + MenuItem::ALL.len() - 1) % MenuItem::ALL.len();
+                        }
+                        KeyCode::ArrowDown if pressed && self.paused => {
+                            self.menu_index = (self.menu_index + 1) % MenuItem::ALL.len();
+                        }
+                        KeyCode::Enter if pressed && self.paused => {
+                            match MenuItem::ALL[self.menu_index] {
+                                MenuItem::Continue => self.set_paused(false),
+                                // Placeholder: the knobs live on F1/F2 for now.
+                                MenuItem::Options => eprintln!("[menu] options: not implemented"),
+                                MenuItem::Exit => event_loop.exit(),
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1177,12 +1221,64 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Overlay geometry is built on the CPU here; the upload and draw
+                // happen inside the UI pass below.
+                if let Some(ui) = self.ui.as_mut() {
+                    let size = self.window.as_ref().unwrap().inner_size();
+                    ui.begin(size.width, size.height);
+                    if self.paused {
+                        let (w, h) = (size.width as f32, size.height as f32);
+                        // Dim the frozen scene. Colours are linear: this is drawn
+                        // into the _SRGB swapchain, which encodes on store.
+                        ui.rect(0.0, 0.0, w, h, [0.0, 0.0, 0.0, 0.55]);
+
+                        let px = (h / 220.0).max(2.0).floor(); // font pixel size
+                        let line = UiPass::text_height(px) * 2.2;
+                        let title_px = px * 1.6;
+                        let title = "PAUSED";
+                        ui.text(
+                            (w - UiPass::text_width(title, title_px)) * 0.5,
+                            h * 0.28,
+                            title_px,
+                            [0.9, 0.9, 0.9, 1.0],
+                            title,
+                        );
+
+                        let top = h * 0.44;
+                        for (i, item) in MenuItem::ALL.iter().enumerate() {
+                            let selected = i == self.menu_index;
+                            let label = item.label();
+                            let tw = UiPass::text_width(label, px);
+                            let x = (w - tw) * 0.5;
+                            let y = top + line * i as f32;
+                            if selected {
+                                // Highlight bar behind the current entry.
+                                let pad = px * 4.0;
+                                ui.rect(
+                                    x - pad,
+                                    y - pad * 0.5,
+                                    tw + pad * 2.0,
+                                    UiPass::text_height(px) + pad,
+                                    [0.25, 0.45, 0.85, 0.85],
+                                );
+                            }
+                            let color = if selected {
+                                [1.0, 1.0, 1.0, 1.0]
+                            } else {
+                                [0.65, 0.65, 0.65, 1.0]
+                            };
+                            ui.text(x, y, px, color, label);
+                        }
+                    }
+                }
+
                 let exposure = self.exposure;
-                if let (Some(r), Some(m), Some(tm), Some(fx), Some(sky)) = (
+                if let (Some(r), Some(m), Some(tm), Some(fx), Some(ui), Some(sky)) = (
                     self.renderer.as_mut(),
                     self.mesh.as_mut(),
                     self.tonemap.as_mut(),
                     self.fxaa.as_mut(),
+                    self.ui.as_ref(),
                     self.sky.as_ref(),
                 ) {
                     // HDR view/sampler are stable except across resize; capture
@@ -1216,6 +1312,9 @@ impl ApplicationHandler for App {
                             fx.update(frame, ldr_view, hdr_sampler);
                             fx.draw(cmd, extent, frame);
                         },
+                        // Overlay, blended over the finished frame. No-op when the
+                        // menu is closed (nothing was built).
+                        |cmd, extent, frame| ui.draw(cmd, extent, frame),
                     );
                 }
             }

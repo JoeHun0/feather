@@ -866,6 +866,7 @@ impl Renderer {
         geometry: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         post: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         aa: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
+        ui: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
     ) {
         if self.window_extent.width == 0 || self.window_extent.height == 0 {
             return;
@@ -1289,6 +1290,49 @@ impl Renderer {
                     ts_base + 5,
                 );
             }
+
+            // ---- UI overlay (§19): last, blended over the finished LDR image. ----
+            // The post chain just wrote this same attachment, and the overlay
+            // blends against it, so the write must be visible to the read.
+            let ui_after_post = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(color_range)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::COLOR_ATTACHMENT_READ
+                        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                );
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[ui_after_post],
+            );
+
+            // LOAD, not CLEAR: the overlay draws on top of the rendered frame.
+            let ui_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(swap_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE);
+            let ui_attachments = [ui_attachment];
+            let ui_rendering = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                })
+                .layer_count(1)
+                .color_attachments(&ui_attachments);
+            dev.cmd_begin_rendering(cmd, &ui_rendering);
+            ui(cmd, extent, frame);
+            dev.cmd_end_rendering(cmd);
 
             // Swapchain: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
             let to_present = vk::ImageMemoryBarrier::default()
