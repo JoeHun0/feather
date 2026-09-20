@@ -722,6 +722,21 @@ punctuation, and mouse hit-testing — navigation is keyboard-only.
   back-to-back at the same window size. Uses core `vkCmdWriteTimestamp` for now; the
   `vkCmdWriteTimestamp2` form arrives with the §10 sync2 barrier pass. Tracy GPU
   zones + an egui overlay are the remaining upgrades.
+- **Test content:** `tools/gen_testscene.py` generates the measurement
+  workload. The orb demo is pathological on purpose (huge overdraw, every object
+  a caster, no occlusion) and so is useless for judging cost; this produces a
+  walkable glTF level in cardinal sectors, each aimed at one system: pillars
+  spanning the ±`SHADOW_RADIUS` boundary (shadows/CSM), stairs and ramps
+  bracketing the 0.4 autostep and rapier's 45° slope limit (§15), thin poles, a
+  lattice and a picket fence at graded distances (AA), a few hundred nodes over a
+  handful of meshes (dedup/instancing/culling), and a metallic×roughness sphere
+  grid (IBL/tonemap reference). `--density low|med|high` scales the field for A/B
+  timing, `--seed` gives reproducible variants, `--check` re-parses the output and
+  asserts the engine's invariants (bounds, ground contact, no intersection with
+  the app's own level geometry, the normal-transform rule below, texture count).
+  Stdlib-only Python; the generator is committed and its output is not, since
+  `/scratch/` is gitignored. **Not** the §17 bake tool — that is the offline
+  asset-blob pipeline, this is dev content.
 - **RenderDoc:** in-application API, capture on a keybind.
 - **Object naming:** `vkSetDebugUtilsObjectName` on buffers/images/pipelines
   from the start (readable validation + captures).
@@ -893,7 +908,9 @@ milestones land.
   its primitive's own material, and a trimesh `ColliderRef`, so a loaded level is
   walkable. Giving a scene suppresses the orb demo (1000 orbs would bury it);
   with no arguments the orb demo runs as before, each orb taking a random built-in
-  mesh + palette material. Culling uses a **per-mesh local bounding sphere**
+  mesh + palette material. The orb demo is a *pathological* workload and is no
+  longer what perf work should be measured against — `tools/gen_testscene.py`
+  (§21) generates the realistic one. Culling uses a **per-mesh local bounding sphere**
   mapped through the model matrix, rather than a blanket radius — required because
   scene meshes are not unit-fitted. Limits: `MAX_TEXTURES = 64` (scenes past that
   fall back to the default textures), a trimesh collider is built per node at load
@@ -961,6 +978,15 @@ milestones land.
 - **Push constants**: currently carry `view_proj` + `light_dir` + `camera_pos`
   (96 B, provisional). Design reserves push constants for tiny per-draw scalars
   and puts camera in a per-frame UBO — revisit when Set 1 lands.
+- **Normal transform (§6)**: `mesh.vert` transforms normals with
+  `mat3(model)`, **not** an inverse-transpose normal matrix. That is correct only
+  for uniform scale, or for non-uniform scale with no rotation. It holds today
+  because orbs are uniformly scaled and level boxes are axis-aligned and
+  unrotated — but it is a real constraint on authored content: anything both
+  rotated *and* non-uniformly scaled will shade wrongly. `tools/gen_testscene.py`
+  therefore bakes meshes at true size so rotated nodes can keep scale 1, and its
+  `--check` asserts the rule. A proper inverse-transpose normal matrix (in the
+  instance record, not recomputed per vertex) is the fix.
 - **Vertex layout (§6)**: pos+normal+uv. Normal mapping uses a screen-space
   **derivative TBN** (no per-vertex tangent); MikkTSpace vertex tangents are the
   higher-quality follow-up (§6 reserves the tangent attribute).
