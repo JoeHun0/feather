@@ -719,6 +719,7 @@ dependencies = [
  "feather-render",
  "glam 0.29.3",
  "rapier3d",
+ "serde_json",
 ]
 
 [[package]]
@@ -728,6 +729,7 @@ dependencies = [
  "glam 0.29.3",
  "gltf",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

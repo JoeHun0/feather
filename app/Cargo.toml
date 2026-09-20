@@ -17,3 +17,8 @@ feather-game.workspace = true
 bevy_ecs.workspace = true
 glam.workspace = true
 rapier3d.workspace = true
+
+[dev-dependencies]
+# Tests only: constructing PrefabSpec params. The runtime reads them through
+# PrefabSpec's typed accessors, so the binary itself needs no JSON dependency.
+serde_json = "1"

@@ -27,6 +27,7 @@
 //! drifting orbs now hang above a ground box with a few obstacle boxes to walk
 //! among.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use bevy_ecs::prelude::*;
@@ -969,6 +970,151 @@ struct App {
     last_frame: Instant,
 }
 
+/// What a prefab spawn function gets: the node's placement plus whatever
+/// geometry and parameters it carries.
+struct SpawnArgs<'a> {
+    transform: Mat4,
+    /// `None` for a marker node — geometry-free, there only to place a prefab.
+    mesh: Option<MeshId>,
+    material: u32,
+    /// Local-space geometry, for building a collider.
+    mesh_data: Option<&'a MeshData>,
+    spec: Option<&'a feather_assets::PrefabSpec>,
+}
+
+impl SpawnArgs<'_> {
+    /// A boolean param, falling back to `default` when absent or the wrong type.
+    fn flag(&self, key: &str, default: bool) -> bool {
+        self.spec.and_then(|s| s.bool(key)).unwrap_or(default)
+    }
+}
+
+/// §18's `HashMap<PrefabId, SpawnFn>`: a new kind of thing is a new function
+/// here, not a change to the scene format.
+type SpawnFn = fn(&mut World, &SpawnArgs);
+
+/// Static level geometry, with two switches read from `params`:
+///
+/// - `collide` (default true) — off closes §26's "no per-node opt-out"; a few
+///   hundred decorative props otherwise each build a trimesh at load.
+/// - `shadow` (default true) — off applies `NoShadowCast`. The demo ground
+///   already does this (a flat slab casts nothing useful but rasterizes the
+///   whole shadow map); this makes it authorable per node instead of hardcoded.
+///
+/// One parameterised prefab rather than a `no_collide` / `no_shadow` pair: the
+/// switches are independent, so separate ids would need one per combination.
+fn spawn_prop(world: &mut World, args: &SpawnArgs) {
+    let collide = args.flag("collide", true);
+    let shadow = args.flag("shadow", true);
+    spawn_scene_node(world, args, collide, !shadow);
+}
+
+/// A node with no prefab at all: geometry that collides and casts, which is what
+/// every scene node did before prefabs existed.
+fn spawn_static_prop(world: &mut World, args: &SpawnArgs) {
+    spawn_scene_node(world, args, true, false);
+}
+
+/// Shared body of the geometry prefabs.
+fn spawn_scene_node(
+    world: &mut World,
+    args: &SpawnArgs,
+    collide: bool,
+    no_shadow: bool,
+) -> Option<Entity> {
+    let mesh = args.mesh?;
+    let collider = match (collide, args.mesh_data) {
+        (true, Some(data)) => {
+            let verts: Vec<Vector> = data
+                .vertices
+                .iter()
+                .map(|v| to_rapier(args.transform.transform_point3(Vec3::from(v.pos))))
+                .collect();
+            let tris: Vec<[u32; 3]> = data
+                .indices
+                .chunks_exact(3)
+                .map(|t| [t[0], t[1], t[2]])
+                .collect();
+            world
+                .resource_mut::<Physics>()
+                .add_static_trimesh(verts, tris)
+        }
+        _ => None,
+    };
+    let mut e = world.spawn((
+        Transform(args.transform),
+        Mesh(mesh),
+        Material(args.material),
+    ));
+    if let Some(c) = collider {
+        e.insert(ColliderRef(c));
+    }
+    if no_shadow {
+        e.insert(NoShadowCast);
+    }
+    Some(e.id())
+}
+
+/// `player_start` places the player and is consumed before the world is built,
+/// so it has no spawn function of its own — see `Session::new`.
+fn prefab_registry() -> HashMap<&'static str, SpawnFn> {
+    let mut r: HashMap<&'static str, SpawnFn> = HashMap::new();
+    r.insert("prop", spawn_prop as SpawnFn);
+    r
+}
+
+/// Load the mesh registry and every CLI scene. Runs before the world exists,
+/// because `player_start` decides where the player is built.
+///
+/// Built-ins occupy the fixed MESH_* slots first (the demo sphere/cube, then the
+/// unit cube every static level piece is scaled from); each scene's meshes are
+/// appended and its node indices rebased onto them.
+fn load_scenes(scenes: &[String]) -> (Vec<MeshData>, Vec<feather_assets::SceneNode>) {
+    let mut meshes: Vec<MeshData> = vec![
+        MeshData::uv_sphere(16, 24, 0.5),
+        MeshData::cube(1.0),
+        MeshData::cube(1.0),
+    ];
+    let mut nodes: Vec<feather_assets::SceneNode> = Vec::new();
+    for path in scenes {
+        match feather_assets::load_gltf_scene(path) {
+            Ok(scene) => {
+                eprintln!(
+                    "loaded {path}: {} meshes, {} nodes",
+                    scene.meshes.len(),
+                    scene.nodes.len()
+                );
+                let base = meshes.len();
+                meshes.extend(scene.meshes);
+                nodes.extend(scene.nodes.into_iter().map(|n| feather_assets::SceneNode {
+                    mesh: n.mesh.map(|m| base + m),
+                    transform: n.transform,
+                    prefab: n.prefab,
+                }));
+            }
+            Err(e) => eprintln!("failed to load {path}: {e} (skipped)"),
+        }
+    }
+    (meshes, nodes)
+}
+
+/// Where the player starts: a `player_start` marker's position and yaw, or the
+/// hardcoded default when a scene does not place one.
+fn player_start(nodes: &[feather_assets::SceneNode]) -> (Vec3, Option<f32>) {
+    for n in nodes {
+        let Some(spec) = n.prefab.as_ref() else {
+            continue;
+        };
+        if spec.id == "player_start" {
+            return (
+                n.transform.transform_point3(Vec3::ZERO),
+                spec.f32("yaw").map(|d| d.to_radians()),
+            );
+        }
+    }
+    (Vec3::new(0.0, GROUND_Y, 8.0), None)
+}
+
 /// Per-frame view data the render closures need. Carried as an `Option` so the
 /// main menu can skip the shadow and geometry passes entirely.
 #[derive(Clone, Copy)]
@@ -1013,15 +1159,24 @@ impl Session {
     /// Build a world and the GPU resources that serve it. `scenes` are the CLI
     /// glTF paths; empty means the procedural orb demo, exactly as before.
     fn new(renderer: &Renderer, scenes: &[String]) -> Self {
+        // Scenes load *first*, because a `player_start` marker (§18) decides
+        // where the player goes and the player is built below.
+        let (meshes, scene_nodes) = load_scenes(scenes);
+        let (start_pos, start_yaw) = player_start(&scene_nodes);
+
         let mut world = World::new();
         world.insert_resource(FrameCount::default());
         let mut physics = Physics::new();
-        // Feet on the ground, looking -Z. The player is a normal ECS entity: sim
-        // state in `Player`, render-rate angles in `Look` (§15).
-        let body = Player::new(&mut physics, Vec3::new(0.0, GROUND_Y, 8.0));
+        // Feet on the ground. The player is a normal ECS entity: sim state in
+        // `Player`, render-rate angles in `Look` (§15).
+        let body = Player::new(&mut physics, start_pos);
         world.insert_resource(physics);
         world.insert_resource(InputState::default());
-        let player = world.spawn((body, Look::new())).id();
+        let mut look = Look::new();
+        if let Some(yaw) = start_yaw {
+            look.yaw = yaw;
+        }
+        let player = world.spawn((body, look)).id();
 
         // The drifting orb demo only runs when no scene was given — a loaded level
         // is what you want to look at, and 1000 orbs would bury it.
@@ -1069,37 +1224,6 @@ impl Session {
         // would serialise them regardless).
         schedule.add_systems((player_target_sys, physics_step_sys, player_readback_sys).chain());
 
-        // Built-in meshes first, at the fixed MESH_* slots: the demo sphere/cube,
-        // then the unit cube every static level piece is scaled from.
-        let mut meshes: Vec<MeshData> = vec![
-            MeshData::uv_sphere(16, 24, 0.5),
-            MeshData::cube(1.0),
-            MeshData::cube(1.0),
-        ];
-        // Then each CLI glTF scene's meshes. `scene_nodes` keeps the placements to
-        // spawn once the material ids are known; mesh indices are offset by however
-        // many meshes are already registered.
-        let mut scene_nodes: Vec<(usize, Mat4)> = Vec::new();
-        for path in scenes {
-            match feather_assets::load_gltf_scene(path) {
-                Ok(scene) => {
-                    eprintln!(
-                        "loaded {path}: {} meshes, {} nodes",
-                        scene.meshes.len(),
-                        scene.nodes.len()
-                    );
-                    let base = meshes.len();
-                    meshes.extend(scene.meshes);
-                    scene_nodes.extend(
-                        scene
-                            .nodes
-                            .into_iter()
-                            .map(|n| (base + n.mesh, n.transform)),
-                    );
-                }
-                Err(e) => eprintln!("failed to load {path}: {e} (skipped)"),
-            }
-        }
         // Built-ins get the demo fit (centre + unit-scale); scene meshes keep their
         // authored transform, so identity.
         let fits: Vec<Mat4> = meshes
@@ -1161,29 +1285,45 @@ impl Session {
         // instances. Each also gets a fixed trimesh collider so the level is
         // walkable. Material ids follow the same `PALETTE + mesh index` rule the
         // table below is built with.
-        for (mesh_idx, transform) in &scene_nodes {
-            let data = &meshes[*mesh_idx];
-            let verts: Vec<Vector> = data
-                .vertices
-                .iter()
-                .map(|v| to_rapier(transform.transform_point3(Vec3::from(v.pos))))
-                .collect();
-            let tris: Vec<[u32; 3]> = data
-                .indices
-                .chunks_exact(3)
-                .map(|t| [t[0], t[1], t[2]])
-                .collect();
-            let collider = world
-                .resource_mut::<Physics>()
-                .add_static_trimesh(verts, tris);
-            let mut e = world.spawn((
-                Transform(*transform),
-                Mesh(MeshId(*mesh_idx as u32)),
-                Material(PALETTE + *mesh_idx as u32),
-            ));
-            if let Some(c) = collider {
-                e.insert(ColliderRef(c));
+        let registry = prefab_registry();
+        let mut unknown: Vec<&str> = Vec::new();
+        // Counted so the effect of `collide: false` is visible in the log rather
+        // than having to be taken on trust.
+        let colliders_before = world.resource::<Physics>().colliders.len();
+        let mut spawned = 0usize;
+        for node in &scene_nodes {
+            // `player_start` was consumed before the world was built.
+            if node.prefab.as_ref().is_some_and(|s| s.id == "player_start") {
+                continue;
             }
+            let mesh_idx = node.mesh;
+            let args = SpawnArgs {
+                transform: node.transform,
+                mesh: mesh_idx.map(|i| MeshId(i as u32)),
+                material: mesh_idx.map_or(0, |i| PALETTE + i as u32),
+                mesh_data: mesh_idx.map(|i| &meshes[i]),
+                spec: node.prefab.as_ref(),
+            };
+            match node.prefab.as_ref() {
+                Some(spec) => match registry.get(spec.id.as_str()) {
+                    Some(f) => f(&mut world, &args),
+                    None => {
+                        // Unknown ids are authorable-ahead-of-time, not errors:
+                        // fall back to static geometry and say so once.
+                        if !unknown.contains(&spec.id.as_str()) {
+                            eprintln!("unknown prefab {:?}; spawning as static geometry", spec.id);
+                            unknown.push(spec.id.as_str());
+                        }
+                        spawn_static_prop(&mut world, &args);
+                    }
+                },
+                None => spawn_static_prop(&mut world, &args),
+            }
+            spawned += 1;
+        }
+        if spawned > 0 {
+            let colliders = world.resource::<Physics>().colliders.len() - colliders_before;
+            eprintln!("scene: {spawned} nodes spawned, {colliders} colliders built");
         }
 
         // One step so the broad-phase BVH the character controller shape-casts
@@ -2824,5 +2964,120 @@ mod tests {
             );
             near = far;
         }
+    }
+
+    // ---- §18 prefabs ----
+
+    /// A world with just enough in it to spawn scene nodes into.
+    fn prefab_world() -> World {
+        let mut w = World::new();
+        w.insert_resource(Physics::new());
+        w
+    }
+
+    fn node(prefab: Option<&str>, params: serde_json::Value) -> feather_assets::SceneNode {
+        feather_assets::SceneNode {
+            mesh: Some(0),
+            transform: Mat4::IDENTITY,
+            prefab: prefab.map(|id| feather_assets::PrefabSpec {
+                id: id.to_string(),
+                params,
+            }),
+        }
+    }
+
+    fn spawn_one(w: &mut World, spec: Option<&feather_assets::PrefabSpec>, cube: &MeshData) {
+        let args = SpawnArgs {
+            transform: Mat4::IDENTITY,
+            mesh: Some(MeshId(0)),
+            material: 0,
+            mesh_data: Some(cube),
+            spec,
+        };
+        match spec.and_then(|s| prefab_registry().get(s.id.as_str()).copied()) {
+            Some(f) => f(w, &args),
+            None => spawn_static_prop(w, &args),
+        }
+    }
+
+    #[test]
+    fn collide_param_controls_whether_a_collider_is_built() {
+        let cube = MeshData::cube(1.0);
+
+        // Default (no prefab): geometry collides, exactly as before prefabs.
+        let mut w = prefab_world();
+        spawn_one(&mut w, None, &cube);
+        assert_eq!(w.query::<&ColliderRef>().iter(&w).count(), 1);
+        assert_eq!(w.resource::<Physics>().colliders.len(), 1);
+
+        // collide: false skips the trimesh — the §26 per-node opt-out.
+        let n = node(Some("prop"), serde_json::json!({ "collide": false }));
+        let mut w = prefab_world();
+        spawn_one(&mut w, n.prefab.as_ref(), &cube);
+        assert_eq!(w.query::<&ColliderRef>().iter(&w).count(), 0);
+        assert_eq!(
+            w.resource::<Physics>().colliders.len(),
+            0,
+            "collider was still built"
+        );
+        // It must still render.
+        assert_eq!(w.query::<&Mesh>().iter(&w).count(), 1);
+    }
+
+    #[test]
+    fn shadow_param_controls_the_no_cast_marker() {
+        let cube = MeshData::cube(1.0);
+        let n = node(Some("prop"), serde_json::json!({ "shadow": false }));
+        let mut w = prefab_world();
+        spawn_one(&mut w, n.prefab.as_ref(), &cube);
+        assert_eq!(w.query::<&NoShadowCast>().iter(&w).count(), 1);
+        // Independent of collision: this one still collides.
+        assert_eq!(w.query::<&ColliderRef>().iter(&w).count(), 1);
+
+        // Absent param defaults to casting.
+        let n = node(Some("prop"), serde_json::json!({}));
+        let mut w = prefab_world();
+        spawn_one(&mut w, n.prefab.as_ref(), &cube);
+        assert_eq!(w.query::<&NoShadowCast>().iter(&w).count(), 0);
+    }
+
+    #[test]
+    fn unknown_prefab_falls_back_to_static_geometry() {
+        let cube = MeshData::cube(1.0);
+        // point_light has no implementation yet (§12). It must still appear as
+        // geometry rather than vanishing or aborting the load.
+        let n = node(Some("point_light"), serde_json::json!({ "range": 8.0 }));
+        assert!(prefab_registry().get("point_light").is_none());
+        let mut w = prefab_world();
+        spawn_one(&mut w, n.prefab.as_ref(), &cube);
+        assert_eq!(w.query::<&Mesh>().iter(&w).count(), 1);
+        assert_eq!(w.query::<&ColliderRef>().iter(&w).count(), 1);
+    }
+
+    #[test]
+    fn player_start_marker_places_the_player() {
+        let marker = feather_assets::SceneNode {
+            mesh: None,
+            transform: Mat4::from_translation(Vec3::new(4.0, -2.0, 7.0)),
+            prefab: Some(feather_assets::PrefabSpec {
+                id: "player_start".into(),
+                params: serde_json::json!({ "yaw": 180.0 }),
+            }),
+        };
+        let (pos, yaw) = player_start(std::slice::from_ref(&marker));
+        assert_eq!(pos, Vec3::new(4.0, -2.0, 7.0));
+        assert_eq!(yaw, Some(std::f32::consts::PI));
+
+        // No marker: the hardcoded default, so unmarked scenes and the orb demo
+        // behave exactly as before.
+        let (pos, yaw) = player_start(&[]);
+        assert_eq!(pos, Vec3::new(0.0, GROUND_Y, 8.0));
+        assert_eq!(yaw, None);
+
+        // A marker without a yaw keeps the default facing.
+        let mut m = marker;
+        m.prefab.as_mut().unwrap().params = serde_json::json!({});
+        let (_, yaw) = player_start(std::slice::from_ref(&m));
+        assert_eq!(yaw, None);
     }
 }

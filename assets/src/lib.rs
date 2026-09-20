@@ -146,14 +146,53 @@ impl MeshData {
     }
 }
 
-/// One placement in a loaded scene: which mesh to draw and where. Several nodes
-/// referencing the same mesh is the common case (props repeated across a level),
-/// and is exactly what the renderer's instanced path wants.
+/// The gameplay half of a node (§18): which prefab to spawn, plus its
+/// parameters, read from the glTF node's `extras`.
+///
+/// Params stay as raw JSON with typed accessors rather than a fixed struct, so
+/// that a new prefab is a new spawn function rather than a format change —
+/// which is §18's whole point.
+#[derive(Clone, Debug)]
+pub struct PrefabSpec {
+    pub id: String,
+    pub params: serde_json::Value,
+}
+
+impl PrefabSpec {
+    pub fn f32(&self, key: &str) -> Option<f32> {
+        self.params.get(key)?.as_f64().map(|v| v as f32)
+    }
+
+    pub fn bool(&self, key: &str) -> Option<bool> {
+        self.params.get(key)?.as_bool()
+    }
+
+    pub fn vec3(&self, key: &str) -> Option<Vec3> {
+        let a = self.params.get(key)?.as_array()?;
+        if a.len() < 3 {
+            return None;
+        }
+        let c: Vec<f32> = a
+            .iter()
+            .filter_map(|v| v.as_f64())
+            .map(|v| v as f32)
+            .collect();
+        (c.len() == 3).then(|| Vec3::new(c[0], c[1], c[2]))
+    }
+}
+
+/// One placement in a loaded scene: what to draw and where, plus any prefab the
+/// node carries. Several nodes referencing the same mesh is the common case
+/// (props repeated across a level), and is exactly what the renderer's instanced
+/// path wants.
 pub struct SceneNode {
-    /// Index into [`SceneData::meshes`].
-    pub mesh: usize,
+    /// Index into [`SceneData::meshes`], or `None` for a **marker**: a node with
+    /// no geometry that exists only to place a prefab (a spawn point, say).
+    pub mesh: Option<usize>,
     /// The node's world transform, with the whole parent chain applied.
     pub transform: Mat4,
+    /// §18 gameplay data from the node's `extras`, when it has any.
+    pub prefab: Option<PrefabSpec>,
 }
 
 /// A glTF scene decomposed for the ECS: meshes in **local** space, plus one node
@@ -179,8 +218,11 @@ pub struct SceneData {
 /// primitive's base-color + normal + metallic-roughness textures (with factors +
 /// normal scale).
 ///
+/// Nodes carrying §18 `extras` gain a [`PrefabSpec`]; a node with a prefab but no
+/// mesh is emitted as a **marker** (`mesh: None`).
+///
 /// Deferred: tangents, skinning, animation, morph targets, non-triangle
-/// primitives, 16-/32-bit image formats, and `extras` gameplay data (§18).
+/// primitives, and 16-/32-bit image formats.
 pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<SceneData, Box<dyn Error>> {
     // import resolves all buffers (blob / external / data URI) and decodes images.
     let (doc, buffers, images) = gltf::import(path)?;
@@ -211,6 +253,8 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<SceneData, Box<dyn Erro
                 add_mesh_nodes(
                     &mesh,
                     Mat4::IDENTITY,
+                    // No scene graph means no nodes, so no prefab data either.
+                    None,
                     &buffers,
                     &images,
                     &mut seen,
@@ -290,6 +334,49 @@ fn to_rgba8(img: &gltf::image::Data) -> Option<TextureData> {
     })
 }
 
+/// Read a node's §18 prefab data from its `extras`.
+///
+/// **Lenient on purpose**: anything unparseable warns and is dropped rather than
+/// failing the import. An authoring typo should cost you one prop, not the whole
+/// level — and `extras` is a free-form escape hatch that other tools write into,
+/// so foreign shapes are expected rather than exceptional.
+fn read_prefab(node: &gltf::Node) -> Option<PrefabSpec> {
+    let raw = node.extras().as_ref()?;
+    let value: serde_json::Value = match serde_json::from_str(raw.get()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "node {}: extras is not valid JSON ({e}); ignored",
+                node_label(node)
+            );
+            return None;
+        }
+    };
+    // No `prefab` key is not an error: extras is shared with other tooling.
+    let id = value.get("prefab")?;
+    let Some(id) = id.as_str() else {
+        eprintln!(
+            "node {}: extras.prefab is not a string; ignored",
+            node_label(node)
+        );
+        return None;
+    };
+    Some(PrefabSpec {
+        id: id.to_string(),
+        params: value
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn node_label(node: &gltf::Node) -> String {
+    match node.name() {
+        Some(n) => format!("{} (#{})", n, node.index()),
+        None => format!("#{}", node.index()),
+    }
+}
+
 fn walk_node(
     node: &gltf::Node,
     parent: Mat4,
@@ -299,8 +386,21 @@ fn walk_node(
     out: &mut SceneData,
 ) {
     let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
-    if let Some(mesh) = node.mesh() {
-        add_mesh_nodes(&mesh, world, buffers, images, seen, out);
+    let prefab = read_prefab(node);
+    match node.mesh() {
+        Some(mesh) => add_mesh_nodes(&mesh, world, prefab, buffers, images, seen, out),
+        // A node with no geometry but a prefab is a marker — the spawn points and
+        // trigger volumes §18 wants. Without a prefab it is just a transform in
+        // the hierarchy, already applied to its children, so nothing to emit.
+        None => {
+            if prefab.is_some() {
+                out.nodes.push(SceneNode {
+                    mesh: None,
+                    transform: world,
+                    prefab,
+                });
+            }
+        }
     }
     for child in node.children() {
         walk_node(&child, world, buffers, images, seen, out);
@@ -313,6 +413,7 @@ fn walk_node(
 fn add_mesh_nodes(
     mesh: &gltf::Mesh,
     world: Mat4,
+    prefab: Option<PrefabSpec>,
     buffers: &[gltf::buffer::Data],
     images: &[gltf::image::Data],
     seen: &mut HashMap<(usize, usize), usize>,
@@ -335,9 +436,12 @@ fn add_mesh_nodes(
                 i
             }
         };
+        // Every primitive of the node inherits its prefab: one glTF node with a
+        // multi-primitive mesh is still one *thing*.
         out.nodes.push(SceneNode {
-            mesh: slot,
+            mesh: Some(slot),
             transform: world,
+            prefab: prefab.clone(),
         });
     }
 }
@@ -439,6 +543,100 @@ mod tests {
         path
     }
 
+    /// Fixture for §18 `extras`: a mesh node with a prefab, a **mesh-less
+    /// marker**, a node whose extras are the wrong shape, and a plain node with
+    /// none — so one file covers every branch of `read_prefab`.
+    fn write_prefab_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let positions: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let mut bin = Vec::new();
+        for f in positions {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+        std::fs::write(dir.join("tri.bin"), &bin).unwrap();
+
+        let gltf = r#"{
+  "asset": { "version": "2.0" },
+  "scene": 0,
+  "scenes": [ { "nodes": [0, 1, 2, 3, 4] } ],
+  "nodes": [
+    { "mesh": 0, "translation": [1, 0, 0],
+      "extras": { "prefab": "no_collide", "params": { "flag": true } } },
+    { "translation": [5, 6, 7],
+      "extras": { "prefab": "player_start", "params": { "yaw": 90.0 } } },
+    { "mesh": 0, "translation": [2, 0, 0] },
+    { "mesh": 0, "translation": [3, 0, 0], "extras": { "prefab": 42 } },
+    { "translation": [9, 9, 9] }
+  ],
+  "meshes": [ { "primitives": [ { "attributes": { "POSITION": 0 } } ] } ],
+  "accessors": [ {
+    "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+    "min": [0, 0, 0], "max": [1, 1, 0]
+  } ],
+  "bufferViews": [ { "buffer": 0, "byteOffset": 0, "byteLength": 36 } ],
+  "buffers": [ { "byteLength": 36, "uri": "tri.bin" } ]
+}"#;
+        let path = dir.join("prefabs.gltf");
+        std::fs::write(&path, gltf).unwrap();
+        path
+    }
+
+    #[test]
+    fn extras_become_prefabs_and_markers() {
+        let dir = fixture_dir("prefabs");
+        let scene = load_gltf_scene(write_prefab_fixture(&dir)).unwrap();
+
+        // 3 mesh nodes + 1 marker. The plain mesh-less node emits nothing: it is
+        // only a transform, already folded into any children.
+        assert_eq!(scene.nodes.len(), 4, "got {:?}", scene.nodes.len());
+
+        let marker = scene
+            .nodes
+            .iter()
+            .find(|n| n.mesh.is_none())
+            .expect("mesh-less marker should be emitted");
+        let spec = marker.prefab.as_ref().expect("marker carries a prefab");
+        assert_eq!(spec.id, "player_start");
+        assert_eq!(spec.f32("yaw"), Some(90.0));
+        assert_eq!(
+            marker.transform.transform_point3(Vec3::ZERO),
+            Vec3::new(5.0, 6.0, 7.0)
+        );
+
+        let tagged = scene
+            .nodes
+            .iter()
+            .find(|n| n.prefab.as_ref().is_some_and(|p| p.id == "no_collide"))
+            .expect("mesh node keeps its prefab");
+        assert_eq!(tagged.mesh, Some(0));
+        assert_eq!(tagged.prefab.as_ref().unwrap().bool("flag"), Some(true));
+
+        // Exactly one prefab-less mesh node, and the malformed one (prefab: 42)
+        // must be among them — dropped, not fatal, and not silently accepted.
+        let plain = scene
+            .nodes
+            .iter()
+            .filter(|n| n.mesh.is_some() && n.prefab.is_none())
+            .count();
+        assert_eq!(plain, 2, "malformed extras should be ignored, not fatal");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prefab_params_are_typed_and_forgiving() {
+        let spec = PrefabSpec {
+            id: "x".into(),
+            params: serde_json::json!({ "yaw": 45, "on": false, "c": [1.0, 2.0, 3.0] }),
+        };
+        assert_eq!(spec.f32("yaw"), Some(45.0));
+        assert_eq!(spec.bool("on"), Some(false));
+        assert_eq!(spec.vec3("c"), Some(Vec3::new(1.0, 2.0, 3.0)));
+        // Wrong type or missing key yields None rather than panicking.
+        assert_eq!(spec.f32("on"), None);
+        assert_eq!(spec.vec3("yaw"), None);
+        assert_eq!(spec.f32("nope"), None);
+    }
+
     fn fixture_dir(name: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("feather_gltf_{}_{}", name, std::process::id()));
@@ -455,7 +653,7 @@ mod tests {
         // three times, which is what lets the renderer instance it.
         assert_eq!(scene.meshes.len(), 1, "primitive should be deduplicated");
         assert_eq!(scene.nodes.len(), 3, "one placement per referencing node");
-        assert!(scene.nodes.iter().all(|n| n.mesh == 0));
+        assert!(scene.nodes.iter().all(|n| n.mesh == Some(0)));
 
         let origins: Vec<Vec3> = scene
             .nodes

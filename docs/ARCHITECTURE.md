@@ -697,14 +697,41 @@ bindings table; no gamepad, no UI focus flag.
   walk nodes → resolve handles → look up prefab → spawn archetype. New types =
   new spawn fn, not a format change. Chunk membership computed at bake, written
   into the blob.
-**Landed (§26):** the first half of data-driven spawning — `load_gltf_scene`
-returns meshes in local space plus one `SceneNode` per placement, and the app
-spawns an entity per node (`Transform` + mesh/material handles + a trimesh
-`ColliderRef`). Primitives are deduplicated by `(mesh, primitive)`, so a mesh
-referenced by many nodes is stored once and drawn as instances. **Pending:** the
-prefab registry and `extras`/sidecar gameplay data — nodes currently spawn as
-static geometry only; chunk membership; and the bake path (§17), since glTF is
-still parsed at runtime.
+**Landed (§26):** data-driven spawning, both halves. `load_gltf_scene` returns
+meshes in local space plus one `SceneNode` per placement, deduplicated by
+`(mesh, primitive)` so a mesh referenced by many nodes is stored once and drawn
+as instances. Each node also carries a `PrefabSpec` read from its glTF
+**`extras`** in this section's `{ prefab, params }` shape, and the app resolves
+it against a `HashMap<&str, SpawnFn>` — a new kind of thing is a new function,
+not a format change.
+
+A node with a prefab but **no mesh** is emitted as a *marker*, which is what
+makes spawn points (and later triggers) expressible at all.
+
+Implemented prefabs are deliberately only those that do something today:
+
+- **`player_start`** — a marker whose position and `yaw` place the player.
+  Consumed *before* the world is built, so scene loading now runs ahead of
+  player creation in `Session::new`. Absent, the hardcoded spawn is used, so the
+  orb demo and unmarked scenes are unchanged.
+- **`prop`** — static geometry with `collide` and `shadow` switches (both
+  default true). `collide: false` closes the per-node collider opt-out §26
+  listed as missing; `shadow: false` applies `NoShadowCast`, previously
+  hardcoded for the demo ground alone. One parameterised prefab rather than a
+  `no_collide`/`no_shadow` pair, since the switches are independent and separate
+  ids would need one per combination.
+
+**Unknown ids warn once and fall back to static geometry** rather than failing.
+That is what lets `point_light` be authored now and become real when §12 lands,
+with no dead component in between — the generated test scene carries two on
+purpose to keep that path exercised. Extras parsing is lenient for the same
+reason: malformed data costs one prop, not the level.
+
+**Pending:** chunk membership; the bake path (§17), since glTF is still parsed
+at runtime; and prefabs for lights and triggers, both blocked on the systems
+that would consume them. The registry lives in `app` beside the components it
+spawns; §22 wants it in `game`, which is blocked on moving the components
+there.
 
 - **Save/load is separate from scene loading.** Do **not** serialize the whole
   `World` (GPU/physics handles aren't serializable). Mark a **saveable subset**:
@@ -1012,7 +1039,8 @@ milestones land.
   mapped through the model matrix, rather than a blanket radius — required because
   scene meshes are not unit-fitted. Limits: `MAX_TEXTURES = 64` (scenes past that
   fall back to the default textures), a trimesh collider is built per node at load
-  (no convex decomposition, no per-node opt-out), scenes land at their authored
+  (no convex decomposition; opt out per node with §18's `prop` prefab and
+  `collide: false`), scenes land at their authored
   coordinates so a model authored around the origin floats above the demo ground
   at `GROUND_Y`, and there is still no broad-phase/LOD, so a large scene leans on
   the per-entity cull.
@@ -1152,8 +1180,10 @@ cascades are the same resolution. Shadows now reach `SHADOW_DISTANCE` (60) rathe
 than a ±16 box;
 bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
 bake pipeline (runtime glTF scene loading + multi-mesh registry landed — the
-offline bake, runtime blob and handle tables are not); scene spawning (glTF nodes
-spawn as static entities; the prefab registry and `extras` gameplay data are
+offline bake, runtime blob and handle tables are not); **scene spawning landed**
+(§18: `extras` → `PrefabSpec`, a prefab registry, marker nodes, `player_start`
+and a parameterised `prop` with per-node collider/shadow opt-outs; unknown ids
+fall back to static geometry; chunk membership and light/trigger prefabs
 pending) / save; rapier beyond the player (kinematic FPS controller, static
 colliders and the ECS↔rapier sync systems landed — dynamic bodies and collision
 layers pending);

@@ -494,7 +494,9 @@ def zone_shadow(s, pal, extras_on):
             h = 3.0 + ((ri * 7 + ci * 3) % 5) * 1.5
             extras = None
             if extras_on and ci % 5 == 0:
-                extras = {"prefab": "light_post", "params": {"intensity": 2.0, "range": 8.0}}
+                # Thin pillars read poorly in the shadow map and cost caster
+                # fill; a few are marked as non-casters to show the switch.
+                extras = {"prefab": "prop", "params": {"shadow": False}}
             t = (float(x), GROUND_Y + h / 2.0, z)
             sc = (w, h, w)
             # Skip rather than intersect: the app's own obstacle boxes sit near
@@ -600,7 +602,12 @@ def zone_pbr(s, pal, extras_on):
         s.place(
             mesh, (12.0 + ei * 5.0, GROUND_Y + 1.6, -27.0),
             scale=(1.4, 1.4, 1.4),
-            extras={"prefab": "point_light", "params": {"color": [1.0, 0.6, 0.2]}} if extras_on else None,
+            # Deliberately an id the engine does not implement: exercises the
+            # unknown-prefab path, which warns once and falls back to static
+            # geometry rather than failing the load. Becomes real with §12.
+            extras={"prefab": "point_light", "params": {"color": [1.0, 0.6, 0.2]}}
+            if extras_on
+            else None,
             name=f"emissive_{ei}",
         )
 
@@ -611,6 +618,11 @@ def zone_field(s, pal, count):
     This is the realistic draw workload: it exercises primitive dedup, the
     per-mesh bounding-sphere frustum cull and the sorted per-mesh draw runs,
     without the orb demo's pathological overdraw.
+
+    Tagged `prop` with `collide: false` (§18): this is scenery at the map edge,
+    and a trimesh collider per node is the single biggest load-time cost in the
+    scene. The traversal and shadow zones keep their collision, since walking on
+    them is the entire point of those.
     """
     kinds = ["box", "sphere", "pole"]
     placed = 0
@@ -634,7 +646,11 @@ def zone_field(s, pal, count):
             rot = yaw(s.rng.uniform(0, 360))
         if not s.free(mesh, t, rot, sc):
             continue
-        s.place(mesh, t, rot, sc, name=f"field_{placed}")
+        s.place(
+            mesh, t, rot, sc,
+            extras={"prefab": "prop", "params": {"collide": False}},
+            name=f"field_{placed}",
+        )
         placed += 1
     return placed
 

@@ -8,5 +8,14 @@ publish = false
 glam.workspace = true
 serde.workspace = true
 # `import` resolves buffers/URIs and decodes images (png/jpeg via the image
-# crate); `utils` gives the mesh accessor readers.
-gltf = { version = "1", default-features = false, features = ["import", "utils"] }
+# crate); `utils` gives the mesh accessor readers; `extras` exposes each node's
+# `extras` JSON (§18 prefab data); `names` makes load warnings able to say which
+# node is at fault.
+gltf = { version = "1", default-features = false, features = [
+    "import",
+    "utils",
+    "extras",
+    "names",
+] }
+# Already in the tree via gltf's `extras`, which hands back a raw JSON value.
+serde_json = "1"
