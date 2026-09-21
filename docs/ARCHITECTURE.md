@@ -1102,6 +1102,21 @@ and punctuation.
   cannot block the app's boxes or the spawn. The procedural level has none.
   Measured (RX 7800 XT, `profile_standard`, `--bench`, `med`, ~1480 nodes):
   `shadow` 0.08 ms, `geo` 0.23 ms, `frame` 0.36 ms.
+  **Detail stress scene:** `tools/gen_detailscene.py` places Poly Haven CC0
+  scans (17k–58k triangles, 2048² JPEG PBR textures, alpha-blended grass) at
+  1.8M / 6M / 14.5M placed triangles. It exists to find where detailed content
+  breaks the engine. Measured:
+  - **Triangles are not the wall.** 14.5M placed costs `frame` 2.65 ms at
+    pinned clocks, scaling ~linearly, and culling kept instances under the
+    8192 budget.
+  - **Textures are.** The loader converts each material's textures *per
+    primitive* (81 conversions of 12 images: 13.5 s of a 13.9 s debug load)
+    and the renderer uploads per material. So ~1 GB of VRAM goes on
+    duplicates of 192 MB of unique images, and past `MAX_TEXTURES` = 64 some
+    materials silently fall back to default textures.
+  - **Collision against render meshes** froze the game (see §15's collision
+    proxies).
+  - No mipmaps and no alpha cutout, visible as shimmer and opaque grass cards.
 - **RenderDoc:** in-application API, capture on a keybind.
 - **Object naming:** `vkSetDebugUtilsObjectName` on buffers/images/pipelines
   from the start (readable validation + captures).

@@ -202,6 +202,23 @@ stone path lit by lamps. Options: `--density low|med|high`, `--seed N`,
 generator). Grass, flowers and ground tiles have no collider and cast no
 shadow; trees, rocks, the tent and fences do both.
 
+### A detail stress scene — Poly Haven scans
+
+```bash
+python3 tools/fetch_assets.py                          # also fetches ~16 MB of Poly Haven models
+python3 tools/gen_detailscene.py --density med --check # writes scratch/detail.glb
+cargo run --release -- scratch/detail.glb
+```
+
+Four CC0 photoscans from [Poly Haven](https://polyhaven.com) (marble bust,
+brass lantern, mossy rock set, grass clumps), each with 2048² PBR textures,
+placed many times over: `low` / `med` / `high` put about 1.8M / 6M / 14.5M
+triangles in the level. Each file is pinned by the MD5 Poly Haven publishes.
+Unlike the nature scene, materials pass through as authored (textures,
+`alphaMode`, `doubleSided`), because they are what's being tested. Use
+`--release` to walk it: debug loads textured scenes slowly (see
+ARCHITECTURE.md §21).
+
 ---
 
 ## 5. Tests — what exists and what it guards
