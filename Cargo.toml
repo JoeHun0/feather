@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["platform", "gfx", "render", "assets", "game", "app", "bake"]
+# Plain `cargo run` means the game: with feather-bake in the workspace there
+# are two binaries, and without this cargo refuses to guess.
+default-members = ["app"]
 
 [workspace.package]
 version = "0.1.0"
