@@ -228,7 +228,7 @@ and uploaded once however many materials share it.
 
 ## 5. Tests — what exists and what it guards
 
-`cargo test --workspace`: 54 tests, all CPU-side (none needs a GPU).
+`cargo test --workspace`: 55 tests, all CPU-side (none needs a GPU).
 
 | Area | Crate | What the tests pin down |
 |---|---|---|
@@ -239,6 +239,7 @@ and uploaded once however many materials share it.
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
 | Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs |
 | Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one decoded copy |
+| Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |
 | Texture slots | render | one slot per unique image × colour space; sRGB and UNORM uses of the same pixels stay separate; overflow past `MAX_TEXTURES` is counted and falls back to the defaults |
 | Light clusters | render | GLSL grid constants + `MAX_LIGHTS` match the Rust ones |
 

@@ -328,6 +328,13 @@ impl MeshRenderer {
                     &vk::SamplerCreateInfo::default()
                         .mag_filter(vk::Filter::LINEAR)
                         .min_filter(vk::Filter::LINEAR)
+                        // Trilinear over the full mip chain the textures now
+                        // carry, plus anisotropy so surfaces at grazing angles
+                        // (the ground ahead) stay sharp instead of blurring.
+                        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                        .max_lod(vk::LOD_CLAMP_NONE)
+                        .anisotropy_enable(renderer.max_anisotropy().is_some())
+                        .max_anisotropy(renderer.max_anisotropy().unwrap_or(1.0).min(16.0))
                         .address_mode_u(vk::SamplerAddressMode::REPEAT)
                         .address_mode_v(vk::SamplerAddressMode::REPEAT)
                         .address_mode_w(vk::SamplerAddressMode::REPEAT),

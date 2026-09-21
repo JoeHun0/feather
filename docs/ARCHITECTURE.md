@@ -1137,6 +1137,8 @@ and punctuation.
   - **Collision against render meshes** froze the game (see §15's collision
     proxies).
   - No mipmaps and no alpha cutout, visible as shimmer and opaque grass cards.
+    **Mipmaps fixed** (full chains + trilinear + anisotropy, §26); alpha
+    cutout pending.
 - **RenderDoc:** in-application API, capture on a keybind.
 - **Object naming:** `vkSetDebugUtilsObjectName` on buffers/images/pipelines
   from the start (readable validation + captures).
@@ -1274,7 +1276,15 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   normal / MR slots) at binding1 (fragment); and a **bindless-lite texture
   array** — fixed `sampler2D textures[64]` at binding2, non-uniformly indexed by
   material (slot 0 = white, slot 1 = flat normal; every *unused* slot points at
-  white/slot 0, not the flat-normal default).
+  white/slot 0, not the flat-normal default). Textures carry a **full mip
+  chain**, built on upload by a GPU blit chain (`_SRGB` blits filter in linear
+  space, so base-colour mips darken correctly). They're sampled **trilinear
+  with 16× anisotropy** (when `samplerAnisotropy` is supported), since mips
+  alone blur the ground at grazing angles. Cost measured on the detail scene:
+  texture memory 192 → 258 MB (the expected +33%), and **no measurable GPU
+  time**. `geo` was flat at `med` and −2% at `high`, because that scene is
+  bound by rasterising millions of triangles, not by texture fetch. So it's a
+  quality fix (no distant shimmer), not a speed-up there.
   Vertex is pos+normal+uv. `view_proj` + `light_dir` + `camera_pos` in a push
   constant (96 B), **linear-space** Cook-Torrance **PBR** (metallic-roughness)
   directional light with **base-color + normal + metallic-roughness textures**
@@ -1485,7 +1495,7 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
 
 Culling (per-view bounding-sphere frustum cull landed for the camera + shadow
 views, §8 — broad-phase/chunk cull, rayon parallelism, AABB refinement, and LOD
-still pending); mips + MikkTSpace vertex tangents; pipeline buckets (PBR BRDF +
+still pending); MikkTSpace vertex tangents (mips landed); pipeline buckets (PBR BRDF +
 base-color/normal/MR textures landed); clustered lighting (**landed** — a `point_light` prefab, a lights SSBO, and a
 16×9×24 cluster grid assigned by one compute dispatch into per-cluster light
 bitmasks, plus sphere-light specular via `source_radius`, §12; spot lights and

@@ -210,6 +210,8 @@ pub struct Renderer {
     samples: vk::SampleCountFlags, // geometry-pass sample count (MSAA setting)
     /// Whether the device's `depthClamp` feature was enabled (§11 pancaking).
     depth_clamp: bool,
+    /// Max sampler anisotropy, or `None` if the feature isn't supported.
+    max_anisotropy: Option<f32>,
     shadow: Option<ShadowMap>,
     shadow_sampler: vk::Sampler, // comparison sampler (sampler2DShadow)
     shadow_dim: u32,             // live shadow-map dimension (quality setting)
@@ -340,16 +342,20 @@ impl Renderer {
         // Depth clamp is what pancakes shadow casters (§11): geometry nearer the
         // sun than a cascade's near plane is flattened onto it, so it still
         // casts instead of being clipped. Near-universal, but optional in core.
-        let depth_clamp = unsafe { instance.get_physical_device_features(physical_device) }
-            .depth_clamp
-            == vk::TRUE;
+        let supported = unsafe { instance.get_physical_device_features(physical_device) };
+        let depth_clamp = supported.depth_clamp == vk::TRUE;
         if !depth_clamp {
             eprintln!(
                 "[gfx] depthClamp unsupported: casters beyond a cascade's near plane \
                  will be clipped and stop casting (§11)"
             );
         }
-        let core_features = vk::PhysicalDeviceFeatures::default().depth_clamp(depth_clamp);
+        // Anisotropic filtering keeps textures seen at grazing angles (the
+        // ground ahead of an FPS player) sharp once they are mipmapped.
+        let anisotropy = supported.sampler_anisotropy == vk::TRUE;
+        let core_features = vk::PhysicalDeviceFeatures::default()
+            .depth_clamp(depth_clamp)
+            .sampler_anisotropy(anisotropy);
         let device_create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_features(&core_features)
@@ -379,6 +385,7 @@ impl Renderer {
         // MSAA (§13): clamp the request to what this device actually supports.
         let limits = unsafe { instance.get_physical_device_properties(physical_device) }.limits;
         let samples = clamp_samples(&limits, msaa);
+        let max_anisotropy = anisotropy.then_some(limits.max_sampler_anisotropy);
         if samples != MSAA_FALLBACK || msaa > 1 {
             eprintln!("[gfx] MSAA: requested {msaa}x, using {:?}", samples);
         }
@@ -496,6 +503,7 @@ impl Renderer {
             shadow_casters: true,
             samples,
             depth_clamp,
+            max_anisotropy,
             hdr_sampler,
             shadow: Some(shadow),
             shadow_sampler,
@@ -547,6 +555,11 @@ impl Renderer {
     /// True if shadow pipelines may enable depth clamp (caster pancaking, §11).
     pub fn depth_clamp(&self) -> bool {
         self.depth_clamp
+    }
+
+    /// The anisotropy a sampler may request, or `None` if it isn't supported.
+    pub fn max_anisotropy(&self) -> Option<f32> {
+        self.max_anisotropy
     }
 
     /// Latest smoothed per-pass GPU times (§21). All zero until a few frames have
@@ -798,9 +811,10 @@ impl Renderer {
         }
     }
 
-    /// Upload RGBA8 `pixels` into a sampled 2D image (single mip) and leave it in
+    /// Upload RGBA8 `pixels` into a sampled 2D image with a **full mip chain**
+    /// (built on the GPU by blits) and leave every level in
     /// `SHADER_READ_ONLY_OPTIMAL`. `srgb` picks `R8G8B8A8_SRGB` (base color, gets
-    /// linearized on sample) vs `_UNORM`. No mip chain yet — a follow-up.
+    /// linearized on sample) vs `_UNORM`.
     pub fn create_texture(&self, pixels: &[u8], width: u32, height: u32, srgb: bool) -> Image {
         let allocator = self.allocator();
         let format = if srgb {
@@ -813,16 +827,21 @@ impl Renderer {
             height: height.max(1),
             depth: 1,
         };
+        let levels = self.texture_mip_levels(format, extent.width, extent.height);
 
         let image_ci = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(extent)
-            .mip_levels(1)
+            .mip_levels(levels)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .usage(
+                vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC, // mip blits read it
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let ai = vk_mem::AllocationCreateInfo {
@@ -856,12 +875,33 @@ impl Renderer {
         let range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
-            level_count: 1,
+            level_count: levels,
             base_array_layer: 0,
             layer_count: 1,
         };
+        let level = |mip: u32| vk::ImageSubresourceRange {
+            base_mip_level: mip,
+            level_count: 1,
+            ..range
+        };
+        let barrier = |mip: u32,
+                       old: vk::ImageLayout,
+                       new: vk::ImageLayout,
+                       src: vk::AccessFlags,
+                       dst: vk::AccessFlags| {
+            vk::ImageMemoryBarrier::default()
+                .old_layout(old)
+                .new_layout(new)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(level(mip))
+                .src_access_mask(src)
+                .dst_access_mask(dst)
+        };
         self.one_time_submit(|cmd| unsafe {
-            // UNDEFINED -> TRANSFER_DST_OPTIMAL
+            let dev = &self.device;
+            // Every level: UNDEFINED -> TRANSFER_DST_OPTIMAL.
             let to_dst = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -871,7 +911,7 @@ impl Renderer {
                 .subresource_range(range)
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-            self.device.cmd_pipeline_barrier(
+            dev.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::TRANSFER,
@@ -881,6 +921,7 @@ impl Renderer {
                 &[to_dst],
             );
 
+            // The pixels go into level 0.
             let region = vk::BufferImageCopy::default()
                 .buffer_offset(0)
                 .image_subresource(vk::ImageSubresourceLayers {
@@ -890,7 +931,7 @@ impl Renderer {
                     layer_count: 1,
                 })
                 .image_extent(extent);
-            self.device.cmd_copy_buffer_to_image(
+            dev.cmd_copy_buffer_to_image(
                 cmd,
                 staging_buf,
                 image,
@@ -898,24 +939,91 @@ impl Renderer {
                 &[region],
             );
 
-            // TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL
-            let to_read = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(range)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-            self.device.cmd_pipeline_barrier(
+            // Each further level is a LINEAR blit of the one above. For _SRGB
+            // formats the blit converts to linear before filtering and back
+            // after, so base-colour mips darken correctly. A level is moved to
+            // SHADER_READ as soon as the next one has been read from it.
+            let size = |mip: u32| {
+                [
+                    (extent.width >> mip).max(1) as i32,
+                    (extent.height >> mip).max(1) as i32,
+                ]
+            };
+            for mip in 1..levels {
+                let src = mip - 1;
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier(
+                        src,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::TRANSFER_READ,
+                    )],
+                );
+                let layers = |m: u32| vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: m,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let corner = |m: u32| {
+                    let [w, h] = size(m);
+                    [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D { x: w, y: h, z: 1 },
+                    ]
+                };
+                let blit = vk::ImageBlit::default()
+                    .src_subresource(layers(src))
+                    .src_offsets(corner(src))
+                    .dst_subresource(layers(mip))
+                    .dst_offsets(corner(mip));
+                dev.cmd_blit_image(
+                    cmd,
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[blit],
+                    vk::Filter::LINEAR,
+                );
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier(
+                        src,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::AccessFlags::SHADER_READ,
+                    )],
+                );
+            }
+            // The last level was only ever written.
+            dev.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[to_read],
+                &[barrier(
+                    levels - 1,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::SHADER_READ,
+                )],
             );
         });
 
@@ -939,6 +1047,25 @@ impl Renderer {
             handle: image,
             view,
             format,
+        }
+    }
+
+    /// Levels to build for a texture: the full chain, or one if this device
+    /// can't linear-blit the format (RGBA8 always can on a conformant device,
+    /// so this is a guard, not an expected path).
+    fn texture_mip_levels(&self, format: vk::Format, width: u32, height: u32) -> u32 {
+        let props = unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.physical_device, format)
+        };
+        let need = vk::FormatFeatureFlags::BLIT_SRC
+            | vk::FormatFeatureFlags::BLIT_DST
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+        if props.optimal_tiling_features.contains(need) {
+            mip_levels(width, height)
+        } else {
+            eprintln!("[gfx] {format:?} can't be linear-blitted: textures get no mips");
+            1
         }
     }
 
@@ -2136,4 +2263,24 @@ unsafe extern "system" fn debug_callback(
     let msg = CStr::from_ptr((*data).p_message);
     eprintln!("[vulkan {severity:?} {types:?}] {}", msg.to_string_lossy());
     vk::FALSE
+}
+
+/// A full mip chain's level count: halve until 1×1.
+fn mip_levels(width: u32, height: u32) -> u32 {
+    32 - width.max(height).max(1).leading_zeros()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mip_levels_cover_the_chain() {
+        assert_eq!(mip_levels(1, 1), 1);
+        assert_eq!(mip_levels(2, 2), 2);
+        assert_eq!(mip_levels(2048, 2048), 12);
+        assert_eq!(mip_levels(2048, 512), 12); // the longer side decides
+        assert_eq!(mip_levels(1000, 3), 10); // floor(log2(1000)) + 1
+        assert_eq!(mip_levels(0, 0), 1); // degenerate input still gets a level
+    }
 }
