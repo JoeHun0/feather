@@ -220,15 +220,15 @@ brass lantern, mossy rock set, grass clumps), each with 2048² PBR textures,
 placed many times over: `low` / `med` / `high` put about 1.8M / 6M / 14.5M
 triangles in the level. Each file is pinned by the MD5 Poly Haven publishes.
 Unlike the nature scene, materials pass through as authored (textures,
-`alphaMode`, `doubleSided`), because they are what's being tested. Use
-`--release` to walk it: debug loads textured scenes slowly (see
-ARCHITECTURE.md §21).
+`alphaMode`, `doubleSided`), because they are what's being tested. Debug
+loads it in ~2 s and release in under half a second; each image is decoded
+and uploaded once however many materials share it.
 
 ---
 
 ## 5. Tests — what exists and what it guards
 
-`cargo test --workspace`: 51 tests, all CPU-side (none needs a GPU).
+`cargo test --workspace`: 54 tests, all CPU-side (none needs a GPU).
 
 | Area | Crate | What the tests pin down |
 |---|---|---|
@@ -238,7 +238,8 @@ ARCHITECTURE.md §21).
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
 | Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs |
-| Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space |
+| Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one decoded copy |
+| Texture slots | render | one slot per unique image × colour space; sRGB and UNORM uses of the same pixels stay separate; overflow past `MAX_TEXTURES` is counted and falls back to the defaults |
 | Light clusters | render | GLSL grid constants + `MAX_LIGHTS` match the Rust ones |
 
 What tests **cannot** cover, and how it is checked instead:

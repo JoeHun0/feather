@@ -5,9 +5,11 @@
 //! Everything here is Vulkan-free by design (§22) — the renderer uploads these
 //! buffers to the GPU.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
+use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
 
@@ -23,6 +25,8 @@ pub struct Vertex {
 }
 
 /// Decoded RGBA8 image (sRGB base-color). Owned CPU pixels the renderer uploads.
+/// Materials hold it by `Arc`: one image used by many materials is converted
+/// and uploaded once, and the renderer dedups by the `Arc`'s identity.
 #[derive(Clone, Debug)]
 pub struct TextureData {
     pub pixels: Vec<u8>, // RGBA8, row-major, width*height*4 bytes
@@ -41,9 +45,9 @@ pub struct Material {
     pub roughness: f32,
     pub emissive: [f32; 3], // linear RGB
     pub normal_scale: f32,
-    pub base_color_texture: Option<TextureData>,
-    pub normal_texture: Option<TextureData>,
-    pub metallic_roughness_texture: Option<TextureData>,
+    pub base_color_texture: Option<Arc<TextureData>>,
+    pub normal_texture: Option<Arc<TextureData>>,
+    pub metallic_roughness_texture: Option<Arc<TextureData>>,
 }
 
 impl Default for Material {
@@ -229,7 +233,11 @@ pub struct SceneData {
 /// primitives, and 16-/32-bit image formats.
 pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<SceneData, Box<dyn Error>> {
     // import resolves all buffers (blob / external / data URI) and decodes images.
-    let (doc, buffers, images) = gltf::import(path)?;
+    let (doc, buffers, raw_images) = gltf::import(path)?;
+    let images = ImageCache {
+        images: &raw_images,
+        rgba: RefCell::new(HashMap::new()),
+    };
 
     let mut out = SceneData {
         meshes: Vec::new(),
@@ -274,9 +282,30 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<SceneData, Box<dyn Erro
     Ok(out)
 }
 
-fn read_material(m: &gltf::Material, images: &[gltf::image::Data]) -> Material {
+/// A scene's decoded glTF images, each converted to RGBA8 **at most once** and
+/// shared by every material that uses it. Before this, every primitive
+/// converted its material's textures afresh: 12 images became 81 conversions
+/// (13.5 s of a debug load) and 81 uploads.
+struct ImageCache<'a> {
+    images: &'a [gltf::image::Data],
+    rgba: RefCell<HashMap<usize, Option<Arc<TextureData>>>>,
+}
+
+impl ImageCache<'_> {
+    /// Keyed by glTF *image*, not texture, so two textures sampling one image
+    /// also share it.
+    fn get(&self, index: usize) -> Option<Arc<TextureData>> {
+        self.rgba
+            .borrow_mut()
+            .entry(index)
+            .or_insert_with(|| self.images.get(index).and_then(to_rgba8).map(Arc::new))
+            .clone()
+    }
+}
+
+fn read_material(m: &gltf::Material, images: &ImageCache) -> Material {
     let pbr = m.pbr_metallic_roughness();
-    let tex = |idx: usize| images.get(idx).and_then(to_rgba8);
+    let tex = |idx: usize| images.get(idx);
     let base_color_texture = pbr
         .base_color_texture()
         .and_then(|i| tex(i.texture().source().index()));
@@ -385,7 +414,7 @@ fn walk_node(
     node: &gltf::Node,
     parent: Mat4,
     buffers: &[gltf::buffer::Data],
-    images: &[gltf::image::Data],
+    images: &ImageCache,
     seen: &mut HashMap<(usize, usize), usize>,
     out: &mut SceneData,
 ) {
@@ -419,7 +448,7 @@ fn add_mesh_nodes(
     world: Mat4,
     prefab: Option<PrefabSpec>,
     buffers: &[gltf::buffer::Data],
-    images: &[gltf::image::Data],
+    images: &ImageCache,
     seen: &mut HashMap<(usize, usize), usize>,
     out: &mut SceneData,
 ) {
@@ -454,7 +483,7 @@ fn add_mesh_nodes(
 fn primitive_mesh(
     prim: &gltf::Primitive,
     buffers: &[gltf::buffer::Data],
-    images: &[gltf::image::Data],
+    images: &ImageCache,
 ) -> Option<MeshData> {
     let reader = prim.reader(|b| Some(&buffers[b.index()][..]));
     let positions: Vec<[f32; 3]> = reader.read_positions()?.collect();
@@ -646,6 +675,64 @@ mod tests {
             std::env::temp_dir().join(format!("feather_gltf_{}_{}", name, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn materials_sharing_an_image_share_one_conversion() {
+        // Three primitives, three materials. Materials 0 and 1 use two
+        // different glTF *textures* that both sample image 0; material 2
+        // uses image 1. Each image must be converted once and shared.
+        let dir = fixture_dir("shared_image");
+        let positions: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let bin: Vec<u8> = positions.iter().flat_map(|f| f.to_le_bytes()).collect();
+        std::fs::write(dir.join("tri.bin"), &bin).unwrap();
+        let red = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        let blue = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/5ncLrgAAAABJRU5ErkJggg==";
+        let gltf = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "scene": 0,
+  "scenes": [ {{ "nodes": [0] }} ],
+  "nodes": [ {{ "mesh": 0 }} ],
+  "meshes": [ {{ "primitives": [
+    {{ "attributes": {{ "POSITION": 0 }}, "material": 0 }},
+    {{ "attributes": {{ "POSITION": 0 }}, "material": 1 }},
+    {{ "attributes": {{ "POSITION": 0 }}, "material": 2 }}
+  ] }} ],
+  "materials": [
+    {{ "pbrMetallicRoughness": {{ "baseColorTexture": {{ "index": 0 }} }} }},
+    {{ "pbrMetallicRoughness": {{ "baseColorTexture": {{ "index": 1 }} }} }},
+    {{ "pbrMetallicRoughness": {{ "baseColorTexture": {{ "index": 2 }} }} }}
+  ],
+  "textures": [ {{ "source": 0 }}, {{ "source": 0 }}, {{ "source": 1 }} ],
+  "images": [
+    {{ "uri": "data:image/png;base64,{red}" }},
+    {{ "uri": "data:image/png;base64,{blue}" }}
+  ],
+  "accessors": [ {{
+    "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+    "min": [0, 0, 0], "max": [1, 1, 0]
+  }} ],
+  "bufferViews": [ {{ "buffer": 0, "byteOffset": 0, "byteLength": 36 }} ],
+  "buffers": [ {{ "byteLength": 36, "uri": "tri.bin" }} ]
+}}"#
+        );
+        let path = dir.join("shared.gltf");
+        std::fs::write(&path, gltf).unwrap();
+        let scene = load_gltf_scene(&path).unwrap();
+        let tex: Vec<Arc<TextureData>> = scene
+            .meshes
+            .iter()
+            .map(|m| m.material.base_color_texture.clone().expect("textured"))
+            .collect();
+        assert_eq!(tex.len(), 3);
+        assert!(Arc::ptr_eq(&tex[0], &tex[1]), "one image, one conversion");
+        assert!(
+            !Arc::ptr_eq(&tex[0], &tex[2]),
+            "distinct images stay distinct"
+        );
+        assert_eq!(tex[0].pixels, [255, 0, 0, 255]);
+        assert_eq!(tex[2].pixels, [0, 0, 255, 255]);
     }
 
     #[test]

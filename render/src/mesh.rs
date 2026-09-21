@@ -7,7 +7,10 @@
 //! come in as Vulkan-free `assets` types.
 
 use ash::vk;
-use feather_assets::{Material, MeshData, Vertex};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use feather_assets::{Material, MeshData, TextureData, Vertex};
 use feather_gfx::{Buffer, Image, MappedBuffer, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use glam::{Mat4, Vec4};
 
@@ -49,6 +52,65 @@ pub struct ClusterView {
     pub aspect: f32,
     pub near: f32,
     pub far: f32,
+}
+
+/// Where each material's textures live in the bindless array (§9).
+struct TexturePlan {
+    /// Unique images to upload, in slot order from `FIRST_TEXTURE_SLOT`.
+    uploads: Vec<(Arc<TextureData>, bool)>,
+    /// Per material: base colour, normal, metallic-roughness slots.
+    slots: Vec<[u32; 3]>,
+    /// Texture references across all materials, before dedup.
+    references: usize,
+    /// References that fell back to a default because the array was full.
+    overflow: usize,
+}
+
+/// Slots 0 (white) and 1 (flat normal) are the resident defaults.
+const FIRST_TEXTURE_SLOT: usize = 2;
+
+/// Assign bindless slots, one per **unique image × colour space**. The key is
+/// the `Arc`'s identity (the loader shares one per glTF image) plus the sRGB
+/// flag, since the same pixels sampled as base colour (sRGB) and as data
+/// (UNORM) need two image views. Pure, so it is testable without a GPU.
+fn plan_texture_slots(materials: &[Material]) -> TexturePlan {
+    let mut uploads: Vec<(Arc<TextureData>, bool)> = Vec::new();
+    let mut index: HashMap<(*const TextureData, bool), u32> = HashMap::new();
+    let (mut references, mut overflow) = (0, 0);
+    let mut slot = |tex: &Option<Arc<TextureData>>, srgb: bool, default: u32| {
+        let Some(t) = tex else {
+            return default;
+        };
+        references += 1;
+        let key = (Arc::as_ptr(t), srgb);
+        if let Some(&s) = index.get(&key) {
+            return s;
+        }
+        if FIRST_TEXTURE_SLOT + uploads.len() >= MAX_TEXTURES {
+            overflow += 1;
+            return default;
+        }
+        let s = (FIRST_TEXTURE_SLOT + uploads.len()) as u32;
+        uploads.push((t.clone(), srgb));
+        index.insert(key, s);
+        s
+    };
+    let slots = materials
+        .iter()
+        .map(|m| {
+            [
+                slot(&m.base_color_texture, true, 0),
+                slot(&m.normal_texture, false, 1),
+                slot(&m.metallic_roughness_texture, false, 0),
+            ]
+        })
+        .collect();
+    TexturePlan {
+        uploads,
+        slots,
+        references,
+        overflow,
+    }
 }
 
 /// Handle to a mesh registered with the renderer, in `new`'s input order.
@@ -277,28 +339,23 @@ impl MeshRenderer {
             renderer.create_texture(&[255, 255, 255, 255], 1, 1, true), // 0: white (sRGB)
             renderer.create_texture(&[128, 128, 255, 255], 1, 1, false), // 1: flat normal (UNORM)
         ];
-        // Upload each material's real textures into the next free slots.
-        let tex_slots: Vec<[u32; 3]> = {
-            let mut upload =
-                |tex: &Option<feather_assets::TextureData>, srgb: bool, default: u32| match tex {
-                    Some(t) if textures.len() < MAX_TEXTURES => {
-                        let slot = textures.len() as u32;
-                        textures.push(renderer.create_texture(&t.pixels, t.width, t.height, srgb));
-                        slot
-                    }
-                    _ => default,
-                };
-            materials
-                .iter()
-                .map(|m| {
-                    [
-                        upload(&m.base_color_texture, true, 0),
-                        upload(&m.normal_texture, false, 1),
-                        upload(&m.metallic_roughness_texture, false, 0),
-                    ]
-                })
-                .collect()
-        };
+        // Each unique image uploads once, however many materials use it.
+        let plan = plan_texture_slots(materials);
+        for (t, srgb) in &plan.uploads {
+            textures.push(renderer.create_texture(&t.pixels, t.width, t.height, *srgb));
+        }
+        let references = plan.references;
+        eprintln!(
+            "[mesh] {} textures uploaded for {references} references",
+            plan.uploads.len()
+        );
+        if plan.overflow > 0 {
+            eprintln!(
+                "[mesh] {} texture references past MAX_TEXTURES ({MAX_TEXTURES}) use the defaults",
+                plan.overflow
+            );
+        }
+        let tex_slots = plan.slots;
 
         // Resident material table (§5). Uploaded once; indexed by material_id.
         let gpu_materials: Vec<GpuMaterial> = materials
@@ -1200,6 +1257,58 @@ const _: () = assert!(MAX_LIGHTS.is_multiple_of(32));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tex(n: u8) -> Arc<TextureData> {
+        Arc::new(TextureData {
+            pixels: vec![n, n, n, 255],
+            width: 1,
+            height: 1,
+        })
+    }
+
+    #[test]
+    fn texture_slots_dedup_by_image_and_colour_space() {
+        let shared = tex(1);
+        let other = tex(2);
+        let with = |base: Option<&Arc<TextureData>>, mr: Option<&Arc<TextureData>>| Material {
+            base_color_texture: base.cloned(),
+            metallic_roughness_texture: mr.cloned(),
+            ..Material::default()
+        };
+        let materials = [
+            with(Some(&shared), None),
+            with(Some(&shared), None), // same image again: same slot
+            with(Some(&other), None),  // a distinct image: its own slot
+            with(None, Some(&shared)), // same pixels as data (UNORM): new slot
+            with(None, None),          // no textures: the defaults
+        ];
+        let plan = plan_texture_slots(&materials);
+        assert_eq!(plan.uploads.len(), 3);
+        assert_eq!(plan.references, 4);
+        assert_eq!(plan.overflow, 0);
+        let s = &plan.slots;
+        assert_eq!(s[0][0], s[1][0], "shared image shares a slot");
+        assert_ne!(s[0][0], s[2][0], "distinct images get distinct slots");
+        assert_ne!(s[3][2], s[0][0], "sRGB and UNORM views are separate");
+        assert_eq!(s[4], [0, 1, 0], "untextured materials use the defaults");
+        assert!(s[..4].iter().flatten().all(|&x| x == 0 || x == 1 || x >= 2));
+    }
+
+    #[test]
+    fn texture_overflow_is_counted_and_falls_back() {
+        // More distinct images than slots: the excess falls back to the
+        // defaults and is reported, rather than vanishing silently.
+        let materials: Vec<Material> = (0..MAX_TEXTURES + 5)
+            .map(|i| Material {
+                base_color_texture: Some(tex(i as u8)),
+                ..Material::default()
+            })
+            .collect();
+        let plan = plan_texture_slots(&materials);
+        assert_eq!(plan.uploads.len(), MAX_TEXTURES - FIRST_TEXTURE_SLOT);
+        assert_eq!(plan.overflow, 7);
+        assert_eq!(plan.slots.last().unwrap()[0], 0, "overflow uses white");
+    }
 
     /// The cluster grid and light cap are repeated as GLSL constants in both
     /// shaders. A mismatch still compiles, and fragments then silently read

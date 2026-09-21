@@ -1128,7 +1128,12 @@ and punctuation.
     primitive* (81 conversions of 12 images: 13.5 s of a 13.9 s debug load)
     and the renderer uploads per material. So ~1 GB of VRAM goes on
     duplicates of 192 MB of unique images, and past `MAX_TEXTURES` = 64 some
-    materials silently fall back to default textures.
+    materials silently fall back to default textures. **Fixed:** the loader
+    converts each glTF *image* once and shares it by `Arc` across materials,
+    and the renderer uploads one slot per unique image × colour space
+    (`plan_texture_slots`). Measured: debug load 13.8 → 2.2 s (release 0.8 →
+    0.35 s), 12 uploads for 81 references, `detail_low` VRAM 1,412 → 638 MB
+    above idle. Overflow past the cap is now reported instead of silent.
   - **Collision against render meshes** froze the game (see §15's collision
     proxies).
   - No mipmaps and no alpha cutout, visible as shimmer and opaque grass cards.
@@ -1337,8 +1342,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   longer what perf work should be measured against — `tools/gen_testscene.py`
   (§21) generates the realistic one. Culling uses a **per-mesh local bounding sphere**
   mapped through the model matrix, rather than a blanket radius — required because
-  scene meshes are not unit-fitted. Limits: `MAX_TEXTURES = 64` (scenes past that
-  fall back to the default textures), a collider is built per node at load (an
+  scene meshes are not unit-fitted. Limits: `MAX_TEXTURES = 64` *unique*
+  images (deduplicated per image × colour space; past that, references use the
+  defaults with a `[mesh]` warning), a collider is built per node at load (an
   exact trimesh up to 2048 triangles and a convex hull above that, overridable
   per node, §15; no convex *decomposition*), scenes land at their authored
   coordinates so a model authored around the origin floats above the demo ground
