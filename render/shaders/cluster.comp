@@ -1,0 +1,103 @@
+#version 450
+
+// Light-cluster assignment (§12). One thread per cluster: build the cluster's
+// view-space AABB, test every light in this frame's list against it, and write
+// a bitmask of the ones that touch it. mesh.frag then walks only those bits.
+//
+// A cluster is a screen tile (in view-space *slopes*, x/d and y/d, so it needs
+// no framebuffer size) times an exponential depth slice. mesh.frag derives its
+// cluster from the same slopes and the same slice formula; the two must agree,
+// or a fragment reads a mask built for a different volume.
+
+// MUST match render::mesh CLUSTER_X/Y/Z, CLUSTER_GROUP and MAX_LIGHTS.
+const uint CLUSTER_X = 16;
+const uint CLUSTER_Y = 9;
+const uint CLUSTER_Z = 24;
+const uint MAX_LIGHTS = 128;
+const uint CLUSTER_WORDS = MAX_LIGHTS / 32;
+const uint CLUSTER_COUNT = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;
+
+layout(local_size_x = 64) in;
+
+const int SHADOW_CASCADES = 4;
+// Same block as mesh.frag (set 0 binding 4); only the tail is used here.
+layout(set = 0, binding = 4) uniform Globals {
+    mat4 light_view_proj[SHADOW_CASCADES];
+    vec4 texel_world;
+    vec4 light_params;   // x = live light count
+    vec4 shadow_params;
+    mat4 view;           // world -> view (looking down -Z)
+    vec4 cluster_params; // x = near, y = far, z = CLUSTER_Z / ln(far/near)
+    vec4 cluster_proj;   // x = tan(fov_x/2), y = tan(fov_y/2)
+} g;
+
+struct Light {
+    vec4 pos_radius;      // xyz = world position, w = radius
+    vec4 color_intensity;
+};
+layout(set = 0, binding = 5) readonly buffer Lights {
+    Light lights[];
+};
+layout(set = 0, binding = 6) writeonly buffer Clusters {
+    uint masks[];
+};
+
+// Slack on every AABB face. The fragment side recomputes its cluster with
+// different float ops (log vs pow, a divide vs a multiply), so a point right on
+// a boundary can land one cluster over; padding keeps the assignment
+// conservative there. Too-generous clusters only cost time, never correctness.
+const float SLOPE_PAD = 1e-4;
+const float DEPTH_PAD = 1e-3; // relative
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= CLUSTER_COUNT) {
+        return;
+    }
+    uint cx = id % CLUSTER_X;
+    uint cy = (id / CLUSTER_X) % CLUSTER_Y;
+    uint cz = id / (CLUSTER_X * CLUSTER_Y);
+
+    // Depth range of this slice, as positive distance in front of the camera.
+    float near = g.cluster_params.x;
+    float ratio = g.cluster_params.y / near;
+    float d0 = near * pow(ratio, float(cz) / float(CLUSTER_Z)) * (1.0 - DEPTH_PAD);
+    float d1 = near * pow(ratio, float(cz + 1) / float(CLUSTER_Z)) * (1.0 + DEPTH_PAD);
+
+    // Tile bounds as view-space slopes. Tile column 0 is the left edge (-x);
+    // row 0 is the *top* (+y), matching gl_FragCoord's origin.
+    vec2 tan_half = g.cluster_proj.xy;
+    float sx0 = tan_half.x * (2.0 * float(cx) / float(CLUSTER_X) - 1.0) - SLOPE_PAD;
+    float sx1 = tan_half.x * (2.0 * float(cx + 1) / float(CLUSTER_X) - 1.0) + SLOPE_PAD;
+    float sy0 = tan_half.y * (1.0 - 2.0 * float(cy + 1) / float(CLUSTER_Y)) - SLOPE_PAD;
+    float sy1 = tan_half.y * (1.0 - 2.0 * float(cy) / float(CLUSTER_Y)) + SLOPE_PAD;
+
+    // The cluster is a frustum segment; x = slope * d is linear in both, so its
+    // extremes sit at the corners.
+    vec3 lo = vec3(
+        min(min(sx0 * d0, sx0 * d1), min(sx1 * d0, sx1 * d1)),
+        min(min(sy0 * d0, sy0 * d1), min(sy1 * d0, sy1 * d1)),
+        -d1);
+    vec3 hi = vec3(
+        max(max(sx0 * d0, sx0 * d1), max(sx1 * d0, sx1 * d1)),
+        max(max(sy0 * d0, sy0 * d1), max(sy1 * d0, sy1 * d1)),
+        -d0);
+
+    uint words[CLUSTER_WORDS];
+    for (uint w = 0; w < CLUSTER_WORDS; ++w) {
+        words[w] = 0u;
+    }
+    uint count = min(uint(g.light_params.x), MAX_LIGHTS);
+    for (uint i = 0; i < count; ++i) {
+        vec4 pr = lights[i].pos_radius;
+        vec3 p = (g.view * vec4(pr.xyz, 1.0)).xyz;
+        vec3 closest = clamp(p, lo, hi);
+        vec3 delta = p - closest;
+        if (dot(delta, delta) <= pr.w * pr.w) {
+            words[i >> 5] |= 1u << (i & 31u);
+        }
+    }
+    for (uint w = 0; w < CLUSTER_WORDS; ++w) {
+        masks[id * CLUSTER_WORDS + w] = words[w];
+    }
+}

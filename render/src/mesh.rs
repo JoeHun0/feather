@@ -24,6 +24,32 @@ const MAX_TEXTURES: usize = 64;
 /// grown: the buffer is sized once, and silently dropping past the cap is
 /// better than a resize mid-frame.
 pub const MAX_LIGHTS: usize = 128;
+/// Light-cluster grid (§12): screen tiles × exponential depth slices. Must
+/// match `cluster.comp` and `mesh.frag` (a test checks).
+const CLUSTER_X: usize = 16;
+const CLUSTER_Y: usize = 9;
+const CLUSTER_Z: usize = 24;
+const CLUSTER_COUNT: usize = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;
+/// Each cluster is a bitmask over the frame's light list, one bit per light.
+/// With `MAX_LIGHTS` capped this is exact — no per-cluster overflow to clamp —
+/// and small: 4 words × 3456 clusters = 55 KB per frame.
+const CLUSTER_WORDS: usize = MAX_LIGHTS / 32;
+/// Threads per cluster-assignment workgroup; one thread per cluster.
+const CLUSTER_GROUP: usize = 64;
+
+/// The camera as the light clusters need it. Must describe the same projection
+/// the geometry pass renders with, or fragments look up the wrong cluster.
+#[derive(Clone, Copy)]
+pub struct ClusterView {
+    /// World → view (right-handed, looking down -Z).
+    pub view: Mat4,
+    /// Vertical field of view, radians.
+    pub fov_y: f32,
+    /// Width / height of the projection.
+    pub aspect: f32,
+    pub near: f32,
+    pub far: f32,
+}
 
 /// Handle to a mesh registered with the renderer, in `new`'s input order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -97,6 +123,12 @@ struct Globals {
     light_params: [f32; 4],
     // x = shadow-map texel size (1/dim), y = depth bias (light-space depth), z/w -
     shadow_params: [f32; 4],
+    /// World → view, for the cluster lookup (§12).
+    view: [f32; 16],
+    /// x = near, y = far, z = CLUSTER_Z / ln(far/near) (depth → slice scale).
+    cluster_params: [f32; 4],
+    /// x = tan(fov_x / 2), y = tan(fov_y / 2): view-space slope at the screen edge.
+    cluster_proj: [f32; 4],
 }
 
 /// One punctual light, std430, 32 bytes (§12).
@@ -155,6 +187,12 @@ pub struct MeshRenderer {
     // Per-frame globals UBO (light-space matrix + shadow params), binding 4.
     globals_buffers: Vec<MappedBuffer>,
     light_buffers: Vec<MappedBuffer>,
+    // Per-frame light-cluster bitmasks (§12), binding 6. Written by
+    // `cluster_pipeline`, read by the main pass; GPU-only, so device-local.
+    // Held for its lifetime: the descriptor sets reference it. Freed on drop.
+    #[allow(dead_code)]
+    cluster_buffers: Vec<Buffer>,
+    cluster_pipeline: vk::Pipeline,
     vertex_buffer: Buffer,
     index_buffer: Buffer,
     // Held for its lifetime: the descriptor sets reference it. Freed on drop.
@@ -288,6 +326,17 @@ impl MeshRenderer {
                 )
             })
             .collect();
+        // Zero-filled once so a mask is never uninitialised, though every
+        // frame's dispatch overwrites all of it before the main pass reads it.
+        let cluster_zeros = vec![0u8; CLUSTER_COUNT * CLUSTER_WORDS * 4];
+        let cluster_buffers: Vec<Buffer> = (0..FRAMES_IN_FLIGHT)
+            .map(|_| {
+                renderer.create_device_local_buffer(
+                    &cluster_zeros,
+                    vk::BufferUsageFlags::STORAGE_BUFFER,
+                )
+            })
+            .collect();
         let globals_buffers: Vec<MappedBuffer> = (0..FRAMES_IN_FLIGHT)
             .map(|_| {
                 renderer.create_host_visible_buffer(
@@ -327,18 +376,26 @@ impl MeshRenderer {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            // binding 4: per-frame globals UBO — light matrix + shadow params.
+            // binding 4: per-frame globals UBO — light matrix + shadow params,
+            // plus the camera the cluster pass builds its grid from.
             vk::DescriptorSetLayoutBinding::default()
                 .binding(4)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            // binding 5: per-frame punctual lights (§12, fragment stage).
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE),
+            // binding 5: per-frame punctual lights (§12) — assigned to clusters
+            // in compute, shaded in fragment.
             vk::DescriptorSetLayoutBinding::default()
                 .binding(5)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE),
+            // binding 6: per-frame light-cluster bitmasks (§12).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(6)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE),
         ];
         let set_layout = unsafe {
             device
@@ -350,10 +407,10 @@ impl MeshRenderer {
         };
 
         let pool_sizes = [
-            // instances + materials + lights.
+            // instances + materials + lights + cluster masks.
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(3 * FRAMES_IN_FLIGHT as u32),
+                .descriptor_count(4 * FRAMES_IN_FLIGHT as u32),
             // the texture array + the shadow map, per set.
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -420,6 +477,11 @@ impl MeshRenderer {
                 .buffer(light_buffers[i].handle)
                 .offset(0)
                 .range(vk::WHOLE_SIZE)];
+            // binding 6 -> this frame's cluster masks.
+            let cluster_info = [vk::DescriptorBufferInfo::default()
+                .buffer(cluster_buffers[i].handle)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
@@ -452,6 +514,11 @@ impl MeshRenderer {
                     .dst_binding(5)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(&light_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(6)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&cluster_info),
             ];
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
@@ -677,6 +744,26 @@ impl MeshRenderer {
             device.destroy_shader_module(shadow_vert, None);
         }
 
+        // Light-cluster assignment (§12), the engine's first compute pipeline.
+        // Reuses `layout`: it binds the same set 0 (globals, lights, masks), and
+        // declares no push constants, so the graphics-only push range is inert.
+        let cluster_comp = load_shader(&device, spv!("cluster.comp"));
+        let cluster_ci = vk::ComputePipelineCreateInfo::default()
+            .stage(
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::COMPUTE)
+                    .module(cluster_comp)
+                    .name(c"main"),
+            )
+            .layout(layout);
+        let cluster_pipeline = unsafe {
+            device
+                .create_compute_pipelines(vk::PipelineCache::null(), &[cluster_ci], None)
+                .map_err(|(_, e)| e)
+                .expect("cluster pipeline")[0]
+        };
+        unsafe { device.destroy_shader_module(cluster_comp, None) };
+
         let renderer = Self {
             device,
             layout,
@@ -689,6 +776,8 @@ impl MeshRenderer {
             instance_buffers,
             globals_buffers,
             light_buffers,
+            cluster_buffers,
+            cluster_pipeline,
             vertex_buffer,
             index_buffer,
             materials_buffer,
@@ -750,6 +839,7 @@ impl MeshRenderer {
         shadows: &mut [Vec<(MeshId, InstanceData)>],
         cascades: &[CascadeSetup],
         lights: &[GpuLight],
+        camera: &ClusterView,
     ) {
         // Clamp rather than overflow: the buffer is sized once at startup.
         self.lights.clear();
@@ -802,6 +892,17 @@ impl MeshRenderer {
             texel_world: [0.0; 4],
             light_params: [self.lights.len() as f32, 0.0, 0.0, 0.0],
             shadow_params: [self.shadow_texel, SHADOW_DEPTH_BIAS, 0.0, 0.0],
+            view: camera.view.to_cols_array(),
+            cluster_params: [
+                camera.near,
+                camera.far,
+                CLUSTER_Z as f32 / (camera.far / camera.near).ln(),
+                0.0,
+            ],
+            cluster_proj: {
+                let tan_y = (camera.fov_y * 0.5).tan();
+                [tan_y * camera.aspect, tan_y, 0.0, 0.0]
+            },
         };
         for (i, c) in cascades.iter().enumerate().take(SHADOW_CASCADES) {
             globals.light_view_proj[i] = c.view_proj.to_cols_array();
@@ -865,6 +966,32 @@ impl MeshRenderer {
             self.set_viewport_scissor(cmd, extent);
             self.bind_geometry(cmd);
             self.draw_runs(cmd, runs);
+        }
+    }
+
+    /// Record the light-cluster assignment (§12): one thread per cluster builds
+    /// its view-space AABB and tests every light in this frame's list against
+    /// it, writing a bitmask. Always dispatched, even with no lights, so the
+    /// main pass never reads a stale mask that names lights no longer present.
+    /// Must be recorded after `draw_shadow` (which uploads the globals + lights)
+    /// and outside a render pass; `draw_frame`'s cluster slot guarantees both.
+    pub fn dispatch_clusters(&self, cmd: vk::CommandBuffer, frame: usize) {
+        let groups = CLUSTER_COUNT.div_ceil(CLUSTER_GROUP) as u32;
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.cluster_pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.layout,
+                0,
+                &[self.sets[frame]],
+                &[],
+            );
+            self.device.cmd_dispatch(cmd, groups, 1, 1);
         }
     }
 
@@ -1042,6 +1169,7 @@ impl Drop for MeshRenderer {
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline(self.shadow_pipeline, None);
             self.device.destroy_pipeline(self.depth_pipeline, None);
+            self.device.destroy_pipeline(self.cluster_pipeline, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_pool(self.pool, None);
             self.device
@@ -1057,5 +1185,41 @@ fn load_shader(device: &ash::Device, bytes: &[u8]) -> vk::ShaderModule {
         device
             .create_shader_module(&info, None)
             .expect("create shader module")
+    }
+}
+
+// A cluster's bitmask must cover every light exactly.
+const _: () = assert!(MAX_LIGHTS.is_multiple_of(32));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cluster grid and light cap are repeated as GLSL constants in both
+    /// shaders. A mismatch still compiles, and fragments then silently read
+    /// masks built for a different grid.
+    #[test]
+    fn shader_cluster_constants_match() {
+        let shaders = [
+            ("cluster.comp", include_str!("../shaders/cluster.comp")),
+            ("mesh.frag", include_str!("../shaders/mesh.frag")),
+        ];
+        let consts = [
+            ("CLUSTER_X", CLUSTER_X),
+            ("CLUSTER_Y", CLUSTER_Y),
+            ("CLUSTER_Z", CLUSTER_Z),
+            ("MAX_LIGHTS", MAX_LIGHTS),
+        ];
+        for (name, src) in shaders {
+            for (c, v) in consts {
+                let decl = format!("const uint {c} = {v};");
+                assert!(src.contains(&decl), "{name} lacks `{decl}`");
+            }
+        }
+        let group = format!("local_size_x = {CLUSTER_GROUP}");
+        assert!(
+            shaders[0].1.contains(&group),
+            "cluster.comp lacks `{group}`"
+        );
     }
 }

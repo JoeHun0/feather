@@ -69,7 +69,7 @@ fn clamp_samples(limits: &vk::PhysicalDeviceLimits, want: u32) -> vk::SampleCoun
 }
 // GPU timing (§21): timestamps per frame-in-flight — shadow (start, end),
 // geometry (start, end), post (start, end). Frame is shadow-start → post-end.
-const TIMESTAMPS_PER_FRAME: u32 = 6;
+const TIMESTAMPS_PER_FRAME: u32 = 8;
 
 /// A GPU buffer that frees itself (and its allocation) on drop.
 pub struct Buffer {
@@ -118,6 +118,8 @@ impl Drop for MappedBuffer {
 #[derive(Clone, Copy, Default)]
 pub struct GpuTimes {
     pub shadow_ms: f32,
+    /// The light-cluster compute pass (§12), between shadow and geometry.
+    pub cluster_ms: f32,
     pub geometry_ms: f32,
     pub post_ms: f32,
     pub frame_ms: f32,
@@ -307,7 +309,7 @@ impl Renderer {
 
         let (physical_device, queue_family_index) =
             pick_device(&instance, &surface_loader, surface)
-                .ok_or("no GPU with a graphics+present queue and swapchain support")?;
+                .ok_or("no GPU with a graphics+compute+present queue and swapchain support")?;
         // Machines with an iGPU + dGPU (or llvmpipe) enumerate several devices,
         // and every [gpu] timing below is meaningless without knowing which one.
         let props = unsafe { instance.get_physical_device_properties(physical_device) };
@@ -323,8 +325,12 @@ impl Renderer {
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities)];
         let device_exts = [ash::khr::swapchain::NAME.as_ptr()];
-        let mut features13 =
-            vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        // maintenance4: glslang emits OpExecutionMode LocalSizeId for compute
+        // shaders targeting Vulkan 1.3 (cluster.comp), which requires it. 1.3
+        // makes supporting it mandatory, so this narrows no device.
+        let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
+            .dynamic_rendering(true)
+            .maintenance4(true);
         // Bindless-lite: non-uniform indexing into a fixed-size sampled-image
         // array (material_id -> textures[]). Widely supported on modern GPUs.
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
@@ -557,13 +563,17 @@ impl Renderer {
         // Mask to valid bits and wrapping-subtract, so a counter wrap within the
         // valid range still yields the right delta. Then ns → ms.
         let to_ms = |start: u64, end: u64| (end & m).wrapping_sub(start & m) as f32 * period * 1e-6;
-        // Slots: shadow (0,1), geometry (2,3), post (4,5); frame = shadow→post.
+        // Slots: shadow (0,1), geometry (2,3), post (4,5), cluster (6,7) —
+        // cluster was added last, so it sits at the end rather than in pass
+        // order; frame = shadow start → post end, which spans it.
         let shadow = to_ms(data[0], data[1]);
+        let cluster = to_ms(data[6], data[7]);
         let geo = to_ms(data[2], data[3]);
         let post = to_ms(data[4], data[5]);
         let frame_ms = to_ms(data[0], data[5]);
         self.gpu_times_raw = GpuTimes {
             shadow_ms: shadow,
+            cluster_ms: cluster,
             geometry_ms: geo,
             post_ms: post,
             frame_ms,
@@ -572,6 +582,7 @@ impl Renderer {
         // Exponential moving average keeps the log line steady enough to read.
         let a = 0.1;
         self.gpu_times.shadow_ms += (shadow - self.gpu_times.shadow_ms) * a;
+        self.gpu_times.cluster_ms += (cluster - self.gpu_times.cluster_ms) * a;
         self.gpu_times.geometry_ms += (geo - self.gpu_times.geometry_ms) * a;
         self.gpu_times.post_ms += (post - self.gpu_times.post_ms) * a;
         self.gpu_times.frame_ms += (frame_ms - self.gpu_times.frame_ms) * a;
@@ -581,8 +592,8 @@ impl Renderer {
             self.ts_log_counter = 0;
             let t = self.gpu_times;
             eprintln!(
-                "[gpu] shadow {:.2}ms  geo {:.2}ms  post {:.2}ms  frame {:.2}ms",
-                t.shadow_ms, t.geometry_ms, t.post_ms, t.frame_ms
+                "[gpu] shadow {:.2}ms  cluster {:.2}ms  geo {:.2}ms  post {:.2}ms  frame {:.2}ms",
+                t.shadow_ms, t.cluster_ms, t.geometry_ms, t.post_ms, t.frame_ms
             );
         }
     }
@@ -958,6 +969,9 @@ impl Renderer {
         &mut self,
         // Called once per cascade with its index — hence `Fn`, not `FnOnce`.
         shadow: impl Fn(vk::CommandBuffer, vk::Extent2D, usize, usize),
+        // Compute work between the shadow and geometry passes (the §12 light
+        // clusters); its writes are made visible to fragment shaders.
+        cluster: impl FnOnce(vk::CommandBuffer, usize),
         geometry: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         post: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         aa: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
@@ -1061,7 +1075,7 @@ impl Renderer {
             .unwrap();
 
             // GPU timing: reset this frame's query slots (must be outside a render
-            // pass) and stamp the shadow-pass start. Bottom-of-pipe for all six, so
+            // pass) and stamp the shadow-pass start. Bottom-of-pipe for all eight, so
             // each delta measures the work recorded between two write points.
             let ts_base = frame as u32 * TIMESTAMPS_PER_FRAME;
             if self.timestamps_supported {
@@ -1166,6 +1180,40 @@ impl Renderer {
                     self.query_pool,
                     ts_base + 1,
                 );
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 6,
+                );
+            }
+
+            // ---- Cluster pass (§12): compute, outside any render pass. ----
+            // Its writes are read by the geometry pass's fragment shader, so a
+            // global barrier (not per-buffer: the pass owns whatever it binds)
+            // orders compute writes before fragment reads.
+            cluster(cmd, frame);
+            if self.timestamps_supported {
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 7,
+                );
+            }
+            let cluster_to_frag = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[cluster_to_frag],
+                &[],
+                &[],
+            );
+            if self.timestamps_supported {
                 dev.cmd_write_timestamp(
                     cmd,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
@@ -2010,7 +2058,11 @@ fn pick_device(
         let props = unsafe { instance.get_physical_device_queue_family_properties(pd) };
         let family = props.iter().enumerate().find_map(|(i, qf)| {
             let i = i as u32;
-            let graphics = qf.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+            // One queue does everything, including §12's cluster compute.
+            // Vulkan guarantees some family has both if any has graphics.
+            let graphics = qf
+                .queue_flags
+                .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE);
             let present = unsafe {
                 surface_loader
                     .get_physical_device_surface_support(pd, i, surface)

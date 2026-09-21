@@ -1,7 +1,7 @@
 # Feather — Engine Architecture
 
 Status: in active implementation — a textured-PBR forward renderer with IBL,
-4-cascade sun shadows, punctual point lights (not yet clustered), a depth
+4-cascade sun shadows, clustered punctual point lights, a depth
 prepass, per-view frustum culling, MSAA/FXAA, GPU per-pass timing, a rapier FPS
 controller in the ECS, glTF scene loading with §18 prefabs, and a main menu +
 pause menu with an options tree are up; see §26 for exactly what's built vs.
@@ -350,7 +350,9 @@ triangle with `LESS_OR_EQUAL` and no depth write, so it survives only where the
 depth buffer is still the cleared 1.0 and shades just the visible background
 instead of the whole screen — **geo 3.0 → 2.8 ms**. It shares `fullscreen.vert`
 with the tonemap pass, which is unaffected because that pass renders with no depth
-attachment. Still pending here: no cluster pass, MSAA resolve or transparent pass.
+attachment. Still pending here: no MSAA resolve or transparent pass. (The
+cluster pass landed — §12 — as a compute dispatch between shadow and geometry,
+guarded by a legacy `vkCmdPipelineBarrier` until the sync2 pass.)
 
 Barriers: Vulkan 1.3 **sync2** (`VkImageMemoryBarrier2`, timeline semaphores).
 Key hazards: shadow depth W→R before opaque; HDR color W→R at resolve; cluster
@@ -472,7 +474,7 @@ which is that line's intent).
   `clusterGrid` → loop `count` entries of `lightIndexList` → accumulate BRDF;
   then add the directional sun (with CSM) unconditionally.
 
-**Landed (§26): punctual lights, but _not yet clustered_.** Stage A of the above:
+**Landed (§26): punctual lights (stage A), then clustering (stage B, below).** Stage A of the above:
 a `PointLight` component placed by §18's `point_light` prefab (on a marker node,
 or on geometry so a lamp both emits and renders), extracted per frame into a
 `GpuLight[]` SSBO at set 0 binding 5, and shaded in `mesh.frag` with the same
@@ -482,12 +484,12 @@ to *exactly* zero at its radius so the cutoff is not a visible sphere edge.
 Lights are culled per frame against the camera frustum **by sphere, not point**,
 so one whose centre is off-screen still lights what is on-screen.
 
-**Every visible light is tested per fragment**, with a distance early-out. Cost
-therefore tracks lights-*in-frame*, not lights-touching-*this-pixel*: fine while
-they are sparse, and it degrades exactly where they overlap. That is the whole
-case for the grid above, and this is deliberately the baseline it gets measured
-against — the component, prefab, extract, SSBO and BRDF are all reused by the
-clustered version, where only the loop's source changes.
+Stage A tested **every visible light per fragment**, with a distance early-out.
+The reasoning then was that cost tracks lights-*in-frame*, not
+lights-touching-*this-pixel*, and that this was the whole case for the grid. The
+stage-B measurement below shows that was mostly wrong for the test scene. The
+component, prefab, extract, SSBO and BRDF all carried over unchanged; only the
+loop's source changed.
 
 **Measured — the baseline stage B has to beat.** `geo` on the test scene with
 `--lights N` scattered as geometry-free markers, so light count was the only
@@ -505,7 +507,8 @@ The spread is itself the symptom: at 120 lights `geo` swings 5.1–12.3 ms purel
 with view direction, because cost tracks lights *in frustum* rather than lights
 *touching the pixel*. Clustering is precisely what converts that into a stable
 per-pixel cost, so this is the case for building it, backed by a number rather
-than assumed. *(Measured on the original dev laptop; re-baseline on new hardware
+than assumed. *(Stage B, below, found this only partly true: most of the growth
+was lights genuinely overlapping, which no grid removes.)* *(Measured on the original dev laptop; re-baseline on new hardware
 before comparing — absolute ms do not transfer between machines.)*
 
 **Re-baselined on the desktop (RX 7800 XT)** with `--bench` (§21): 1920×1045,
@@ -532,11 +535,72 @@ fixed cost, which at these sizes may not be negligible.
 position/radius/colour/intensity only; §12's `dir_cone` and `type` are omitted
 rather than padded, since unused fields cost bandwidth every frame.
 
-**Pending:** everything that makes it *clustered* — the grid, both compute
-dispatches, `clusterGrid`/`lightIndexList` and the fragment lookup. **There is no
-compute support in the codebase at all**, and `pick_physical_device` selects a
-queue family on `GRAPHICS` alone without ever checking `COMPUTE`, so that comes
-first. Also pending: spot lights, and shadowed point lights (cube maps).
+**Landed (§26): stage B, the cluster grid.** 16×9×24, exponential slices over the
+camera's own near/far (0.1 / 200 — `CAMERA_NEAR`/`CAMERA_FAR` in the app, shared
+with the projection so the two cannot drift). One compute dispatch per frame
+(`cluster.comp`, one thread per cluster, 64-thread groups) — the engine's first
+compute pipeline — runs in its own `draw_frame` slot between the shadow and
+geometry passes, is timed as `[gpu] … cluster`, and is followed by a
+compute-write → fragment-read barrier. It reuses the mesh renderer's set 0 and
+pipeline layout (masks at binding 6). `pick_device` now requires
+`GRAPHICS | COMPUTE` in one family, and `maintenance4` is enabled because glslang
+emits `LocalSizeId` for Vulkan 1.3 compute (mandatory in 1.3, so no device is
+excluded). Three deliberate departures from the design above:
+
+- **A per-cluster bitmask, not `{offset,count}` + `lightIndexList` + an atomic
+  counter.** With `MAX_LIGHTS = 128` a mask is *exact* — 4 words per cluster,
+  55 KB per frame in flight — so there is no per-cluster overflow to clamp, no
+  atomics and no counter reset, and the fragment visits lights in ascending
+  order (`findLSB`). It grows linearly with the cap. Revisit only if lights
+  reach the thousands.
+- **No cached AABB pass.** Each thread builds its cluster's AABB inline (a few
+  ALU ops), which removes a buffer, a pass, and the resize/FOV invalidation
+  path.
+- **Tiles defined by view-space slope, not `gl_FragCoord`.** The fragment derives
+  its tile from x/d, y/d against tan(fov/2), exactly as the compute side bounds
+  it. There is one shared definition, no framebuffer size in the UBO, and no
+  one-frame skew during a resize. The AABB faces are padded slightly
+  (`SLOPE_PAD`, `DEPTH_PAD`) because the two sides reach boundaries through
+  different float ops.
+
+**Correctness is exact, and was checked as such.** A light outside the cluster
+contributes exactly zero (the falloff window reaches 0 at the radius), so with
+conservative clusters the clustered sum *is* the brute-force sum. A temporary
+harness ran the brute loop alongside in `mesh.frag` and atomically counted
+contributing-but-unmasked lights over every fragment of the full `--bench` sweep:
+**0** at 60 and at 120 lights. The negative control (radius halved in the compute
+test) reported 2.9 billion. Under sync validation, removing the new barrier raises
+`SYNC-HAZARD-READ-AFTER-WRITE` on the mask buffer; with it, stage B adds no
+hazards (pre-existing ones: §21).
+
+**Measured (RX 7800 XT, `profile_standard`, `--bench`, back-to-back A/B), and a
+premise corrected.** `--lights N` (r = 14, heavily overlapping):
+
+| lights | `geo` stage A → B | `cluster` pass | `frame` A → B |
+|---|---|---|---|
+| 0 | 0.19 → 0.20 | 0.00 | 0.32 → 0.35 |
+| 60 | 0.45 → 0.40 | 0.02 | 0.59 → 0.56 |
+| 120 | 0.76 → 0.61 | 0.03 | 0.89 → 0.79 |
+
+Only −20% at 120, against a predicted ~−50%, because **cost tracks lights that
+actually contribute, not lights tested.** The harness counted 4.11 / 8.46
+contributing lights per fragment at 60 / 120. After clustering, the light cost
+(`geo` minus the 0-light run) is 0.048 ms per contributing light at *both*
+counts, so it is linear. Stage A was ~0.065, meaning the brute loop's rejects
+were only ~25% of its light cost, and that 25% is all clustering removes. Stage
+A's "superlinear" growth was mostly real overlap (8.46 > 2 × 4.11), not wasted
+tests. The clusters are ~2.6× conservative (22.2 lights walked per fragment vs
+8.46 contributing). Tightening them would only trim the cheap reject part.
+
+Clustering pays where lights-in-frame ≫ lights-touching-the-pixel. Same scene
+with the scattered lights shrunk to r = 4 (≈1 per pixel): `geo` 0.37 → **0.22**
+(−41%), p10–p90 narrowing from 51% to 41% of the median. `--lights` (r = 14,
+~8.5 per pixel) is deliberately clustering's *worst* case. With dense overlap,
+the next cost to attack is the BRDF itself, not assignment.
+
+**Pending:** spot lights (cone-vs-AABB in `cluster.comp`); shadowed point lights
+(cube maps); a `--light-radius` option in the generator (the r = 4 run edited a
+copy of the scene by hand).
 
 ## 13. Image pipeline: IBL + post
 
@@ -912,7 +976,7 @@ and punctuation.
 - **GPU:** timestamp queries bracketing passes → per-pass ms. This is how
   SSR/volumetrics cost gets judged. **Landed** (§26): a timestamp query pool in
   `gfx` brackets the shadow, geometry, and post passes, reads back after the frame
-  fence (no stall), and logs smoothed per-pass ms to stderr (`[gpu] shadow … geo …
+  fence (no stall), and logs smoothed per-pass ms to stderr (`[gpu] shadow … cluster … geo …
   post … frame …`), with a `Renderer::gpu_times` accessor for a future overlay.
   **Caveat when reading these numbers:** absolute per-pass ms shift with overall
   GPU load/clock state — the fixed-size shadow pass measured 2.5 ms with a small
@@ -964,7 +1028,13 @@ and punctuation.
 - **Validation:** core on debug builds; **sync validation** + best-practices as
   toggles (sync validation essential for hand-written sync2 barriers).
   **Landed (§26):** core validation on debug builds, enabled only if the layer is
-  installed (otherwise a startup warning, not a failure); the toggles are not.
+  installed (otherwise a startup warning, not a failure). Sync validation has
+  no in-app toggle yet, but runs via the layer's env var:
+  `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`. **Known issue:** on committed code
+  it reports ~3.4k cross-frame image layout-transition hazards per `--bench`
+  run (swapchain acquire, and `UNDEFINED` transitions on the shared depth/HDR/
+  shadow images using `TOP_OF_PIPE` as their source stage). They predate
+  stage B and are unfixed.
 - **Debug draw:** immediate line/shape renderer (bounds, frustums, rapier
   colliders) + fullscreen debug modes via push-constant flags (wireframe,
   cascade tint, cluster-light heatmap, overdraw).
@@ -991,9 +1061,9 @@ app        thin binary wiring it together
 2. ECS-driven scene: extract stage + instanced draw of many meshes from `World`.
 3. Lighting: CSM sun + GTAO + a few clustered lights + IBL ambient (the "better
    than 2010" look lands here). (Landed: PBR + textures, analytic-sky IBL,
-   4-cascade CSM with 3×3 PCF, and punctual point lights — brute-force per
-   fragment, not yet clustered. Remaining: the §12 cluster grid, GTAO, cubemap
-   IBL, and caster pancaking.)
+   4-cascade CSM with 3×3 PCF, and clustered punctual point lights (§12 stage
+   B, the engine's first compute pass). Remaining: GTAO, cubemap IBL, and
+   caster pancaking.)
 4. Physics + FPS controller (rapier), fixed timestep + interpolation → walkable.
    (Landed: fixed timestep + interpolation, the rapier kinematic FPS controller
    against static colliders, and the ECS↔rapier sync systems with the player as an
@@ -1292,9 +1362,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
 Culling (per-view bounding-sphere frustum cull landed for the camera + shadow
 views, §8 — broad-phase/chunk cull, rayon parallelism, AABB refinement, and LOD
 still pending); mips + MikkTSpace vertex tangents; pipeline buckets (PBR BRDF +
-base-color/normal/MR textures landed); clustered lighting (**punctual lights landed** — a `point_light` prefab, a
-lights SSBO and a per-fragment loop over every visible light; the cluster grid
-and its two compute dispatches are not, and no compute support exists yet);
+base-color/normal/MR textures landed); clustered lighting (**landed** — a `point_light` prefab, a lights SSBO, and a
+16×9×24 cluster grid assigned by one compute dispatch into per-cluster light
+bitmasks, §12; spot lights and point-light shadows pending);
 precomputed cubemap/HDR IBL (analytic-sky IBL landed);
 shadows: **4-cascade CSM + 3×3 PCF landed** (§11) — practical splits, sphere-fit
 and texel-snapped per cascade, a depth array layer each, per-cascade caster

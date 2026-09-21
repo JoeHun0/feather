@@ -39,18 +39,29 @@ layout(set = 0, binding = 4) uniform Globals {
     vec4 texel_world;   // world units per shadow texel, per cascade
     vec4 light_params;  // x = live light count
     vec4 shadow_params; // x = texel size (1/dim), y = depth bias
+    mat4 view;           // world -> view, for the cluster lookup
+    vec4 cluster_params; // x = near, y = far, z = CLUSTER_Z / ln(far/near)
+    vec4 cluster_proj;   // x = tan(fov_x/2), y = tan(fov_y/2)
 } g;
 
-// Punctual lights (§12). Every visible light is tested per fragment with a
-// distance early-out: no cluster grid yet, so cost tracks lights-in-frame rather
-// than lights-touching-this-pixel. That is exactly what clustering will fix, and
-// this is the baseline it gets measured against.
+// Punctual lights (§12), shaded only if this fragment's cluster lists them.
 struct Light {
     vec4 pos_radius;      // xyz = world position, w = radius
     vec4 color_intensity; // rgb = linear colour, a = intensity
 };
 layout(set = 0, binding = 5) readonly buffer Lights {
     Light lights[];
+};
+
+// Light-cluster grid, written by cluster.comp. MUST match it and render::mesh.
+const uint CLUSTER_X = 16;
+const uint CLUSTER_Y = 9;
+const uint CLUSTER_Z = 24;
+const uint MAX_LIGHTS = 128;
+const uint CLUSTER_WORDS = MAX_LIGHTS / 32;
+// One bitmask per cluster over this frame's light list.
+layout(set = 0, binding = 6) readonly buffer Clusters {
+    uint cluster_masks[];
 };
 
 layout(location = 0) in vec3 v_normal;
@@ -213,6 +224,22 @@ float attenuation(float dist, float radius) {
     return window * window / (dist * dist + 1.0);
 }
 
+// Which cluster a world-space point falls in. Tiles are defined by view-space
+// slope (x/d, y/d) rather than gl_FragCoord, which is exactly how cluster.comp
+// bounds them — the two share one definition, and neither needs the
+// framebuffer size.
+uint cluster_index(vec3 world_pos) {
+    vec3 p = (g.view * vec4(world_pos, 1.0)).xyz;
+    float d = max(-p.z, g.cluster_params.x);
+    vec2 ndc = vec2(p.x, p.y) / (d * g.cluster_proj.xy); // [-1, 1] on screen
+    uint tx = uint(clamp(floor((ndc.x * 0.5 + 0.5) * float(CLUSTER_X)), 0.0, float(CLUSTER_X - 1)));
+    // Row 0 is the top of the screen, i.e. +y in view space.
+    uint ty = uint(clamp(floor((0.5 - ndc.y * 0.5) * float(CLUSTER_Y)), 0.0, float(CLUSTER_Y - 1)));
+    float slice = floor(log(d / g.cluster_params.x) * g.cluster_params.z);
+    uint tz = uint(clamp(slice, 0.0, float(CLUSTER_Z - 1)));
+    return tx + ty * CLUSTER_X + tz * CLUSTER_X * CLUSTER_Y;
+}
+
 // Cook-Torrance for one punctual light, reusing the same BRDF terms as the sun
 // rather than a second lighting path.
 vec3 punctual(Light l, vec3 N, vec3 V, vec3 world_pos, vec3 albedo, vec3 f0,
@@ -286,11 +313,20 @@ void main() {
     float shadow = sun_shadow(v_world_pos, ng);
     vec3 lo = (kd * albedo / PI + specular) * SUN_RADIANCE * ndl * shadow;
 
-    // Punctual lights (§12), added to the same accumulator. Unshadowed: point
-    // shadows need cube maps, which is a feature of its own.
-    int light_count = int(g.light_params.x);
-    for (int i = 0; i < light_count; ++i) {
-        lo += punctual(lights[i], N, V, v_world_pos, albedo, f0, roughness, metallic);
+    // Punctual lights (§12), added to the same accumulator — only those this
+    // fragment's cluster lists, visited in ascending index order. A light
+    // outside the cluster contributes exactly zero (the falloff window reaches
+    // 0 at the radius), so with conservative clusters this sums precisely what
+    // the brute-force loop over every light did. Unshadowed: point shadows need
+    // cube maps, which is a feature of its own.
+    uint cluster = cluster_index(v_world_pos);
+    for (uint w = 0; w < CLUSTER_WORDS; ++w) {
+        uint bits = cluster_masks[cluster * CLUSTER_WORDS + w];
+        while (bits != 0u) {
+            uint b = uint(findLSB(bits));
+            bits &= bits - 1u;
+            lo += punctual(lights[w * 32u + b], N, V, v_world_pos, albedo, f0, roughness, metallic);
+        }
     }
 
     // --- Ambient (analytic IBL: split-sum against the procedural sky) ---

@@ -36,8 +36,8 @@ use feather_assets::MeshData;
 use feather_gfx::{GpuTimes, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use feather_platform::winit;
 use feather_render::{
-    CascadeSetup, FxaaPass, GpuLight, InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass,
-    UiPass,
+    CascadeSetup, ClusterView, FxaaPass, GpuLight, InstanceData, MeshId, MeshRenderer, SkyPass,
+    TonemapPass, UiPass,
 };
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
@@ -722,6 +722,12 @@ struct Player {
     controller: KinematicCharacterController,
 }
 
+/// Camera projection. Shared by the view matrix and the light clusters (§12),
+/// which must describe the same frustum or fragments read the wrong cluster.
+const CAMERA_FOV_Y: f32 = 60.0 * std::f32::consts::PI / 180.0;
+const CAMERA_NEAR: f32 = 0.1;
+const CAMERA_FAR: f32 = 200.0;
+
 /// Look angles, updated at **render rate** for responsive aim (§14/§15) — unlike
 /// [`Player`], which is fixed-step. Separate component so the two rates don't get
 /// tangled.
@@ -762,11 +768,15 @@ impl Look {
         (fwd, right, right.cross(fwd).normalize_or_zero())
     }
 
+    /// World → view (right-handed, looking down -Z).
+    fn view(&self, eye: Vec3) -> Mat4 {
+        Mat4::look_to_rh(eye, self.forward(), Vec3::Y)
+    }
+
     fn view_proj(&self, eye: Vec3, aspect: f32) -> Mat4 {
-        let view = Mat4::look_to_rh(eye, self.forward(), Vec3::Y);
-        let mut proj = Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 200.0);
+        let mut proj = Mat4::perspective_rh(CAMERA_FOV_Y, aspect, CAMERA_NEAR, CAMERA_FAR);
         proj.y_axis.y *= -1.0;
-        proj * view
+        proj * self.view(eye)
     }
 }
 
@@ -1006,6 +1016,7 @@ impl Bench {
             self.samples.len()
         );
         eprintln!("[bench] shadow  {}", col(|t| t.shadow_ms));
+        eprintln!("[bench] cluster {}", col(|t| t.cluster_ms));
         eprintln!("[bench] geo     {}", col(|t| t.geometry_ms));
         eprintln!("[bench] post    {}", col(|t| t.post_ms));
         eprintln!("[bench] frame   {}", col(|t| t.frame_ms));
@@ -1970,6 +1981,13 @@ impl ApplicationHandler for App {
                     let size = self.window.as_ref().unwrap().inner_size();
                     let aspect = size.width as f32 / size.height.max(1) as f32;
                     let view_proj = look.view_proj(eye, aspect);
+                    let cluster_view = ClusterView {
+                        view: look.view(eye),
+                        fov_y: CAMERA_FOV_Y,
+                        aspect,
+                        near: CAMERA_NEAR,
+                        far: CAMERA_FAR,
+                    };
                     let inv_view_proj = view_proj.inverse();
                     let light_dir = self.light_dir;
                     let camera_pos = eye;
@@ -2093,8 +2111,13 @@ impl ApplicationHandler for App {
                     // CPU prep once (sort + stage instances/globals); the shadow
                     // and main passes then replay them. Uploads happen in
                     // draw_shadow, after the frame fence.
-                    s.mesh
-                        .prepare_frame(&mut main_items, &mut shadow_items, &cascades, &lights);
+                    s.mesh.prepare_frame(
+                        &mut main_items,
+                        &mut shadow_items,
+                        &cascades,
+                        &lights,
+                        &cluster_view,
+                    );
                     if let Some(b) = self.bench.as_mut() {
                         b.lights = lights.len();
                     }
@@ -2185,6 +2208,13 @@ impl ApplicationHandler for App {
                         |cmd, extent, frame, cascade| {
                             if let Some(s) = session {
                                 s.mesh.draw_shadow(cmd, extent, frame, cascade);
+                            }
+                        },
+                        // Light clusters (§12): after draw_shadow has uploaded
+                        // this frame's lights + globals, before the main pass.
+                        |cmd, frame| {
+                            if let Some(s) = session {
+                                s.mesh.dispatch_clusters(cmd, frame);
                             }
                         },
                         // Geometry (§10): depth prepass, then the lit opaque pass
