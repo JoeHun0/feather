@@ -517,6 +517,9 @@ def zone_shadow(s, pal, extras_on):
                         "color": [1.0, 0.85, 0.6],
                         "intensity": 30.0,
                         "radius": 12.0,
+                        # Emitter size for the sphere-light specular (§12);
+                        # these are geometry-free, so "a small lamp".
+                        "source_radius": 0.15,
                     },
                 },
                 f"lamp_{i}",
@@ -629,6 +632,9 @@ def zone_pbr(s, pal, extras_on):
                     "color": [1.0, 0.6, 0.2] if ei == 0 else [0.4, 0.7, 1.0],
                     "intensity": 40.0,
                     "radius": 14.0,
+                    # The orb's own radius (0.5 sphere x 1.4), so a mirror
+                    # sphere's highlight is the size of the orb's reflection.
+                    "source_radius": 0.7,
                 },
             }
             if extras_on
@@ -660,6 +666,7 @@ def scatter_lights(s, count, radius=14.0):
                     "color": [1.0, 0.55 + 0.35 * t, 0.3 + 0.6 * t],
                     "intensity": 18.0,
                     "radius": radius,
+                    "source_radius": 0.15,
                 },
             },
             f"scatter_light_{i}",

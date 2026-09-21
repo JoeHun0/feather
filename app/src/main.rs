@@ -1072,6 +1072,10 @@ struct PointLight {
     intensity: f32,
     /// Distance at which the light reaches exactly zero.
     radius: f32,
+    /// Physical size of the emitter, in metres (§12's sphere-light specular).
+    /// Zero is a true point, which makes a near-singular highlight on smooth
+    /// metal; the default is bulb-sized. Clamped to `[0, radius]`.
+    source_radius: f32,
 }
 
 impl Default for PointLight {
@@ -1080,6 +1084,7 @@ impl Default for PointLight {
             color: Vec3::ONE,
             intensity: 12.0,
             radius: 10.0,
+            source_radius: 0.1,
         }
     }
 }
@@ -1099,7 +1104,10 @@ fn extract_lights(world: &mut World, frustum: &Frustum) -> Vec<GpuLight> {
         }
         out.push(GpuLight {
             pos_radius: [pos.x, pos.y, pos.z, l.radius],
-            color_intensity: [l.color.x, l.color.y, l.color.z, l.intensity],
+            radiance_source: {
+                let c = l.color * l.intensity;
+                [c.x, c.y, c.z, l.source_radius]
+            },
         });
     }
     out
@@ -1122,6 +1130,57 @@ fn light_attenuation(distance: f32, radius: f32) -> f32 {
     let t = (distance / radius).powi(4);
     let window = (1.0 - t).clamp(0.0, 1.0);
     window * window / (distance * distance + 1.0)
+}
+
+/// Scalar specular of one light as `mesh.frag`'s `punctual()` computes it
+/// (F = 1, no falloff), treating the light as a sphere of `src` (Karis's
+/// representative point). A **reference copy** like `light_attenuation`, with
+/// the same limit: it pins the maths, not the shader.
+#[cfg(test)]
+fn sphere_light_specular(n: Vec3, v: Vec3, delta: Vec3, src: f32, roughness: f32) -> f32 {
+    let dist = delta.length();
+    let r = 2.0 * v.dot(n) * n - v; // reflect(-v, n)
+    let center_to_ray = delta.dot(r) * r - delta;
+    let t = (src / center_to_ray.length().max(1e-6)).clamp(0.0, 1.0);
+    let ls = (delta + center_to_ray * t).normalize();
+    let ndl = n.dot(ls).max(0.0);
+    if ndl <= 0.0 {
+        return 0.0;
+    }
+    let h = (v + ls).normalize();
+    let ndv = n.dot(v).max(1e-4);
+    let a = roughness * roughness;
+    let a_wide = (a + src / (2.0 * dist.max(1e-4))).clamp(0.0, 1.0);
+    let d = ggx_d(n.dot(h).max(0.0), a) * (a / a_wide).powi(2);
+    d * smith_g(ndv, ndl, roughness) / (4.0 * ndv * ndl + 1e-4) * ndl
+}
+
+/// The same term for an infinitesimal point light, as `punctual()` was before
+/// the sphere-light change — the baseline `src = 0` must reproduce.
+#[cfg(test)]
+fn point_light_specular(n: Vec3, v: Vec3, delta: Vec3, roughness: f32) -> f32 {
+    let l = delta.normalize();
+    let ndl = n.dot(l).max(0.0);
+    if ndl <= 0.0 {
+        return 0.0;
+    }
+    let h = (v + l).normalize();
+    let ndv = n.dot(v).max(1e-4);
+    let d = ggx_d(n.dot(h).max(0.0), roughness * roughness);
+    d * smith_g(ndv, ndl, roughness) / (4.0 * ndv * ndl + 1e-4) * ndl
+}
+
+#[cfg(test)]
+fn ggx_d(ndh: f32, a: f32) -> f32 {
+    let a2 = a * a;
+    let d = ndh * ndh * (a2 - 1.0) + 1.0;
+    a2 / (std::f32::consts::PI * d * d)
+}
+
+#[cfg(test)]
+fn smith_g(ndv: f32, ndl: f32, rough: f32) -> f32 {
+    let k = (rough + 1.0).powi(2) / 8.0;
+    ndv / (ndv * (1.0 - k) + k) * (ndl / (ndl * (1.0 - k) + k))
 }
 
 /// What a prefab spawn function gets: the node's placement plus whatever
@@ -1177,13 +1236,21 @@ fn spawn_prop(world: &mut World, args: &SpawnArgs) {
 /// carrying `point_light` nodes since before there was a light system.
 fn spawn_point_light(world: &mut World, args: &SpawnArgs) {
     let d = PointLight::default();
+    let radius = args.spec.and_then(|s| s.f32("radius")).unwrap_or(d.radius);
     let light = PointLight {
         color: args.spec.and_then(|s| s.vec3("color")).unwrap_or(d.color),
         intensity: args
             .spec
             .and_then(|s| s.f32("intensity"))
             .unwrap_or(d.intensity),
-        radius: args.spec.and_then(|s| s.f32("radius")).unwrap_or(d.radius),
+        radius,
+        // A source larger than the light's reach is meaningless, and a negative
+        // one would invert the representative-point clamp in the shader.
+        source_radius: args
+            .spec
+            .and_then(|s| s.f32("source_radius"))
+            .unwrap_or(d.source_radius)
+            .clamp(0.0, radius.max(0.0)),
     };
     // Geometry is optional: a marker node lights without being visible, a mesh
     // node is a lamp that both emits and renders.
@@ -3346,6 +3413,19 @@ mod tests {
         assert_eq!(l.color, Vec3::new(1.0, 0.5, 0.25));
         assert_eq!(l.intensity, 7.5);
         assert_eq!(l.radius, 3.0);
+        assert_eq!(l.source_radius, PointLight::default().source_radius);
+
+        // source_radius: read when given, clamped to [0, radius].
+        for (given, want) in [(0.4, 0.4), (0.0, 0.0), (-1.0, 0.0), (9.0, 3.0)] {
+            let sized = feather_assets::PrefabSpec {
+                id: "point_light".into(),
+                params: serde_json::json!({ "radius": 3.0, "source_radius": given }),
+            };
+            let mut w = prefab_world();
+            spawn_one(&mut w, Some(&sized), &cube);
+            let l = *w.query::<&PointLight>().single(&w).unwrap();
+            assert_eq!(l.source_radius, want, "source_radius {given}");
+        }
 
         // The geometry switches behave as they do on `prop`, rather than
         // point_light being the one prefab where `shadow` silently does nothing.
@@ -3430,6 +3510,143 @@ mod tests {
             lights.iter().all(|l| l.pos_radius[2] < 0.0),
             "the light behind the camera should have been culled"
         );
+    }
+
+    #[test]
+    fn sphere_light_with_zero_source_is_a_point_light() {
+        // Random normals, view directions in the upper hemisphere, light offsets
+        // and roughness: src = 0 must be exactly the old point light.
+        let unit = |seed: u32| {
+            let v = Vec3::new(
+                rand01(seed) - 0.5,
+                rand01(seed + 1) - 0.5,
+                rand01(seed + 2) - 0.5,
+            );
+            v.normalize_or(Vec3::Y)
+        };
+        for i in 0..500u32 {
+            let n = unit(i * 11);
+            let mut v = unit(i * 11 + 3);
+            if v.dot(n) < 0.0 {
+                v = -v;
+            }
+            let delta = unit(i * 11 + 6) * (0.5 + 10.0 * rand01(i * 11 + 9));
+            let rough = 0.04 + 0.96 * rand01(i * 11 + 10);
+            let sphere = sphere_light_specular(n, v, delta, 0.0, rough);
+            let point = point_light_specular(n, v, delta, rough);
+            assert!(
+                (sphere - point).abs() <= 1e-4 * point.abs().max(1.0),
+                "case {i}: sphere {sphere} vs point {point}"
+            );
+        }
+    }
+
+    /// Smooth metal, viewed exactly along the light's mirror direction, 5 m
+    /// away, at 45°.
+    fn mirror_setup() -> (Vec3, Vec3, Vec3) {
+        let n = Vec3::Y;
+        let delta = Vec3::new(1.0, 1.0, 0.0).normalize() * 5.0;
+        let l = delta.normalize();
+        let v = 2.0 * l.dot(n) * n - l;
+        (n, v, delta)
+    }
+
+    #[test]
+    fn sphere_light_removes_the_smooth_metal_singularity() {
+        let (n, v, delta) = mirror_setup();
+        let peak = |src: f32| sphere_light_specular(n, v, delta, src, 0.04);
+        let point = peak(0.0);
+        // The singularity is real: a point light on roughness-0.04 metal peaks
+        // far above anything a sized source produces...
+        assert!(point.is_finite() && point > 1000.0, "point peak {point}");
+        // ...and a size tames it, monotonically.
+        let mut prev = point;
+        for src in [0.02, 0.05, 0.1, 0.25, 0.7] {
+            let p = peak(src);
+            assert!(p.is_finite() && p > 0.0);
+            assert!(p < prev, "peak rose at src {src}: {p} >= {prev}");
+            prev = p;
+        }
+        assert!(
+            point / peak(0.1) > 10.0,
+            "a bulb-sized source should cut it >10x"
+        );
+    }
+
+    #[test]
+    fn sphere_light_highlight_matches_the_source_size() {
+        // Turning the view by θ turns the reflection ray by θ. While that ray
+        // still passes through the sphere the lobe is flat-topped (the
+        // representative point lies on the ray), so the highlight is a disc.
+        // Its half-width at half maximum should be about the sphere's angular
+        // radius, asin(src / d): a mirror sphere's highlight matches the
+        // lamp's own reflection.
+        let (n, v, delta) = mirror_setup();
+        let half_width = |src: f32| {
+            let peak = sphere_light_specular(n, v, delta, src, 0.04);
+            (1..20_000)
+                .map(|i| i as f32 * 0.001_f32.to_radians())
+                .find(|&a| {
+                    let vr = glam::Quat::from_rotation_z(a) * v;
+                    sphere_light_specular(n, vr, delta, src, 0.04) < peak * 0.5
+                })
+                .expect("the highlight ends somewhere")
+        };
+        let mut prev = 0.0;
+        for src in [0.05, 0.1, 0.25, 0.7] {
+            let w = half_width(src);
+            let angular = (src / delta.length()).asin();
+            assert!(w > prev, "highlight did not widen at src {src}");
+            assert!(
+                (0.9..1.3).contains(&(w / angular)),
+                "src {src}: half-width {:.3}° vs source {:.3}°",
+                w.to_degrees(),
+                angular.to_degrees()
+            );
+            prev = w;
+        }
+    }
+
+    #[test]
+    fn sphere_light_roughly_conserves_energy() {
+        // The (α/α')² normalisation exists to keep a sized light about as bright
+        // overall as the point it replaces. Integrate the specular lobe over view
+        // directions around the mirror direction and compare. This pins the two
+        // ways it goes wrong: widening twice (D at α' as well) keeps ~1% of the
+        // energy, and a src/3d widening overshoots ~3x on smooth metal.
+        let (n, _, delta) = mirror_setup();
+        let l = delta.normalize();
+        let vm = 2.0 * l.dot(n) * n - l;
+        let t1 = vm.cross(Vec3::Z).normalize();
+        let t2 = vm.cross(t1);
+        let energy = |src: f32, rough: f32, cap_deg: f32| {
+            let (nt, nphi) = (600, 64);
+            let cap = cap_deg.to_radians();
+            let mut sum = 0.0;
+            for i in 0..nt {
+                let th = (i as f32 + 0.5) / nt as f32 * cap;
+                for j in 0..nphi {
+                    let ph = (j as f32 + 0.5) / nphi as f32 * std::f32::consts::TAU;
+                    let v = vm * th.cos() + (t1 * ph.cos() + t2 * ph.sin()) * th.sin();
+                    if v.dot(n) <= 0.0 {
+                        continue;
+                    }
+                    let w = th.sin() * (cap / nt as f32) * (std::f32::consts::TAU / nphi as f32);
+                    sum += sphere_light_specular(n, v, delta, src, rough) * w;
+                }
+            }
+            sum
+        };
+        for (rough, cap, lo, hi) in [(0.04, 40.0, 0.9, 1.6), (0.3, 89.0, 0.85, 1.2)] {
+            let point = energy(0.0, rough, cap);
+            for src in [0.1, 0.25, 0.7] {
+                let ratio = energy(src, rough, cap) / point;
+                assert!(
+                    (lo..hi).contains(&ratio),
+                    "rough {rough} src {src}: {ratio:.2}x the point light's energy"
+                );
+            }
+        }
     }
 
     #[test]

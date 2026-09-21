@@ -141,8 +141,10 @@ struct Globals {
 pub struct GpuLight {
     /// xyz = world position, w = radius (the distance at which it reaches zero).
     pub pos_radius: [f32; 4],
-    /// rgb = linear colour, a = intensity.
-    pub color_intensity: [f32; 4],
+    /// rgb = linear colour × intensity (premultiplied on the CPU, which frees
+    /// the alpha channel), a = source radius: the light's physical size, for
+    /// the sphere-light specular in `mesh.frag`.
+    pub radiance_source: [f32; 4],
 }
 
 /// Per-cascade setup the app computes and both passes consume.

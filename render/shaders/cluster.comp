@@ -33,7 +33,7 @@ layout(set = 0, binding = 4) uniform Globals {
 
 struct Light {
     vec4 pos_radius;      // xyz = world position, w = radius
-    vec4 color_intensity;
+    vec4 radiance_source; // unused here: assignment needs only position + radius
 };
 layout(set = 0, binding = 5) readonly buffer Lights {
     Light lights[];

@@ -172,7 +172,7 @@ if absent. A node's `extras` can name a prefab:
 |---|---|---|
 | `player_start` | `yaw` degrees (keep the default look direction) | where NEW GAME spawns the player; first one wins |
 | `prop` | `collide` (true), `shadow` (true) | a mesh with optional collider / shadow casting |
-| `point_light` | `color` [1,1,1], `intensity` 12, `radius` 10 | on a bare marker or on geometry (a lamp that also renders) |
+| `point_light` | `color` [1,1,1], `intensity` 12, `radius` 10, `source_radius` 0.1 | on a bare marker or on geometry (a lamp that also renders). `source_radius` is the emitter's physical size, clamped to [0, radius]: it sets the size of the highlight on shiny surfaces. Match it to the lamp's geometry; 0 is a true point, which makes a pinprick-bright highlight on smooth metal |
 
 An unknown prefab name falls back to static geometry. Up to 128 point lights
 can be *visible* at once; lights past that are dropped for the frame with a
@@ -182,14 +182,14 @@ can be *visible* at once; lights past that are dropped for the frame with a
 
 ## 5. Tests — what exists and what it guards
 
-`cargo test --workspace`: 42 tests, all CPU-side (none needs a GPU).
+`cargo test --workspace`: 46 tests, all CPU-side (none needs a GPU).
 
 | Area | Crate | What the tests pin down |
 |---|---|---|
 | Character controller | app | settling, walking speed, jumps and head bumps, no air-jump, autostep lip vs wall, sliding along box faces, noclip |
 | Menus | app | row layout and hit-testing, wraparound, Esc/back behaviour, OPTIONS reachable from both menus, MSAA only outside a session, **every label drawable by the 5×7 A–Z/0–9 font** |
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice |
-| Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point |
+| Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
 | Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs |
 | Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space |
 | Light clusters | render | GLSL grid constants + `MAX_LIGHTS` match the Rust ones |

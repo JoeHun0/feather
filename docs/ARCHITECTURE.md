@@ -531,9 +531,11 @@ whole light loop is well under a millisecond, so stage B's case rests on
 laptop/Deck-class GPUs, and its A/B here must account for a compute dispatch's
 fixed cost, which at these sizes may not be negligible.
 
-`MAX_LIGHTS = 128`, clamped with a warning. `GpuLight` is 32 bytes and carries
-position/radius/colour/intensity only; §12's `dir_cone` and `type` are omitted
-rather than padded, since unused fields cost bandwidth every frame.
+`MAX_LIGHTS = 128`, clamped with a warning. `GpuLight` is 32 bytes:
+`pos_radius` and `radiance_source` (rgb = colour × intensity, premultiplied on
+the CPU to free the alpha for the source radius). §12's `dir_cone` and `type`
+are omitted rather than padded, since unused fields cost bandwidth every
+frame.
 
 **Landed (§26): stage B, the cluster grid.** 16×9×24, exponential slices over the
 camera's own near/far (0.1 / 200 — `CAMERA_NEAR`/`CAMERA_FAR` in the app, shared
@@ -600,6 +602,39 @@ authored r = 14 lights: 2 of 124 lights. Regenerate it with
 `--lights 120 --light-radius 4`.) `--lights` at its default r = 14 (~8.5 per
 pixel) is deliberately clustering's *worst* case. With dense overlap,
 the next cost to attack is the BRDF itself, not assignment.
+
+**Landed (§26): sphere-light specular (Karis 2013, representative point).** A
+true point light on smooth metal (roughness clamps at 0.04, α = 0.0016) makes a
+near-singular, sun-bright dot. Each light now has a `source_radius` (prefab
+param, default 0.1 m, clamped to [0, radius]). Specular is lit from the point
+on that sphere closest to the reflection ray, which flattens D into a disc the
+size of the source. D at the *original* α is then scaled by (α/α')², with
+α' = α + src/(2d). Diffuse keeps the centre direction. **Falloff stays on the
+centre distance**, so a light still reaches exactly zero at its radius and the
+stage-B clustering stays exact. The generator gives its emissive orbs their
+real 0.7 m, so a mirror sphere's highlight matches the orb's reflection.
+
+Two corrections to the textbook form, both found by integrating the lobe in a
+CPU reference (`sphere_light_*` tests, which pin these properties):
+- **D must stay at α.** Evaluating D at α' *and* multiplying by (α/α')² widens
+  twice and kept ~1% of the energy.
+- **The widening constant is `2d`, not the `3d` some write-ups give.** Half the
+  source's angular radius, since half-vectors move half as far. At `/2` the
+  energy is within ±12% of the point light at roughness 0.3 and +15–49% on
+  mirror-smooth metal, the approximation's known looseness. `/3` overshoots up
+  to 3.3×.
+
+The highlight half-width is 0.9–1.3× the source's angular radius (tested). src
+= 0 reduces to the old point light (tested against a transcription of it).
+
+**Measured cost** (A/B, `profile_standard`): +0.16 ms `geo` at `--lights 120`
+(0.61 → 0.77), but +0.01 ms at `--light-radius 4` (0.22 → 0.23). The cost is per
+*contributing* light (~0.019 ms each at full screen, ~+40% on the per-light
+BRDF): the extra `length` + `normalize` are real work. Two cuts are already in:
+`reflect(-V, N)` is hoisted per fragment, and a whole-sphere-below-horizon test
+(`dot(N, delta) <= -src`) runs before the representative point. Together they
+recovered 0.05 ms of a first +0.21. It is expensive only where ~8.5 lights
+overlap every pixel.
 
 **Pending:** spot lights (cone-vs-AABB in `cluster.comp`); shadowed point lights
 (cube maps).
@@ -1375,7 +1410,8 @@ views, §8 — broad-phase/chunk cull, rayon parallelism, AABB refinement, and L
 still pending); mips + MikkTSpace vertex tangents; pipeline buckets (PBR BRDF +
 base-color/normal/MR textures landed); clustered lighting (**landed** — a `point_light` prefab, a lights SSBO, and a
 16×9×24 cluster grid assigned by one compute dispatch into per-cluster light
-bitmasks, §12; spot lights and point-light shadows pending);
+bitmasks, plus sphere-light specular via `source_radius`, §12; spot lights and
+point-light shadows pending);
 precomputed cubemap/HDR IBL (analytic-sky IBL landed);
 shadows: **4-cascade CSM + 3×3 PCF landed** (§11) — practical splits, sphere-fit
 and texel-snapped per cascade, a depth array layer each, per-cascade caster

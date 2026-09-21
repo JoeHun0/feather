@@ -47,7 +47,7 @@ layout(set = 0, binding = 4) uniform Globals {
 // Punctual lights (§12), shaded only if this fragment's cluster lists them.
 struct Light {
     vec4 pos_radius;      // xyz = world position, w = radius
-    vec4 color_intensity; // rgb = linear colour, a = intensity
+    vec4 radiance_source; // rgb = colour × intensity (linear), a = source radius
 };
 layout(set = 0, binding = 5) readonly buffer Lights {
     Light lights[];
@@ -136,11 +136,14 @@ vec3 fresnel_schlick(float cos_theta, vec3 f0) {
 vec3 fresnel_schlick_roughness(float cos_theta, vec3 f0, float rough) {
     return f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
-float distribution_ggx(float ndh, float rough) {
-    float a = rough * rough;
+// GGX D in terms of alpha (= roughness²), so a caller can widen alpha itself.
+float distribution_ggx_alpha(float ndh, float a) {
     float a2 = a * a;
     float d = ndh * ndh * (a2 - 1.0) + 1.0;
     return a2 / (PI * d * d);
+}
+float distribution_ggx(float ndh, float rough) {
+    return distribution_ggx_alpha(ndh, rough * rough);
 }
 float geometry_smith(float ndv, float ndl, float rough) {
     float r = rough + 1.0;
@@ -240,9 +243,30 @@ uint cluster_index(vec3 world_pos) {
     return tx + ty * CLUSTER_X + tz * CLUSTER_X * CLUSTER_Y;
 }
 
-// Cook-Torrance for one punctual light, reusing the same BRDF terms as the sun
-// rather than a second lighting path.
-vec3 punctual(Light l, vec3 N, vec3 V, vec3 world_pos, vec3 albedo, vec3 f0,
+// Cook-Torrance for one light, reusing the same BRDF terms as the sun rather
+// than a second lighting path.
+//
+// The light is a **sphere** of `radiance_source.a` (Karis 2013, representative
+// point). An infinitesimal point makes a near-singular highlight on smooth
+// metal: at roughness 0.04 the GGX lobe is so narrow that the reflection
+// becomes a tiny, sun-bright dot. So specular is lit from the point on the
+// sphere closest to the reflection ray. That makes D flat-topped across a disc
+// the size of the source, so D is scaled by (α/α')², the widened lobe's
+// normalisation over the original's, with α' = α + src / 2d (the source's
+// angular radius, halved for half-vector space). It is applied to D at the
+// *original* α; also evaluating D at α' widens twice and loses ~99% of the
+// energy. Measured on the CPU reference: within ±12% of the point light's
+// energy at roughness 0.3 and +15–49% on mirror-smooth metal, the known
+// looseness of the approximation. Diffuse keeps the centre direction.
+//
+// Falloff stays on the *centre* distance. Measured from the representative
+// point, a light could reach just past its radius, and §12's clusters rely on
+// it being exactly zero there. With src = 0 every step reduces to the plain
+// point light (the same maths; only the float operation order differs).
+//
+// `R` is the view reflected about N: light-independent, so the caller computes
+// it once per fragment rather than once per light.
+vec3 punctual(Light l, vec3 N, vec3 V, vec3 R, vec3 world_pos, vec3 albedo, vec3 f0,
               float roughness, float metallic) {
     vec3 delta = l.pos_radius.xyz - world_pos;
     float dist = length(delta);
@@ -250,23 +274,37 @@ vec3 punctual(Light l, vec3 N, vec3 V, vec3 world_pos, vec3 albedo, vec3 f0,
     if (att <= 0.0) {
         return vec3(0.0);
     }
-    vec3 L = delta / max(dist, 1e-4);
-    float ndl = max(dot(N, L), 0.0);
-    if (ndl <= 0.0) {
+    float src = l.radiance_source.a;
+    // The whole sphere is below this surface's horizon: nothing to light, and
+    // this is cheap enough to test before the representative point. With
+    // src = 0 it is the old point-light N·L <= 0 test.
+    if (dot(N, delta) <= -src) {
         return vec3(0.0);
     }
-    vec3 H = normalize(V + L);
+    vec3 L = delta / max(dist, 1e-4);
+    float ndl = max(dot(N, L), 0.0);
+
+    // Representative point: the closest point on the sphere to the reflection ray.
+    vec3 center_to_ray = dot(delta, R) * R - delta;
+    vec3 closest = delta + center_to_ray * clamp(src / max(length(center_to_ray), 1e-6), 0.0, 1.0);
+    vec3 Ls = normalize(closest);
+    float ndl_s = max(dot(N, Ls), 0.0);
+
+    vec3 H = normalize(V + Ls);
     float ndv = max(dot(N, V), 1e-4);
     float ndh = max(dot(N, H), 0.0);
     float hdv = max(dot(H, V), 0.0);
 
-    float ndf = distribution_ggx(ndh, roughness);
-    float gs = geometry_smith(ndv, ndl, roughness);
+    float a = roughness * roughness;
+    float a_wide = clamp(a + src / (2.0 * max(dist, 1e-4)), 0.0, 1.0);
+    float norm = (a / a_wide) * (a / a_wide);
+    float ndf = distribution_ggx_alpha(ndh, a) * norm;
+    float gs = geometry_smith(ndv, ndl_s, roughness);
     vec3 f = fresnel_schlick(hdv, f0);
-    vec3 spec = (ndf * gs * f) / (4.0 * ndv * ndl + 0.0001);
+    vec3 spec = (ndf * gs * f) / (4.0 * ndv * ndl_s + 0.0001);
     vec3 kd = (vec3(1.0) - f) * (1.0 - metallic);
-    vec3 radiance = l.color_intensity.rgb * l.color_intensity.a * att;
-    return (kd * albedo / PI + spec) * radiance * ndl;
+    vec3 radiance = l.radiance_source.rgb * att;
+    return (kd * albedo / PI * ndl + spec * ndl_s) * radiance;
 }
 
 void main() {
@@ -320,12 +358,13 @@ void main() {
     // the brute-force loop over every light did. Unshadowed: point shadows need
     // cube maps, which is a feature of its own.
     uint cluster = cluster_index(v_world_pos);
+    vec3 R = reflect(-V, N);
     for (uint w = 0; w < CLUSTER_WORDS; ++w) {
         uint bits = cluster_masks[cluster * CLUSTER_WORDS + w];
         while (bits != 0u) {
             uint b = uint(findLSB(bits));
             bits &= bits - 1u;
-            lo += punctual(lights[w * 32u + b], N, V, v_world_pos, albedo, f0, roughness, metallic);
+            lo += punctual(lights[w * 32u + b], N, V, R, v_world_pos, albedo, f0, roughness, metallic);
         }
     }
 
