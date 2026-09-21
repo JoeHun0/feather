@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["platform", "gfx", "render", "assets", "game", "app"]
+members = ["platform", "gfx", "render", "assets", "game", "app", "bake"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,6 +18,9 @@ bevy_ecs          = { version = "0.16", features = ["multi_threaded"] }
 rapier3d          = "=0.35.3"
 serde             = { version = "1", features = ["derive"] }
 shaderc           = "0.8"
+# texture bake (§17): BC7 encoder (bake crate only) and the content-hash key
+intel_tex_2       = "0.5"
+xxhash-rust       = { version = "0.8", features = ["xxh3"] }
 # internal (path deps, referenced as `<crate>.workspace = true`)
 feather-platform = { path = "platform" }
 feather-gfx      = { path = "gfx" }

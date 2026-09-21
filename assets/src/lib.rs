@@ -5,6 +5,8 @@
 //! Everything here is Vulkan-free by design (§22) — the renderer uploads these
 //! buffers to the GPU.
 
+pub mod bake;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;

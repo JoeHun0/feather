@@ -6,6 +6,8 @@ publish = false
 
 [dependencies]
 glam.workspace = true
+# Content key for baked textures (§17), shared by the bake tool and the runtime.
+xxhash-rust.workspace = true
 serde.workspace = true
 # `import` resolves buffers/URIs and decodes images (png/jpeg via the image
 # crate); `utils` gives the mesh accessor readers; `extras` exposes each node's

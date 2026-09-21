@@ -181,7 +181,13 @@ struct GraphicsSettings {
     /// FXAA post-AA (§13). Unlike MSAA this is live-toggleable (`F2`): it bakes
     /// nothing into pipelines, and the LDR intermediate is always allocated.
     fxaa: bool,
+    /// Use baked BC7 textures from `BAKE_DIR` when present (§17). `--no-bake`
+    /// forces raw RGBA8, for A/B comparisons.
+    bake: bool,
 }
+
+/// Where `feather-bake` writes, and the runtime looks for, baked textures.
+const BAKE_DIR: &str = "scratch/bake/tex";
 
 impl Default for GraphicsSettings {
     fn default() -> Self {
@@ -189,6 +195,7 @@ impl Default for GraphicsSettings {
             shadows: ShadowQuality::High,
             msaa: 1,
             fxaa: false,
+            bake: true,
         }
     }
 }
@@ -1512,7 +1519,7 @@ struct Session {
 impl Session {
     /// Build a world and the GPU resources that serve it. `scenes` are the CLI
     /// glTF paths; empty means the procedural orb demo, exactly as before.
-    fn new(renderer: &Renderer, scenes: &[String]) -> Self {
+    fn new(renderer: &Renderer, scenes: &[String], bake: bool) -> Self {
         // Scenes load *first*, because a `player_start` marker (§18) decides
         // where the player goes and the player is built below.
         let (meshes, scene_nodes) = load_scenes(scenes);
@@ -1684,7 +1691,9 @@ impl Session {
         // against contains the level before the first fixed tick.
         world.resource_mut::<Physics>().step();
 
-        let (mesh, _ids) = MeshRenderer::new(renderer, &meshes, &materials, MAX_INSTANCES);
+        let bake_dir = bake.then(|| std::path::Path::new(BAKE_DIR));
+        let (mesh, _ids) =
+            MeshRenderer::new(renderer, &meshes, &materials, MAX_INSTANCES, bake_dir);
         let sky = SkyPass::new(renderer);
 
         Self {
@@ -1845,7 +1854,7 @@ impl App {
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
-        let session = Session::new(renderer, &self.scenes);
+        let session = Session::new(renderer, &self.scenes, self.settings.bake);
         self.session = Some(session);
         self.paused = false;
         self.menu.reset(MenuScreen::Root);
@@ -2677,6 +2686,7 @@ fn main() {
                 None => eprintln!("--msaa needs a sample count (1/2/4/8); ignoring"),
             },
             "--bench" => bench = true,
+            "--no-bake" => settings.bake = false,
             _ => scenes.push(a),
         }
     }

@@ -10,6 +10,7 @@ use ash::vk;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use feather_assets::bake::{baked_path, texture_key, BakedTexture};
 use feather_assets::{Material, MeshData, TextureData, Vertex};
 use feather_gfx::{Buffer, Image, MappedBuffer, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use glam::{Mat4, Vec4};
@@ -61,6 +62,18 @@ struct TexturePlan {
     references: usize,
     /// References that fell back to a default because the array was full.
     overflow: usize,
+}
+
+/// Bytes of an RGBA8 texture with its full mip chain (what the raw path uploads).
+fn rgba8_chain_bytes(width: u32, height: u32) -> usize {
+    let (mut w, mut h, mut total) = (width.max(1), height.max(1), 0usize);
+    loop {
+        total += (w * h * 4) as usize;
+        if w == 1 && h == 1 {
+            return total;
+        }
+        (w, h) = ((w / 2).max(1), (h / 2).max(1));
+    }
 }
 
 /// Slots 0 (white) and 1 (flat normal) are the resident defaults.
@@ -294,6 +307,7 @@ impl MeshRenderer {
         meshes: &[MeshData],
         materials: &[Material],
         max_instances: u32,
+        bake_dir: Option<&std::path::Path>,
     ) -> (Self, Vec<MeshId>) {
         let device = renderer.device();
 
@@ -350,14 +364,40 @@ impl MeshRenderer {
         // The shadow map is the one other combined sampler in the set.
         let capacity = renderer.max_bindless_textures().saturating_sub(1);
         let plan = plan_texture_slots(materials, capacity);
+        let (mut baked, mut bytes) = (0usize, 0usize);
         for (t, srgb) in &plan.uploads {
-            textures.push(renderer.create_texture(&t.pixels, t.width, t.height, *srgb));
+            // A baked BC7 chain (§17) when the bake has one for exactly this
+            // texture in this colour space and the device can sample BC.
+            // Otherwise raw RGBA8 with GPU-built mips. Never an error.
+            let bc7 = bake_dir
+                .filter(|_| renderer.texture_compression_bc())
+                .and_then(|dir| BakedTexture::read(&baked_path(dir, texture_key(t, *srgb))).ok())
+                .filter(|b| b.srgb == *srgb && (b.width, b.height) == (t.width, t.height));
+            let image = match &bc7 {
+                Some(b) => {
+                    baked += 1;
+                    bytes += b.levels.iter().map(Vec::len).sum::<usize>();
+                    renderer.create_texture_bc7(&b.levels, b.width, b.height, *srgb)
+                }
+                None => {
+                    bytes += rgba8_chain_bytes(t.width, t.height);
+                    renderer.create_texture(&t.pixels, t.width, t.height, *srgb)
+                }
+            };
+            textures.push(image);
         }
         let references = plan.references;
+        let raw = plan.uploads.len() - baked;
         eprintln!(
-            "[mesh] {} textures uploaded for {references} references",
-            plan.uploads.len()
+            "[mesh] {} textures uploaded for {references} references ({baked} baked BC7, {raw} raw), {:.1} MB",
+            plan.uploads.len(),
+            bytes as f64 / 1_048_576.0
         );
+        if raw > 0 && bake_dir.is_some() {
+            eprintln!(
+                "[mesh] {raw} textures aren't baked: `feather-bake SCENE...` compresses them ~4x"
+            );
+        }
         if plan.overflow > 0 {
             eprintln!(
                 "[mesh] {} texture references past the device's {capacity} texture slots use the defaults",

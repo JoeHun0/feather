@@ -894,6 +894,29 @@ bindings table; no gamepad, no UI focus flag.
   handle table loads; baked output is gitignored build cache, open sources are
   truth; `--watch` is the hot-reload seam.
 
+**Landed (§26): the texture part of the bake.** `bake/` (`feather-bake`)
+loads scenes with the runtime's own loader and collects every (image, colour
+space) pair actually used: base colour as sRGB, normal and MR as data. For
+each it builds a mip chain on the CPU (2×2 box, **sRGB averaged in linear
+space**, edge-clamped for odd sizes), pads each level to 4×4 blocks, and
+**BC7-encodes** it with Intel's ISPC encoder (`intel_tex_2`, bake crate only,
+so the engine never links it). It writes a thin header + raw blocks per level
+to `scratch/bake/tex/<key>.bc7`. The key (`feather_assets::bake::texture_key`)
+is xxh3 of the *decoded* pixels + size + colour space + `BAKE_VERSION`, so
+it's content-addressed and incremental, and cross-scene dedup comes free. The
+runtime computes the same key per unique texture and uploads the baked chain
+when one exists and the device has `textureCompressionBC`. **Otherwise raw
+RGBA8 with GPU-built mips, never an error.** `--no-bake` forces raw for A/B.
+Baked files are validated on read (magic, version, per-level sizes against
+the dimensions) and written via temp + rename, so an interrupted bake is
+never trusted. Measured on the detail scene: **64 MB of BC7 vs 256 MB raw**
+(4×), 12 textures baked in 4.3 s, a re-run skips all 12, validation clean
+(including 1×1/2×2 partial-block levels), and `geo` identical.
+Not yet: BC5 for normal maps (needs z reconstruction in the shader); keying on
+*source* bytes so baked scenes can skip JPEG decode at load (today the decode
+still runs to compute the key); meshes, materials and scenes (the rest of
+this section).
+
 ## 18. Scene spawning + save/load
 
 - **Data-driven spawn via prefab registry:** node = static part (transform,
@@ -1137,8 +1160,9 @@ and punctuation.
   - **Collision against render meshes** froze the game (see §15's collision
     proxies).
   - No mipmaps and no alpha cutout, visible as shimmer and opaque grass cards.
-    **Mipmaps fixed** (full chains + trilinear + anisotropy, §26); alpha
-    cutout pending.
+    **Mipmaps fixed** (full chains + trilinear + anisotropy, §26); memory
+    **fixed** by the §17 texture bake (BC7: 64 vs 256 MB); alpha cutout
+    pending until content needs it (no current asset has alpha).
 - **RenderDoc:** in-application API, capture on a keybind.
 - **Object naming:** `vkSetDebugUtilsObjectName` on buffers/images/pipelines
   from the start (readable validation + captures).
@@ -1491,10 +1515,11 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   several meshes in shared vertex/index buffers drawn by sorted per-mesh runs; a
   resident `materials[]` SSBO indexed by per-instance `material_id`; and a fixed
   bindless `textures[]` array (glTF images or white/flat-normal defaults),
-  consumed by a Cook-Torrance PBR BRDF. Still missing: **mips**, MikkTSpace
-  vertex tangents (normal mapping is derivative-based), pipeline buckets (one
-  pipeline for everything), skinning/animation, and the offline **bake** path
-  (runtime blob, handle tables, load-time allocator). glTF loads directly each
+  consumed by a Cook-Torrance PBR BRDF. Mips landed (GPU-built, or baked BC7,
+  §17). Still missing: MikkTSpace vertex tangents (normal mapping is
+  derivative-based), pipeline buckets (one pipeline for everything),
+  skinning/animation, and the rest of the offline **bake** path (textures
+  landed; runtime blob, handle tables, load-time allocator not). glTF loads directly each
   run; a session's meshes/materials/textures are now **freed on returning to the
   main menu** (§19) — the first teardown path — but nothing is *streamed*, and
   freeing is still all-or-nothing per session; one material per merged glTF (first primitive
@@ -1518,8 +1543,9 @@ pending**, and since array layers share an extent all
 cascades are the same resolution. Shadows now reach `SHADOW_DISTANCE` (60) rather
 than a ±16 box;
 bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
-bake pipeline (runtime glTF scene loading + multi-mesh registry landed — the
-offline bake, runtime blob and handle tables are not); **scene spawning landed**
+bake pipeline (runtime glTF scene loading + multi-mesh registry landed, and
+the **texture bake** — BC7 mip chains in a content-addressed cache, §17; mesh /
+material / scene bake, runtime blob and handle tables are not); **scene spawning landed**
 (§18: `extras` → `PrefabSpec`, a prefab registry, marker nodes, `player_start`
 and a parameterised `prop` with per-node collider/shadow opt-outs; unknown ids
 fall back to static geometry; chunk membership and light/trigger prefabs

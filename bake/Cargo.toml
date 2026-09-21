@@ -1,0 +1,9 @@
+[package]
+name = "feather-bake"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+feather-assets.workspace = true
+intel_tex_2.workspace = true

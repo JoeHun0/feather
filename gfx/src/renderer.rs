@@ -214,6 +214,8 @@ pub struct Renderer {
     max_anisotropy: Option<f32>,
     /// Combined image samplers one set may hold (the bindless array's ceiling).
     max_bindless_textures: usize,
+    /// Whether BC-compressed textures can be sampled (`textureCompressionBC`).
+    texture_compression_bc: bool,
     shadow: Option<ShadowMap>,
     shadow_sampler: vk::Sampler, // comparison sampler (sampler2DShadow)
     shadow_dim: u32,             // live shadow-map dimension (quality setting)
@@ -358,9 +360,13 @@ impl Renderer {
         // Anisotropic filtering keeps textures seen at grazing angles (the
         // ground ahead of an FPS player) sharp once they are mipmapped.
         let anisotropy = supported.sampler_anisotropy == vk::TRUE;
+        // BC7 textures from the §17 bake. Universal on desktop and the Deck;
+        // without it the renderer uploads raw RGBA8 instead.
+        let bc = supported.texture_compression_bc == vk::TRUE;
         let core_features = vk::PhysicalDeviceFeatures::default()
             .depth_clamp(depth_clamp)
-            .sampler_anisotropy(anisotropy);
+            .sampler_anisotropy(anisotropy)
+            .texture_compression_bc(bc);
         let device_create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_features(&core_features)
@@ -521,6 +527,7 @@ impl Renderer {
             depth_clamp,
             max_anisotropy,
             max_bindless_textures,
+            texture_compression_bc: bc,
             hdr_sampler,
             shadow: Some(shadow),
             shadow_sampler,
@@ -584,6 +591,11 @@ impl Renderer {
     /// other samplers bound beside it.
     pub fn max_bindless_textures(&self) -> usize {
         self.max_bindless_textures
+    }
+
+    /// True if baked BC7 textures can be uploaded (`create_texture_bc7`).
+    pub fn texture_compression_bc(&self) -> bool {
+        self.texture_compression_bc
     }
 
     /// Latest smoothed per-pass GPU times (§21). All zero until a few frames have
@@ -1064,6 +1076,166 @@ impl Renderer {
                 .expect("texture view")
         };
 
+        Image {
+            allocator: allocator.clone(),
+            allocation,
+            device: self.device.clone(),
+            handle: image,
+            view,
+            format,
+        }
+    }
+
+    /// Upload a baked BC7 mip chain (§17) as a sampled image, every level in one
+    /// staging copy with a region per level; no blits, since the bake built the
+    /// mips. `levels[i]` must be level i's blocks, as `feather_assets::bake`
+    /// writes and validates them.
+    pub fn create_texture_bc7(
+        &self,
+        levels: &[Vec<u8>],
+        width: u32,
+        height: u32,
+        srgb: bool,
+    ) -> Image {
+        let allocator = self.allocator();
+        let format = if srgb {
+            vk::Format::BC7_SRGB_BLOCK
+        } else {
+            vk::Format::BC7_UNORM_BLOCK
+        };
+        let count = levels.len() as u32;
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(count)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let ai = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferDevice,
+            ..Default::default()
+        };
+        let (image, allocation) = unsafe {
+            allocator
+                .create_image(&image_ci, &ai)
+                .expect("bc7 texture image")
+        };
+
+        let total: usize = levels.iter().map(Vec::len).sum();
+        let staging_ci = vk::BufferCreateInfo::default()
+            .size(total as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let staging_ai = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferHost,
+            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
+            ..Default::default()
+        };
+        let (staging_buf, mut staging_alloc) = unsafe {
+            allocator
+                .create_buffer(&staging_ci, &staging_ai)
+                .expect("bc7 staging")
+        };
+        let mut regions = Vec::with_capacity(levels.len());
+        unsafe {
+            let ptr = allocator
+                .map_memory(&mut staging_alloc)
+                .expect("map bc7 staging");
+            let mut offset = 0usize;
+            for (mip, level) in levels.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(level.as_ptr(), ptr.add(offset), level.len());
+                regions.push(
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(offset as u64)
+                        .image_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: mip as u32,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image_extent(vk::Extent3D {
+                            width: (width >> mip).max(1),
+                            height: (height >> mip).max(1),
+                            depth: 1,
+                        }),
+                );
+                offset += level.len();
+            }
+            allocator.unmap_memory(&mut staging_alloc);
+        }
+
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: count,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        self.one_time_submit(|cmd| unsafe {
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
+            self.device.cmd_copy_buffer_to_image(
+                cmd,
+                staging_buf,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &regions,
+            );
+            let to_read = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_read],
+            );
+        });
+        unsafe { allocator.destroy_buffer(staging_buf, &mut staging_alloc) };
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(range);
+        let view = unsafe {
+            self.device
+                .create_image_view(&view_info, None)
+                .expect("bc7 texture view")
+        };
         Image {
             allocator: allocator.clone(),
             allocation,
