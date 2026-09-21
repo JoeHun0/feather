@@ -1,9 +1,11 @@
 # Feather — Engine Architecture
 
 Status: in active implementation — a textured-PBR forward renderer with IBL,
-sun shadows, a depth prepass, per-view frustum culling, MSAA/FXAA, GPU per-pass
-timing, a rapier FPS controller in the ECS, glTF scene loading and a minimal UI
-is up; see §26 for exactly what's built vs. still designed.
+4-cascade sun shadows, punctual point lights (not yet clustered), a depth
+prepass, per-view frustum culling, MSAA/FXAA, GPU per-pass timing, a rapier FPS
+controller in the ECS, glTF scene loading with §18 prefabs, and a main menu +
+pause menu with an options tree are up; see §26 for exactly what's built vs.
+still designed.
 Scope: a from-scratch Rust + Vulkan engine for a minimalist open-world FPS.
 Visual floor is a 2010-era look; the baseline actually targets ~2016 image
 quality where it costs little. Long-term goal: an original Zone-flavored
@@ -487,6 +489,25 @@ case for the grid above, and this is deliberately the baseline it gets measured
 against — the component, prefab, extract, SSBO and BRDF are all reused by the
 clustered version, where only the loop's source changes.
 
+**Measured — the baseline stage B has to beat.** `geo` on the test scene with
+`--lights N` scattered as geometry-free markers, so light count was the only
+variable (`shadow` held flat at ~1.5 ms across all three, confirming it):
+
+| lights | `geo` median | spread |
+|---|---|---|
+| 0 | 2.39 ms | 1.6 ms |
+| 60 | 5.53 ms | 5.0 ms |
+| 120 | 9.97 ms | 7.1 ms |
+
+4.2× at 120 lights, and **superlinear** — ~52 µs per light for the first 60,
+~74 µs for the next — because more lights survive the frustum cull and overlap.
+The spread is itself the symptom: at 120 lights `geo` swings 5.1–12.3 ms purely
+with view direction, because cost tracks lights *in frustum* rather than lights
+*touching the pixel*. Clustering is precisely what converts that into a stable
+per-pixel cost, so this is the case for building it, backed by a number rather
+than assumed. *(Measured on the original dev laptop; re-baseline on new hardware
+before comparing — absolute ms do not transfer between machines.)*
+
 `MAX_LIGHTS = 128`, clamped with a warning. `GpuLight` is 32 bytes and carries
 position/radius/colour/intensity only; §12's `dir_cone` and `type` are omitted
 rather than padded, since unused fields cost bandwidth every frame.
@@ -883,12 +904,19 @@ and punctuation.
   workload. The orb demo is pathological on purpose (huge overdraw, every object
   a caster, no occlusion) and so is useless for judging cost; this produces a
   walkable glTF level in cardinal sectors, each aimed at one system: pillars
-  spanning the ±`SHADOW_RADIUS` boundary (shadows/CSM), stairs and ramps
+  running from inside to well past the old ±16 single-map shadow boundary
+  (shadows/CSM), stairs and ramps
   bracketing the 0.4 autostep and rapier's 45° slope limit (§15), thin poles, a
   lattice and a picket fence at graded distances (AA), a few hundred nodes over a
   handful of meshes (dedup/instancing/culling), and a metallic×roughness sphere
-  grid (IBL/tonemap reference). `--density low|med|high` scales the field for A/B
-  timing, `--seed` gives reproducible variants, `--check` re-parses the output and
+  grid (IBL/tonemap reference). Nodes carry §18 prefabs: the field scatter is
+  `prop` with `collide: false`, a `player_start` marker places the player, and
+  point lights sit on the emissive spheres and down the pillar rows.
+  `--density low|med|high` scales the field for A/B timing, `--lights N` scatters
+  N extra point lights as geometry-free markers (the §12 light-loop benchmark:
+  mesh count is unchanged, so light count is the only variable), `--textures`
+  adds procedural textures, `--seed` gives reproducible variants, `--check`
+  re-parses the output and
   asserts the engine's invariants (bounds, ground contact, no intersection with
   the app's own level geometry, the normal-transform rule below, texture count).
   Stdlib-only Python; the generator is committed and its output is not, since
@@ -924,9 +952,10 @@ app        thin binary wiring it together
    (validates buffers, descriptors, depth).
 2. ECS-driven scene: extract stage + instanced draw of many meshes from `World`.
 3. Lighting: CSM sun + GTAO + a few clustered lights + IBL ambient (the "better
-   than 2010" look lands here). (Landed: PBR + textures, analytic-sky IBL, and a
-   single player-following shadow map with 3×3 PCF. Remaining: CSM cascades,
-   GTAO, clustered lights, cubemap IBL.)
+   than 2010" look lands here). (Landed: PBR + textures, analytic-sky IBL,
+   4-cascade CSM with 3×3 PCF, and punctual point lights — brute-force per
+   fragment, not yet clustered. Remaining: the §12 cluster grid, GTAO, cubemap
+   IBL, and caster pancaking.)
 4. Physics + FPS controller (rapier), fixed timestep + interpolation → walkable.
    (Landed: fixed timestep + interpolation, the rapier kinematic FPS controller
    against static colliders, and the ECS↔rapier sync systems with the player as an
@@ -967,7 +996,13 @@ Snapshot of what's actually built vs. the design above. The design sections are
 unchanged targets; this records reality so the doc doesn't drift. Update as
 milestones land.
 
-### Done (milestones 0–2 + textured PBR + analytic IBL + sky + fixed-step rapier controller)
+**On the millisecond figures throughout this document:** they were measured on
+the original dev laptop. They are only meaningful *relative to each other* — as
+A/B deltas taken back-to-back at one window size on one machine. On different
+hardware, re-measure both sides of any comparison before drawing conclusions;
+the ratios and the reasoning should carry over, the absolute numbers will not.
+
+### Done (milestones 0–2, most of 3–4: PBR + IBL + sky, CSM, punctual lights, rapier controller, prefabs, menus)
 
 - **Workspace/toolchain**: 6 crates, `rust-toolchain.toml` (stable), GLSL→SPIR-V
   at build time via `shaderc` in `render/build.rs`, embedded from `OUT_DIR`.
@@ -976,8 +1011,10 @@ milestones land.
   pin; default features). rapier 0.35 builds on its own newer glam (0.33, via
   `glamx`) rather than nalgebra, so its `Vector`/`Pose` are *not* the workspace's
   glam 0.29 `Vec3` — `app` converts at the boundary (`to_rapier`/`from_rapier`)
-  until the workspace glam is bumped to match. Also `gltf 1` (`import` + `utils`
-  features, pulling in the `image` crate) in `assets`. Not yet added: kira, egui,
+  until the workspace glam is bumped to match. Also `gltf 1` (`import`, `utils`,
+  `extras` and `names` features, pulling in the `image` crate) and `serde_json 1`
+  in `assets` — the latter for §18 prefab params, already in the tree via gltf.
+  `app` has `serde_json` as a dev-dependency only. Not yet added: kira, egui,
   tracy.
 - **gfx**: instance/debug messenger/surface/device/queues; VK 1.3 **dynamic
   rendering** (feature enabled); swapchain + image views + resize; **depth**
@@ -1063,9 +1100,10 @@ milestones land.
   piece is scaled from, auto-fitted to the grid), and **glTF paths on the CLI are
   loaded as scenes** appended after them — one entity per node with a `Transform`,
   its primitive's own material, and a trimesh `ColliderRef`, so a loaded level is
-  walkable. Giving a scene suppresses the orb demo (1000 orbs would bury it);
-  with no arguments the orb demo runs as before, each orb taking a random built-in
-  mesh + palette material. The orb demo is a *pathological* workload and is no
+  walkable. The app opens on the main menu with nothing loaded (§19); NEW GAME
+  builds a session from the CLI scenes. Giving a scene suppresses the orb demo
+  (1000 orbs would bury it); with no scene arguments NEW GAME builds the orb demo,
+  each orb taking a random built-in mesh + palette material. The orb demo is a *pathological* workload and is no
   longer what perf work should be measured against — `tools/gen_testscene.py`
   (§21) generates the realistic one. Culling uses a **per-mesh local bounding sphere**
   mapped through the model matrix, rather than a blanket radius — required because
@@ -1076,8 +1114,9 @@ milestones land.
   coordinates so a model authored around the origin floats above the demo ground
   at `GROUND_Y`, and there is still no broad-phase/LOD, so a large scene leans on
   the per-entity cull.
-- **Build order (§23)**: step 1 done; step 2 done; step 3 partially — PBR direct
-  lighting + full textures + analytic-sky IBL, *not* CSM/GTAO or cubemap IBL;
+- **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
+  lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
+  *not* the cluster grid, GTAO or cubemap IBL;
   step 4 mostly landed — fixed timestep + interpolation and the rapier kinematic
   FPS controller against static colliders (ECS↔rapier sync systems and dynamic
   bodies still pending, see below). Steps 5+ not started.
@@ -1157,8 +1196,17 @@ milestones land.
   "prefilter" is a crude roughness lerp (no real GGX convolution/mips). The sky
   *is* now drawn as a visible background (SkyPass) matching the reflected
   environment. Real cubemap IBL (equirect→cube, irradiance/prefilter passes,
-  BRDF LUT) is the follow-up. Also still missing: shadows, auto-exposure, bloom.
-  The tonemap curve is a drop-in point for AgX.
+  BRDF LUT) is the follow-up. Sun shadows (§11 CSM) and punctual point lights
+  (§12) now exist. Still missing: auto-exposure and bloom. The tonemap curve is a
+  drop-in point for AgX.
+  **Known artifact — specular singularity on smooth metal.** A punctual light has
+  zero area, so on low-roughness metal (the PBR grid bottoms out at 0.06) its
+  specular lobe collapses to a near-singular bright dot. With a geometry-free
+  marker light the source itself is invisible, so it reads as the reflection of a
+  sun that isn't there. Correct for the model, wrong-looking in practice. The
+  standard fix is Karis's representative-point approximation: treat each light as
+  a sphere of some source radius and renormalise the specular lobe, which spreads
+  the highlight into a believable disc. Independent of clustering.
 - **HDR/depth targets (§9)**: single engine-owned images shared across both
   frames-in-flight (matches the design: render targets are engine-owned, not
   per-frame). With `FRAMES_IN_FLIGHT = 2` this carries a latent cross-frame WAW
