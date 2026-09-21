@@ -16,7 +16,10 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use vk_mem::Alloc; // brings create_buffer/create_image into scope
 
 pub const FRAMES_IN_FLIGHT: usize = 2;
+// Validation is wanted on debug builds; whether it's actually enabled also
+// depends on the layer being installed (see `validation_layer_available`).
 const VALIDATION: bool = cfg!(debug_assertions);
+const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 // Linear-space clear for the HDR target (tonemap encodes to sRGB on output).
 const CLEAR_COLOR: [f32; 4] = [0.02, 0.02, 0.05, 1.0];
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
@@ -242,23 +245,35 @@ impl Renderer {
             .engine_version(vk::make_api_version(0, 0, 1, 0))
             .api_version(vk::API_VERSION_1_3);
 
+        // Requesting a layer that isn't installed fails instance creation, so
+        // validation is only enabled when the layer is actually present. The
+        // debug_utils extension and messenger follow the same flag: the layer
+        // is what supplies the messages.
+        let validation = VALIDATION && validation_layer_available(&entry);
+        if VALIDATION && !validation {
+            eprintln!(
+                "[vulkan] VK_LAYER_KHRONOS_validation not found; running without \
+                 validation (install vulkan-validationlayers or the Vulkan SDK)"
+            );
+        }
+
         let display_handle = window.display_handle()?.as_raw();
         let mut ext_names: Vec<*const c_char> =
             ash_window::enumerate_required_extensions(display_handle)?.to_vec();
-        if VALIDATION {
+        if validation {
             ext_names.push(ash::ext::debug_utils::NAME.as_ptr());
         }
-        let layer_names = [c"VK_LAYER_KHRONOS_validation".as_ptr()];
+        let layer_names = [VALIDATION_LAYER.as_ptr()];
 
         let mut create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(&ext_names);
-        if VALIDATION {
+        if validation {
             create_info = create_info.enabled_layer_names(&layer_names);
         }
         let instance = unsafe { entry.create_instance(&create_info, None)? };
 
-        let debug = if VALIDATION {
+        let debug = if validation {
             let du = ash::ext::debug_utils::Instance::new(&entry, &instance);
             let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
                 .message_severity(
@@ -1987,6 +2002,13 @@ fn pick_device(
         }
     }
     fallback
+}
+
+fn validation_layer_available(entry: &Entry) -> bool {
+    let layers = unsafe { entry.enumerate_instance_layer_properties() }.unwrap_or_default();
+    layers
+        .iter()
+        .any(|l| l.layer_name_as_c_str() == Ok(VALIDATION_LAYER))
 }
 
 unsafe extern "system" fn debug_callback(

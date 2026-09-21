@@ -927,6 +927,8 @@ and punctuation.
   from the start (readable validation + captures).
 - **Validation:** core on debug builds; **sync validation** + best-practices as
   toggles (sync validation essential for hand-written sync2 barriers).
+  **Landed (§26):** core validation on debug builds, enabled only if the layer is
+  installed (otherwise a startup warning, not a failure); the toggles are not.
 - **Debug draw:** immediate line/shape renderer (bounds, frustums, rapier
   colliders) + fullscreen debug modes via push-constant flags (wireframe,
   cascade tint, cluster-light heatmap, overdraw).
@@ -1016,8 +1018,12 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   in `assets` — the latter for §18 prefab params, already in the tree via gltf.
   `app` has `serde_json` as a dev-dependency only. Not yet added: kira, egui,
   tracy.
-- **gfx**: instance/debug messenger/surface/device/queues; VK 1.3 **dynamic
-  rendering** (feature enabled); swapchain + image views + resize; **depth**
+- **gfx**: instance/debug messenger/surface/device/queues (on debug builds the
+  validation layer + messenger are enabled only when
+  `VK_LAYER_KHRONOS_validation` is installed; if missing, a warning is printed
+  and the engine runs unvalidated rather than failing instance creation);
+  VK 1.3 **dynamic rendering** (feature enabled); swapchain + image views +
+  resize; **depth**
   (D32_SFLOAT) created with the swapchain; **vk-mem** allocator held as
   `Arc<Allocator>`; RAII `Buffer`/`Image`/`MappedBuffer` (self-freeing);
   device-local staging upload (`create_device_local_buffer`), persistently-
