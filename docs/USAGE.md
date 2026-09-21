@@ -52,6 +52,11 @@ cargo test --workspace menu          # every test with "menu" in its name
 cargo test --workspace shader_cluster
 ```
 
+**Debug builds optimise dependencies** (`[profile.dev.package."*"]` in
+`Cargo.toml`); the engine's own crates stay at full debug. Without it, rapier
+and the image decoder ran ~10x slower in debug. It costs a slower *clean*
+build (~41 s to ~62 s); incremental builds are unaffected.
+
 Release build (the `[gpu]` timings measured the same as debug; shaders compile
 optimised):
 
@@ -171,7 +176,7 @@ if absent. A node's `extras` can name a prefab:
 | Prefab | Params (defaults) | Notes |
 |---|---|---|
 | `player_start` | `yaw` degrees (keep the default look direction) | where NEW GAME spawns the player; first one wins |
-| `prop` | `collide` (true), `shadow` (true) | a mesh with optional collider / shadow casting |
+| `prop` | `collide` (true), `shadow` (true), `collider` (`auto`) | a mesh with optional collider / shadow casting. `collider`: `auto` (exact mesh up to 2048 triangles, convex hull above), `mesh`, `hull`, `box`, `none`. Detailed props should never collide as exact meshes: a 34k-triangle one cost 27 ms per physics tick |
 | `point_light` | `color` [1,1,1], `intensity` 12, `radius` 10, `source_radius` 0.1 | on a bare marker or on geometry (a lamp that also renders). `source_radius` is the emitter's physical size, clamped to [0, radius]: it sets the size of the highlight on shiny surfaces. Match it to the lamp's geometry; 0 is a true point, which makes a pinprick-bright highlight on smooth metal |
 
 An unknown prefab name falls back to static geometry. Up to 128 point lights
@@ -223,11 +228,12 @@ ARCHITECTURE.md §21).
 
 ## 5. Tests — what exists and what it guards
 
-`cargo test --workspace`: 48 tests, all CPU-side (none needs a GPU).
+`cargo test --workspace`: 51 tests, all CPU-side (none needs a GPU).
 
 | Area | Crate | What the tests pin down |
 |---|---|---|
 | Character controller | app | settling, walking speed, jumps and head bumps, no air-jump, autostep lip vs wall, sliding along box faces, noclip |
+| Collision proxies | app | the `collider` param picks mesh/hull/box/none, `auto` switches to a hull past 2048 triangles, `collide: false` still wins; a dense 30 cm prop is walkable as a hull; a flat hull still holds the player |
 | Menus | app | row layout and hit-testing, wraparound, Esc/back behaviour, OPTIONS reachable from both menus, MSAA only outside a session, **every label drawable by the 5×7 A–Z/0–9 font** |
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |

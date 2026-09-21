@@ -825,6 +825,20 @@ bindings table; no gamepad, no UI focus flag.
 - **Camera look decoupled to render rate** (responsive aim) while body position
   interpolates from the fixed step (stable physics). Root-motion, if ever used,
   must sample at sim rate (drives collision).
+- **Collision proxies, never detailed render meshes.** **Landed (§26):** each
+  scene primitive collides by the `collider` prefab param: `mesh` (exact
+  trimesh), `hull` (convex hull), `box` (oriented bounds, as a hull of their
+  eight corners) or `none`. The default `auto` keeps the exact mesh within
+  `TRIMESH_MAX_TRIS` = 2048 triangles and uses a hull above it. The measurement
+  behind it: standing on a 34k-triangle Poly Haven lantern's trimesh cost
+  **27 ms per physics tick in debug** (213 ms stepping off its rim; 2.5 / 27 ms
+  in release), and the fixed-step catch-up (up to `MAX_STEPS` ticks a frame)
+  turned that into seconds per frame. As a hull the same lantern costs 0.01 ms
+  a tick. Hulls are per primitive, so a rock *set* is one hull per rock. They
+  fill concavities, which an author overrides with `collider: "mesh"`. Flat
+  geometry still gets a zero-thickness hull that collides fine (tested); only
+  points with no hull at all fall back to the exact mesh. `collide: false`
+  still wins, so older scenes keep their meaning.
 
 ## 16. Skinned / animated meshes
 
@@ -906,7 +920,8 @@ Implemented prefabs are deliberately only those that do something today:
   player creation in `Session::new`. Absent, the hardcoded spawn is used, so the
   orb demo and unmarked scenes are unchanged.
 - **`prop`** — static geometry with `collide` and `shadow` switches (both
-  default true). `collide: false` closes the per-node collider opt-out §26
+  default true), and a `collider` choice (`auto`/`mesh`/`hull`/`box`/`none`,
+  §15). `collide: false` closes the per-node collider opt-out §26
   listed as missing; `shadow: false` applies `NoShadowCast`, previously
   hardcoded for the demo ground alone. One parameterised prefab rather than a
   `no_collide`/`no_shadow` pair, since the switches are independent and separate
@@ -1323,9 +1338,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   (§21) generates the realistic one. Culling uses a **per-mesh local bounding sphere**
   mapped through the model matrix, rather than a blanket radius — required because
   scene meshes are not unit-fitted. Limits: `MAX_TEXTURES = 64` (scenes past that
-  fall back to the default textures), a trimesh collider is built per node at load
-  (no convex decomposition; opt out per node with §18's `prop` prefab and
-  `collide: false`), scenes land at their authored
+  fall back to the default textures), a collider is built per node at load (an
+  exact trimesh up to 2048 triangles and a convex hull above that, overridable
+  per node, §15; no convex *decomposition*), scenes land at their authored
   coordinates so a model authored around the origin floats above the demo ground
   at `GROUND_Y`, and there is still no broad-phase/LOD, so a large scene leans on
   the per-entity cull.

@@ -24,3 +24,11 @@ feather-gfx      = { path = "gfx" }
 feather-render   = { path = "render" }
 feather-assets   = { path = "assets" }
 feather-game     = { path = "game" }
+
+# Optimise dependencies even in debug builds; the engine's own crates stay at
+# full debug. Measured on the detail scene: building rapier colliders took
+# 2-10 s unoptimised vs 0.6-1.6 s, and rapier's per-tick cost against dense
+# meshes is ~10x higher unoptimised. Cost: a clean build goes from ~41 s to
+# ~62 s; incremental builds of our own crates are unaffected.
+[profile.dev.package."*"]
+opt-level = 3

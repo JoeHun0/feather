@@ -167,6 +167,10 @@ impl PrefabSpec {
         self.params.get(key)?.as_bool()
     }
 
+    pub fn str(&self, key: &str) -> Option<&str> {
+        self.params.get(key)?.as_str()
+    }
+
     pub fn vec3(&self, key: &str) -> Option<Vec3> {
         let a = self.params.get(key)?.as_array()?;
         if a.len() < 3 {

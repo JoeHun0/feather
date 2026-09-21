@@ -692,6 +692,12 @@ impl Physics {
         }
     }
 
+    /// A static convex hull of world-space points (§15 collision proxies).
+    /// `None` when there is no hull (too few or collinear points).
+    fn add_static_hull(&mut self, points: &[Vector]) -> Option<ColliderHandle> {
+        ColliderBuilder::convex_hull(points).map(|b| self.colliders.insert(b))
+    }
+
     /// A fixed axis-aligned box collider (static level geometry).
     fn add_static_box(&mut self, center: Vec3, size: Vec3) -> ColliderHandle {
         let h = size * 0.5;
@@ -1276,6 +1282,102 @@ fn spawn_static_prop(world: &mut World, args: &SpawnArgs) {
 }
 
 /// Shared body of the geometry prefabs.
+/// Triangle budget above which a prop collides as a convex hull instead of its
+/// exact mesh (§15). Measured on a 34k-triangle Poly Haven lantern: standing on
+/// its trimesh cost 27 ms per physics tick in debug (213 ms stepping off the
+/// rim) and 2.5 ms in release, and the fixed-step catch-up multiplied that
+/// into seconds per frame. Props of a few hundred triangles cost nothing
+/// measurable, so they keep exact collision.
+const TRIMESH_MAX_TRIS: usize = 2048;
+
+/// How a scene node collides (§15), from the `collider` prefab param.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColliderKind {
+    /// Exact mesh within `TRIMESH_MAX_TRIS`, a convex hull above it.
+    Auto,
+    Mesh,
+    Hull,
+    /// Oriented bounding box: the hull of the local bounds' eight corners.
+    Box,
+    None,
+}
+
+impl ColliderKind {
+    /// `collide: false` wins over `collider`, so older scenes keep meaning.
+    fn from_args(args: &SpawnArgs, collide: bool) -> Self {
+        if !collide {
+            return Self::None;
+        }
+        match args.spec.and_then(|s| s.str("collider")) {
+            None | Some("auto") => Self::Auto,
+            Some("mesh") => Self::Mesh,
+            Some("hull") => Self::Hull,
+            Some("box") => Self::Box,
+            Some("none") => Self::None,
+            Some(other) => {
+                eprintln!("[scene] unknown collider \"{other}\"; using auto");
+                Self::Auto
+            }
+        }
+    }
+}
+
+/// Build one primitive's static collider in world space. Flat geometry still
+/// gets a (zero-thickness) hull, which collides fine (tested). Only points with
+/// no hull at all, too few or collinear, fall back to the exact mesh.
+fn build_collider(
+    physics: &mut Physics,
+    data: &MeshData,
+    transform: Mat4,
+    kind: ColliderKind,
+) -> Option<ColliderHandle> {
+    let kind = match kind {
+        ColliderKind::Auto if data.indices.len() / 3 > TRIMESH_MAX_TRIS => ColliderKind::Hull,
+        ColliderKind::Auto => ColliderKind::Mesh,
+        k => k,
+    };
+    let world = |p: Vec3| to_rapier(transform.transform_point3(p));
+    let trimesh = |physics: &mut Physics| {
+        let verts: Vec<Vector> = data
+            .vertices
+            .iter()
+            .map(|v| world(Vec3::from(v.pos)))
+            .collect();
+        let tris: Vec<[u32; 3]> = data
+            .indices
+            .chunks_exact(3)
+            .map(|t| [t[0], t[1], t[2]])
+            .collect();
+        physics.add_static_trimesh(verts, tris)
+    };
+    let points: Vec<Vector> = match kind {
+        ColliderKind::None => return None,
+        ColliderKind::Mesh | ColliderKind::Auto => return trimesh(physics),
+        ColliderKind::Hull => data
+            .vertices
+            .iter()
+            .map(|v| world(Vec3::from(v.pos)))
+            .collect(),
+        ColliderKind::Box => {
+            let (lo, hi) = data.bounds();
+            (0..8)
+                .map(|i| {
+                    let pick = |bit: usize, a: f32, b: f32| if i & bit == 0 { a } else { b };
+                    world(Vec3::new(
+                        pick(1, lo.x, hi.x),
+                        pick(2, lo.y, hi.y),
+                        pick(4, lo.z, hi.z),
+                    ))
+                })
+                .collect()
+        }
+    };
+    physics.add_static_hull(&points).or_else(|| {
+        eprintln!("[scene] degenerate {kind:?} collider; using the exact mesh");
+        trimesh(physics)
+    })
+}
+
 fn spawn_scene_node(
     world: &mut World,
     args: &SpawnArgs,
@@ -1283,24 +1385,15 @@ fn spawn_scene_node(
     no_shadow: bool,
 ) -> Option<Entity> {
     let mesh = args.mesh?;
-    let collider = match (collide, args.mesh_data) {
-        (true, Some(data)) => {
-            let verts: Vec<Vector> = data
-                .vertices
-                .iter()
-                .map(|v| to_rapier(args.transform.transform_point3(Vec3::from(v.pos))))
-                .collect();
-            let tris: Vec<[u32; 3]> = data
-                .indices
-                .chunks_exact(3)
-                .map(|t| [t[0], t[1], t[2]])
-                .collect();
-            world
-                .resource_mut::<Physics>()
-                .add_static_trimesh(verts, tris)
-        }
-        _ => None,
-    };
+    let kind = ColliderKind::from_args(args, collide);
+    let collider = args.mesh_data.and_then(|data| {
+        build_collider(
+            &mut world.resource_mut::<Physics>(),
+            data,
+            args.transform,
+            kind,
+        )
+    });
     let mut e = world.spawn((
         Transform(args.transform),
         Mesh(mesh),
@@ -3406,6 +3499,135 @@ mod tests {
     }
 
     // ---- §12 punctual lights ----
+
+    /// The shape rapier built for the single collider-carrying prop in `w`.
+    fn collider_shape(w: &mut World) -> Option<rapier3d::parry::shape::ShapeType> {
+        let c = w.query::<&ColliderRef>().iter(w).next()?.0;
+        Some(
+            w.resource::<Physics>()
+                .colliders
+                .get(c)?
+                .shape()
+                .shape_type(),
+        )
+    }
+
+    #[test]
+    fn collider_param_selects_the_proxy() {
+        use rapier3d::parry::shape::ShapeType::{ConvexPolyhedron, TriMesh};
+        let cube = MeshData::cube(1.0); // 12 triangles
+        let dense = MeshData::uv_sphere(64, 64, 1.0); // well past TRIMESH_MAX_TRIS
+        assert!(dense.indices.len() / 3 > TRIMESH_MAX_TRIS);
+        let cases: [(&MeshData, serde_json::Value, Option<_>); 8] = [
+            // Auto: exact under the budget, a hull over it.
+            (&cube, serde_json::json!({}), Some(TriMesh)),
+            (&dense, serde_json::json!({}), Some(ConvexPolyhedron)),
+            // Explicit choices override the budget either way.
+            (
+                &cube,
+                serde_json::json!({ "collider": "hull" }),
+                Some(ConvexPolyhedron),
+            ),
+            (
+                &dense,
+                serde_json::json!({ "collider": "mesh" }),
+                Some(TriMesh),
+            ),
+            (
+                &dense,
+                serde_json::json!({ "collider": "box" }),
+                Some(ConvexPolyhedron),
+            ),
+            (&dense, serde_json::json!({ "collider": "none" }), None),
+            // `collide: false` still wins, so older scenes keep their meaning.
+            (
+                &cube,
+                serde_json::json!({ "collide": false, "collider": "mesh" }),
+                None,
+            ),
+            // An unknown value warns and falls back to auto.
+            (
+                &cube,
+                serde_json::json!({ "collider": "bogus" }),
+                Some(TriMesh),
+            ),
+        ];
+        for (i, (mesh, params, want)) in cases.into_iter().enumerate() {
+            let spec = feather_assets::PrefabSpec {
+                id: "prop".into(),
+                params,
+            };
+            let mut w = prefab_world();
+            spawn_one(&mut w, Some(&spec), mesh);
+            assert_eq!(collider_shape(&mut w), want, "case {i}");
+        }
+    }
+
+    #[test]
+    fn a_flat_hull_still_holds_the_player() {
+        // Coplanar points: parry still builds a (zero-thickness) hull rather
+        // than failing. What matters is that it collides, so check that
+        // directly: a floor tile asked for a hull, raised 1 m, must hold the
+        // player instead of letting them fall through to the ground.
+        let v = |x: f32, z: f32| feather_assets::Vertex {
+            pos: [x, 0.0, z],
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0, 0.0],
+        };
+        let quad = MeshData {
+            vertices: vec![v(-2.0, -2.0), v(2.0, -2.0), v(2.0, 2.0), v(-2.0, 2.0)],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            material: Default::default(),
+        };
+        let at = Mat4::from_translation(Vec3::new(0.0, GROUND_Y + 1.0, 0.0));
+        let (mut physics, _) = setup(&[], Vec3::new(20.0, GROUND_Y, 20.0));
+        build_collider(&mut physics, &quad, at, ColliderKind::Hull).expect("collider");
+        let mut p = Player::new(&mut physics, Vec3::new(0.0, GROUND_Y + 2.0, 0.0));
+        physics.step();
+        for _ in 0..90 {
+            step(&mut p, &mut physics, Vec3::ZERO, false, 0.0, false);
+        }
+        assert!(p.on_ground, "should stand on the tile");
+        assert!(
+            (p.pos.y - (GROUND_Y + 1.0)).abs() < 0.05,
+            "stood at {}",
+            p.pos.y
+        );
+    }
+
+    #[test]
+    fn a_dense_prop_is_walkable_as_a_hull() {
+        // The lantern case, synthetic: a 30 cm ball of ~32k triangles on the
+        // ground. Auto makes it a hull; the player can stand on it and walk off.
+        let ball = MeshData::uv_sphere(128, 128, 0.3);
+        assert!(ball.indices.len() / 3 > TRIMESH_MAX_TRIS);
+        let at = Mat4::from_translation(Vec3::new(0.0, GROUND_Y + 0.3, 0.0));
+        let (mut physics, _) = setup(&[], Vec3::new(20.0, GROUND_Y, 20.0));
+        let c = build_collider(&mut physics, &ball, at, ColliderKind::Auto).expect("collider");
+        assert_eq!(
+            physics.colliders.get(c).unwrap().shape().shape_type(),
+            rapier3d::parry::shape::ShapeType::ConvexPolyhedron
+        );
+        let mut p = Player::new(&mut physics, Vec3::new(0.0, GROUND_Y + 1.0, 0.0));
+        physics.step();
+        for _ in 0..60 {
+            step(&mut p, &mut physics, Vec3::ZERO, false, 0.0, false);
+        }
+        assert!(p.on_ground, "should stand on the ball");
+        assert!(
+            p.pos.y > GROUND_Y + 0.4,
+            "stood at {}, not on top of the ball",
+            p.pos.y
+        );
+        for _ in 0..90 {
+            step(&mut p, &mut physics, Vec3::X, false, 0.0, false);
+        }
+        assert!(
+            p.on_ground && (p.pos.y - GROUND_Y).abs() < 0.05,
+            "landed at {}",
+            p.pos.y
+        );
+    }
 
     #[test]
     fn point_light_prefab_reads_params_with_defaults() {
