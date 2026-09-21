@@ -594,13 +594,15 @@ tests. The clusters are ~2.6× conservative (22.2 lights walked per fragment vs
 
 Clustering pays where lights-in-frame ≫ lights-touching-the-pixel. Same scene
 with the scattered lights shrunk to r = 4 (≈1 per pixel): `geo` 0.37 → **0.22**
-(−41%), p10–p90 narrowing from 51% to 41% of the median. `--lights` (r = 14,
-~8.5 per pixel) is deliberately clustering's *worst* case. With dense overlap,
+(−41%), p10–p90 narrowing from 51% to 41% of the median. (That run predates
+`--light-radius` and used a hand-edited copy, which also shrank the scene's two
+authored r = 14 lights: 2 of 124 lights. Regenerate it with
+`--lights 120 --light-radius 4`.) `--lights` at its default r = 14 (~8.5 per
+pixel) is deliberately clustering's *worst* case. With dense overlap,
 the next cost to attack is the BRDF itself, not assignment.
 
 **Pending:** spot lights (cone-vs-AABB in `cluster.comp`); shadowed point lights
-(cube maps); a `--light-radius` option in the generator (the r = 4 run edited a
-copy of the scene by hand).
+(cube maps).
 
 ## 13. Image pipeline: IBL + post
 
@@ -1014,7 +1016,8 @@ and punctuation.
   point lights sit on the emissive spheres and down the pillar rows.
   `--density low|med|high` scales the field for A/B timing, `--lights N` scatters
   N extra point lights as geometry-free markers (the §12 light-loop benchmark:
-  mesh count is unchanged, so light count is the only variable), `--textures`
+  mesh count is unchanged, so light count is the only variable) and
+  `--light-radius R` sets their overlap (default 14), `--textures`
   adds procedural textures, `--seed` gives reproducible variants, `--check`
   re-parses the output and
   asserts the engine's invariants (bounds, ground contact, no intersection with

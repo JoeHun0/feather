@@ -132,7 +132,8 @@ data URI). The level is laid out in sectors, each aimed at one system:
 | `--zones LIST` | `all` | comma list of the zones above |
 | `--density low\|med\|high` | `med` | field size: 120 / 320 / 800 nodes |
 | `--seed N` | `7` | RNG seed; same seed + options → byte-identical file |
-| `--lights N` | `0` | scatter N extra point lights (r = 14, deliberately overlapping) as geometry-free markers |
+| `--lights N` | `0` | scatter N extra point lights as geometry-free markers |
+| `--light-radius R` | `14` | radius of the scattered lights. 14 ≈ 8.5 lights per pixel (heavy overlap, clustering's worst case); 4 ≈ 1 per pixel. Must be > 0; authored lights are unaffected |
 | `--textures` | off | procedural base-color / normal / MR textures |
 | `--no-extras` | off | omit all prefab `extras` (incompatible with `--lights`) |
 | `--check` | off | validate the output against the engine's constraints |
@@ -147,6 +148,9 @@ Recipes:
 ```bash
 # The light benchmark set (only the light count differs; same seed = same level)
 for n in 0 60 120; do python3 tools/gen_testscene.py --lights $n -o scratch/lights$n.gltf; done
+
+# Many small lights: the case clustering is built for
+python3 tools/gen_testscene.py --lights 120 --light-radius 4 -o scratch/lights120_r4.gltf --check
 
 # Culling / instancing load
 python3 tools/gen_testscene.py --density high -o scratch/dense.gltf --check

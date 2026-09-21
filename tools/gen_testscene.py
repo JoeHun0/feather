@@ -637,13 +637,14 @@ def zone_pbr(s, pal, extras_on):
         )
 
 
-def scatter_lights(s, count):
+def scatter_lights(s, count, radius=14.0):
     """Extra punctual lights spread over the walkable area (§12).
 
     Marker nodes with no geometry, so they add lighting cost and nothing else —
     which is what makes them a clean independent variable when measuring the
-    per-fragment light loop. Radii deliberately overlap: the brute-force loop
-    costs lights-in-frame, so overlap is the case clustering has to beat.
+    light loop. `radius` sets how much they overlap: the default 14 puts ~8.5
+    lights on every ground pixel, clustering's worst case, while ~4 leaves about
+    one — where clustering pays (ARCHITECTURE.md §12 has both measured).
     """
     for i in range(count):
         x = s.rng.uniform(-36.0, 36.0)
@@ -658,7 +659,7 @@ def scatter_lights(s, count):
                 "params": {
                     "color": [1.0, 0.55 + 0.35 * t, 0.3 + 0.6 * t],
                     "intensity": 18.0,
-                    "radius": 14.0,
+                    "radius": radius,
                 },
             },
             f"scatter_light_{i}",
@@ -895,13 +896,16 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--lights", type=int, default=0, metavar="N",
                     help="extra scattered point lights, for measuring the §12 "
-                         "per-fragment light loop (engine caps at 128 visible)")
+                         "clustered light loop (engine caps at 128 visible)")
+    ap.add_argument("--light-radius", type=float, default=14.0, metavar="R",
+                    help="radius of the --lights scatter (default 14: heavy "
+                         "overlap; ~4: about one light per pixel)")
     ap.add_argument("--textures", action="store_true",
                     help="procedural base-color/normal/MR textures (off by default "
                          "to stay well clear of MAX_TEXTURES)")
     ap.add_argument("--no-extras", action="store_true",
-                    help="omit the §18 prefab extras (inert today; the loader "
-                         "ignores them)")
+                    help="omit the §18 prefab extras (player_start, props, "
+                         "point lights); the engine then spawns at its default")
     ap.add_argument("--check", action="store_true", help="validate after writing")
     args = ap.parse_args()
 
@@ -929,10 +933,12 @@ def main():
         if n < DENSITY[args.density]:
             print(f"note: field placed {n}/{DENSITY[args.density]} "
                   "(ran out of free space)", file=sys.stderr)
+    if args.light_radius <= 0.0:
+        ap.error("--light-radius must be > 0 (a zero-radius light lights nothing)")
     if args.lights > 0:
         if not extras_on:
             ap.error("--lights needs extras; drop --no-extras")
-        scatter_lights(s, args.lights)
+        scatter_lights(s, args.lights, args.light_radius)
     if extras_on:
         g.add_marker(SPAWN, {"prefab": "player_start", "params": {"yaw": 180.0}}, "player_start")
 
