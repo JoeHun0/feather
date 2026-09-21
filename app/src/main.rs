@@ -2076,16 +2076,8 @@ impl ApplicationHandler for App {
                     }; SHADOW_CASCADES];
                     let mut near = 0.1f32;
                     for (i, far) in splits.iter().copied().enumerate() {
-                        let (centre, radius) = slice_sphere(
-                            eye,
-                            fwd,
-                            right_v,
-                            up_v,
-                            60f32.to_radians(),
-                            aspect,
-                            near,
-                            far,
-                        );
+                        let (centre, radius) =
+                            slice_sphere(eye, fwd, right_v, up_v, CAMERA_FOV_Y, aspect, near, far);
                         let (view_proj, texel_world) = fit_cascade(centre, radius, sun_dir, dim);
                         cascades[i] = CascadeSetup {
                             view_proj,
@@ -2098,8 +2090,11 @@ impl ApplicationHandler for App {
                     // per view. Camera frustum trims the main pass; each cascade's ortho
                     // trims its own caster set.
                     let camera_frustum = Frustum::from_view_proj(&view_proj);
-                    let light_frusta: [Frustum; SHADOW_CASCADES] =
-                        std::array::from_fn(|i| Frustum::from_view_proj(&cascades[i].view_proj));
+                    // Casters ignore the cascade's near plane: up-light geometry is
+                    // pancaked onto it (§11) rather than dropped.
+                    let light_frusta: [Frustum; SHADOW_CASCADES] = std::array::from_fn(|i| {
+                        Frustum::from_view_proj(&cascades[i].view_proj).without_near()
+                    });
                     let lights = extract_lights(&mut s.world, &camera_frustum);
 
                     // Extract: interpolate each entity's sim state (prev -> curr) by
@@ -2416,9 +2411,12 @@ fn fit_cascade(centre: Vec3, radius: f32, sun_dir: Vec3, dim: u32) -> (Mat4, f32
         c.z,
     );
     let centre = basis.inverse().transform_point3(snapped);
-    // Pull the light back past the sphere so casters above it are still inside
-    // the depth range. Without pancaking (§11, not yet implemented) a caster
-    // further than this toward the light is clipped and stops casting.
+    // Pull the light back past the sphere. With pancaking (§11) a caster further
+    // than this toward the light is no longer lost: casters are culled without
+    // the near plane and depth-clamped onto it. So `SHADOW_BACK` now only
+    // spends depth precision, and it stays at 40 because SHADOW_DEPTH_BIAS is
+    // in normalised depth over `back + radius`: shrinking the range would
+    // silently shrink the world-space bias.
     let back = radius + SHADOW_BACK;
     let light_eye = centre - sun_dir * back;
     let view = Mat4::look_at_rh(light_eye, centre, Vec3::Y);
@@ -2491,6 +2489,17 @@ impl Frustum {
             planes[i] = if len > 0.0 { p / len } else { p };
         }
         Self { planes }
+    }
+
+    /// The same frustum with its near plane dropped, for culling **shadow
+    /// casters** (§11 pancaking). Geometry nearer the sun than a cascade's near
+    /// plane still shadows the cascade: the shadow pipeline's depth clamp
+    /// flattens it onto depth 0 instead of clipping it. An ortho's side planes
+    /// are parallel to the light, so anything outside them could never shadow
+    /// the box and stays culled; only the near plane is at fault.
+    fn without_near(mut self) -> Self {
+        self.planes[4] = Vec4::new(0.0, 0.0, 0.0, 1.0); // every point passes
+        self
     }
 
     /// True unless the sphere is entirely behind some plane (i.e. culled).
@@ -3510,6 +3519,92 @@ mod tests {
             lights.iter().all(|l| l.pos_radius[2] < 0.0),
             "the light behind the camera should have been culled"
         );
+    }
+
+    /// The test level's tower (tools/gen_testscene.py): a 70 m pillar at
+    /// (30, 30), and the point on the ground where its top's shadow lands.
+    fn tower_top_and_its_shadow() -> (Vec3, Vec3, Vec3) {
+        let sun = Vec3::new(-0.4, -1.0, -0.3).normalize(); // as App::new
+        let top = Vec3::new(30.0, GROUND_Y + 69.5, 30.0);
+        let tip = top + sun * ((GROUND_Y - top.y) / sun.y);
+        (sun, top, tip)
+    }
+
+    #[test]
+    fn tall_casters_beyond_the_near_plane_still_cast() {
+        // The real cascade setup, with the player standing on the tower's
+        // shadow tip and looking at the tower.
+        let (sun, top, tip) = tower_top_and_its_shadow();
+        let eye = Vec3::new(tip.x, GROUND_Y + EYE_HEIGHT, tip.z);
+        let mut look = Look::new();
+        let to_tower = (top - eye).with_y(0.0).normalize();
+        look.yaw = to_tower.z.atan2(to_tower.x);
+        let (fwd, right, up) = look.camera_basis();
+        let splits = cascade_splits(0.1, SHADOW_DISTANCE, SHADOW_LAMBDA);
+        let mut near = 0.1;
+        let mut covering = 0;
+        let mut clipped = Vec::new();
+        for (i, far) in splits.into_iter().enumerate() {
+            let (c, r) = slice_sphere(eye, fwd, right, up, CAMERA_FOV_Y, 16.0 / 9.0, near, far);
+            near = far;
+            let (vp, _) = fit_cascade(c, r, sun, 2048);
+            let full = Frustum::from_view_proj(&vp);
+            if !full.contains_sphere(tip, 0.0) {
+                continue; // the shadow lands outside this cascade's box
+            }
+            covering += 1;
+            let caster_z = vp.project_point3(top).z;
+            let receiver_z = vp.project_point3(tip).z;
+            assert!(
+                receiver_z > 0.0,
+                "cascade {i}: receiver at depth {receiver_z}"
+            );
+            let kept = Frustum::from_view_proj(&vp)
+                .without_near()
+                .contains_sphere(top, 0.5);
+            assert!(kept, "cascade {i}: caster culling must keep the top");
+            if caster_z < 0.0 {
+                // Up-light of the near plane: before pancaking it was culled and
+                // cast nothing here; now it is kept, and the depth clamp puts it
+                // at 0, in front of the receiver.
+                assert!(
+                    !full.contains_sphere(top, 0.5),
+                    "cascade {i}: top not culled"
+                );
+                clipped.push(i);
+            } else {
+                // A cascade big enough to reach it was never affected.
+                assert!(full.contains_sphere(top, 0.5), "cascade {i}");
+            }
+        }
+        // The bug bites where it is most visible: the tight cascades around
+        // the player, so the shadow tip vanishes as you walk onto it.
+        assert!(clipped.contains(&0), "clipped cascades: {clipped:?}");
+        assert!(covering > 0, "no cascade covers the shadow tip");
+    }
+
+    #[test]
+    fn without_near_only_drops_the_near_plane() {
+        let (sun, _, tip) = tower_top_and_its_shadow();
+        let (vp, _) = fit_cascade(tip, 5.0, sun, 2048);
+        let full = Frustum::from_view_proj(&vp);
+        let casters = Frustum::from_view_proj(&vp).without_near();
+        for i in 0..2000u32 {
+            let p = tip
+                + Vec3::new(
+                    rand01(i * 5) - 0.5,
+                    rand01(i * 5 + 1) - 0.5,
+                    rand01(i * 5 + 2) - 0.5,
+                ) * 200.0;
+            let r = rand01(i * 5 + 3) * 3.0;
+            let n = full.planes[4];
+            let in_front_of_near = n.truncate().dot(p) + n.w >= -r;
+            if in_front_of_near {
+                assert_eq!(full.contains_sphere(p, r), casters.contains_sphere(p, r));
+            } else {
+                assert!(!full.contains_sphere(p, r));
+            }
+        }
     }
 
     #[test]

@@ -383,7 +383,8 @@ profiling shows a bubble to fill.
 Set 2 carries per-cascade light-space `viewProj`, split depths, world-texel
 size.
 
-**Landed (§26):** **4 cascades**, the design above less pancaking and PCSS. One
+**Landed (§26):** **4 cascades**, the design above less PCSS (pancaking landed
+later; see the end of this section). One
 D32 depth image with one **array layer per cascade** (`SHADOW_CASCADES = 4`),
 `gfx` rendering a depth-only pass per layer and `mesh.frag` sampling all of them
 through a `sampler2DArrayShadow`. Splits use the practical scheme (λ = 0.75) over
@@ -447,9 +448,30 @@ recover the mid-field (at 30 the 5–11 band comes out *worse*, 1.7×), because 
 scheme just re-shuffles which cascade covers where. **Per-cascade resolution is
 the only real lever**, and it costs fill linearly.
 
-**Pending:** **caster pancaking** — the cascade volume is not extended toward the
-light, so a caster further from the cascade sphere than `radius + SHADOW_BACK`
-is clipped and stops casting; PCSS; and per-cascade resolution variation (array
+**Landed (§26): caster pancaking.** Each cascade's light ortho starts
+`radius + SHADOW_BACK` (r + 40 m) up-light of its sphere. A caster further
+toward the sun was lost twice over: the light frustum's near plane culled it,
+and the rasteriser would have clipped whatever got through. Now casters are
+culled against the cascade frustum **with its near plane dropped**
+(`Frustum::without_near`). The side planes are parallel to the light, so
+anything outside them could never shadow the box and stays culled. The shadow
+pipeline enables **hardware depth clamp**, which flattens up-light geometry
+onto depth 0 so everything behind it compares as shadowed. That is exact per
+fragment, unlike clamping z in `shadow.vert`, which distorts triangles that
+cross the near plane. `depthClamp` is optional in core Vulkan: it is enabled
+when supported, and otherwise startup warns and the old clipping stays.
+`SHADOW_BACK` stays 40 even though it now only spends depth precision,
+because `SHADOW_DEPTH_BIAS` is in normalised depth over `back + radius`, so
+shrinking the range would silently shrink the world-space bias.
+
+The test level's 70 m tower at (30, 30) exercises it: its top is ~78 m
+up-light, which clips cascades 0–2 (radii ~5 / 11 / 25 m) but not the 73 m
+cascade 3. So before the fix its shadow's far end vanished exactly where you
+stood on it, near spawn, and reappeared from further away. A unit test builds
+the real cascades with the player on that shadow tip and asserts both the bug
+and the fix. Cost: none measurable (`--bench` identical to 0.01 ms).
+
+**Pending:** PCSS; and per-cascade resolution variation (array
 layers must share an extent, so §11's "far cascade 1024²" is not expressible in
 a single array — the sphere fit already gives far cascades more world per texel,
 which is that line's intent).
@@ -1108,8 +1130,8 @@ app        thin binary wiring it together
 3. Lighting: CSM sun + GTAO + a few clustered lights + IBL ambient (the "better
    than 2010" look lands here). (Landed: PBR + textures, analytic-sky IBL,
    4-cascade CSM with 3×3 PCF, and clustered punctual point lights (§12 stage
-   B, the engine's first compute pass). Remaining: GTAO, cubemap IBL, and
-   caster pancaking.)
+   B, the engine's first compute pass), and caster pancaking. Remaining: GTAO
+   and cubemap IBL.)
 4. Physics + FPS controller (rapier), fixed timestep + interpolation → walkable.
    (Landed: fixed timestep + interpolation, the rapier kinematic FPS controller
    against static colliders, and the ECS↔rapier sync systems with the player as an
@@ -1416,7 +1438,8 @@ precomputed cubemap/HDR IBL (analytic-sky IBL landed);
 shadows: **4-cascade CSM + 3×3 PCF landed** (§11) — practical splits, sphere-fit
 and texel-snapped per cascade, a depth array layer each, per-cascade caster
 culling, projection-based selection with an edge blend, and normal-offset bias;
-**pancaking and PCSS still pending**, and since array layers share an extent all
+caster pancaking (depth clamp + near-plane-free caster culling); **PCSS still
+pending**, and since array layers share an extent all
 cascades are the same resolution. Shadows now reach `SHADOW_DISTANCE` (60) rather
 than a ±16 box;
 bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset

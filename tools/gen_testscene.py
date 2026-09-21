@@ -478,7 +478,8 @@ class Scene:
 # Laid out in cardinal sectors so each can be framed on its own from spawn.
 
 def zone_shadow(s, pal, extras_on):
-    """North (-Z). Pillars spanning the shadow box boundary.
+    """North (-Z). Pillars spanning the shadow box boundary, plus one very tall
+    tower to the south-east whose shadow tests caster pancaking (§11).
 
     The player spawns at z=8 and SHADOW_RADIUS is 16, so shadows stop at z~=-8.
     These rows run from z=-5 (inside) to z=-36 (far outside), which makes the
@@ -504,6 +505,14 @@ def zone_shadow(s, pal, extras_on):
             if not s.free(pal["box"], t, None, sc, margin=0.0):
                 continue
             s.place(pal["box"], t, scale=sc, extras=extras, name=f"pillar_{ri}_{ci}")
+    # A 70 m tower far to the south-east: the §11 caster-pancaking test. With
+    # the sun at (-0.4, -1, -0.3) its top's shadow lands at about (2, 9), next
+    # to spawn, but the top is ~78 m up-light, past the near plane
+    # (radius + 40) of the tight cascades around the player. Unpancaked, the
+    # shadow's far end vanishes as you walk onto it.
+    tower_t, tower_sc = (30.0, GROUND_Y + 35.0, 30.0), (1.5, 70.0, 1.5)
+    assert s.free(pal["box"], tower_t, None, tower_sc), "tower site is occupied"
+    s.place(pal["box"], tower_t, scale=tower_sc, name="pancake_tower")
     # A line of lights down the pillar rows. They overlap deliberately: the
     # brute-force loop costs lights-in-frame, so overlap is what clustering has
     # to beat later.

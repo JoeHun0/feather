@@ -697,8 +697,12 @@ impl MeshRenderer {
         let shadow_dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&shadow_dyn_states);
         // Front-face cull + slope-scaled depth bias (set dynamically per pass)
-        // reduce shadow acne and peter-panning.
+        // reduce shadow acne and peter-panning. Depth clamp pancakes casters
+        // (§11): anything nearer the sun than the cascade's near plane lands on
+        // it at depth 0 instead of being clipped, so it still shadows everything
+        // behind it. Exact per fragment, unlike clamping z in the vertex shader.
         let shadow_raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .depth_clamp_enable(renderer.depth_clamp())
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::FRONT)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)

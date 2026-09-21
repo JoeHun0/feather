@@ -120,7 +120,7 @@ data URI). The level is laid out in sectors, each aimed at one system:
 
 | Zone | Exercises |
 |---|---|
-| `shadow` | pillars running past the old single-map boundary (CSM) |
+| `shadow` | pillars running past the old single-map boundary (CSM), and a 70 m tower at (30, 30) whose shadow ends beside spawn (caster pancaking) |
 | `traversal` | stairs and ramps around the 0.4 autostep and 45° slope limit |
 | `aa` | thin poles, a lattice, a picket fence at graded distances |
 | `field` | hundreds of nodes over a few meshes (dedup, instancing, culling) |
@@ -182,13 +182,13 @@ can be *visible* at once; lights past that are dropped for the frame with a
 
 ## 5. Tests — what exists and what it guards
 
-`cargo test --workspace`: 46 tests, all CPU-side (none needs a GPU).
+`cargo test --workspace`: 48 tests, all CPU-side (none needs a GPU).
 
 | Area | Crate | What the tests pin down |
 |---|---|---|
 | Character controller | app | settling, walking speed, jumps and head bumps, no air-jump, autostep lip vs wall, sliding along box faces, noclip |
 | Menus | app | row layout and hit-testing, wraparound, Esc/back behaviour, OPTIONS reachable from both menus, MSAA only outside a session, **every label drawable by the 5×7 A–Z/0–9 font** |
-| Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice |
+| Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
 | Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs |
 | Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space |

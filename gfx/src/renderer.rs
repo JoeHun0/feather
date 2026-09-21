@@ -208,6 +208,8 @@ pub struct Renderer {
     /// False when nothing will be drawn into the shadow map this frame.
     shadow_casters: bool,
     samples: vk::SampleCountFlags, // geometry-pass sample count (MSAA setting)
+    /// Whether the device's `depthClamp` feature was enabled (§11 pancaking).
+    depth_clamp: bool,
     shadow: Option<ShadowMap>,
     shadow_sampler: vk::Sampler, // comparison sampler (sampler2DShadow)
     shadow_dim: u32,             // live shadow-map dimension (quality setting)
@@ -335,8 +337,22 @@ impl Renderer {
         // array (material_id -> textures[]). Widely supported on modern GPUs.
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
             .shader_sampled_image_array_non_uniform_indexing(true);
+        // Depth clamp is what pancakes shadow casters (§11): geometry nearer the
+        // sun than a cascade's near plane is flattened onto it, so it still
+        // casts instead of being clipped. Near-universal, but optional in core.
+        let depth_clamp = unsafe { instance.get_physical_device_features(physical_device) }
+            .depth_clamp
+            == vk::TRUE;
+        if !depth_clamp {
+            eprintln!(
+                "[gfx] depthClamp unsupported: casters beyond a cascade's near plane \
+                 will be clipped and stop casting (§11)"
+            );
+        }
+        let core_features = vk::PhysicalDeviceFeatures::default().depth_clamp(depth_clamp);
         let device_create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
+            .enabled_features(&core_features)
             .enabled_extension_names(&device_exts)
             .push_next(&mut features13)
             .push_next(&mut features12);
@@ -479,6 +495,7 @@ impl Renderer {
             fxaa: false,
             shadow_casters: true,
             samples,
+            depth_clamp,
             hdr_sampler,
             shadow: Some(shadow),
             shadow_sampler,
@@ -525,6 +542,11 @@ impl Renderer {
     /// support; every geometry-pass pipeline must be built with this.
     pub fn samples(&self) -> vk::SampleCountFlags {
         self.samples
+    }
+
+    /// True if shadow pipelines may enable depth clamp (caster pancaking, §11).
+    pub fn depth_clamp(&self) -> bool {
+        self.depth_clamp
     }
 
     /// Latest smoothed per-pass GPU times (§21). All zero until a few frames have
