@@ -1,10 +1,13 @@
 # Feather — Engine Architecture
 
 Status: in active implementation — a textured-PBR forward renderer with IBL,
-4-cascade sun shadows, clustered punctual point lights, a depth
-prepass, per-view frustum culling, MSAA/FXAA, GPU per-pass timing, a rapier FPS
-controller in the ECS, glTF scene loading with §18 prefabs, and a main menu +
-pause menu with an options tree are up; see §26 for exactly what's built vs.
+4-cascade sun shadows with caster pancaking, clustered punctual point lights
+with sphere-light specular, a depth prepass, per-view frustum culling,
+MSAA/FXAA, mipmapped textures (deduplicated, a per-level bindless array, and
+an offline BC7 bake), GPU per-pass timing, a rapier FPS controller in the ECS
+with collision proxies for detailed props, glTF scene loading with §18
+prefabs, and a main menu + pause menu with an options tree are up;
+validation, including sync validation, is clean; see §26 for exactly what's built vs.
 still designed. How to build, run, test and measure it: [USAGE.md](USAGE.md).
 Scope: a from-scratch Rust + Vulkan engine for a minimalist open-world FPS.
 Visual floor is a 2010-era look; the baseline actually targets ~2016 image
@@ -1261,7 +1264,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
 
 ### Done (milestones 0–2, most of 3–4: PBR + IBL + sky, CSM, punctual lights, rapier controller, prefabs, menus)
 
-- **Workspace/toolchain**: 6 crates, `rust-toolchain.toml` (stable), GLSL→SPIR-V
+- **Workspace/toolchain**: 7 crates (`bake` is the offline §17 tool;
+  `default-members = ["app"]` so plain `cargo run` means the game),
+  `rust-toolchain.toml` (stable), GLSL→SPIR-V
   at build time via `shaderc` in `render/build.rs`, embedded from `OUT_DIR`.
 - **Deps in use**: ash 0.38, ash-window 0.13, raw-window-handle 0.6, winit 0.30,
   vk-mem 0.4, glam 0.29, bevy_ecs 0.16, serde 1, rapier3d `=0.35.3` (exact
@@ -1271,8 +1276,11 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   until the workspace glam is bumped to match. Also `gltf 1` (`import`, `utils`,
   `extras` and `names` features, pulling in the `image` crate) and `serde_json 1`
   in `assets` — the latter for §18 prefab params, already in the tree via gltf.
-  `app` has `serde_json` as a dev-dependency only. Not yet added: kira, egui,
-  tracy.
+  `app` has `serde_json` as a dev-dependency only. `xxhash-rust` (xxh3) in
+  `assets` for the baked-texture content key; `intel_tex_2` (Intel's ISPC BCn
+  encoder) in `bake` only, so the engine never links it. Dependencies build
+  optimised even in debug (`[profile.dev.package."*"]`). Not yet added: kira,
+  egui, tracy.
 - **gfx**: instance/debug messenger/surface/device/queues (on debug builds the
   validation layer + messenger are enabled only when
   `VK_LAYER_KHRONOS_validation` is installed; if missing, a warning is printed
@@ -1554,8 +1562,9 @@ colliders and the ECS↔rapier sync systems landed — dynamic bodies and collis
 layers pending);
 skinning; UI/HUD (§19's lightweight quad/text renderer + the Esc pause menu
 landed, with keyboard *and* mouse navigation, an OPTIONS screen tree, and live
-shadow-quality/FXAA controls under GRAPHICS — MSAA is shown there but stays
-restart-only until pipelines can be rebuilt live; egui dev UI, SDF text and
+shadow-quality/FXAA controls under GRAPHICS — MSAA is changeable there only
+from the main menu, since the session's mesh and sky pipelines bake the sample
+count; egui dev UI, SDF text and
 lower-case/punctuation pending); audio; debug/profiling tooling (per-pass GPU timestamp timing
 landed — stderr log + `Renderer::gpu_times`, plus the `--bench` sweep harness;
 Tracy / RenderDoc / egui overlay and

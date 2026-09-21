@@ -229,8 +229,8 @@ and uploaded once however many materials share it.
 ### Compressing textures — `feather-bake`
 
 ```bash
-cargo run --release -p feather-bake -- scratch/detail_med.glb   # any scenes; incremental
-cargo run --release -- scratch/detail_med.glb                    # now uploads BC7
+cargo run --release -p feather-bake -- scratch/detail.glb   # any scenes; incremental
+cargo run --release -- scratch/detail.glb                    # now uploads BC7
 ```
 
 The bake turns every texture a scene uses into a **BC7** mip chain in
