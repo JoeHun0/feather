@@ -1091,6 +1091,10 @@ impl Renderer {
             // ---- Shadow pass: render the sun depth map (depth-only). ----
 
             // Shadow: UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL (prior contents dropped).
+            // One image serves every frame in flight, so the transition (a write)
+            // must wait for the previous frame's use of it — its depth writes and
+            // the geometry pass sampling it — rather than start at TOP_OF_PIPE. A
+            // barrier's first scope covers earlier submissions on the queue.
             let shadow_to_attach = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
@@ -1098,11 +1102,12 @@ impl Renderer {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(shadow_img.image.handle)
                 .subresource_range(shadow_range)
-                .src_access_mask(vk::AccessFlags::empty())
+                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
             dev.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1225,6 +1230,8 @@ impl Renderer {
             // ---- Geometry pass: render into the linear HDR target. ----
 
             // HDR: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL (prior contents discarded).
+            // Shared across frames in flight: wait for the previous frame's colour
+            // writes/resolve and the tonemap pass sampling it.
             let to_hdr = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -1232,11 +1239,12 @@ impl Renderer {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(hdr.handle)
                 .subresource_range(color_range)
-                .src_access_mask(vk::AccessFlags::empty())
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
             dev.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1247,6 +1255,7 @@ impl Renderer {
             // Same transition for the resolve target when MSAA is on — it is
             // written by the resolve at end_rendering.
             if let Some(r) = hdr_resolve {
+                // Shared across frames: wait for the previous resolve and tonemap read.
                 let to_resolve = vk::ImageMemoryBarrier::default()
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -1254,11 +1263,12 @@ impl Renderer {
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(r.handle)
                     .subresource_range(color_range)
-                    .src_access_mask(vk::AccessFlags::empty())
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                     .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
                 dev.cmd_pipeline_barrier(
                     cmd,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
                     vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                     vk::DependencyFlags::empty(),
                     &[],
@@ -1268,6 +1278,7 @@ impl Renderer {
             }
 
             // Depth: UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL
+            // Shared across frames: wait for the previous frame's depth tests.
             let to_depth = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
@@ -1275,11 +1286,12 @@ impl Renderer {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(depth.handle)
                 .subresource_range(depth_range)
-                .src_access_mask(vk::AccessFlags::empty())
+                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
             dev.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
                 vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1359,6 +1371,10 @@ impl Renderer {
             );
 
             // Swapchain: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
+            // Without FXAA this is the swapchain image: COLOR_ATTACHMENT_OUTPUT is the
+            // stage the acquire semaphore waits at, so the transition chains after the
+            // acquire. With FXAA it is the shared LDR image, whose previous-frame
+            // writes and FXAA read this also waits for.
             let to_color = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -1366,11 +1382,12 @@ impl Renderer {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(post_image)
                 .subresource_range(color_range)
-                .src_access_mask(vk::AccessFlags::empty())
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
             dev.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::DependencyFlags::empty(),
                 &[],

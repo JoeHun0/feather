@@ -275,10 +275,9 @@ while it runs.
 | Loader debugging | `VK_LOADER_DEBUG=layer` shows which layers actually load |
 | Simulate a missing layer | `VK_LOADER_LAYERS_DISABLE=VK_LAYER_KHRONOS_validation` |
 
-**Known issue:** sync validation currently reports thousands of pre-existing
-cross-frame image layout-transition hazards (ARCHITECTURE.md §21). To judge a
-change, compare the message *counts* against committed code rather than
-expecting zero:
+**Sync validation is clean: expect zero messages.** Anything it reports after
+your change is yours (ARCHITECTURE.md §21 has the rule that fixed the last
+batch). To see the messages grouped by type:
 
 ```bash
 VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true target/debug/feather --bench scratch/lights120.gltf 2>&1 \

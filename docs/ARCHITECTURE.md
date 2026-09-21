@@ -1030,11 +1030,19 @@ and punctuation.
   **Landed (§26):** core validation on debug builds, enabled only if the layer is
   installed (otherwise a startup warning, not a failure). Sync validation has
   no in-app toggle yet, but runs via the layer's env var:
-  `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`. **Known issue:** on committed code
-  it reports ~3.4k cross-frame image layout-transition hazards per `--bench`
-  run (swapchain acquire, and `UNDEFINED` transitions on the shared depth/HDR/
-  shadow images using `TOP_OF_PIPE` as their source stage). They predate
-  stage B and are unfixed.
+  `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`. **It is clean — keep it so.** The
+  first run found ~3.4k cross-frame hazards per `--bench` run. The shadow,
+  depth, HDR, resolve and LDR images are *single* images shared by every frame
+  in flight, yet their `UNDEFINED` transitions used `TOP_OF_PIPE` as the
+  source stage. That ordered nothing against the previous frame still writing
+  or sampling them. Without FXAA the same mistake left the swapchain
+  transition unchained from the acquire semaphore (which waits at
+  `COLOR_ATTACHMENT_OUTPUT`). Each transition now takes as its source the
+  stages of that image's previous-frame uses. A barrier's first scope covers
+  earlier submissions on the queue, so this orders frame N+1 after frame N.
+  Verified at 0 messages across default, MSAA 4×, FXAA, shadows-off, all
+  three combined, and the main menu; `--bench` timings were unchanged. Any
+  *new* per-frame image must follow the same rule.
 - **Debug draw:** immediate line/shape renderer (bounds, frustums, rapier
   colliders) + fullscreen debug modes via push-constant flags (wireframe,
   cascade tint, cluster-light heatmap, overdraw).
