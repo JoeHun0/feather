@@ -868,7 +868,13 @@ def check(doc, strict_dedup=True):
         if aabb[0][1] < GROUND_Y - 0.01:
             errors.append(f"node {ni} ({name}): sinks below GROUND_Y "
                           f"({aabb[0][1]:.2f} < {GROUND_Y})")
-        for k in keep:
+        # Ground cover (a flat decal lying on the ground, e.g. the nature
+        # scene's grass tiles) can neither intersect the app's boxes nor block
+        # the spawn, so it is exempt from the keep-out test. The procedural
+        # level has none, so this changes nothing for it.
+        ground_cover = (aabb[1][1] - aabb[0][1] < 0.05
+                        and abs(aabb[0][1] - GROUND_Y) < 0.05)
+        for k in ([] if ground_cover else keep):
             if overlaps(aabb, k):
                 errors.append(f"node {ni} ({name}): intersects the app's own level "
                               "geometry or the spawn clearance")

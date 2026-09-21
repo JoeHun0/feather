@@ -178,6 +178,30 @@ An unknown prefab name falls back to static geometry. Up to 128 point lights
 can be *visible* at once; lights past that are dropped for the frame with a
 `[light]` warning.
 
+### A scene from real CC0 models — Kenney Nature Kit
+
+```bash
+python3 tools/fetch_assets.py                 # once: ~10.5 MB, SHA-256 pinned
+python3 tools/gen_naturescene.py --check      # writes scratch/nature.glb
+cargo run -- scratch/nature.glb
+```
+
+`fetch_assets.py` downloads the pinned archive, **refuses it if the SHA-256
+doesn't match**, and extracts only the `.glb` models and the licence into
+`scratch/assets/kenney_nature_kit/` (gitignored, like all of `scratch/`). Run
+it again and it's a no-op. `--zip PATH` uses an archive you already have
+(still hash-checked); `--force` re-extracts.
+
+The kit is **CC0** (Creative Commons Zero, see its `License.txt`): free for any
+use, with credit to Kenney (kenney.nl) appreciated but not required.
+
+`gen_naturescene.py` builds a grass meadow, forest, rocks, a cliff ridge on the
+east edge, a camp with a fire light (you spawn at its edge, facing the fire), and a
+stone path lit by lamps. Options: `--density low|med|high`, `--seed N`,
+`-o PATH`, `--check` (the same engine constraints as the procedural
+generator). Grass, flowers and ground tiles have no collider and cast no
+shadow; trees, rocks, the tent and fences do both.
+
 ---
 
 ## 5. Tests — what exists and what it guards

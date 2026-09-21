@@ -1082,6 +1082,26 @@ and punctuation.
   Stdlib-only Python; the generator is committed and its output is not, since
   `/scratch/` is gitignored. **Not** the §17 bake tool — that is the offline
   asset-blob pipeline, this is dev content.
+  **Real-asset scene:** `tools/fetch_assets.py` pins third-party CC0 packs by URL
+  + SHA-256 (refusing a mismatch) into the gitignored `scratch/assets/`, and
+  `tools/gen_naturescene.py` composes the **Kenney Nature Kit** into
+  `scratch/nature.glb`: a meadow of grass tiles, a forest, rocks, a cliff
+  ridge, a lit camp and a lamp-lit path. It is one level `.glb` with prefab
+  `extras`, like the generator's, so the engine needed no change. What it has
+  to do to the kit:
+  - Kenney's materials are `KHR_materials_unlit` with metallic = 1, roughness
+    = 1, which the engine (ignoring `unlit`) would draw as dark tinted metal.
+    They become dielectric (metallic 0, roughness 0.9) with the colour kept.
+  - Inner transforms are baked into the vertices, so placements are
+    translation + yaw + uniform scale, which satisfies the normal rule by
+    construction.
+  - Every model is instanced.
+  - Models are scaled ×4 (Kenney trees are 1.7 units).
+  It reuses `gen_testscene.check()`. That check now exempts flat ground cover
+  (under 5 cm, lying on the ground) from the keep-out test: a floor decal
+  cannot block the app's boxes or the spawn. The procedural level has none.
+  Measured (RX 7800 XT, `profile_standard`, `--bench`, `med`, ~1480 nodes):
+  `shadow` 0.08 ms, `geo` 0.23 ms, `frame` 0.36 ms.
 - **RenderDoc:** in-application API, capture on a keybind.
 - **Object naming:** `vkSetDebugUtilsObjectName` on buffers/images/pipelines
   from the start (readable validation + captures).

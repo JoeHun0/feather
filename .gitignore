@@ -1,3 +1,5 @@
 *.patch
 /target
 /scratch/
+# Python bytecode (tools/gen_naturescene.py imports gen_testscene)
+__pycache__/
