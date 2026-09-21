@@ -5,7 +5,7 @@ Status: in active implementation — a textured-PBR forward renderer with IBL,
 prepass, per-view frustum culling, MSAA/FXAA, GPU per-pass timing, a rapier FPS
 controller in the ECS, glTF scene loading with §18 prefabs, and a main menu +
 pause menu with an options tree are up; see §26 for exactly what's built vs.
-still designed.
+still designed. How to build, run, test and measure it: [USAGE.md](USAGE.md).
 Scope: a from-scratch Rust + Vulkan engine for a minimalist open-world FPS.
 Visual floor is a 2010-era look; the baseline actually targets ~2016 image
 quality where it costs little. Long-term goal: an original Zone-flavored
