@@ -26,8 +26,9 @@ Engine constraints this respects (all verified against the source)
   intersect those.
 * The loader takes triangles only, requires POSITION, computes normals when
   absent and reads TEXCOORD_0 when present (assets/src/lib.rs:322, :352-361).
-* MAX_TEXTURES = 64 (render/src/mesh.rs:22); past that, materials fall back to
-  the default textures.
+* The engine's bindless texture array is sized per level to the textures it
+  uses, limited by the device (millions), so --check no longer caps textures;
+  --many-textures deliberately exceeds the old fixed 64.
 * NORMAL TRANSFORM: mesh.vert uses mat3(model), which is only correct for
   uniform scale, or for non-uniform scale with no rotation
   (render/shaders/mesh.vert:33). So: rotated nodes must be uniformly scaled, and
@@ -51,7 +52,6 @@ GROUND_HALF = 40.0
 SPAWN = (0.0, -9.0, 8.0)
 SHADOW_RADIUS = 16.0
 AUTOSTEP = 0.4
-MAX_TEXTURES = 64
 
 # The five obstacle boxes the app always spawns (app/src/main.rs:898-904), as
 # (center_x, center_y_offset_above_ground, center_z, size_x, size_y, size_z).
@@ -727,7 +727,7 @@ def zone_field(s, pal, count):
 
 # --- Palette ----------------------------------------------------------------
 
-def build_palette(g, use_textures):
+def build_palette(g, use_textures, many_textures=False):
     """Mesh + material palette.
 
     Deliberately few meshes for most of the scene, so hundreds of nodes collapse
@@ -737,8 +737,7 @@ def build_palette(g, use_textures):
     """
     # Several *distinct* base-color textures, not one shared set: the point is
     # to populate multiple slots of the bindless textures[] array so the
-    # non-uniform indexing path is actually exercised. Still far under
-    # MAX_TEXTURES (render/src/mesh.rs:22).
+    # non-uniform indexing path is actually exercised.
     tex_box = tex_sphere = tex_metal = tex_ramp = None
     if use_textures:
         normal_t = g.add_texture(normal_tex())
@@ -786,8 +785,21 @@ def build_palette(g, use_textures):
         for ri in range(5):
             metallic = mi / 5.0
             roughness = 0.06 + (ri / 4.0) * 0.9
+            tex = None
+            if many_textures:
+                # Its own base-colour checker (tinted by grid cell, so every
+                # sphere is visibly distinct) and its own MR texture near 1,
+                # so the material factors still set the metallic x roughness
+                # grid. 60 unique images: the level exceeds the old fixed
+                # 64-slot array on its own.
+                i = mi * 5 + ri
+                tint = (60 + (i * 37) % 180, 60 + (i * 91) % 180, 60 + (i * 53) % 180, 255)
+                base = g.add_texture(checker_tex(cells=2 + ri * 2, a=tint))
+                mr = g.add_texture(checker_tex(cells=4, a=(255, 255, 255, 255),
+                                               b=(255, 235 - i, 255, 255)))
+                tex = (base, normal_t, mr)
             mat = g.add_material(
-                f"pbr_m{mi}_r{ri}", (0.82, 0.80, 0.76, 1.0), metallic, roughness
+                f"pbr_m{mi}_r{ri}", (0.82, 0.80, 0.76, 1.0), metallic, roughness, tex=tex
             )
             pal["pbr"].append(g.add_mesh(f"pbr_m{mi}_r{ri}", [(geom, mat)]))
 
@@ -881,9 +893,6 @@ def check(doc, strict_dedup=True):
                 break
 
     n_tex = len(doc.get("textures", []))
-    if n_tex >= MAX_TEXTURES:
-        errors.append(f"{n_tex} textures >= MAX_TEXTURES ({MAX_TEXTURES}); "
-                      "the surplus would fall back to defaults (render/src/mesh.rs:22)")
     ratio = mesh_nodes / max(1, len(referenced))
     if strict_dedup and ratio <= 1.0:
         errors.append(f"{mesh_nodes} mesh-bearing nodes over {len(referenced)} referenced "
@@ -923,8 +932,11 @@ def main():
                     help="radius of the --lights scatter (default 14: heavy "
                          "overlap; ~4: about one light per pixel)")
     ap.add_argument("--textures", action="store_true",
-                    help="procedural base-color/normal/MR textures (off by default "
-                         "to stay well clear of MAX_TEXTURES)")
+                    help="procedural base-color/normal/MR textures")
+    ap.add_argument("--many-textures", action="store_true",
+                    help="also give each of the 30 PBR spheres its own base-colour "
+                         "and MR texture (~70 unique images, past the engine's "
+                         "old 64-slot cap); implies --textures")
     ap.add_argument("--no-extras", action="store_true",
                     help="omit the §18 prefab extras (player_start, props, "
                          "point lights); the engine then spawns at its default")
@@ -939,7 +951,7 @@ def main():
 
     g = Gltf()
     s = Scene(g, random.Random(args.seed))
-    pal = build_palette(g, args.textures)
+    pal = build_palette(g, args.textures or args.many_textures, args.many_textures)
     extras_on = not args.no_extras
 
     if "shadow" in want:

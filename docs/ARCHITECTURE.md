@@ -1093,7 +1093,7 @@ and punctuation.
   adds procedural textures, `--seed` gives reproducible variants, `--check`
   re-parses the output and
   asserts the engine's invariants (bounds, ground contact, no intersection with
-  the app's own level geometry, the normal-transform rule below, texture count).
+  the app's own level geometry, the normal-transform rule below).
   Stdlib-only Python; the generator is committed and its output is not, since
   `/scratch/` is gitignored. **Not** the §17 bake tool — that is the offline
   asset-blob pipeline, this is dev content.
@@ -1127,7 +1127,7 @@ and punctuation.
   - **Textures are.** The loader converts each material's textures *per
     primitive* (81 conversions of 12 images: 13.5 s of a 13.9 s debug load)
     and the renderer uploads per material. So ~1 GB of VRAM goes on
-    duplicates of 192 MB of unique images, and past `MAX_TEXTURES` = 64 some
+    duplicates of 192 MB of unique images, and past the then-fixed 64 slots some
     materials silently fall back to default textures. **Fixed:** the loader
     converts each glTF *image* once and shares it by `Arc` across materials,
     and the renderer uploads one slot per unique image × colour space
@@ -1274,9 +1274,16 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   at set0/binding0 (vertex); a **resident materials SSBO** `GpuMaterial` (§5: 64 B
   — base color, metallic, roughness, emissive, normal_scale, `tex` = base /
   normal / MR slots) at binding1 (fragment); and a **bindless-lite texture
-  array** — fixed `sampler2D textures[64]` at binding2, non-uniformly indexed by
-  material (slot 0 = white, slot 1 = flat normal; every *unused* slot points at
-  white/slot 0, not the flat-normal default). Textures carry a **full mip
+  array** — a runtime-sized `sampler2D textures[]` at binding2 (the
+  `runtimeDescriptorArray` feature), non-uniformly indexed by material. It is
+  **sized per level to exactly the textures it uses**: slot 0 = white, slot 1
+  = flat normal, then one slot per unique image × colour space, with no
+  padding. The only ceiling is the device's combined-image-sampler limit
+  (8.4M per stage here). The fixed `textures[64]` it replaced let a level hold
+  only ~20 Poly Haven-style models (3 textures each); `gen_testscene.py
+  --many-textures` (66 textures) proves the difference: the old binary
+  dropped 4 references to defaults, the new one uploads all 66. GPU cost is
+  identical (`--bench` A/B). Textures carry a **full mip
   chain**, built on upload by a GPU blit chain (`_SRGB` blits filter in linear
   space, so base-colour mips darken correctly). They're sampled **trilinear
   with 16× anisotropy** (when `samplerAnisotropy` is supported), since mips
@@ -1352,9 +1359,10 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   longer what perf work should be measured against — `tools/gen_testscene.py`
   (§21) generates the realistic one. Culling uses a **per-mesh local bounding sphere**
   mapped through the model matrix, rather than a blanket radius — required because
-  scene meshes are not unit-fitted. Limits: `MAX_TEXTURES = 64` *unique*
-  images (deduplicated per image × colour space; past that, references use the
-  defaults with a `[mesh]` warning), a collider is built per node at load (an
+  scene meshes are not unit-fitted. Limits: unique textures are
+  bounded only by the device's descriptor limits (deduplicated per image ×
+  colour space; past the limit, references use the defaults with a `[mesh]`
+  warning), a collider is built per node at load (an
   exact trimesh up to 2048 triangles and a convex hull above that, overridable
   per node, §15; no convex *decomposition*), scenes land at their authored
   coordinates so a model authored around the origin floats above the demo ground
@@ -1413,10 +1421,11 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   geometry only depenetrates when not moving; default rapier features (no
   `enhanced-determinism`), so cross-machine replay isn't guaranteed yet.
 - **Descriptors (§9)**: one set with three bindings — per-frame instances
-  (binding 0), resident materials (binding 1), and a resident **fixed-size**
-  `sampler2D textures[64]` (binding 2), as N discrete per-frame sets. Not yet the
+  (binding 0), resident materials (binding 1), and a resident
+  `sampler2D textures[]` (binding 2) sized per level, as N discrete per-frame
+  sets. Not yet the
   Set 0 (resident) / Set 1 (per-frame ring) / Set 2 (per-view) split, and the
-  texture array is a fixed size filled at load — **not** update-after-bind /
+  texture array is sized and filled at load — **not** update-after-bind /
   partially-bound (fine until streaming; no runtime texture loading yet).
 - **Push constants**: currently carry `view_proj` + `light_dir` + `camera_pos`
   (96 B, provisional). Design reserves push constants for tiny per-draw scalars

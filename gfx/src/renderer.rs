@@ -212,6 +212,8 @@ pub struct Renderer {
     depth_clamp: bool,
     /// Max sampler anisotropy, or `None` if the feature isn't supported.
     max_anisotropy: Option<f32>,
+    /// Combined image samplers one set may hold (the bindless array's ceiling).
+    max_bindless_textures: usize,
     shadow: Option<ShadowMap>,
     shadow_sampler: vk::Sampler, // comparison sampler (sampler2DShadow)
     shadow_dim: u32,             // live shadow-map dimension (quality setting)
@@ -337,8 +339,11 @@ impl Renderer {
             .maintenance4(true);
         // Bindless-lite: non-uniform indexing into a fixed-size sampled-image
         // array (material_id -> textures[]). Widely supported on modern GPUs.
+        // Runtime-sized `textures[]` (§9): the bindless array is sized per level
+        // to exactly the textures it uses, limited only by the device.
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
-            .shader_sampled_image_array_non_uniform_indexing(true);
+            .shader_sampled_image_array_non_uniform_indexing(true)
+            .runtime_descriptor_array(true);
         // Depth clamp is what pancakes shadow casters (§11): geometry nearer the
         // sun than a cascade's near plane is flattened onto it, so it still
         // casts instead of being clipped. Near-universal, but optional in core.
@@ -386,6 +391,17 @@ impl Renderer {
         let limits = unsafe { instance.get_physical_device_properties(physical_device) }.limits;
         let samples = clamp_samples(&limits, msaa);
         let max_anisotropy = anisotropy.then_some(limits.max_sampler_anisotropy);
+        // Combined image samplers count against both sampler and sampled-image
+        // limits, per stage and per set.
+        let max_bindless_textures = [
+            limits.max_per_stage_descriptor_sampled_images,
+            limits.max_per_stage_descriptor_samplers,
+            limits.max_descriptor_set_sampled_images,
+            limits.max_descriptor_set_samplers,
+        ]
+        .into_iter()
+        .min()
+        .unwrap_or(0) as usize;
         if samples != MSAA_FALLBACK || msaa > 1 {
             eprintln!("[gfx] MSAA: requested {msaa}x, using {:?}", samples);
         }
@@ -504,6 +520,7 @@ impl Renderer {
             samples,
             depth_clamp,
             max_anisotropy,
+            max_bindless_textures,
             hdr_sampler,
             shadow: Some(shadow),
             shadow_sampler,
@@ -560,6 +577,13 @@ impl Renderer {
     /// The anisotropy a sampler may request, or `None` if it isn't supported.
     pub fn max_anisotropy(&self) -> Option<f32> {
         self.max_anisotropy
+    }
+
+    /// How many combined image samplers one descriptor set may hold, per stage
+    /// and per set: the ceiling for the bindless `textures[]` array plus any
+    /// other samplers bound beside it.
+    pub fn max_bindless_textures(&self) -> usize {
+        self.max_bindless_textures
     }
 
     /// Latest smoothed per-pass GPU times (§21). All zero until a few frames have

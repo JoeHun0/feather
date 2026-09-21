@@ -20,9 +20,6 @@ macro_rules! spv {
     };
 }
 
-/// Fixed size of the bindless texture array (`textures[]` in the shader). Slot 0
-/// is a resident white default; unused slots also point at it.
-const MAX_TEXTURES: usize = 64;
 /// Cap on punctual lights visible in one frame (§12). Clamped rather than
 /// grown: the buffer is sized once, and silently dropping past the cap is
 /// better than a resize mid-frame.
@@ -73,7 +70,10 @@ const FIRST_TEXTURE_SLOT: usize = 2;
 /// the `Arc`'s identity (the loader shares one per glTF image) plus the sRGB
 /// flag, since the same pixels sampled as base colour (sRGB) and as data
 /// (UNORM) need two image views. Pure, so it is testable without a GPU.
-fn plan_texture_slots(materials: &[Material]) -> TexturePlan {
+///
+/// `capacity` is the most slots the array may have: the device's limit, not a
+/// fixed constant (§9). References past it fall back to the defaults.
+fn plan_texture_slots(materials: &[Material], capacity: usize) -> TexturePlan {
     let mut uploads: Vec<(Arc<TextureData>, bool)> = Vec::new();
     let mut index: HashMap<(*const TextureData, bool), u32> = HashMap::new();
     let (mut references, mut overflow) = (0, 0);
@@ -86,7 +86,7 @@ fn plan_texture_slots(materials: &[Material]) -> TexturePlan {
         if let Some(&s) = index.get(&key) {
             return s;
         }
-        if FIRST_TEXTURE_SLOT + uploads.len() >= MAX_TEXTURES {
+        if FIRST_TEXTURE_SLOT + uploads.len() >= capacity {
             overflow += 1;
             return default;
         }
@@ -347,7 +347,9 @@ impl MeshRenderer {
             renderer.create_texture(&[128, 128, 255, 255], 1, 1, false), // 1: flat normal (UNORM)
         ];
         // Each unique image uploads once, however many materials use it.
-        let plan = plan_texture_slots(materials);
+        // The shadow map is the one other combined sampler in the set.
+        let capacity = renderer.max_bindless_textures().saturating_sub(1);
+        let plan = plan_texture_slots(materials, capacity);
         for (t, srgb) in &plan.uploads {
             textures.push(renderer.create_texture(&t.pixels, t.width, t.height, *srgb));
         }
@@ -358,11 +360,14 @@ impl MeshRenderer {
         );
         if plan.overflow > 0 {
             eprintln!(
-                "[mesh] {} texture references past MAX_TEXTURES ({MAX_TEXTURES}) use the defaults",
+                "[mesh] {} texture references past the device's {capacity} texture slots use the defaults",
                 plan.overflow
             );
         }
         let tex_slots = plan.slots;
+        // The runtime-sized `textures[]` binding holds exactly these: the two
+        // defaults plus one per unique image, with no padding.
+        let texture_count = textures.len() as u32;
 
         // Resident material table (§5). Uploaded once; indexed by material_id.
         let gpu_materials: Vec<GpuMaterial> = materials
@@ -430,11 +435,12 @@ impl MeshRenderer {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            // binding 2: bindless texture array (fragment stage).
+            // binding 2: bindless texture array (fragment stage), sized to this
+            // level's textures; the shader declares it runtime-sized.
             vk::DescriptorSetLayoutBinding::default()
                 .binding(2)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(MAX_TEXTURES as u32)
+                .descriptor_count(texture_count)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
             // binding 3: sun shadow map, comparison-sampled (fragment stage).
             vk::DescriptorSetLayoutBinding::default()
@@ -480,7 +486,7 @@ impl MeshRenderer {
             // the texture array + the shadow map, per set.
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(((MAX_TEXTURES + 1) * FRAMES_IN_FLIGHT) as u32),
+                .descriptor_count((texture_count + 1) * FRAMES_IN_FLIGHT as u32),
             // the globals UBO, per set.
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
@@ -509,12 +515,12 @@ impl MeshRenderer {
         };
         // Texture array image infos (resident; the same for every frame's set).
         // Every slot is bound — used slots to their texture, the rest to white.
-        let tex_infos: Vec<vk::DescriptorImageInfo> = (0..MAX_TEXTURES)
-            .map(|i| {
-                let view = textures.get(i).unwrap_or(&textures[0]).view;
+        let tex_infos: Vec<vk::DescriptorImageInfo> = textures
+            .iter()
+            .map(|t| {
                 vk::DescriptorImageInfo::default()
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .image_view(view)
+                    .image_view(t.view)
                     .sampler(sampler)
             })
             .collect();
@@ -1289,7 +1295,7 @@ mod tests {
             with(None, Some(&shared)), // same pixels as data (UNORM): new slot
             with(None, None),          // no textures: the defaults
         ];
-        let plan = plan_texture_slots(&materials);
+        let plan = plan_texture_slots(&materials, 1024);
         assert_eq!(plan.uploads.len(), 3);
         assert_eq!(plan.references, 4);
         assert_eq!(plan.overflow, 0);
@@ -1305,14 +1311,16 @@ mod tests {
     fn texture_overflow_is_counted_and_falls_back() {
         // More distinct images than slots: the excess falls back to the
         // defaults and is reported, rather than vanishing silently.
-        let materials: Vec<Material> = (0..MAX_TEXTURES + 5)
+        // A small capacity stands in for a device limit.
+        let capacity = 16;
+        let materials: Vec<Material> = (0..capacity + 5)
             .map(|i| Material {
                 base_color_texture: Some(tex(i as u8)),
                 ..Material::default()
             })
             .collect();
-        let plan = plan_texture_slots(&materials);
-        assert_eq!(plan.uploads.len(), MAX_TEXTURES - FIRST_TEXTURE_SLOT);
+        let plan = plan_texture_slots(&materials, capacity);
+        assert_eq!(plan.uploads.len(), capacity - FIRST_TEXTURE_SLOT);
         assert_eq!(plan.overflow, 7);
         assert_eq!(plan.slots.last().unwrap()[0], 0, "overflow uses white");
     }

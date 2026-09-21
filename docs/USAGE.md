@@ -140,12 +140,13 @@ data URI). The level is laid out in sectors, each aimed at one system:
 | `--lights N` | `0` | scatter N extra point lights as geometry-free markers |
 | `--light-radius R` | `14` | radius of the scattered lights. 14 ≈ 8.5 lights per pixel (heavy overlap, clustering's worst case); 4 ≈ 1 per pixel. Must be > 0; authored lights are unaffected |
 | `--textures` | off | procedural base-color / normal / MR textures |
+| `--many-textures` | off | also gives each of the 30 PBR spheres its own base-colour and MR texture: 66 unique images, past the engine's old 64-slot cap (implies `--textures`) |
 | `--no-extras` | off | omit all prefab `extras` (incompatible with `--lights`) |
 | `--check` | off | validate the output against the engine's constraints |
 
 **Always pass `--check` when you change the generator.** It enforces the
 constraints that are otherwise silent: bounds, ground contact, no overlap with
-the app's built-in level boxes, texture count ≤ 64, and the normal-transform
+the app's built-in level boxes, and the normal-transform
 rule (see the pitfalls in §9).
 
 Recipes:
@@ -240,7 +241,7 @@ and uploaded once however many materials share it.
 | Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs |
 | Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one decoded copy |
 | Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |
-| Texture slots | render | one slot per unique image × colour space; sRGB and UNORM uses of the same pixels stay separate; overflow past `MAX_TEXTURES` is counted and falls back to the defaults |
+| Texture slots | render | one slot per unique image × colour space; sRGB and UNORM uses of the same pixels stay separate; overflow past the capacity is counted and falls back to the defaults |
 | Light clusters | render | GLSL grid constants + `MAX_LIGHTS` match the Rust ones |
 
 What tests **cannot** cover, and how it is checked instead:

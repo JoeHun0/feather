@@ -17,9 +17,10 @@ struct Material {
 layout(set = 0, binding = 1) readonly buffer Materials {
     Material materials[];
 };
-// Bindless-lite: slot 0 = white, slot 1 = flat normal. Base color _SRGB;
-// normal + MR are _UNORM. Must match render::MAX_TEXTURES.
-layout(set = 0, binding = 2) uniform sampler2D textures[64];
+// Bindless: slot 0 = white, slot 1 = flat normal, then one slot per unique image
+// the level uses. Runtime-sized: the renderer sizes the binding per level,
+// limited only by the device. Base color _SRGB; normal + MR are _UNORM.
+layout(set = 0, binding = 2) uniform sampler2D textures[];
 // Cascades in the sun shadow map. MUST match feather_gfx::SHADOW_CASCADES.
 const int SHADOW_CASCADES = 4;
 // How far to push the sample along the surface normal, in shadow texels (§11's
