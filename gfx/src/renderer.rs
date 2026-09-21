@@ -111,9 +111,10 @@ impl Drop for MappedBuffer {
     }
 }
 
-/// Smoothed per-pass GPU time in milliseconds (§21), from timestamp queries.
-/// Zeroed until the first frames are measured, and all zero if the device/queue
-/// doesn't support timestamps.
+/// Per-pass GPU time in milliseconds (§21), from timestamp queries — smoothed
+/// via [`Renderer::gpu_times`], raw via [`Renderer::gpu_times_raw`]. Zeroed
+/// until the first frames are measured, and all zero if the device/queue doesn't
+/// support timestamps.
 #[derive(Clone, Copy, Default)]
 pub struct GpuTimes {
     pub shadow_ms: f32,
@@ -226,6 +227,7 @@ pub struct Renderer {
     timestamps_supported: bool,
     ts_written: Vec<bool>, // per frame-in-flight: slots written at least once
     gpu_times: GpuTimes,
+    gpu_times_raw: GpuTimes,
     ts_log_counter: u32,
 }
 
@@ -306,6 +308,15 @@ impl Renderer {
         let (physical_device, queue_family_index) =
             pick_device(&instance, &surface_loader, surface)
                 .ok_or("no GPU with a graphics+present queue and swapchain support")?;
+        // Machines with an iGPU + dGPU (or llvmpipe) enumerate several devices,
+        // and every [gpu] timing below is meaningless without knowing which one.
+        let props = unsafe { instance.get_physical_device_properties(physical_device) };
+        let name = props.device_name_as_c_str().unwrap_or(c"?");
+        eprintln!(
+            "[gfx] device: {} ({:?})",
+            name.to_string_lossy(),
+            props.device_type
+        );
 
         let priorities = [1.0f32];
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
@@ -480,6 +491,7 @@ impl Renderer {
             timestamps_supported,
             ts_written: vec![false; FRAMES_IN_FLIGHT],
             gpu_times: GpuTimes::default(),
+            gpu_times_raw: GpuTimes::default(),
             ts_log_counter: 0,
         })
     }
@@ -515,6 +527,13 @@ impl Renderer {
         self.gpu_times
     }
 
+    /// The most recent unsmoothed per-pass GPU times, for benchmarks that want
+    /// a distribution rather than the EMA. Lags the current frame by
+    /// `FRAMES_IN_FLIGHT`, since a slot is read back only when it is reused.
+    pub fn gpu_times_raw(&self) -> GpuTimes {
+        self.gpu_times_raw
+    }
+
     /// Read the four timestamps this frame's slots recorded on their previous use,
     /// convert to per-pass ms, smooth, and log once per ~60 frames. Called after
     /// the frame fence, so the results are guaranteed available (no `WAIT`).
@@ -543,6 +562,12 @@ impl Renderer {
         let geo = to_ms(data[2], data[3]);
         let post = to_ms(data[4], data[5]);
         let frame_ms = to_ms(data[0], data[5]);
+        self.gpu_times_raw = GpuTimes {
+            shadow_ms: shadow,
+            geometry_ms: geo,
+            post_ms: post,
+            frame_ms,
+        };
 
         // Exponential moving average keeps the log line steady enough to read.
         let a = 0.1;

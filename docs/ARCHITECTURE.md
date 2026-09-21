@@ -508,6 +508,26 @@ per-pixel cost, so this is the case for building it, backed by a number rather
 than assumed. *(Measured on the original dev laptop; re-baseline on new hardware
 before comparing — absolute ms do not transfer between machines.)*
 
+**Re-baselined on the desktop (RX 7800 XT)** with `--bench` (§21): 1920×1045,
+360° sweep at the spawn point, 720 raw per-frame samples, GPU clocks pinned
+with `profile_standard`, debug build (release measured identical):
+
+| lights | visible (median) | `geo` median | p10–p90 |
+|---|---|---|---|
+| 0 | 2 | 0.19 ms | 0.16–0.23 |
+| 60 | 34 | 0.45 ms | 0.37–0.53 |
+| 120 | 66 | 0.76 ms | 0.62–0.88 |
+
+The **ratio carries over** — 4.0× at 120 lights against the laptop's 4.2×, still
+superlinear (~8.1 µs per visible light for the first 32, ~9.7 µs for the next)
+— while the absolute cost is ~13× lower. "0 lights" is not zero: the base
+scene's own `point_light` markers put up to 6 in view. Without pinned clocks
+the same sweep read 3.3× and 0.52 ms at 120: the idle GPU downclocks, which
+inflates light workloads more than heavy ones (see §21). On this hardware the
+whole light loop is well under a millisecond, so stage B's case rests on
+laptop/Deck-class GPUs, and its A/B here must account for a compute dispatch's
+fixed cost, which at these sizes may not be negligible.
+
 `MAX_LIGHTS = 128`, clamped with a warning. `GpuLight` is 32 bytes and carries
 position/radius/colour/intensity only; §12's `dir_cone` and `type` are omitted
 rather than padded, since unused fields cost bandwidth every frame.
@@ -900,6 +920,22 @@ and punctuation.
   back-to-back at the same window size. Uses core `vkCmdWriteTimestamp` for now; the
   `vkCmdWriteTimestamp2` form arrives with the §10 sync2 barrier pass. Tracy GPU
   zones + an egui overlay are the remaining upgrades.
+  **Also landed:** startup logs the chosen device (`[gfx] device: …`) — machines
+  with an iGPU + dGPU enumerate both, and a timing is meaningless without
+  knowing which ran it. `Renderer::gpu_times_raw` exposes the unsmoothed times
+  (lagging by `FRAMES_IN_FLIGHT`). **`--bench`** is the repeatable A/B harness:
+  it skips the menu, opens a 1920×1080 window, settles 120 frames at the spawn
+  point, sweeps yaw through 360° at level pitch over 720 frames, prints
+  min/p10/median/p90/max of the raw per-pass times plus the visible-light
+  count, and exits. Raw rather than EMA because the view-dependent spread is
+  often the thing being measured.
+  **Pin GPU clocks before measuring.** Under FIFO a fast GPU idles most of the
+  frame and downclocks; on the RX 7800 XT, going uncapped (busier GPU) cut
+  `geo` ~30% at 0 lights but only ~13% at 120 — a load-dependent bias that
+  back-to-back A/B does not cancel. On amdgpu:
+  `echo profile_standard | sudo tee /sys/class/drm/cardN/device/power_dpm_force_performance_level`
+  (resets on reboot, or write `auto`). With it set, vsync on vs off measured
+  identical, confirming clock state was the only distortion.
 - **Test content:** `tools/gen_testscene.py` generates the measurement
   workload. The orb demo is pathological on purpose (huge overdraw, every object
   a caster, no occlusion) and so is useless for judging cost; this produces a
@@ -1280,7 +1316,8 @@ landed, with keyboard *and* mouse navigation, an OPTIONS screen tree, and live
 shadow-quality/FXAA controls under GRAPHICS — MSAA is shown there but stays
 restart-only until pipelines can be rebuilt live; egui dev UI, SDF text and
 lower-case/punctuation pending); audio; debug/profiling tooling (per-pass GPU timestamp timing
-landed — stderr log + `Renderer::gpu_times`; Tracy / RenderDoc / egui overlay and
+landed — stderr log + `Renderer::gpu_times`, plus the `--bench` sweep harness;
+Tracy / RenderDoc / egui overlay and
 CPU-side zones pending); GPU-driven culling; streaming; stage pipelining;
 anti-aliasing (**MSAA** `--msaa N` at startup and **FXAA** on `F2` both landed,
 §13 — **SMAA** is still absent, as are live MSAA switching and a tonemapped

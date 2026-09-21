@@ -33,7 +33,7 @@ use std::time::Instant;
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::ExecutorKind;
 use feather_assets::MeshData;
-use feather_gfx::{Renderer, SHADOW_CASCADES};
+use feather_gfx::{GpuTimes, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use feather_platform::winit;
 use feather_render::{
     CascadeSetup, FxaaPass, GpuLight, InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass,
@@ -934,6 +934,85 @@ struct Input {
     mouse_dy: f32,
 }
 
+/// Frames `--bench` waits at the spawn point before sweeping: lets the player
+/// settle onto the ground and the GPU clocks ramp up. 2 s at 60 Hz.
+const BENCH_SETTLE: u32 = 120;
+/// Frames the 360° sweep takes: 0.5° per frame, 12 s at 60 Hz.
+const BENCH_SWEEP: u32 = 720;
+
+/// `--bench`: a scripted, repeatable GPU-timing run (§21), so A/B comparisons
+/// don't depend on a hand-driven camera. Skips the menu, starts the session at a
+/// fixed window size, settles at the spawn point, then turns a full circle at
+/// level pitch recording **raw** per-frame times — the logged EMA hides exactly
+/// the view-dependent spread that the light-loop cost is about — prints a
+/// summary and exits.
+struct Bench {
+    frame: u32,
+    start_yaw: Option<f32>,
+    /// Raw GPU times + visible-light count per sweep frame. The two are
+    /// `FRAMES_IN_FLIGHT` frames (1°) apart, which is noise for a distribution.
+    samples: Vec<(GpuTimes, usize)>,
+    lights: usize,
+}
+
+impl Bench {
+    fn new() -> Self {
+        Self {
+            frame: 0,
+            start_yaw: None,
+            samples: Vec::with_capacity(BENCH_SWEEP as usize),
+            lights: 0,
+        }
+    }
+
+    /// Overrides the player's look for this frame: held at the spawn yaw while
+    /// settling, then swept through 360°.
+    fn drive(&mut self, look: &mut Look) {
+        let start = *self.start_yaw.get_or_insert(look.yaw);
+        let t = self.frame.saturating_sub(BENCH_SETTLE) as f32 / BENCH_SWEEP as f32;
+        look.yaw = start + std::f32::consts::TAU * t.min(1.0);
+        look.pitch = 0.0;
+    }
+
+    /// Record this frame's readback; true once the sweep is complete. Timings
+    /// read back now belong to the frame `FRAMES_IN_FLIGHT` ago, hence the lag.
+    fn record(&mut self, raw: GpuTimes) -> bool {
+        let lag = FRAMES_IN_FLIGHT as u32;
+        if self.frame >= BENCH_SETTLE + lag {
+            self.samples.push((raw, self.lights));
+        }
+        self.frame += 1;
+        self.frame >= BENCH_SETTLE + BENCH_SWEEP + lag
+    }
+
+    fn report(&self, width: u32, height: u32) {
+        // min / p10 / median / p90 / max, over the sweep.
+        fn stats(mut v: Vec<f32>) -> String {
+            v.sort_by(f32::total_cmp);
+            let at = |q: f32| v[((v.len() - 1) as f32 * q).round() as usize];
+            format!(
+                "min {:6.2}  p10 {:6.2}  med {:6.2}  p90 {:6.2}  max {:6.2}",
+                at(0.0),
+                at(0.1),
+                at(0.5),
+                at(0.9),
+                at(1.0)
+            )
+        }
+        let col = |f: fn(&GpuTimes) -> f32| stats(self.samples.iter().map(|(t, _)| f(t)).collect());
+        let lights = stats(self.samples.iter().map(|&(_, n)| n as f32).collect());
+        eprintln!(
+            "[bench] {width}x{height}, {} sweep frames (ms)",
+            self.samples.len()
+        );
+        eprintln!("[bench] shadow  {}", col(|t| t.shadow_ms));
+        eprintln!("[bench] geo     {}", col(|t| t.geometry_ms));
+        eprintln!("[bench] post    {}", col(|t| t.post_ms));
+        eprintln!("[bench] frame   {}", col(|t| t.frame_ms));
+        eprintln!("[bench] lights  {lights}  (visible, after cull)");
+    }
+}
+
 struct App {
     // FIELD ORDER IS LOAD-BEARING. Rust drops fields in declaration order, and
     // everything above `renderer` owns GPU resources that must be freed while
@@ -968,6 +1047,8 @@ struct App {
     /// glTF scenes NEW GAME loads (CLI paths). Empty = the procedural demo.
     /// Kept on `App` rather than `Session` so it survives a teardown.
     scenes: Vec<String>,
+    /// `--bench` run state; `None` in normal play.
+    bench: Option<Bench>,
     last_frame: Instant,
 }
 
@@ -1452,7 +1533,7 @@ impl Session {
 impl App {
     /// Starts with **no session**: the app opens on the main menu and only
     /// builds a world when NEW GAME is chosen.
-    fn new(scenes: Vec<String>, settings: GraphicsSettings) -> Self {
+    fn new(scenes: Vec<String>, settings: GraphicsSettings, bench: bool) -> Self {
         let light = Vec3::new(-0.4, -1.0, -0.3).normalize();
         Self {
             session: None,
@@ -1469,6 +1550,7 @@ impl App {
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             exposure: 1.0,
             scenes,
+            bench: bench.then(Bench::new),
             last_frame: Instant::now(),
         }
     }
@@ -1630,9 +1712,15 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let window = event_loop
-            .create_window(feather_platform::window_attributes("feather — first person"))
-            .expect("create window");
+        let mut attrs = feather_platform::window_attributes("feather — first person");
+        if self.bench.is_some() {
+            // A fixed extent, so bench runs are comparable (the compositor may
+            // still override it; the report prints what was actually used).
+            attrs = attrs
+                .with_inner_size(winit::dpi::PhysicalSize::new(1920, 1080))
+                .with_resizable(false);
+        }
+        let window = event_loop.create_window(attrs).expect("create window");
         // Opens on the main menu, so the cursor starts free rather than grabbed.
         window.set_cursor_visible(true);
 
@@ -1652,6 +1740,9 @@ impl ApplicationHandler for App {
         self.ui = Some(ui);
         self.renderer = Some(renderer);
         self.window = Some(window);
+        if self.bench.is_some() {
+            self.start_session();
+        }
     }
 
     fn device_event(&mut self, _e: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
@@ -1808,6 +1899,9 @@ impl ApplicationHandler for App {
                         let mut look = s.world.get_mut::<Look>(s.player).expect("player has Look");
                         look.yaw += self.input.mouse_dx * sens;
                         look.pitch = (look.pitch - self.input.mouse_dy * sens).clamp(-1.54, 1.54);
+                        if let Some(b) = self.bench.as_mut() {
+                            b.drive(&mut look);
+                        }
                         *look
                     };
                     self.input.mouse_dx = 0.0;
@@ -2001,6 +2095,9 @@ impl ApplicationHandler for App {
                     // draw_shadow, after the frame fence.
                     s.mesh
                         .prepare_frame(&mut main_items, &mut shadow_items, &cascades, &lights);
+                    if let Some(b) = self.bench.as_mut() {
+                        b.lights = lights.len();
+                    }
                     frame_view = Some(FrameView {
                         view_proj,
                         inv_view_proj,
@@ -2129,6 +2226,18 @@ impl ApplicationHandler for App {
                         // menu is closed (nothing was built).
                         |cmd, extent, frame| ui.draw(cmd, extent, frame),
                     );
+                }
+
+                if let (Some(b), Some(r)) = (self.bench.as_mut(), self.renderer.as_ref()) {
+                    if self.session.is_some() && b.record(r.gpu_times_raw()) {
+                        let size = self
+                            .window
+                            .as_ref()
+                            .map(|w| w.inner_size())
+                            .unwrap_or_default();
+                        b.report(size.width, size.height);
+                        event_loop.exit();
+                    }
                 }
             }
             _ => {}
@@ -2356,9 +2465,11 @@ fn main() {
     // CLI paths are glTF *scenes* to load and walk around
     // (`cargo run -- level.glb`); each node becomes its own entity. With no args,
     // the procedural drifting-orb demo runs instead. `--msaa N` (1/2/4/8) picks
-    // the geometry-pass sample count, clamped to device support.
+    // the geometry-pass sample count, clamped to device support. `--bench` runs
+    // the scripted timing sweep (see `Bench`) instead of the menu.
     let mut settings = GraphicsSettings::default();
     let mut scenes: Vec<String> = Vec::new();
+    let mut bench = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -2366,13 +2477,14 @@ fn main() {
                 Some(n) => settings.msaa = n,
                 None => eprintln!("--msaa needs a sample count (1/2/4/8); ignoring"),
             },
+            "--bench" => bench = true,
             _ => scenes.push(a),
         }
     }
 
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(scenes, settings);
+    let mut app = App::new(scenes, settings, bench);
     event_loop.run_app(&mut app).expect("run app");
 }
 
