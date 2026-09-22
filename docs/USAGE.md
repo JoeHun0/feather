@@ -81,7 +81,8 @@ use it for timing.
 |---|---|
 | `SCENE` (bare path, repeatable) | glTF scene(s) NEW GAME loads. Each node becomes an entity; glTF `extras` become prefabs (§4). |
 | `--msaa N` | Geometry-pass MSAA sample count: 1 / 2 / 4 / 8, clamped to what the device supports. Overrides `config/graphics.toml` for this run only (never saved). Also changeable from the main menu's OPTIONS > GRAPHICS (not mid-game), which *is* saved. |
-| `--no-bake` | Ignore baked textures and upload raw RGBA8, for A/B against the bake (§4). |
+| `--no-bake` | Ignore the bake: raw RGBA8 textures and raw meshes (no LODs), for A/B against it (§4). |
+| `--no-lod` | Draw every mesh at LOD0 but keep the baked vertex order, to A/B the LOD win alone (§4). |
 | `--bench` | Scripted timing run: skips the menu, sweeps the camera 360°, prints a summary and exits. Ignores the config files. See §7. |
 
 Typical runs:
@@ -277,27 +278,45 @@ Unlike the nature scene, materials pass through as authored (textures,
 loads it in ~2 s and release in under half a second; each image is decoded
 and uploaded once however many materials share it.
 
-### Compressing textures — `feather-bake`
+### Baking — `feather-bake`
 
 ```bash
 cargo run --release -p feather-bake -- scratch/detail.glb   # any scenes; incremental
-cargo run --release -- scratch/detail.glb                    # now uploads BC7
+cargo run --release -- scratch/detail.glb                    # now uses the bake
 ```
 
-The bake turns every texture a scene uses into a **BC7** mip chain in
-`scratch/bake/tex/`: 4× less GPU memory (the detail scene: 64 MB instead of
-256 MB) and no load-time mip building. The engine picks the baked version up
-automatically, keyed on the texture's pixels. Anything not baked still loads
-raw, so baking is optional. The `[mesh]` line says which you got:
-`12 textures uploaded ... (12 baked BC7, 0 raw), 64.0 MB`. Re-running skips
-textures already baked; delete `scratch/bake/` to start over. Use `--release`
-for the bake: the encoder is slow in debug.
+The bake writes to `scratch/bake/` (`--out DIR` to change it). Anything not
+baked still loads raw, so baking is optional. Re-running skips everything
+already baked, since files are keyed on content; delete `scratch/bake/` to
+start over. Use `--release`: the BC7 encoder is slow in debug.
+
+- **Textures** → `tex/`: every texture a scene uses becomes a **BC7** mip
+  chain. That's 4× less GPU memory (the detail scene: 64 MB instead of 256 MB)
+  and no load-time mip building.
+- **Meshes** → `mesh/`: vertices reordered for the GPU's caches, plus a
+  **LOD chain**. Each level has about half the triangles of the one before, and
+  small disconnected parts such as grass blades get dropped. Meshes under 256
+  triangles keep full detail only. The bake prints each mesh's chain
+  (`tris 30830 > 15415 > ...` and each level's error).
+- **At runtime** the engine picks, per instance and per view, the coarsest LOD
+  whose error stays under **1 pixel** on screen, or under **one shadow texel**
+  for each shadow cascade. On `detail_high` that cut the triangles drawn by
+  ~92% and the frame from 1.83 to 0.50 ms (§17 in ARCHITECTURE.md).
+  `--no-lod` turns it off for comparison.
+
+The `[mesh]` lines at load say what you got, e.g.
+`30 meshes (27 baked, 135 LODs): 2.7 MB vertices, 3.0 MB indices` and
+`12 textures uploaded ... (12 baked BC7, 0 raw), 64.0 MB`.
+
+**What to look for** when judging LODs: distant objects should look the same
+with `--no-lod` as without, with no visible popping as you walk towards them,
+and distant shadows should look unchanged.
 
 ---
 
 ## 5. Tests — what exists and what it guards
 
-`cargo test --workspace`: 61 tests, all CPU-side (none needs a GPU).
+`cargo test --workspace`: 90 tests, all CPU-side (none needs a GPU).
 
 | Area | Crate | What the tests pin down |
 |---|---|---|
@@ -310,6 +329,9 @@ for the bake: the encoder is slow in debug.
 | Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one decoded copy |
 | Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |
 | Texture bake | assets, bake | keys separate content and colour space; BC7 level sizes round partial blocks up; baked files round-trip and reject truncation or wrong sizes; sRGB mips average *light* (black/white → 188, not 128); chains end at 1×1; every baked level has exactly the blocks Vulkan copies |
+| Mesh bake + LOD | assets, bake, render | baked meshes round-trip and reject damage (truncation, trailing bytes, bad magic, out-of-range index, decreasing or NaN error, partial triangle, no LODs); the mesh key ignores the material; a sphere gets a chain with fewer triangles and growing error per level and LOD0 is the input reordered; small meshes stay LOD0; disconnected parts prune; the pixel and texel rules (distance, scale, non-uniform scale, inside the sphere); runs split per (mesh, LOD) |
+| Config files | app | both templates parse back to the defaults; each bad line warns and keeps the default; saving edits one value in place; create-once, the `settings.toml` → `graphics.toml` migration, an unreadable file is left alone |
+| Controls | app | key names round-trip; reserved menu keys are refused; a key on two actions warns; two keys on one action hold until both are released; toggles ignore auto-repeat but exposure repeats; a rebound jump moves |
 | Texture slots | render | one slot per unique image × colour space; sRGB and UNORM uses of the same pixels stay separate; overflow past the capacity is counted and falls back to the defaults |
 | Light clusters | render | GLSL grid constants + `MAX_LIGHTS` match the Rust ones |
 
@@ -337,7 +359,8 @@ Everything goes to stderr.
 | `[quality] shadows / fxaa: …` | a setting changed |
 | `[config] …` | a config file created / loaded / renamed, a line ignored or a key bound twice, plus the effective graphics settings at startup |
 | `[light] N visible lights exceeds MAX_LIGHTS` | lights past 128 were dropped this frame |
-| `[bench] …` | the `--bench` summary |
+| `[mesh] N meshes (B baked, L LODs): …` | geometry uploaded at load, and how much of it came from the bake |
+| `[bench] …` | the `--bench` summary, including triangles submitted per frame (`Mtris main/shadow`) and the share of instances at each LOD (`LOD mix`) |
 
 ---
 

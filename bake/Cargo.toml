@@ -7,3 +7,4 @@ publish = false
 [dependencies]
 feather-assets.workspace = true
 intel_tex_2.workspace = true
+meshopt.workspace = true

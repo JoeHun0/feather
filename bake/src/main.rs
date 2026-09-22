@@ -1,27 +1,35 @@
-//! Texture bake (§17): turn every texture a scene uses into a BC7 mip chain in a
-//! content-addressed cache that the runtime uploads instead of raw RGBA8.
+//! Asset bake (§17): textures to BC7 mip chains and meshes to an optimised
+//! vertex order plus a LOD chain, in a content-addressed cache the runtime
+//! uses instead of the raw assets.
 //!
 //!     cargo run --release -p feather-bake -- SCENE.gltf|.glb... [--out DIR]
 //!
-//! For each (image, colour space) pair a scene actually uses (base colour as
-//! sRGB, normal and metallic-roughness as data), the bake builds mips on the
-//! CPU (averaging sRGB in linear space, like the runtime's GPU blits), then
-//! BC7-encodes every level with Intel's ISPC encoder. Output goes to
-//! `<key>.bc7` under `--out` (default `scratch/bake/tex`), keyed exactly as
-//! the runtime keys it (`feather_assets::bake::texture_key`). It's
-//! incremental: pairs whose file exists are skipped. Open sources stay the
+//! Textures: for each (image, colour space) pair a scene actually uses (base
+//! colour as sRGB, normal and metallic-roughness as data), the bake builds mips
+//! on the CPU (averaging sRGB in linear space, like the runtime's GPU blits),
+//! then BC7-encodes every level with Intel's ISPC encoder.
+//!
+//! Meshes: see `mesh.rs` (meshoptimizer vertex-cache + fetch order, LODs).
+//!
+//! Output goes under `--out` (default `scratch/bake`): `tex/<key>.bc7` and
+//! `mesh/<key>.fbm`, keyed exactly as the runtime keys them. It's
+//! incremental: anything whose file exists is skipped. Open sources stay the
 //! truth; the cache can be deleted at any time.
 
+mod mesh;
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use feather_assets::bake::{baked_path, texture_key, BakedTexture};
-use feather_assets::{load_gltf_scene, TextureData};
+use feather_assets::bake::{
+    baked_mesh_path, baked_path, mesh_key, texture_key, BakedTexture, MESH_DIR, TEX_DIR,
+};
+use feather_assets::{load_gltf_scene, MeshData, TextureData};
 
 fn main() {
-    let mut out = PathBuf::from("scratch/bake/tex");
+    let mut out = PathBuf::from("scratch/bake");
     let mut scenes = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -34,88 +42,122 @@ fn main() {
         eprintln!("usage: feather-bake SCENE.gltf|.glb... [--out DIR]");
         std::process::exit(2);
     }
-    std::fs::create_dir_all(&out).expect("create the bake directory");
+    let (tex_dir, mesh_dir) = (out.join(TEX_DIR), out.join(MESH_DIR));
+    std::fs::create_dir_all(&tex_dir).expect("create the texture bake directory");
+    std::fs::create_dir_all(&mesh_dir).expect("create the mesh bake directory");
 
-    // Every (texture, colour space) pair in use, deduped by content key across
-    // all scenes.
-    let mut jobs: HashMap<u64, (Arc<TextureData>, bool)> = HashMap::new();
+    // Every (texture, colour space) pair and every mesh in use, deduped by
+    // content key across all scenes.
+    let mut textures: HashMap<u64, (Arc<TextureData>, bool)> = HashMap::new();
+    let mut meshes: HashMap<u64, MeshData> = HashMap::new();
     for scene in &scenes {
         let data = load_gltf_scene(scene).unwrap_or_else(|e| panic!("{scene}: {e}"));
-        for m in data.meshes.iter().map(|m| &m.material) {
+        for m in &data.meshes {
+            let mat = &m.material;
             for (tex, srgb) in [
-                (&m.base_color_texture, true),
-                (&m.normal_texture, false),
-                (&m.metallic_roughness_texture, false),
+                (&mat.base_color_texture, true),
+                (&mat.normal_texture, false),
+                (&mat.metallic_roughness_texture, false),
             ] {
                 if let Some(t) = tex {
-                    jobs.entry(texture_key(t, srgb))
+                    textures
+                        .entry(texture_key(t, srgb))
                         .or_insert((t.clone(), srgb));
                 }
             }
+            meshes.entry(mesh_key(m)).or_insert_with(|| m.clone());
         }
     }
-    let todo: Vec<(u64, Arc<TextureData>, bool)> = jobs
-        .into_iter()
-        .filter(|(key, _)| !baked_path(&out, *key).exists())
-        .map(|(key, (t, srgb))| (key, t, srgb))
-        .collect();
-    let cached = count_cached(&out, &scenes);
-    println!("{} to bake, {cached} already cached", todo.len());
 
-    // Textures in parallel; each is independent.
+    let (tex_todo, tex_cached): (Vec<_>, Vec<_>) = textures
+        .into_iter()
+        .partition(|(key, _)| !baked_path(&tex_dir, *key).exists());
+    println!(
+        "textures: {} to bake, {} already cached",
+        tex_todo.len(),
+        tex_cached.len()
+    );
     let t0 = Instant::now();
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let bytes: usize = std::thread::scope(|s| {
-        let chunks: Vec<_> = todo.chunks(todo.len().div_ceil(threads).max(1)).collect();
-        let handles: Vec<_> = chunks
-            .into_iter()
-            .map(|chunk| {
-                let out = &out;
-                s.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|(key, tex, srgb)| {
-                            let baked = bake(tex, *srgb);
-                            baked
-                                .write(&baked_path(out, *key))
-                                .expect("write baked texture");
-                            baked.levels.iter().map(Vec::len).sum::<usize>()
-                        })
-                        .sum::<usize>()
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).sum()
-    });
+    let bytes: usize = parallel(&tex_todo, |(key, (tex, srgb))| {
+        let baked = bake(tex, *srgb);
+        baked
+            .write(&baked_path(&tex_dir, *key))
+            .expect("write baked texture");
+        baked.levels.iter().map(Vec::len).sum::<usize>()
+    })
+    .into_iter()
+    .sum();
     println!(
         "baked {} textures ({:.1} MB of BC7) in {:.1} s into {}",
-        todo.len(),
+        tex_todo.len(),
         bytes as f64 / 1_048_576.0,
         t0.elapsed().as_secs_f32(),
-        out.display()
+        tex_dir.display()
+    );
+
+    let (mesh_todo, mesh_cached): (Vec<_>, Vec<_>) = meshes
+        .into_iter()
+        .partition(|(key, _)| !baked_mesh_path(&mesh_dir, *key).exists());
+    println!(
+        "meshes: {} to bake, {} already cached",
+        mesh_todo.len(),
+        mesh_cached.len()
+    );
+    let t0 = Instant::now();
+    let mut reports = parallel(&mesh_todo, |(key, m)| {
+        let baked = mesh::bake_mesh(m);
+        baked
+            .write(&baked_mesh_path(&mesh_dir, *key))
+            .expect("write baked mesh");
+        let tris: Vec<String> = baked
+            .lods
+            .iter()
+            .map(|l| (l.indices.len() / 3).to_string())
+            .collect();
+        let errors: Vec<String> = baked.lods[1..]
+            .iter()
+            .map(|l| format!("{:.2e}", l.error))
+            .collect();
+        (
+            m.indices.len() / 3,
+            format!(
+                "  {key:016x}: tris {} | error {}",
+                tris.join(" > "),
+                if errors.is_empty() {
+                    "-".into()
+                } else {
+                    errors.join(" ")
+                }
+            ),
+        )
+    });
+    // Biggest first: those are the ones worth reading.
+    reports.sort_by_key(|r| std::cmp::Reverse(r.0));
+    for (_, line) in &reports {
+        println!("{line}");
+    }
+    println!(
+        "baked {} meshes in {:.1} s into {}",
+        mesh_todo.len(),
+        t0.elapsed().as_secs_f32(),
+        mesh_dir.display()
     );
 }
 
-/// How many of the scenes' pairs were already baked (for the summary line).
-fn count_cached(out: &Path, scenes: &[String]) -> usize {
-    let mut keys = std::collections::HashSet::new();
-    for scene in scenes {
-        let data = load_gltf_scene(scene).expect("scene loaded above");
-        for m in data.meshes.iter().map(|m| &m.material) {
-            for (tex, srgb) in [
-                (&m.base_color_texture, true),
-                (&m.normal_texture, false),
-                (&m.metallic_roughness_texture, false),
-            ] {
-                if let Some(t) = tex {
-                    keys.insert(texture_key(t, srgb));
-                }
-            }
-        }
-    }
-    keys.into_iter()
-        .filter(|k| baked_path(out, *k).exists())
-        .count()
+/// `f` over `items` on every core, results in input order.
+fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let f = &f;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = items
+            .chunks(items.len().div_ceil(threads).max(1))
+            .map(|chunk| s.spawn(move || chunk.iter().map(f).collect::<Vec<R>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    })
 }
 
 /// One texture's BC7 mip chain.

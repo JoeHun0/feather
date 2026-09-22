@@ -244,8 +244,8 @@ mod tests {
     }
 
     /// Settings fields compared as a tuple (the struct has no PartialEq).
-    fn key(s: &GraphicsSettings) -> (ShadowQuality, u32, bool, bool) {
-        (s.shadows, s.msaa, s.fxaa, s.bake)
+    fn key(s: &GraphicsSettings) -> (ShadowQuality, u32, bool, bool, bool) {
+        (s.shadows, s.msaa, s.fxaa, s.bake, s.lod)
     }
 
     #[test]

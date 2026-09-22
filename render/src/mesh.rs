@@ -1,7 +1,7 @@
 //! Instanced, lit mesh renderer. Several meshes live in one shared vertex +
-//! index buffer (each a `{first_index, index_count, vertex_offset}` slice);
-//! per-frame instances are sorted by mesh so each mesh draws as one contiguous
-//! run (`cmd_draw_indexed` with `firstInstance`). Per-instance data is
+//! index buffer (each a vertex offset plus one index range per LOD, §17);
+//! per-frame instances get a LOD per view and are sorted by (mesh, LOD) so each
+//! pair draws as one contiguous run (`cmd_draw_indexed` with `firstInstance`). Per-instance data is
 //! `{ model, material_id }`; the fragment shader reads the material from a
 //! resident materials SSBO and applies a directional light. Meshes and materials
 //! come in as Vulkan-free `assets` types.
@@ -10,10 +10,13 @@ use ash::vk;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use feather_assets::bake::{baked_path, texture_key, BakedTexture};
+use feather_assets::bake::{
+    baked_mesh_path, baked_path, mesh_key, texture_key, BakedMesh, BakedTexture, MESH_DIR,
+    MIN_LOD_TRIS, TEX_DIR,
+};
 use feather_assets::{Material, MeshData, TextureData, Vertex};
 use feather_gfx::{Buffer, Image, MappedBuffer, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
-use glam::{Mat4, Vec4};
+use glam::{Mat4, Vec3, Vec4};
 
 macro_rules! spv {
     ($name:expr) => {
@@ -50,6 +53,8 @@ pub struct ClusterView {
     pub aspect: f32,
     pub near: f32,
     pub far: f32,
+    /// Viewport height in pixels, for projecting LOD error to the screen (§17).
+    pub viewport_height: f32,
 }
 
 /// Where each material's textures live in the bindless array (§9).
@@ -130,14 +135,110 @@ fn plan_texture_slots(materials: &[Material], capacity: usize) -> TexturePlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MeshId(pub u32);
 
-/// Where one mesh lives inside the shared vertex/index buffers. `vertex_offset`
-/// is added to each (mesh-local) index at draw time, so per-mesh indices stay
-/// 0-based.
-#[derive(Clone, Copy)]
-struct MeshSlice {
+/// One level of detail: a range of the shared index buffer.
+#[derive(Clone, Copy, Debug)]
+struct LodSlice {
     first_index: u32,
     index_count: u32,
+    /// Geometric error against LOD0 in mesh-local units (0 for LOD0);
+    /// non-decreasing along a mesh's chain.
+    error: f32,
+}
+
+/// Where one mesh lives inside the shared vertex/index buffers. `vertex_offset`
+/// is added to each (mesh-local) index at draw time, so per-mesh indices stay
+/// 0-based. Every LOD indexes the same vertices. An unbaked mesh has one LOD.
+#[derive(Clone, Debug)]
+struct MeshSlice {
     vertex_offset: i32,
+    lods: Vec<LodSlice>,
+    /// Local bounding sphere, for projecting LOD error.
+    center: Vec3,
+    radius: f32,
+}
+
+/// Most LODs a mesh keeps; they're packed into 4 bits of the run sort key.
+const MAX_LODS: usize = 16;
+/// Largest LOD error allowed on screen, in pixels. Below one pixel a coarser
+/// level is indistinguishable from the full mesh, up to shading.
+const LOD_PIXEL_ERROR: f32 = 1.0;
+
+/// How a view turns an instance into an acceptable LOD error (§17).
+#[derive(Clone, Copy, Debug)]
+enum LodRule {
+    /// Perspective camera: error projected to pixels at the instance's
+    /// nearest point.
+    Screen {
+        eye: Vec3,
+        /// Pixels per world unit at distance 1: `height / (2 tan(fov/2))`.
+        px_per_unit: f32,
+        near: f32,
+    },
+    /// Shadow cascade: detail finer than one shadow texel can't show, at any
+    /// distance (the ortho has no perspective).
+    Texel(f32),
+}
+
+impl LodRule {
+    /// The largest mesh-local error acceptable for an instance with `model`
+    /// and local bounding sphere (`center`, `radius`).
+    fn budget(self, model: &Mat4, center: Vec3, radius: f32) -> f32 {
+        // World units per mesh unit: the largest axis scale, so the error is
+        // never under-estimated on a stretched instance.
+        let scale = model
+            .x_axis
+            .truncate()
+            .length()
+            .max(model.y_axis.truncate().length())
+            .max(model.z_axis.truncate().length())
+            .max(1e-12);
+        match self {
+            LodRule::Screen {
+                eye,
+                px_per_unit,
+                near,
+            } => {
+                let centre = model.transform_point3(center);
+                let distance = (centre.distance(eye) - radius * scale).max(near);
+                LOD_PIXEL_ERROR * distance / (px_per_unit * scale)
+            }
+            LodRule::Texel(texel) => texel / scale,
+        }
+    }
+}
+
+/// The coarsest LOD whose error fits `budget` (LOD0 always does).
+fn pick_lod(lods: &[LodSlice], budget: f32) -> usize {
+    lods.iter().rposition(|l| l.error <= budget).unwrap_or(0)
+}
+
+/// Bounding sphere of a vertex set: the AABB centre and the farthest vertex.
+fn bounding_sphere(vertices: &[Vertex]) -> (Vec3, f32) {
+    let Some(first) = vertices.first() else {
+        return (Vec3::ZERO, 0.0);
+    };
+    let (lo, hi) = vertices.iter().fold(
+        (Vec3::from(first.pos), Vec3::from(first.pos)),
+        |(lo, hi), v| (lo.min(Vec3::from(v.pos)), hi.max(Vec3::from(v.pos))),
+    );
+    let center = (lo + hi) * 0.5;
+    let radius = vertices
+        .iter()
+        .map(|v| Vec3::from(v.pos).distance(center))
+        .fold(0.0, f32::max);
+    (center, radius)
+}
+
+/// Triangles and LOD choices of one frame, for `--bench` (§17). Triangles
+/// are counted per instance submitted, before any GPU culling.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FrameStats {
+    pub main_tris: u64,
+    pub shadow_tris: u64,
+    /// Instances drawn at each LOD, camera view.
+    pub main_lods: [u32; MAX_LODS],
+    /// Instances drawn at each LOD, summed over the shadow cascades.
+    pub shadow_lods: [u32; MAX_LODS],
 }
 
 /// GPU material record (§5): std430, 64 bytes, indexed by `material_id`.
@@ -231,8 +332,8 @@ pub struct CascadeSetup {
     pub texel_world: f32,
 }
 
-/// A contiguous run of same-mesh instances. `upload_instances` sorts + records
-/// these once per frame; the shadow and main passes each replay them.
+/// A contiguous run of same-(mesh, LOD) instances. `prepare_frame` sorts +
+/// records these once per frame; the shadow and main passes each replay them.
 #[derive(Clone, Copy)]
 struct Run {
     first_index: u32,
@@ -282,6 +383,11 @@ pub struct MeshRenderer {
     slices: Vec<MeshSlice>,
     // Reused each frame to gather sorted instances before the SSBO upload.
     scratch: Vec<InstanceData>,
+    // Reused each frame: instances keyed by (mesh, LOD) for sorting.
+    keyed: Vec<(u32, InstanceData)>,
+    /// `false` = always LOD0 (`--no-lod`), keeping the baked vertex order.
+    lod_enabled: bool,
+    stats: FrameStats,
     // Per-mesh runs recorded by `prepare_frame`, replayed by each pass. Both index
     // one instance SSBO laid out as [main instances | shadow instances]; the run
     // `run_start` is the firstInstance offset into that concatenation.
@@ -312,21 +418,69 @@ impl MeshRenderer {
         let device = renderer.device();
 
         // Merge every mesh into one vertex + one index buffer; record each slice.
+        // A baked mesh (§17) brings its optimised vertex order and LOD chain;
+        // otherwise the loader's mesh goes in as its only LOD. Never an error.
+        let mesh_dir = bake_dir.map(|d| d.join(MESH_DIR));
         let mut vertices: Vec<Vertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         let mut slices: Vec<MeshSlice> = Vec::with_capacity(meshes.len());
         let mut ids: Vec<MeshId> = Vec::with_capacity(meshes.len());
+        let (mut baked_meshes, mut lod_count, mut would_gain) = (0usize, 0usize, 0usize);
         for (i, mesh) in meshes.iter().enumerate() {
+            let baked = mesh_dir
+                .as_deref()
+                .and_then(|d| BakedMesh::read(&baked_mesh_path(d, mesh_key(mesh))).ok());
+            let (verts, lods): (&[Vertex], Vec<(f32, &[u32])>) = match &baked {
+                Some(b) => {
+                    baked_meshes += 1;
+                    let lods = b.lods.iter().take(MAX_LODS);
+                    (
+                        &b.vertices,
+                        lods.map(|l| (l.error, &l.indices[..])).collect(),
+                    )
+                }
+                None => {
+                    if mesh.indices.len() / 3 >= MIN_LOD_TRIS {
+                        would_gain += 1;
+                    }
+                    (&mesh.vertices, vec![(0.0, &mesh.indices[..])])
+                }
+            };
+            let (center, radius) = bounding_sphere(verts);
+            let mut lod_slices = Vec::with_capacity(lods.len());
+            for (error, lod) in lods {
+                lod_slices.push(LodSlice {
+                    first_index: indices.len() as u32,
+                    index_count: lod.len() as u32,
+                    error,
+                });
+                // Per-mesh indices stay 0-based; vertex_offset rebases them at draw.
+                indices.extend_from_slice(lod);
+            }
+            lod_count += lod_slices.len();
             slices.push(MeshSlice {
-                first_index: indices.len() as u32,
-                index_count: mesh.indices.len() as u32,
                 vertex_offset: vertices.len() as i32,
+                lods: lod_slices,
+                center,
+                radius,
             });
             ids.push(MeshId(i as u32));
-            vertices.extend_from_slice(&mesh.vertices);
-            // Per-mesh indices stay 0-based; vertex_offset rebases them at draw.
-            indices.extend_from_slice(&mesh.indices);
+            vertices.extend_from_slice(verts);
         }
+        eprintln!(
+            "[mesh] {} meshes ({baked_meshes} baked, {lod_count} LODs): {:.1} MB vertices, {:.1} MB indices",
+            meshes.len(),
+            std::mem::size_of_val(&vertices[..]) as f64 / 1_048_576.0,
+            std::mem::size_of_val(&indices[..]) as f64 / 1_048_576.0,
+        );
+        // Only meshes big enough to get LODs; worded to stay true for the
+        // app's built-in meshes, which no scene contains and no bake reaches.
+        if would_gain > 0 && bake_dir.is_some() {
+            eprintln!(
+                "[mesh] {would_gain} meshes of {MIN_LOD_TRIS}+ triangles have no LODs (not baked; `feather-bake SCENE...` bakes a scene's meshes)"
+            );
+        }
+        let tex_dir = bake_dir.map(|d| d.join(TEX_DIR));
 
         let vertex_buffer = renderer
             .create_device_local_buffer(as_bytes(&vertices), vk::BufferUsageFlags::VERTEX_BUFFER);
@@ -369,7 +523,8 @@ impl MeshRenderer {
             // A baked BC7 chain (§17) when the bake has one for exactly this
             // texture in this colour space and the device can sample BC.
             // Otherwise raw RGBA8 with GPU-built mips. Never an error.
-            let bc7 = bake_dir
+            let bc7 = tex_dir
+                .as_deref()
                 .filter(|_| renderer.texture_compression_bc())
                 .and_then(|dir| BakedTexture::read(&baked_path(dir, texture_key(t, *srgb))).ok())
                 .filter(|b| b.srgb == *srgb && (b.width, b.height) == (t.width, t.height));
@@ -901,6 +1056,9 @@ impl MeshRenderer {
             sampler,
             slices,
             scratch: Vec::new(),
+            keyed: Vec::new(),
+            lod_enabled: true,
+            stats: FrameStats::default(),
             main_runs: Vec::new(),
             shadow_runs: (0..SHADOW_CASCADES).map(|_| Vec::new()).collect(),
             lights: Vec::new(),
@@ -974,24 +1132,39 @@ impl MeshRenderer {
         }
 
         let cap = self.max_instances as usize;
+        // LOD rules per view (§17): pixels for the camera, texels per cascade.
+        // `None` pins everything to LOD0 (`--no-lod`).
+        let screen = LodRule::Screen {
+            eye: camera.view.inverse().w_axis.truncate(),
+            px_per_unit: camera.viewport_height / (2.0 * (camera.fov_y * 0.5).tan()),
+            near: camera.near,
+        };
+        let enabled = self.lod_enabled;
+        let mut stats = FrameStats::default();
         // main region at offset 0, then one region per cascade. `run_start` is the
         // firstInstance base into the concatenated SSBO.
-        let mut base = build_runs(
-            main,
-            &self.slices,
-            &mut self.scratch,
-            &mut self.main_runs,
-            0,
-        );
+        let mut runs = Runs {
+            slices: &self.slices,
+            keyed: &mut self.keyed,
+            scratch: &mut self.scratch,
+        };
+        let main_stats = runs.build(main, enabled.then_some(screen), &mut self.main_runs, 0);
+        stats.main_tris = main_stats.tris;
+        stats.main_lods = main_stats.lods;
+        let mut base = main_stats.instances;
         for (cascade, casters) in shadows.iter_mut().enumerate().take(SHADOW_CASCADES) {
-            base += build_runs(
-                casters,
-                &self.slices,
-                &mut self.scratch,
-                &mut self.shadow_runs[cascade],
-                base,
-            );
+            let rule = cascades
+                .get(cascade)
+                .map(|c| LodRule::Texel(c.texel_world))
+                .filter(|_| enabled);
+            let st = runs.build(casters, rule, &mut self.shadow_runs[cascade], base);
+            stats.shadow_tris += st.tris;
+            for (total, n) in stats.shadow_lods.iter_mut().zip(st.lods) {
+                *total += n;
+            }
+            base += st.instances;
         }
+        self.stats = stats;
         // Guard the shared buffer's capacity (main + every cascade could, worst
         // case, exceed it); drop the tail of scratch and any runs past the cap.
         if self.scratch.len() > cap {
@@ -1214,6 +1387,17 @@ impl MeshRenderer {
         self.device.cmd_set_scissor(cmd, 0, &[scissor]);
     }
 
+    /// Triangles and LOD mix submitted by the last `prepare_frame`.
+    pub fn frame_stats(&self) -> FrameStats {
+        self.stats
+    }
+
+    /// `false` pins every instance to LOD0 (`--no-lod`): the A/B that
+    /// separates the baked vertex order from the LOD win.
+    pub fn set_lod_enabled(&mut self, enabled: bool) {
+        self.lod_enabled = enabled;
+    }
+
     unsafe fn bind_geometry(&self, cmd: vk::CommandBuffer) {
         self.device
             .cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer.handle], &[0]);
@@ -1237,41 +1421,77 @@ impl MeshRenderer {
     }
 }
 
-/// Sort one culled list by mesh, append its instances to `scratch`, and record the
-/// contiguous per-mesh runs with `firstInstance = base + local_start`. Returns the
-/// number of instances appended. `base` must equal `scratch.len()` at entry.
-fn build_runs(
-    items: &mut [(MeshId, InstanceData)],
-    slices: &[MeshSlice],
-    scratch: &mut Vec<InstanceData>,
-    runs: &mut Vec<Run>,
-    base: u32,
-) -> u32 {
-    // Contiguous runs per mesh -> one draw each. Unstable sort is fine; draw order
-    // within a mesh doesn't matter (opaque + depth test).
-    items.sort_unstable_by_key(|(mesh, _)| mesh.0);
-    scratch.extend(items.iter().map(|(_, inst)| *inst));
+/// What one view's run building produced.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RunStats {
+    instances: u32,
+    tris: u64,
+    lods: [u32; MAX_LODS],
+}
 
-    let count = items.len();
-    let mut first = 0usize;
-    while first < count {
-        let mesh = items[first].0;
-        let mut run = 1usize;
-        while first + run < count && items[first + run].0 == mesh {
-            run += 1;
-        }
-        if let Some(slice) = slices.get(mesh.0 as usize) {
+/// The per-frame state run building shares across views.
+struct Runs<'a> {
+    slices: &'a [MeshSlice],
+    keyed: &'a mut Vec<(u32, InstanceData)>,
+    scratch: &'a mut Vec<InstanceData>,
+}
+
+impl Runs<'_> {
+    /// Pick each item's LOD under `rule` (`None` = LOD0), sort by (mesh, LOD),
+    /// append the instances to `scratch`, and record one run per contiguous
+    /// (mesh, LOD) group with `firstInstance = base + local_start`. `base`
+    /// must equal `scratch.len()` at entry.
+    fn build(
+        &mut self,
+        items: &[(MeshId, InstanceData)],
+        rule: Option<LodRule>,
+        runs: &mut Vec<Run>,
+        base: u32,
+    ) -> RunStats {
+        let mut stats = RunStats::default();
+        self.keyed.clear();
+        self.keyed.extend(items.iter().filter_map(|(mesh, inst)| {
+            // Unknown meshes are dropped here, as the draw loop always did.
+            let slice = self.slices.get(mesh.0 as usize)?;
+            let lod = rule.map_or(0, |r| {
+                pick_lod(
+                    &slice.lods,
+                    r.budget(&inst.model, slice.center, slice.radius),
+                )
+            });
+            Some(((mesh.0 << 4) | lod as u32, *inst))
+        }));
+        // Unstable sort is fine; draw order within a run doesn't matter
+        // (opaque + depth test).
+        self.keyed.sort_unstable_by_key(|(key, _)| *key);
+        self.scratch
+            .extend(self.keyed.iter().map(|(_, inst)| *inst));
+
+        let count = self.keyed.len();
+        let mut first = 0usize;
+        while first < count {
+            let key = self.keyed[first].0;
+            let mut run = 1usize;
+            while first + run < count && self.keyed[first + run].0 == key {
+                run += 1;
+            }
+            let slice = &self.slices[(key >> 4) as usize];
+            let lod = (key & 0xf) as usize;
+            let l = slice.lods[lod];
             runs.push(Run {
-                first_index: slice.first_index,
-                index_count: slice.index_count,
+                first_index: l.first_index,
+                index_count: l.index_count,
                 vertex_offset: slice.vertex_offset,
                 run_start: base + first as u32,
                 run_len: run as u32,
             });
+            stats.tris += (l.index_count / 3) as u64 * run as u64;
+            stats.lods[lod] += run as u32;
+            first += run;
         }
-        first += run;
+        stats.instances = count as u32;
+        stats
     }
-    count as u32
 }
 
 /// Small constant bias in light-space depth, added in the shader on top of the
@@ -1363,6 +1583,143 @@ mod tests {
         assert_eq!(plan.uploads.len(), capacity - FIRST_TEXTURE_SLOT);
         assert_eq!(plan.overflow, 7);
         assert_eq!(plan.slots.last().unwrap()[0], 0, "overflow uses white");
+    }
+
+    fn lods(errors: &[f32]) -> Vec<LodSlice> {
+        errors
+            .iter()
+            .enumerate()
+            .map(|(i, &error)| LodSlice {
+                first_index: i as u32 * 300,
+                index_count: 300 >> i,
+                error,
+            })
+            .collect()
+    }
+
+    fn screen() -> LodRule {
+        LodRule::Screen {
+            eye: Vec3::ZERO,
+            px_per_unit: 1000.0,
+            near: 0.1,
+        }
+    }
+
+    #[test]
+    fn pick_lod_takes_the_coarsest_level_within_budget() {
+        let l = lods(&[0.0, 0.01, 0.02, 0.08]);
+        assert_eq!(pick_lod(&l, 0.0), 0);
+        assert_eq!(pick_lod(&l, 0.015), 1);
+        assert_eq!(pick_lod(&l, 0.02), 2);
+        assert_eq!(pick_lod(&l, 1.0), 3);
+        // A negative budget can't happen, but must still give LOD0.
+        assert_eq!(pick_lod(&l, -1.0), 0);
+    }
+
+    #[test]
+    fn screen_budget_is_one_pixel_and_grows_with_distance() {
+        let at = |z: f32, scale: f32| {
+            let model = Mat4::from_translation(Vec3::new(0.0, 0.0, -z))
+                * Mat4::from_scale(Vec3::splat(scale));
+            screen().budget(&model, Vec3::ZERO, 0.5)
+        };
+        // Unit scale, 10.5 away, radius 0.5: nearest point at 10 units, where one
+        // pixel is 10 / 1000 = 0.01 world units.
+        assert!((at(10.5, 1.0) - 0.01).abs() < 1e-6, "{}", at(10.5, 1.0));
+        assert!(at(100.0, 1.0) > at(10.0, 1.0));
+        // A twice-as-big instance at the same distance must keep finer detail
+        // (in mesh units the budget halves, and more: its sphere is nearer).
+        assert!(at(20.0, 2.0) < at(20.0, 1.0) / 2.0);
+        // Inside the sphere: clamped to the near plane, i.e. LOD0 territory.
+        assert!(at(0.2, 1.0) <= 0.1 / 1000.0 + 1e-9);
+        // Non-uniform scale uses the largest axis.
+        let stretched = Mat4::from_translation(Vec3::new(0.0, 0.0, -50.0))
+            * Mat4::from_scale(Vec3::new(1.0, 4.0, 1.0));
+        let b = screen().budget(&stretched, Vec3::ZERO, 0.0);
+        assert!((b - 50.0 / (1000.0 * 4.0)).abs() < 1e-7, "{b}");
+    }
+
+    #[test]
+    fn texel_budget_ignores_distance() {
+        let rule = LodRule::Texel(0.05);
+        let near = Mat4::from_translation(Vec3::new(0.0, 0.0, -1.0));
+        let far = Mat4::from_translation(Vec3::new(0.0, 0.0, -500.0));
+        assert_eq!(rule.budget(&near, Vec3::ZERO, 1.0), 0.05);
+        assert_eq!(rule.budget(&far, Vec3::ZERO, 1.0), 0.05);
+        let big = Mat4::from_scale(Vec3::splat(5.0));
+        assert!((rule.budget(&big, Vec3::ZERO, 1.0) - 0.01).abs() < 1e-7);
+    }
+
+    #[test]
+    fn runs_split_by_mesh_and_lod() {
+        let slices = vec![
+            MeshSlice {
+                vertex_offset: 0,
+                lods: lods(&[0.0, 0.01, 0.1]),
+                center: Vec3::ZERO,
+                radius: 0.5,
+            },
+            MeshSlice {
+                vertex_offset: 100,
+                lods: lods(&[0.0]),
+                center: Vec3::ZERO,
+                radius: 0.5,
+            },
+        ];
+        let inst = |z: f32| InstanceData::new(Mat4::from_translation(Vec3::new(0.0, 0.0, -z)), 0);
+        // Mesh 0 at 5 (LOD0: budget 0.0045), 20 and 30 (LOD1), 500 (LOD2);
+        // mesh 1 far away (its only LOD); mesh 7 doesn't exist.
+        let items = vec![
+            (MeshId(0), inst(500.0)),
+            (MeshId(0), inst(20.0)),
+            (MeshId(1), inst(900.0)),
+            (MeshId(0), inst(5.0)),
+            (MeshId(7), inst(5.0)),
+            (MeshId(0), inst(30.0)),
+        ];
+        let (mut keyed, mut scratch, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+        let mut b = Runs {
+            slices: &slices,
+            keyed: &mut keyed,
+            scratch: &mut scratch,
+        };
+        let st = b.build(&items, Some(screen()), &mut runs, 10);
+        let got: Vec<(u32, u32, i32, u32, u32)> = runs
+            .iter()
+            .map(|r| {
+                (
+                    r.first_index,
+                    r.index_count,
+                    r.vertex_offset,
+                    r.run_start,
+                    r.run_len,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 300, 0, 10, 1),   // mesh 0 LOD0
+                (300, 150, 0, 11, 2), // mesh 0 LOD1 x2
+                (600, 75, 0, 13, 1),  // mesh 0 LOD2
+                (0, 300, 100, 14, 1), // mesh 1 LOD0
+            ]
+        );
+        assert_eq!(st.instances, 5, "the unknown mesh is dropped");
+        assert_eq!(scratch.len(), 5);
+        assert_eq!(st.tris, 100 + 2 * 50 + 25 + 100);
+        assert_eq!(&st.lods[..3], &[2, 2, 1]);
+
+        // No rule: everything at LOD0.
+        let (mut keyed, mut scratch, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+        let mut b = Runs {
+            slices: &slices,
+            keyed: &mut keyed,
+            scratch: &mut scratch,
+        };
+        let st = b.build(&items, None, &mut runs, 0);
+        assert_eq!(st.lods[0], 5);
+        assert_eq!(runs.len(), 2);
     }
 
     /// The cluster grid and light cap are repeated as GLSL constants in both

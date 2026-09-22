@@ -277,7 +277,8 @@ planes from any `viewProj`) tests each entity's conservative bounding **sphere**
 fit). Run inline in the app's extract loop, **per view**: the camera frustum trims
 the main pass and the sun light ortho trims the shadow pass, each producing its own
 instance set. Still **single-threaded** (no rayon fold-reduce), **sphere-only** (no
-AABB refinement), and with **no broad phase / chunk culling or LOD** yet. Note the
+AABB refinement), and with **no broad phase / chunk culling** yet (LOD landed in
+§17, chosen in the renderer rather than here). Note the
 observed behavior: at a dense fragment-bound view the *frame time* barely moves
 (the culled objects were already off-screen — zero pixels), so the win is in
 vertex/draw work and shows up when the view is sparse or geometry/overdraw-bound;
@@ -963,8 +964,66 @@ never trusted. Measured on the detail scene: **64 MB of BC7 vs 256 MB raw**
 (including 1×1/2×2 partial-block levels), and `geo` identical.
 Not yet: BC5 for normal maps (needs z reconstruction in the shader); keying on
 *source* bytes so baked scenes can skip JPEG decode at load (today the decode
-still runs to compute the key); meshes, materials and scenes (the rest of
-this section).
+still runs to compute the key).
+
+**Landed (§26): the mesh part of the bake, and LODs.** Same shape as textures:
+the runtime loads the glTF, keys each mesh (`mesh_key`: xxh3 of the loader's
+vertices + indices + `MESH_BAKE_VERSION`, *not* the material, so a shape
+used with several materials bakes once), and uses
+`scratch/bake/mesh/<key>.fbm` when it exists. Otherwise it uses the raw mesh
+as a single LOD, never an error. The bake root is now `scratch/bake/`, with
+`tex/` beside `mesh/`. meshoptimizer (`meshopt`, bake crate only) does the
+work:
+- **LOD0** is the input triangles, vertex-cache ordered.
+- **Each further level** is simplified *from LOD0* towards half the previous
+  level's triangles, with normals as a weighted attribute (so shading creases
+  hold) and **`Prune`**, which drops disconnected parts smaller than the
+  error. Grass blades can't be merged by edge collapse at all, and they're two
+  thirds of `detail_high`'s triangles.
+- **The chain stops** when a step removes < 10%, below 64 triangles, or at 8
+  levels. Meshes under 256 triangles keep LOD0 only.
+- **All levels share one vertex array**, fetch-ordered over the concatenated
+  index lists, so LODs cost index memory only.
+- **Each level stores its error** in mesh-local units: meshopt's relative
+  error × `simplify_scale`, forced non-decreasing.
+- **Files are validated on read:** every index in range, whole triangles,
+  finite non-decreasing errors, no trailing bytes.
+
+**Selection is a render concern.** `MeshRenderer` keeps a LOD list and a local
+bounding sphere per mesh, and `prepare_frame` picks, per instance per view,
+the coarsest level whose error fits the view's budget. For the camera that's
+**1 pixel** at the instance's nearest point:
+`err · scale · (h / 2tan(fov/2)) / (dist − r)`, with the largest axis scale so
+a stretched instance is never under-estimated. For each shadow cascade it's
+**one shadow texel** (`texel_world`, distance-free, since the ortho can't
+resolve anything finer). Runs are keyed (mesh, LOD), and the app's culling
+didn't change. `--no-lod` pins LOD0 with the baked vertex order.
+
+Measured on `detail_high` (pinned clocks, 3 interleaved runs, medians; every
+run gave the same numbers):
+
+| | HEAD | `--no-lod` | LOD |
+|---|---|---|---|
+| main Mtris / frame | 3.66 | 3.66 | **0.29** (−92%) |
+| shadow Mtris / frame | 7.06 | 7.06 | **0.61** (−91%) |
+| `shadow` | 0.76 ms | 0.78 ms | **0.18 ms** (−76%) |
+| `geo` | 1.03 ms | 1.03 ms | **0.28 ms** (−73%) |
+| frame | 1.83 ms | 1.86 ms | **0.50 ms** (−73%) |
+
+The **vertex order alone did nothing** (predicted: within ±5%; Poly Haven's
+exports were already cache-friendly). The **LOD win was far larger than
+predicted** (geo −25…45%, shadow −30…60%). The prediction assumed pixel cost
+would dominate once triangles dropped. In fact most of the time went to
+rasterising sub-pixel triangles. That also corrects the earlier reading that
+14.5M triangles "isn't the bottleneck": they were ~¾ of the geometry and
+shadow time. Cost: indices 1.5 → 3.0 MB (predicted 1.5–2×), vertices
+unchanged at 2.7 MB. The testscene (nothing ≥ 256 triangles) is unchanged,
+and the bake takes 0.1 s for `detail_high`'s 27 meshes.
+Open risk, not measured: a caster drawn coarser than its own receiver could
+self-shadow. It's bounded to one texel, inside the existing bias, but it's
+a thing to look at. Collision still uses the loader's full meshes; a coarse
+LOD for trimesh colliders is a follow-up.
+Not yet: materials and scenes as baked blobs (the rest of this section).
 
 ## 18. Scene spawning + save/load
 
@@ -1268,7 +1327,8 @@ app        thin binary wiring it together
    ECS entity. Remaining: dynamic bodies — see §26.)
 5. Bounded arena content, chunked culling, bindless materials, PBR bake path.
    (Landed: per-view frustum culling, bindless-lite materials, and glTF scene
-   loading. Remaining: chunked/broad-phase culling, LOD, and the offline bake.)
+   loading, the offline bake for textures and meshes, and mesh LODs. Remaining:
+  chunked/broad-phase culling.)
 6. Deferred-by-design items as needed: streaming, stage pipelining, GPU-driven
    indirect culling, SSR/volumetrics, probes.
 
@@ -1377,8 +1437,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   **analytic-sky environment ambient** (split-sum IBL: hemisphere irradiance +
   reflection + Karis env-BRDF, no cubemap), written unclamped to the HDR target,
   `cull NONE` + depth. Draw
-  sorts `(MeshId, instance)` by mesh, emits **one `cmd_draw_indexed` per
-  contiguous run** (`firstInstance` = run start). `TonemapPass` — attributeless
+  sorts `(MeshId, instance)` by (mesh, LOD), the LOD picked per view (§17), and
+  emits **one `cmd_draw_indexed` per contiguous run** (`firstInstance` = run start). `TonemapPass` — attributeless
   fullscreen triangle sampling the HDR target, **exposure + Narkowicz ACES**,
   output left linear for the `_SRGB` swapchain to encode; exposure via push
   constant. `SkyPass` — far-plane fullscreen procedural-sky background drawn
@@ -1447,8 +1507,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   exact trimesh up to 2048 triangles and a convex hull above that, overridable
   per node, §15; no convex *decomposition*), scenes land at their authored
   coordinates so a model authored around the origin floats above the demo ground
-  at `GROUND_Y`, and there is still no broad-phase/LOD, so a large scene leans on
-  the per-entity cull.
+  at `GROUND_Y`, and there is still no broad phase, so a large scene leans on
+  the per-entity cull (and on LODs, §17, for its triangle count).
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
   *not* the cluster grid, GTAO or cubemap IBL;
@@ -1577,7 +1637,7 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
 
 Culling (per-view bounding-sphere frustum cull landed for the camera + shadow
 views, §8 — broad-phase/chunk cull, rayon parallelism, AABB refinement, and LOD
-still pending); MikkTSpace vertex tangents (mips landed); pipeline buckets (PBR BRDF +
+still pending; LOD landed, §17); MikkTSpace vertex tangents (mips landed); pipeline buckets (PBR BRDF +
 base-color/normal/MR textures landed); clustered lighting (**landed** — a `point_light` prefab, a lights SSBO, and a
 16×9×24 cluster grid assigned by one compute dispatch into per-cluster light
 bitmasks, plus sphere-light specular via `source_radius`, §12; spot lights and

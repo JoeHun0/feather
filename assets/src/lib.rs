@@ -19,7 +19,7 @@ use glam::{Mat4, Vec3};
 /// (position at offset 0, normal at offset 12, uv at offset 24). `#[repr(C)]` so
 /// a slice uploads straight into a device-local vertex buffer.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],

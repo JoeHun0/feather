@@ -38,8 +38,8 @@ use feather_assets::MeshData;
 use feather_gfx::{GpuTimes, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use feather_platform::winit;
 use feather_render::{
-    CascadeSetup, ClusterView, FxaaPass, GpuLight, InstanceData, MeshId, MeshRenderer, SkyPass,
-    TonemapPass, UiPass,
+    CascadeSetup, ClusterView, FrameStats, FxaaPass, GpuLight, InstanceData, MeshId, MeshRenderer,
+    SkyPass, TonemapPass, UiPass,
 };
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
@@ -199,13 +199,17 @@ struct GraphicsSettings {
     /// FXAA post-AA (§13). Unlike MSAA this is live-toggleable (`F2`): it bakes
     /// nothing into pipelines, and the LDR intermediate is always allocated.
     fxaa: bool,
-    /// Use baked BC7 textures from `BAKE_DIR` when present (§17). `--no-bake`
-    /// forces raw RGBA8, for A/B comparisons.
+    /// Use baked assets from `BAKE_DIR` when present (§17): BC7 textures and
+    /// meshes with LODs. `--no-bake` forces the raw assets, for A/B comparisons.
     bake: bool,
+    /// Pick LODs per view (§17). `--no-lod` pins LOD0 while keeping the baked
+    /// vertex order, so an A/B separates the ordering win from the LOD win.
+    lod: bool,
 }
 
-/// Where `feather-bake` writes, and the runtime looks for, baked textures.
-const BAKE_DIR: &str = "scratch/bake/tex";
+/// Where `feather-bake` writes, and the runtime looks for, baked assets
+/// (`tex/` and `mesh/` below it).
+const BAKE_DIR: &str = "scratch/bake";
 
 impl Default for GraphicsSettings {
     fn default() -> Self {
@@ -214,6 +218,7 @@ impl Default for GraphicsSettings {
             msaa: 1,
             fxaa: false,
             bake: true,
+            lod: true,
         }
     }
 }
@@ -992,8 +997,10 @@ struct Bench {
     start_yaw: Option<f32>,
     /// Raw GPU times + visible-light count per sweep frame. The two are
     /// `FRAMES_IN_FLIGHT` frames (1°) apart, which is noise for a distribution.
-    samples: Vec<(GpuTimes, usize)>,
+    samples: Vec<(GpuTimes, usize, FrameStats)>,
     lights: usize,
+    /// This frame's triangles and LOD mix (§17).
+    stats: FrameStats,
 }
 
 impl Bench {
@@ -1003,6 +1010,7 @@ impl Bench {
             start_yaw: None,
             samples: Vec::with_capacity(BENCH_SWEEP as usize),
             lights: 0,
+            stats: FrameStats::default(),
         }
     }
 
@@ -1020,7 +1028,7 @@ impl Bench {
     fn record(&mut self, raw: GpuTimes) -> bool {
         let lag = FRAMES_IN_FLIGHT as u32;
         if self.frame >= BENCH_SETTLE + lag {
-            self.samples.push((raw, self.lights));
+            self.samples.push((raw, self.lights, self.stats));
         }
         self.frame += 1;
         self.frame >= BENCH_SETTLE + BENCH_SWEEP + lag
@@ -1040,8 +1048,33 @@ impl Bench {
                 at(1.0)
             )
         }
-        let col = |f: fn(&GpuTimes) -> f32| stats(self.samples.iter().map(|(t, _)| f(t)).collect());
-        let lights = stats(self.samples.iter().map(|&(_, n)| n as f32).collect());
+        let col =
+            |f: fn(&GpuTimes) -> f32| stats(self.samples.iter().map(|(t, _, _)| f(t)).collect());
+        let lights = stats(self.samples.iter().map(|&(_, n, _)| n as f32).collect());
+        let mtris = |f: fn(&FrameStats) -> u64| {
+            stats(
+                self.samples
+                    .iter()
+                    .map(|(_, _, s)| f(s) as f32 / 1e6)
+                    .collect(),
+            )
+        };
+        // Share of instances at each LOD over the whole sweep, as "0:62% 1:20% ...".
+        let mix = |f: fn(&FrameStats) -> [u32; 16]| {
+            let mut sum = [0u64; 16];
+            for (_, _, s) in &self.samples {
+                for (t, n) in sum.iter_mut().zip(f(s)) {
+                    *t += n as u64;
+                }
+            }
+            let total = sum.iter().sum::<u64>().max(1) as f64;
+            sum.iter()
+                .enumerate()
+                .filter(|(_, &n)| n > 0)
+                .map(|(i, &n)| format!("{i}:{:.0}%", n as f64 * 100.0 / total))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         eprintln!(
             "[bench] {width}x{height}, {} sweep frames (ms)",
             self.samples.len()
@@ -1052,6 +1085,10 @@ impl Bench {
         eprintln!("[bench] post    {}", col(|t| t.post_ms));
         eprintln!("[bench] frame   {}", col(|t| t.frame_ms));
         eprintln!("[bench] lights  {lights}  (visible, after cull)");
+        eprintln!("[bench] Mtris main   {}", mtris(|s| s.main_tris));
+        eprintln!("[bench] Mtris shadow {}", mtris(|s| s.shadow_tris));
+        eprintln!("[bench] LOD mix main   {}", mix(|s| s.main_lods));
+        eprintln!("[bench] LOD mix shadow {}", mix(|s| s.shadow_lods));
     }
 }
 
@@ -1545,7 +1582,7 @@ struct Session {
 impl Session {
     /// Build a world and the GPU resources that serve it. `scenes` are the CLI
     /// glTF paths; empty means the procedural orb demo, exactly as before.
-    fn new(renderer: &Renderer, scenes: &[String], bake: bool) -> Self {
+    fn new(renderer: &Renderer, scenes: &[String], bake: bool, lod: bool) -> Self {
         // Scenes load *first*, because a `player_start` marker (§18) decides
         // where the player goes and the player is built below.
         let (meshes, scene_nodes) = load_scenes(scenes);
@@ -1718,8 +1755,9 @@ impl Session {
         world.resource_mut::<Physics>().step();
 
         let bake_dir = bake.then(|| std::path::Path::new(BAKE_DIR));
-        let (mesh, _ids) =
+        let (mut mesh, _ids) =
             MeshRenderer::new(renderer, &meshes, &materials, MAX_INSTANCES, bake_dir);
+        mesh.set_lod_enabled(lod);
         let sky = SkyPass::new(renderer);
 
         Self {
@@ -1899,7 +1937,12 @@ impl App {
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
-        let session = Session::new(renderer, &self.scenes, self.settings.bake);
+        let session = Session::new(
+            renderer,
+            &self.scenes,
+            self.settings.bake,
+            self.settings.lod,
+        );
         self.session = Some(session);
         self.paused = false;
         self.menu.reset(MenuScreen::Root);
@@ -2244,6 +2287,7 @@ impl ApplicationHandler for App {
                         aspect,
                         near: CAMERA_NEAR,
                         far: CAMERA_FAR,
+                        viewport_height: size.height.max(1) as f32,
                     };
                     let inv_view_proj = view_proj.inverse();
                     let light_dir = self.light_dir;
@@ -2372,6 +2416,7 @@ impl ApplicationHandler for App {
                     );
                     if let Some(b) = self.bench.as_mut() {
                         b.lights = lights.len();
+                        b.stats = s.mesh.frame_stats();
                     }
                     frame_view = Some(FrameView {
                         view_proj,
@@ -2788,6 +2833,7 @@ fn main() {
             },
             "--bench" => bench = true,
             "--no-bake" => settings.bake = false,
+            "--no-lod" => settings.lod = false,
             _ => scenes.push(a),
         }
     }

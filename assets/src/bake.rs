@@ -1,16 +1,23 @@
-//! Baked textures (§17): the half of the texture bake that the runtime and the
-//! `bake` tool share, which is the content key and the file format.
+//! Baked assets (§17): the half of the bake that the runtime and the `bake`
+//! tool share, which is the content keys and the file formats.
 //!
 //! The bake turns each (image, colour space) a scene uses into a BC7 mip chain,
-//! stored under a key derived from the decoded pixels. The runtime computes the
-//! same key and uploads the baked chain when it finds one, falling back to raw
-//! RGBA8 when it doesn't. Open sources stay the truth, and the cache is
-//! disposable.
+//! and each mesh into an optimised vertex order plus a LOD chain, stored under
+//! keys derived from the decoded content. The runtime computes the same keys
+//! and uses a baked file when it finds one, falling back to the raw asset when
+//! it doesn't. Open sources stay the truth, and the cache is disposable.
+//!
+//! Layout under the bake root: `tex/<key>.bc7` and `mesh/<key>.fbm`.
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::TextureData;
+use crate::{MeshData, TextureData, Vertex};
+
+/// Subdirectory of the bake root holding baked textures.
+pub const TEX_DIR: &str = "tex";
+/// Subdirectory of the bake root holding baked meshes.
+pub const MESH_DIR: &str = "mesh";
 
 /// Bump when the bake's output changes meaning (mip filter, encoder settings,
 /// file layout): stale cache entries then simply aren't found.
@@ -34,6 +41,144 @@ pub fn texture_key(tex: &TextureData, srgb: bool) -> u64 {
 /// Where a key's baked file lives in the cache directory.
 pub fn baked_path(dir: &Path, key: u64) -> PathBuf {
     dir.join(format!("{key:016x}.bc7"))
+}
+
+/// Bump when the mesh bake's output changes meaning (simplifier settings, LOD
+/// rules, file layout). Separate from `BAKE_VERSION` so re-tuning LODs doesn't
+/// invalidate the (slow) texture bake.
+pub const MESH_BAKE_VERSION: u32 = 1;
+/// Meshes under this many triangles bake to LOD0 only: their cost is the
+/// draw, not the triangles. Shared so the runtime only suggests baking meshes
+/// that would gain LODs.
+pub const MIN_LOD_TRIS: usize = 256;
+const MESH_MAGIC: [u8; 4] = *b"FBMS";
+
+/// Content key of one mesh: its vertices and indices exactly as the loader
+/// produced them. The material isn't part of it, so a shape reused with
+/// several materials bakes once.
+pub fn mesh_key(mesh: &MeshData) -> u64 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    h.update(&MESH_BAKE_VERSION.to_le_bytes());
+    h.update(&(mesh.vertices.len() as u64).to_le_bytes());
+    h.update(pod_bytes(&mesh.vertices));
+    h.update(pod_bytes(&mesh.indices));
+    h.digest()
+}
+
+/// Where a key's baked mesh lives in the mesh directory.
+pub fn baked_mesh_path(dir: &Path, key: u64) -> PathBuf {
+    dir.join(format!("{key:016x}.fbm"))
+}
+
+fn pod_bytes<T: Copy>(s: &[T]) -> &[u8] {
+    // Vertex is repr(C) f32s and u32 has no padding: every byte is initialised.
+    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+}
+
+/// One level of detail: an index list into the shared vertex array.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lod {
+    /// Geometric error of this level against the original, in mesh-local
+    /// units (0 for LOD0). The runtime projects it to decide when the level
+    /// is good enough.
+    pub error: f32,
+    pub indices: Vec<u32>,
+}
+
+/// A baked mesh: vertices reordered for fetch locality, shared by every LOD,
+/// and LODs from full detail (0) to coarsest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BakedMesh {
+    pub vertices: Vec<Vertex>,
+    pub lods: Vec<Lod>,
+}
+
+impl BakedMesh {
+    /// Magic, version, vertex count, raw `Vertex` array, LOD count, then per
+    /// LOD its error, index count and indices. Temp + rename like textures.
+    pub fn write(&self, path: &Path) -> io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = io::BufWriter::new(std::fs::File::create(&tmp)?);
+            f.write_all(&MESH_MAGIC)?;
+            f.write_all(&MESH_BAKE_VERSION.to_le_bytes())?;
+            f.write_all(&(self.vertices.len() as u32).to_le_bytes())?;
+            f.write_all(pod_bytes(&self.vertices))?;
+            f.write_all(&(self.lods.len() as u32).to_le_bytes())?;
+            for lod in &self.lods {
+                f.write_all(&lod.error.to_le_bytes())?;
+                f.write_all(&(lod.indices.len() as u32).to_le_bytes())?;
+                f.write_all(pod_bytes(&lod.indices))?;
+            }
+            f.flush()?;
+        }
+        std::fs::rename(tmp, path)
+    }
+
+    /// Read and *validate* a baked mesh. Anything the renderer would trust
+    /// blindly is checked: sizes, whole triangles, every index in range, at
+    /// least one LOD, and errors that never decrease (the selection walks the
+    /// chain assuming coarser means worse). Any failure is an error and the
+    /// caller uses the raw mesh.
+    pub fn read(path: &Path) -> io::Result<Self> {
+        let mut data = Vec::new();
+        std::fs::File::open(path)?.read_to_end(&mut data)?;
+        let mut r = Cursor { data: &data, at: 0 };
+        if r.take(4)? != MESH_MAGIC {
+            return Err(invalid("not a baked mesh"));
+        }
+        if r.u32()? != MESH_BAKE_VERSION {
+            return Err(invalid("baked by another version"));
+        }
+        let vertex_count = r.u32()? as usize;
+        let raw = r.take(vertex_count * std::mem::size_of::<Vertex>())?;
+        // 8 little-endian f32s per vertex: pos, normal, uv.
+        let (floats, _) = raw.as_chunks::<4>();
+        let vertices: Vec<Vertex> = floats
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|v| {
+                let f = v.map(f32::from_le_bytes);
+                Vertex {
+                    pos: [f[0], f[1], f[2]],
+                    normal: [f[3], f[4], f[5]],
+                    uv: [f[6], f[7]],
+                }
+            })
+            .collect();
+        let lod_count = r.u32()?;
+        if lod_count == 0 {
+            return Err(invalid("no LODs"));
+        }
+        let mut lods: Vec<Lod> = Vec::with_capacity(lod_count as usize);
+        for _ in 0..lod_count {
+            let error = f32::from_le_bytes(r.take(4)?.try_into().unwrap());
+            let count = r.u32()? as usize;
+            if count == 0 || !count.is_multiple_of(3) {
+                return Err(invalid("LOD isn't whole triangles"));
+            }
+            let indices: Vec<u32> = r
+                .take(count * 4)?
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
+                .collect();
+            if indices.iter().any(|&i| i as usize >= vertex_count) {
+                return Err(invalid("index out of range"));
+            }
+            let prev = lods.last().map_or(0.0, |l| l.error);
+            if !error.is_finite() || error < prev {
+                return Err(invalid("LOD errors must be finite and non-decreasing"));
+            }
+            lods.push(Lod { error, indices });
+        }
+        if r.at != data.len() {
+            return Err(invalid("trailing bytes"));
+        }
+        Ok(Self { vertices, lods })
+    }
 }
 
 /// Bytes of BC7 blocks for one mip level: 16 per 4×4 block, partial blocks
@@ -164,6 +309,95 @@ mod tests {
         assert_eq!(bc7_level_size(8, 8, 1), 16); // 4x4: one block
         assert_eq!(bc7_level_size(8, 8, 3), 16); // 1x1 still costs a block
         assert_eq!(bc7_level_size(6, 2, 0), 32); // 2 blocks by 1
+    }
+
+    fn mesh() -> BakedMesh {
+        let v = |x: f32| Vertex {
+            pos: [x, 0.0, 1.0],
+            normal: [0.0, 1.0, 0.0],
+            uv: [x, 0.5],
+        };
+        BakedMesh {
+            vertices: (0..4).map(|i| v(i as f32)).collect(),
+            lods: vec![
+                Lod {
+                    error: 0.0,
+                    indices: vec![0, 1, 2, 0, 2, 3],
+                },
+                Lod {
+                    error: 0.25,
+                    indices: vec![0, 1, 3],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn mesh_keys_ignore_material_but_not_geometry() {
+        let m = mesh();
+        let data = |indices: Vec<u32>| MeshData {
+            vertices: m.vertices.clone(),
+            indices,
+            material: crate::Material::default(),
+        };
+        let a = data(vec![0, 1, 2]);
+        let mut b = data(vec![0, 1, 2]);
+        b.material.roughness = 0.1;
+        assert_eq!(mesh_key(&a), mesh_key(&b));
+        assert_ne!(mesh_key(&a), mesh_key(&data(vec![0, 2, 1])));
+    }
+
+    #[test]
+    fn baked_meshes_round_trip_and_reject_damage() {
+        let dir = std::env::temp_dir().join(format!("feather_bake_mesh_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = baked_mesh_path(&dir, 0x42);
+        mesh().write(&path).unwrap();
+        assert_eq!(BakedMesh::read(&path).unwrap(), mesh());
+
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(BakedMesh::read(&path).is_err(), "truncated");
+        let mut extra = bytes.clone();
+        extra.push(0);
+        std::fs::write(&path, &extra).unwrap();
+        assert!(BakedMesh::read(&path).is_err(), "trailing bytes");
+        let mut magic = bytes.clone();
+        magic[0] = b'X';
+        std::fs::write(&path, &magic).unwrap();
+        assert!(BakedMesh::read(&path).is_err(), "bad magic");
+
+        for (why, damage) in [
+            ("index out of range", {
+                let mut m = mesh();
+                m.lods[1].indices[2] = 4;
+                m
+            }),
+            ("decreasing error", {
+                let mut m = mesh();
+                m.lods[1].error = -1.0;
+                m
+            }),
+            ("NaN error", {
+                let mut m = mesh();
+                m.lods[1].error = f32::NAN;
+                m
+            }),
+            ("partial triangle", {
+                let mut m = mesh();
+                m.lods[1].indices.pop();
+                m
+            }),
+            ("no LODs", {
+                let mut m = mesh();
+                m.lods.clear();
+                m
+            }),
+        ] {
+            damage.write(&path).unwrap();
+            assert!(BakedMesh::read(&path).is_err(), "{why} was accepted");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
