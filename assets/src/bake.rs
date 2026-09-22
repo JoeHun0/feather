@@ -21,20 +21,56 @@ pub const MESH_DIR: &str = "mesh";
 
 /// Bump when the bake's output changes meaning (mip filter, encoder settings,
 /// file layout): stale cache entries then simply aren't found.
-pub const BAKE_VERSION: u32 = 1;
+pub const BAKE_VERSION: u32 = 2;
 const MAGIC: [u8; 4] = *b"FBTX";
 
-/// Content key of one texture as the bake sees it. Keyed on the *decoded*
-/// pixels, so it's the same however the image was stored (file, GLB buffer,
-/// data URI), plus the colour space, since the same pixels baked as sRGB and
-/// as data are different outputs.
-pub fn texture_key(tex: &TextureData, srgb: bool) -> u64 {
+/// What a texture is used as, which decides how it's baked.
+///
+/// Normal maps are `Data`, i.e. three-channel BC7, on purpose. BC5 (X, Y with Z
+/// rebuilt in the shader) was measured on the detail scene's four normal maps
+/// and rejected: the rock and grass maps hold inward-pointing and non-unit
+/// texels (25% and 24% of them) that only a third channel reproduces, so BC5
+/// moved their mean error from 1.1° to 17.8° (rocks) and 1.4° to 5.2° (grass),
+/// while gaining under 0.1° on the clean bust map. Same VRAM either way.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum TexKind {
+    /// Base colour: BC7, sampled as sRGB.
+    Color,
+    /// Linear data (metallic-roughness, normal maps): BC7, UNORM.
+    Data,
+}
+
+impl TexKind {
+    /// Sampled with sRGB decoding (only base colour).
+    pub fn srgb(self) -> bool {
+        self == TexKind::Color
+    }
+
+    fn tag(self) -> u32 {
+        match self {
+            TexKind::Data => 0,
+            TexKind::Color => 1,
+        }
+    }
+
+    fn from_tag(tag: u32) -> Option<Self> {
+        [TexKind::Data, TexKind::Color]
+            .into_iter()
+            .find(|k| k.tag() == tag)
+    }
+}
+
+/// Content key of one texture as the bake sees it: the image's **encoded**
+/// bytes (`source_key`), so the runtime can find the bake without decoding
+/// anything, plus the kind, since the same image baked as sRGB colour and as
+/// linear data gives different outputs.
+pub fn texture_key(tex: &TextureData, kind: TexKind) -> u64 {
     let mut h = xxhash_rust::xxh3::Xxh3::new();
     h.update(&BAKE_VERSION.to_le_bytes());
+    h.update(&kind.tag().to_le_bytes());
     h.update(&tex.width.to_le_bytes());
     h.update(&tex.height.to_le_bytes());
-    h.update(&[srgb as u8]);
-    h.update(&tex.pixels);
+    h.update(&tex.source_key.to_le_bytes());
     h.digest()
 }
 
@@ -181,25 +217,25 @@ impl BakedMesh {
     }
 }
 
-/// Bytes of BC7 blocks for one mip level: 16 per 4×4 block, partial blocks
-/// rounded up, which is exactly what Vulkan expects for a BC7 level.
+/// Bytes of one BC7 mip level: 16 per 4×4 block, partial blocks rounded up,
+/// which is exactly what Vulkan expects.
 pub fn bc7_level_size(width: u32, height: u32, level: u32) -> usize {
     let w = (width >> level).max(1);
     let h = (height >> level).max(1);
     (w.div_ceil(4) * h.div_ceil(4) * 16) as usize
 }
 
-/// A baked BC7 mip chain: level 0 first, down to 1×1.
+/// A baked BC7 mip chain, level 0 first, down to 1×1.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BakedTexture {
-    pub srgb: bool,
+    pub kind: TexKind,
     pub width: u32,
     pub height: u32,
     pub levels: Vec<Vec<u8>>,
 }
 
 impl BakedTexture {
-    /// Thin header + raw GPU-ready payloads (§17): magic, version, sRGB flag,
+    /// Thin header + raw GPU-ready payloads (§17): magic, version, kind,
     /// width, height, level count, then each level's length and blocks.
     /// Written to a temporary name and renamed, so an interrupted bake never
     /// leaves a truncated file that a later run would trust.
@@ -210,7 +246,7 @@ impl BakedTexture {
             f.write_all(&MAGIC)?;
             for v in [
                 BAKE_VERSION,
-                self.srgb as u32,
+                self.kind.tag(),
                 self.width,
                 self.height,
                 self.levels.len() as u32,
@@ -236,11 +272,12 @@ impl BakedTexture {
         if r.take(4)? != MAGIC {
             return Err(invalid("not a baked texture"));
         }
-        let (version, srgb, width, height, count) =
+        let (version, kind, width, height, count) =
             (r.u32()?, r.u32()?, r.u32()?, r.u32()?, r.u32()?);
         if version != BAKE_VERSION {
             return Err(invalid("baked by another version"));
         }
+        let kind = TexKind::from_tag(kind).ok_or_else(|| invalid("unknown texture kind"))?;
         let mut levels = Vec::with_capacity(count as usize);
         for level in 0..count {
             let len = r.u32()? as usize;
@@ -250,7 +287,7 @@ impl BakedTexture {
             levels.push(r.take(len)?.to_vec());
         }
         Ok(Self {
-            srgb: srgb != 0,
+            kind,
             width,
             height,
             levels,
@@ -288,19 +325,29 @@ mod tests {
     use super::*;
 
     fn tex(fill: u8) -> TextureData {
-        TextureData {
-            pixels: vec![fill; 8 * 8 * 4],
-            width: 8,
-            height: 8,
-        }
+        TextureData::from_rgba8(vec![fill; 8 * 8 * 4], 8, 8)
     }
 
     #[test]
-    fn keys_are_content_and_colour_space_addressed() {
-        assert_eq!(texture_key(&tex(1), true), texture_key(&tex(1), true));
-        assert_ne!(texture_key(&tex(1), true), texture_key(&tex(2), true));
-        // Same pixels, different colour space: different bakes.
-        assert_ne!(texture_key(&tex(1), true), texture_key(&tex(1), false));
+    fn keys_are_content_and_kind_addressed() {
+        let k = |t: &TextureData, kind| texture_key(t, kind);
+        assert_eq!(k(&tex(1), TexKind::Color), k(&tex(1), TexKind::Color));
+        assert_ne!(k(&tex(1), TexKind::Color), k(&tex(2), TexKind::Color));
+        // Same image, different use: different bakes.
+        assert_ne!(k(&tex(1), TexKind::Color), k(&tex(1), TexKind::Data));
+        // Keyed on the source, not on decoding: two textures with the same
+        // encoded bytes share a key without either being decoded.
+        let png = |c: u8| {
+            let mut out = Vec::new();
+            image::RgbImage::from_pixel(2, 2, image::Rgb([c, 0, 0]))
+                .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+                .unwrap();
+            TextureData::from_encoded(out).unwrap()
+        };
+        let (a, b) = (png(7), png(7));
+        assert_eq!(k(&a, TexKind::Data), k(&b, TexKind::Data));
+        assert_ne!(k(&a, TexKind::Data), k(&png(8), TexKind::Data));
+        assert!(!a.is_decoded() && !b.is_decoded());
     }
 
     #[test]
@@ -405,7 +452,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("feather_bake_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let baked = BakedTexture {
-            srgb: true,
+            kind: TexKind::Color,
             width: 8,
             height: 4,
             levels: (0..4)
@@ -413,8 +460,21 @@ mod tests {
                 .collect(),
         };
         let path = baked_path(&dir, 0x1234);
+        for kind in [TexKind::Color, TexKind::Data] {
+            let b = BakedTexture {
+                kind,
+                ..baked.clone()
+            };
+            b.write(&path).unwrap();
+            assert_eq!(BakedTexture::read(&path).unwrap(), b);
+        }
+        // An unknown kind tag is rejected (it's the u32 after magic + version).
         baked.write(&path).unwrap();
-        assert_eq!(BakedTexture::read(&path).unwrap(), baked);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8] = 9;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(BakedTexture::read(&path).is_err());
+        baked.write(&path).unwrap();
 
         // A truncated file is rejected, not trusted.
         let bytes = std::fs::read(&path).unwrap();

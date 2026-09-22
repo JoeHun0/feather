@@ -129,7 +129,7 @@ pipeline/descriptor state.
 | Map        | Color space | Compression | Notes                              |
 |------------|-------------|-------------|------------------------------------|
 | Base color | sRGB        | BC7         | RGBA; A = cutout alpha             |
-| Normal     | linear      | BC5         | 2-channel, reconstruct Z in shader |
+| Normal     | linear      | BC7         | 3-channel; BC5 measured and rejected (§17) |
 | ORM        | linear      | BC7/BC1     | occlusion=R, roughness=G, metal=B  |
 | Emissive   | sRGB        | BC7         | optional                           |
 
@@ -945,15 +945,16 @@ hold, repeat, rebinding) is unit-tested without a GPU through
   truth; `--watch` is the hot-reload seam.
 
 **Landed (§26): the texture part of the bake.** `bake/` (`feather-bake`)
-loads scenes with the runtime's own loader and collects every (image, colour
-space) pair actually used: base colour as sRGB, normal and MR as data. For
+loads scenes with the runtime's own loader and collects every (image, kind)
+pair actually used (`TexKind`): base colour as sRGB, normal and MR as data. For
 each it builds a mip chain on the CPU (2×2 box, **sRGB averaged in linear
 space**, edge-clamped for odd sizes), pads each level to 4×4 blocks, and
 **BC7-encodes** it with Intel's ISPC encoder (`intel_tex_2`, bake crate only,
 so the engine never links it). It writes a thin header + raw blocks per level
 to `scratch/bake/tex/<key>.bc7`. The key (`feather_assets::bake::texture_key`)
-is xxh3 of the *decoded* pixels + size + colour space + `BAKE_VERSION`, so
-it's content-addressed and incremental, and cross-scene dedup comes free. The
+is xxh3 of the image's **encoded source bytes** + size + kind + `BAKE_VERSION`
+(2; it was the decoded pixels until the change below), so it's
+content-addressed and incremental, and cross-scene dedup comes free. The
 runtime computes the same key per unique texture and uploads the baked chain
 when one exists and the device has `textureCompressionBC`. **Otherwise raw
 RGBA8 with GPU-built mips, never an error.** `--no-bake` forces raw for A/B.
@@ -962,9 +963,54 @@ the dimensions) and written via temp + rename, so an interrupted bake is
 never trusted. Measured on the detail scene: **64 MB of BC7 vs 256 MB raw**
 (4×), 12 textures baked in 4.3 s, a re-run skips all 12, validation clean
 (including 1×1/2×2 partial-block levels), and `geo` identical.
-Not yet: BC5 for normal maps (needs z reconstruction in the shader); keying on
-*source* bytes so baked scenes can skip JPEG decode at load (today the decode
-still runs to compute the key).
+**Landed (§26): baked textures are never decoded.** The loader no longer uses
+`gltf::import`, which decoded every image up front. It resolves buffers
+(`import_buffers`) and reads each image's **encoded** bytes (buffer view,
+`data:` URI or file), taking only the size from the header. `TextureData`
+holds those bytes and decodes to RGBA8 on the first `pixels()` call, with
+the `image` crate's own conversion, optimised even in debug, replacing our
+per-pixel RGB→RGBA loop. The key hashes the source bytes, so a baked texture
+is found and uploaded without ever being decoded; the `[mesh]` line counts
+decoded images to prove it. A side effect: 16-bit PNGs, which used to fall
+back to the factors, now load. On `detail_high` (baked, 3 interleaved runs):
+
+| | before | after |
+|---|---|---|
+| load, debug | 2.66–2.72 s | **0.60–0.61 s** |
+| load, release | 0.63–0.64 s | **0.41–0.42 s** |
+| peak RSS, debug / release | 469 / 421 MB | **231 / 182 MB** |
+| texture VRAM (exact) | 64.0 MB | 64.0 MB |
+| GPU frame | 0.51 ms | 0.51 ms |
+
+Predictions: debug −50% or more (held), release −0.2…0.5 s (held), and RSS
+−190 MB, which was wrong: it's −239 MB, because the image crate's
+intermediate RGB decode was also alive at peak. The "world" phase (spawning +
+colliders), which this doesn't touch, got ~0.05 s slower in both builds.
+Unexplained; plausibly CPU clocks no longer warmed by the decode that used to
+run just before it. The driver's VRAM counter agrees within noise (+390 MB
+around the sweep both ways).
+
+**BC5 for normal maps was measured and rejected.** The design (§5 table) had
+normal maps as BC5: X and Y in two independent channels, Z rebuilt in the
+shader, the same 8 bpp as BC7. Decoding both bakes of the detail scene's four
+normal maps and measuring angular error against the source (mean / p99):
+
+| map | BC7, XYZ (kept) | BC5, Z rebuilt | source, Z rebuilt |
+|---|---|---|---|
+| bust | 0.31° / 1.85° | 0.23° / 2.03° | 0.11° / 1.45° |
+| lantern | 0.68° / 3.13° | 0.69° / 5.53° | 0.38° / 4.85° |
+| grass | 1.43° / 10.1° | 5.19° / 70.4° | 4.87° / 70.4° |
+| rocks | 1.13° / 5.63° | 17.8° / 71.4° | 17.8° / 71.4° |
+
+The last column is the uncompressed source through the same Z rebuild. It
+shows the loss isn't compression: the rock and grass maps hold inward-pointing
+(Z < 0: 25% of the rock texels) and non-unit (24% of the grass texels) normals,
+common in scan bakes, which only a third channel reproduces. Against BC7
+through the *same* Z rebuild, BC5 is 25–35% better on the clean maps, which is
+the textbook claim. But it's not the engine's comparison, and the prediction
+("about half BC7's error") was wrong for this content. Normal maps stay BC7.
+Renormalising averaged normals in their mips was measured too (< 0.06° mean
+after BC7; the shader normalises anyway) and dropped.
 
 **Landed (§26): the mesh part of the bake, and LODs.** Same shape as textures:
 the runtime loads the glTF, keys each mesh (`mesh_key`: xxh3 of the loader's
@@ -1461,13 +1507,13 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
 - **assets**: Vulkan-free CPU mesh types (`Vertex` = pos+normal+uv, `MeshData` +
   bounds + `Material` with optional decoded base-color / normal / MR textures),
   procedural `uv_sphere` + `cube`, and a **glTF/GLB scene loader**
-  (`load_gltf_scene`, via `gltf::import`) returning `SceneData { meshes, nodes }`
+  (`load_gltf_scene`, via `gltf::import_buffers`) returning `SceneData { meshes, nodes }`
   — one `MeshData` per referenced (mesh, primitive) pair in **local** space with
   **its own material**, plus one `SceneNode` per placement carrying that node's
   world transform. Primitives are deduplicated, so a mesh used by N nodes is
   stored once and drawn as N instances. Reads UVs, computes normals when absent,
-  decodes base-color/normal/MR textures to RGBA8, and resolves .glb / external /
-  data-URI buffers and images. Covered by the crate's first unit tests (a
+  reads base-color/normal/MR images as encoded bytes (decoded lazily, §17), and
+  resolves .glb / external / data-URI buffers and images. Covered by the crate's first unit tests (a
   synthesized glTF fixture asserting dedup and transform inheritance).
 - **app**: winit loop; bevy_ecs world + multi-threaded schedule (`integrate`,
   `tick`) driven on a **fixed timestep** (accumulator + `FIXED_DT`, frame delta

@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use glam::{Mat4, Vec3};
 
@@ -26,14 +26,84 @@ pub struct Vertex {
     pub uv: [f32; 2],
 }
 
-/// Decoded RGBA8 image (sRGB base-color). Owned CPU pixels the renderer uploads.
-/// Materials hold it by `Arc`: one image used by many materials is converted
-/// and uploaded once, and the renderer dedups by the `Arc`'s identity.
-#[derive(Clone, Debug)]
+/// A texture image, held **encoded** (the PNG/JPEG bytes as stored) and decoded
+/// to RGBA8 only on first use (§17). A baked texture is keyed on `source_key`
+/// and uploaded straight from the bake, so its pixels are never decoded.
+/// Materials hold it by `Arc`: one image used by many materials is decoded and
+/// uploaded once, and the renderer dedups by the `Arc`'s identity.
+#[derive(Clone)]
 pub struct TextureData {
-    pub pixels: Vec<u8>, // RGBA8, row-major, width*height*4 bytes
     pub width: u32,
     pub height: u32,
+    /// xxh3 of the encoded bytes (or of the pixels, for `from_rgba8`): the
+    /// content half of the bake key.
+    pub source_key: u64,
+    encoded: Vec<u8>,
+    decoded: OnceLock<Option<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for TextureData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextureData")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("source_key", &format_args!("{:016x}", self.source_key))
+            .field("decoded", &self.is_decoded())
+            .finish()
+    }
+}
+
+impl TextureData {
+    /// From encoded image bytes (PNG or JPEG). Reads only the header, for the
+    /// size; `None` if it isn't a readable image.
+    pub fn from_encoded(encoded: Vec<u8>) -> Option<Self> {
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(&encoded))
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()?;
+        Some(Self {
+            width,
+            height,
+            source_key: xxhash_rust::xxh3::xxh3_64(&encoded),
+            encoded,
+            decoded: OnceLock::new(),
+        })
+    }
+
+    /// From pixels already decoded to RGBA8 (procedural or test textures),
+    /// keyed on those pixels.
+    pub fn from_rgba8(pixels: Vec<u8>, width: u32, height: u32) -> Self {
+        assert_eq!(pixels.len(), (width * height * 4) as usize, "RGBA8 size");
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        h.update(&width.to_le_bytes());
+        h.update(&height.to_le_bytes());
+        h.update(&pixels);
+        Self {
+            width,
+            height,
+            source_key: h.digest(),
+            encoded: Vec::new(),
+            decoded: OnceLock::from(Some(pixels)),
+        }
+    }
+
+    /// RGBA8, row-major, `width * height * 4` bytes; decoded on the first
+    /// call. `None` if the bytes don't decode (or decode to another size than
+    /// the header said): callers treat it like a missing texture.
+    pub fn pixels(&self) -> Option<&[u8]> {
+        self.decoded
+            .get_or_init(|| {
+                let rgba = image::load_from_memory(&self.encoded).ok()?.to_rgba8();
+                (rgba.dimensions() == (self.width, self.height)).then(|| rgba.into_raw())
+            })
+            .as_deref()
+    }
+
+    /// Whether `pixels` has run (or the texture was made from pixels).
+    pub fn is_decoded(&self) -> bool {
+        self.decoded.get().is_some()
+    }
 }
 
 /// Surface parameters for a mesh (glTF metallic-roughness aligned). Factor
@@ -234,11 +304,22 @@ pub struct SceneData {
 /// Deferred: tangents, skinning, animation, morph targets, non-triangle
 /// primitives, and 16-/32-bit image formats.
 pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<SceneData, Box<dyn Error>> {
-    // import resolves all buffers (blob / external / data URI) and decodes images.
-    let (doc, buffers, raw_images) = gltf::import(path)?;
+    // Buffers (blob / external / data URI) are resolved here; images are only
+    // read as encoded bytes, and decoded later if and when something needs
+    // their pixels (§17).
+    let path = path.as_ref();
+    let gltf::Gltf {
+        document: doc,
+        blob,
+    } = gltf::Gltf::open(path)?;
+    let base = path.parent().unwrap_or(Path::new(""));
+    let buffers = gltf::import_buffers(&doc, Some(base), blob)?;
     let images = ImageCache {
-        images: &raw_images,
-        rgba: RefCell::new(HashMap::new()),
+        doc: &doc,
+        buffers: &buffers,
+        base,
+        by_index: RefCell::new(HashMap::new()),
+        by_source: RefCell::new(HashMap::new()),
     };
 
     let mut out = SceneData {
@@ -284,24 +365,73 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<SceneData, Box<dyn Erro
     Ok(out)
 }
 
-/// A scene's decoded glTF images, each converted to RGBA8 **at most once** and
-/// shared by every material that uses it. Before this, every primitive
-/// converted its material's textures afresh: 12 images became 81 conversions
-/// (13.5 s of a debug load) and 81 uploads.
+/// A scene's glTF images, each read **at most once** and shared by every
+/// material that uses it. Before sharing, every primitive converted its
+/// material's textures afresh: 12 images became 81 conversions (13.5 s of a
+/// debug load) and 81 uploads.
 struct ImageCache<'a> {
-    images: &'a [gltf::image::Data],
-    rgba: RefCell<HashMap<usize, Option<Arc<TextureData>>>>,
+    doc: &'a gltf::Document,
+    buffers: &'a [gltf::buffer::Data],
+    base: &'a Path,
+    by_index: RefCell<HashMap<usize, Option<Arc<TextureData>>>>,
+    /// Two images with identical bytes share one texture too.
+    by_source: RefCell<HashMap<u64, Arc<TextureData>>>,
 }
 
 impl ImageCache<'_> {
     /// Keyed by glTF *image*, not texture, so two textures sampling one image
-    /// also share it.
+    /// also share it. An unreadable image warns and yields `None`: the
+    /// material falls back to its factors.
     fn get(&self, index: usize) -> Option<Arc<TextureData>> {
-        self.rgba
+        self.by_index
             .borrow_mut()
             .entry(index)
-            .or_insert_with(|| self.images.get(index).and_then(to_rgba8).map(Arc::new))
+            .or_insert_with(|| {
+                let image = self.doc.images().nth(index)?;
+                let tex = encoded_image(&image, self.base, self.buffers)
+                    .and_then(TextureData::from_encoded);
+                let Some(tex) = tex else {
+                    eprintln!("[scene] image {index} isn't a readable PNG/JPEG; using the material's factors");
+                    return None;
+                };
+                let shared = self
+                    .by_source
+                    .borrow_mut()
+                    .entry(tex.source_key)
+                    .or_insert_with(|| Arc::new(tex))
+                    .clone();
+                Some(shared)
+            })
             .clone()
+    }
+}
+
+/// An image's encoded bytes, wherever the glTF keeps them: a buffer view, a
+/// `data:` URI or a file next to the glTF.
+fn encoded_image(
+    image: &gltf::Image,
+    base: &Path,
+    buffers: &[gltf::buffer::Data],
+) -> Option<Vec<u8>> {
+    match image.source() {
+        gltf::image::Source::View { view, .. } => {
+            let data = &buffers.get(view.buffer().index())?.0;
+            data.get(view.offset()..view.offset() + view.length())
+                .map(<[u8]>::to_vec)
+        }
+        gltf::image::Source::Uri { uri, .. } => {
+            if let Some(data) = uri.strip_prefix("data:") {
+                let (_, b64) = data.split_once(";base64,")?;
+                base64::decode(b64).ok()
+            } else {
+                let rel = uri
+                    .strip_prefix("file://")
+                    .or_else(|| uri.strip_prefix("file:"))
+                    .unwrap_or(uri);
+                let rel = urlencoding::decode(rel).ok()?;
+                std::fs::read(base.join(&*rel)).ok()
+            }
+        }
     }
 }
 
@@ -328,45 +458,6 @@ fn read_material(m: &gltf::Material, images: &ImageCache) -> Material {
         normal_texture,
         metallic_roughness_texture,
     }
-}
-
-/// Normalize a decoded glTF image to RGBA8. Returns None for formats not handled
-/// yet (16-/32-bit), in which case the material falls back to its color factor.
-fn to_rgba8(img: &gltf::image::Data) -> Option<TextureData> {
-    use gltf::image::Format;
-    let (width, height) = (img.width, img.height);
-    let n = (width as usize) * (height as usize) * 4;
-    let px = &img.pixels;
-    let pixels = match img.format {
-        Format::R8G8B8A8 => px.clone(),
-        Format::R8G8B8 => {
-            let mut out = Vec::with_capacity(n);
-            for c in px.chunks_exact(3) {
-                out.extend_from_slice(&[c[0], c[1], c[2], 255]);
-            }
-            out
-        }
-        Format::R8 => {
-            let mut out = Vec::with_capacity(n);
-            for &g in px {
-                out.extend_from_slice(&[g, g, g, 255]);
-            }
-            out
-        }
-        Format::R8G8 => {
-            let mut out = Vec::with_capacity(n);
-            for c in px.chunks_exact(2) {
-                out.extend_from_slice(&[c[0], c[0], c[0], c[1]]);
-            }
-            out
-        }
-        _ => return None,
-    };
-    Some(TextureData {
-        pixels,
-        width,
-        height,
-    })
 }
 
 /// Read a node's §18 prefab data from its `extras`.
@@ -733,8 +824,15 @@ mod tests {
             !Arc::ptr_eq(&tex[0], &tex[2]),
             "distinct images stay distinct"
         );
-        assert_eq!(tex[0].pixels, [255, 0, 0, 255]);
-        assert_eq!(tex[2].pixels, [0, 0, 255, 255]);
+        // Nothing decodes until asked: this is what lets a baked texture skip
+        // its JPEG decode entirely.
+        assert!(tex.iter().all(|t| !t.is_decoded()));
+        assert_eq!((tex[0].width, tex[0].height), (1, 1));
+        // 1x1 RGB PNGs, expanded to opaque RGBA as before.
+        assert_eq!(tex[0].pixels(), Some(&[255, 0, 0, 255][..]));
+        assert_eq!(tex[2].pixels(), Some(&[0, 0, 255, 255][..]));
+        assert!(tex[0].is_decoded() && !tex[2].encoded.is_empty());
+        assert_ne!(tex[0].source_key, tex[2].source_key);
     }
 
     #[test]

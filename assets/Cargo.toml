@@ -21,3 +21,9 @@ gltf = { version = "1", default-features = false, features = [
 ] }
 # Already in the tree via gltf's `extras`, which hands back a raw JSON value.
 serde_json = "1"
+# Images are read as *encoded* bytes and decoded lazily (§17), so a baked
+# texture is never decoded. All three were already in the tree via gltf's
+# `import`; these are the same versions and features.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+base64 = "0.13"
+urlencoding = "2"

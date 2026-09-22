@@ -306,7 +306,11 @@ start over. Use `--release`: the BC7 encoder is slow in debug.
 
 The `[mesh]` lines at load say what you got, e.g.
 `30 meshes (27 baked, 135 LODs): 2.7 MB vertices, 3.0 MB indices` and
-`12 textures uploaded ... (12 baked BC7, 0 raw), 64.0 MB`.
+`12 textures uploaded ... (12 baked BC7, 0 raw; 0 images decoded), 64.0 MB`.
+A baked texture is found by its source file's bytes and never decoded, which
+is most of why a baked scene loads fast (`[load]` below). After an engine
+update that changes the bake format, the first load reports raw textures
+until you re-run the bake; stale files in `scratch/bake/` are simply ignored.
 
 **What to look for** when judging LODs: distant objects should look the same
 with `--no-lod` as without, with no visible popping as you walk towards them,
@@ -326,9 +330,9 @@ and distant shadows should look unchanged.
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
 | Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs |
-| Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one decoded copy |
+| Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one texture, which isn't decoded until asked and then matches the old RGB→RGBA expansion |
 | Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |
-| Texture bake | assets, bake | keys separate content and colour space; BC7 level sizes round partial blocks up; baked files round-trip and reject truncation or wrong sizes; sRGB mips average *light* (black/white → 188, not 128); chains end at 1×1; every baked level has exactly the blocks Vulkan copies |
+| Texture bake | assets, bake | keys separate content and kind (sRGB colour vs data), and are computed from the encoded bytes without decoding; BC7 level sizes round partial blocks up; baked files round-trip and reject truncation, wrong sizes or an unknown kind; sRGB mips average *light* (black/white → 188, not 128); chains end at 1×1; every baked level has exactly the blocks Vulkan copies |
 | Mesh bake + LOD | assets, bake, render | baked meshes round-trip and reject damage (truncation, trailing bytes, bad magic, out-of-range index, decreasing or NaN error, partial triangle, no LODs); the mesh key ignores the material; a sphere gets a chain with fewer triangles and growing error per level and LOD0 is the input reordered; small meshes stay LOD0; disconnected parts prune; the pixel and texel rules (distance, scale, non-uniform scale, inside the sphere); runs split per (mesh, LOD) |
 | Config files | app | both templates parse back to the defaults; each bad line warns and keeps the default; saving edits one value in place; create-once, the `settings.toml` → `graphics.toml` migration, an unreadable file is left alone |
 | Controls | app | key names round-trip; reserved menu keys are refused; a key on two actions warns; two keys on one action hold until both are released; toggles ignore auto-repeat but exposure repeats; a rebound jump moves |
@@ -360,6 +364,8 @@ Everything goes to stderr.
 | `[config] …` | a config file created / loaded / renamed, a line ignored or a key bound twice, plus the effective graphics settings at startup |
 | `[light] N visible lights exceeds MAX_LIGHTS` | lights past 128 were dropped this frame |
 | `[mesh] N meshes (B baked, L LODs): …` | geometry uploaded at load, and how much of it came from the bake |
+| `[mesh] N textures uploaded … (B baked BC7, R raw; D images decoded)` | textures at load; with a complete bake D is 0 |
+| `[load] scenes … world … renderer … total …` | where a session's load time went: parsing + reading images + meshes, spawning + colliders, GPU upload |
 | `[bench] …` | the `--bench` summary, including triangles submitted per frame (`Mtris main/shadow`) and the share of instances at each LOD (`LOD mix`) |
 
 ---

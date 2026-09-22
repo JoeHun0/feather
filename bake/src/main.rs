@@ -4,10 +4,11 @@
 //!
 //!     cargo run --release -p feather-bake -- SCENE.gltf|.glb... [--out DIR]
 //!
-//! Textures: for each (image, colour space) pair a scene actually uses (base
-//! colour as sRGB, normal and metallic-roughness as data), the bake builds mips
-//! on the CPU (averaging sRGB in linear space, like the runtime's GPU blits),
-//! then BC7-encodes every level with Intel's ISPC encoder.
+//! Textures: for each (image, kind) pair a scene actually uses (base colour as
+//! sRGB, normal and metallic-roughness as data), the bake decodes the image,
+//! builds mips on the CPU (averaging sRGB in linear space, like the runtime's
+//! GPU blits), then BC7-encodes every level with Intel's ISPC encoder. (Why
+//! normal maps stay BC7 rather than BC5: see `TexKind`.)
 //!
 //! Meshes: see `mesh.rs` (meshoptimizer vertex-cache + fetch order, LODs).
 //!
@@ -24,7 +25,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use feather_assets::bake::{
-    baked_mesh_path, baked_path, mesh_key, texture_key, BakedTexture, MESH_DIR, TEX_DIR,
+    baked_mesh_path, baked_path, mesh_key, texture_key, BakedTexture, TexKind, MESH_DIR, TEX_DIR,
 };
 use feather_assets::{load_gltf_scene, MeshData, TextureData};
 
@@ -46,23 +47,23 @@ fn main() {
     std::fs::create_dir_all(&tex_dir).expect("create the texture bake directory");
     std::fs::create_dir_all(&mesh_dir).expect("create the mesh bake directory");
 
-    // Every (texture, colour space) pair and every mesh in use, deduped by
-    // content key across all scenes.
-    let mut textures: HashMap<u64, (Arc<TextureData>, bool)> = HashMap::new();
+    // Every (texture, kind) pair and every mesh in use, deduped by content key
+    // across all scenes.
+    let mut textures: HashMap<u64, (Arc<TextureData>, TexKind)> = HashMap::new();
     let mut meshes: HashMap<u64, MeshData> = HashMap::new();
     for scene in &scenes {
         let data = load_gltf_scene(scene).unwrap_or_else(|e| panic!("{scene}: {e}"));
         for m in &data.meshes {
             let mat = &m.material;
-            for (tex, srgb) in [
-                (&mat.base_color_texture, true),
-                (&mat.normal_texture, false),
-                (&mat.metallic_roughness_texture, false),
+            for (tex, kind) in [
+                (&mat.base_color_texture, TexKind::Color),
+                (&mat.normal_texture, TexKind::Data),
+                (&mat.metallic_roughness_texture, TexKind::Data),
             ] {
                 if let Some(t) = tex {
                     textures
-                        .entry(texture_key(t, srgb))
-                        .or_insert((t.clone(), srgb));
+                        .entry(texture_key(t, kind))
+                        .or_insert((t.clone(), kind));
                 }
             }
             meshes.entry(mesh_key(m)).or_insert_with(|| m.clone());
@@ -78,8 +79,13 @@ fn main() {
         tex_cached.len()
     );
     let t0 = Instant::now();
-    let bytes: usize = parallel(&tex_todo, |(key, (tex, srgb))| {
-        let baked = bake(tex, *srgb);
+    let bytes: usize = parallel(&tex_todo, |(key, (tex, kind))| {
+        // An image that doesn't decode is skipped: the runtime then falls back
+        // for that slot, as it would without a bake.
+        let Some(baked) = bake(tex, *kind) else {
+            eprintln!("skipping a {kind:?} texture that doesn't decode");
+            return 0;
+        };
         baked
             .write(&baked_path(&tex_dir, *key))
             .expect("write baked texture");
@@ -160,10 +166,23 @@ fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
     })
 }
 
-/// One texture's BC7 mip chain.
-fn bake(tex: &TextureData, srgb: bool) -> BakedTexture {
+/// One mip level's RGBA8 pixels: the bake's working format.
+#[derive(Clone, Debug)]
+struct Level {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+/// One texture's BC7 mip chain. `None` if the image doesn't decode.
+fn bake(tex: &TextureData, kind: TexKind) -> Option<BakedTexture> {
+    let top = Level {
+        pixels: tex.pixels()?.to_vec(),
+        width: tex.width,
+        height: tex.height,
+    };
     let settings = intel_tex_2::bc7::alpha_basic_settings();
-    let levels = mip_chain(tex, srgb)
+    let levels = mip_chain(&top, kind)
         .iter()
         .map(|level| {
             let padded = pad_to_blocks(level);
@@ -178,20 +197,23 @@ fn bake(tex: &TextureData, srgb: bool) -> BakedTexture {
             )
         })
         .collect();
-    BakedTexture {
-        srgb,
+    Some(BakedTexture {
+        kind,
         width: tex.width,
         height: tex.height,
         levels,
-    }
+    })
 }
 
 /// Every level from full size down to 1×1, each a 2×2 box filter of the one
 /// above (edges clamped for odd sizes). sRGB colour is averaged in *linear*
 /// space: averaging the encoded values would darken every mip, the same bug
-/// the runtime's GPU blit path avoids.
-fn mip_chain(tex: &TextureData, srgb: bool) -> Vec<TextureData> {
-    let mut chain = vec![tex.clone()];
+/// the runtime's GPU blit path avoids. Data (normal maps included) is averaged
+/// as-is: the shader normalises the sampled normal, so a shortened average
+/// points the same way (renormalising here was measured at under 0.06° mean
+/// difference after BC7, not worth a separate filter).
+fn mip_chain(top: &Level, kind: TexKind) -> Vec<Level> {
+    let mut chain = vec![top.clone()];
     while let Some(prev) = chain.last().filter(|t| t.width > 1 || t.height > 1) {
         let (w, h) = ((prev.width / 2).max(1), (prev.height / 2).max(1));
         let mut pixels = Vec::with_capacity((w * h * 4) as usize);
@@ -202,29 +224,27 @@ fn mip_chain(tex: &TextureData, srgb: bool) -> Vec<TextureData> {
                     let sy = (2 * y + dy).min(prev.height - 1);
                     ((sy * prev.width + sx) * 4) as usize
                 });
-                for c in 0..4 {
-                    let colour = srgb && c < 3; // alpha is always linear
-                    let sum: f32 = taps
-                        .iter()
-                        .map(|&i| {
-                            let v = prev.pixels[i + c];
-                            if colour {
-                                srgb_to_linear(v)
-                            } else {
-                                v as f32 / 255.0
-                            }
-                        })
-                        .sum();
-                    let avg = sum / 4.0;
-                    pixels.push(if colour {
-                        linear_to_srgb(avg)
-                    } else {
-                        (avg * 255.0).round() as u8
-                    });
+                let avg = |c: usize, f: fn(u8) -> f32| {
+                    taps.iter().map(|&i| f(prev.pixels[i + c])).sum::<f32>() / 4.0
+                };
+                let unorm = |v: u8| v as f32 / 255.0;
+                let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                match kind {
+                    TexKind::Color => {
+                        for c in 0..3 {
+                            pixels.push(linear_to_srgb(avg(c, srgb_to_linear)));
+                        }
+                        pixels.push(to_u8(avg(3, unorm))); // alpha is linear
+                    }
+                    TexKind::Data => {
+                        for c in 0..4 {
+                            pixels.push(to_u8(avg(c, unorm)));
+                        }
+                    }
                 }
             }
         }
-        chain.push(TextureData {
+        chain.push(Level {
             pixels,
             width: w,
             height: h,
@@ -251,9 +271,10 @@ fn linear_to_srgb(l: f32) -> u8 {
     (c.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// BC7 encodes whole 4×4 blocks. Pad a level up to them by repeating the edge,
-/// so the padding can't bleed a foreign colour into the real texels' blocks.
-fn pad_to_blocks(t: &TextureData) -> TextureData {
+/// BC7 and BC5 encode whole 4×4 blocks. Pad a level up to them by repeating
+/// the edge, so the padding can't bleed a foreign colour into the real texels'
+/// blocks.
+fn pad_to_blocks(t: &Level) -> Level {
     let (w, h) = (t.width.div_ceil(4) * 4, t.height.div_ceil(4) * 4);
     if (w, h) == (t.width, t.height) {
         return t.clone();
@@ -265,7 +286,7 @@ fn pad_to_blocks(t: &TextureData) -> TextureData {
             pixels.extend_from_slice(&t.pixels[i..i + 4]);
         }
     }
-    TextureData {
+    Level {
         pixels,
         width: w,
         height: h,
@@ -277,14 +298,14 @@ mod tests {
     use super::*;
     use feather_assets::bake::bc7_level_size;
 
-    fn tex(width: u32, height: u32, px: impl Fn(u32, u32) -> [u8; 4]) -> TextureData {
+    fn level(width: u32, height: u32, px: impl Fn(u32, u32) -> [u8; 4]) -> Level {
         let mut pixels = Vec::new();
         for y in 0..height {
             for x in 0..width {
                 pixels.extend_from_slice(&px(x, y));
             }
         }
-        TextureData {
+        Level {
             pixels,
             width,
             height,
@@ -296,7 +317,7 @@ mod tests {
         // A black/white checker: its true average brightness is 50% *light*,
         // which is 188 in sRGB. Averaging the encoded bytes would give 128, a
         // visibly darker mip.
-        let checker = tex(2, 2, |x, y| {
+        let checker = level(2, 2, |x, y| {
             if (x + y) % 2 == 0 {
                 [0, 0, 0, 255]
             } else {
@@ -304,12 +325,12 @@ mod tests {
             }
         });
         assert_eq!(
-            &mip_chain(&checker, true)[1].pixels[..4],
+            &mip_chain(&checker, TexKind::Color)[1].pixels[..4],
             &[188, 188, 188, 255]
         );
-        // Data textures (normal, metallic-roughness) average the values as-is.
+        // Data textures (metallic-roughness) average the values as-is.
         assert_eq!(
-            &mip_chain(&checker, false)[1].pixels[..4],
+            &mip_chain(&checker, TexKind::Data)[1].pixels[..4],
             &[128, 128, 128, 255]
         );
     }
@@ -317,7 +338,7 @@ mod tests {
     #[test]
     fn chains_end_at_one_by_one() {
         for (w, h, levels) in [(8, 8, 4), (8, 2, 4), (5, 3, 3), (1, 1, 1)] {
-            let chain = mip_chain(&tex(w, h, |_, _| [9, 9, 9, 255]), false);
+            let chain = mip_chain(&level(w, h, |_, _| [9, 9, 9, 255]), TexKind::Data);
             assert_eq!(chain.len(), levels, "{w}x{h}");
             let last = chain.last().unwrap();
             assert_eq!((last.width, last.height), (1, 1), "{w}x{h}");
@@ -328,8 +349,9 @@ mod tests {
     fn baked_levels_have_exactly_the_blocks_vulkan_expects() {
         // Odd, non-square, not a multiple of 4: every level must still be
         // exactly the size the runtime (and Vulkan) will copy.
-        let t = tex(10, 6, |x, y| [x as u8 * 20, y as u8 * 40, 7, 255]);
-        let baked = bake(&t, true);
+        let l = level(10, 6, |x, y| [x as u8 * 20, y as u8 * 40, 7, 255]);
+        let t = TextureData::from_rgba8(l.pixels, 10, 6);
+        let baked = bake(&t, TexKind::Color).unwrap();
         assert_eq!(baked.levels.len(), 4);
         for (l, level) in baked.levels.iter().enumerate() {
             assert_eq!(level.len(), bc7_level_size(10, 6, l as u32), "level {l}");

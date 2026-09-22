@@ -1585,7 +1585,9 @@ impl Session {
     fn new(renderer: &Renderer, scenes: &[String], bake: bool, lod: bool) -> Self {
         // Scenes load *first*, because a `player_start` marker (§18) decides
         // where the player goes and the player is built below.
+        let t_start = Instant::now();
         let (meshes, scene_nodes) = load_scenes(scenes);
+        let t_scenes = t_start.elapsed();
         let (start_pos, start_yaw) = player_start(&scene_nodes);
 
         let mut world = World::new();
@@ -1755,9 +1757,20 @@ impl Session {
         world.resource_mut::<Physics>().step();
 
         let bake_dir = bake.then(|| std::path::Path::new(BAKE_DIR));
+        let t_renderer = Instant::now();
         let (mut mesh, _ids) =
             MeshRenderer::new(renderer, &meshes, &materials, MAX_INSTANCES, bake_dir);
         mesh.set_lod_enabled(lod);
+        // Where a session's load time goes (§17): parse + images + meshes, then
+        // spawning + colliders, then the GPU upload.
+        let (t_renderer, t_total) = (t_renderer.elapsed(), t_start.elapsed());
+        eprintln!(
+            "[load] scenes {:.2} s, world {:.2} s, renderer {:.2} s, total {:.2} s",
+            t_scenes.as_secs_f32(),
+            (t_total - t_scenes - t_renderer).as_secs_f32(),
+            t_renderer.as_secs_f32(),
+            t_total.as_secs_f32(),
+        );
         let sky = SkyPass::new(renderer);
 
         Self {

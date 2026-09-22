@@ -726,10 +726,13 @@ dependencies = [
 name = "feather-assets"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "glam 0.29.3",
  "gltf",
+ "image",
  "serde",
  "serde_json",
+ "urlencoding",
  "xxhash-rust",
 ]
 

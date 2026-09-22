@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use feather_assets::bake::{
-    baked_mesh_path, baked_path, mesh_key, texture_key, BakedMesh, BakedTexture, MESH_DIR,
+    baked_mesh_path, baked_path, mesh_key, texture_key, BakedMesh, BakedTexture, TexKind, MESH_DIR,
     MIN_LOD_TRIS, TEX_DIR,
 };
 use feather_assets::{Material, MeshData, TextureData, Vertex};
@@ -59,8 +59,9 @@ pub struct ClusterView {
 
 /// Where each material's textures live in the bindless array (§9).
 struct TexturePlan {
-    /// Unique images to upload, in slot order from `FIRST_TEXTURE_SLOT`.
-    uploads: Vec<(Arc<TextureData>, bool)>,
+    /// Unique (image, kind) pairs to upload, in slot order from
+    /// `FIRST_TEXTURE_SLOT`.
+    uploads: Vec<(Arc<TextureData>, TexKind)>,
     /// Per material: base colour, normal, metallic-roughness slots.
     slots: Vec<[u32; 3]>,
     /// Texture references across all materials, before dedup.
@@ -84,23 +85,24 @@ fn rgba8_chain_bytes(width: u32, height: u32) -> usize {
 /// Slots 0 (white) and 1 (flat normal) are the resident defaults.
 const FIRST_TEXTURE_SLOT: usize = 2;
 
-/// Assign bindless slots, one per **unique image × colour space**. The key is
-/// the `Arc`'s identity (the loader shares one per glTF image) plus the sRGB
-/// flag, since the same pixels sampled as base colour (sRGB) and as data
-/// (UNORM) need two image views. Pure, so it is testable without a GPU.
+/// Assign bindless slots, one per **unique image × kind**. The key is the
+/// `Arc`'s identity (the loader shares one per image) plus the kind, since the
+/// same pixels sampled as base colour (sRGB) and as data (UNORM: normal and
+/// metallic-roughness maps) need two image views. Pure, so it is testable
+/// without a GPU.
 ///
 /// `capacity` is the most slots the array may have: the device's limit, not a
 /// fixed constant (§9). References past it fall back to the defaults.
 fn plan_texture_slots(materials: &[Material], capacity: usize) -> TexturePlan {
-    let mut uploads: Vec<(Arc<TextureData>, bool)> = Vec::new();
-    let mut index: HashMap<(*const TextureData, bool), u32> = HashMap::new();
+    let mut uploads: Vec<(Arc<TextureData>, TexKind)> = Vec::new();
+    let mut index: HashMap<(*const TextureData, TexKind), u32> = HashMap::new();
     let (mut references, mut overflow) = (0, 0);
-    let mut slot = |tex: &Option<Arc<TextureData>>, srgb: bool, default: u32| {
+    let mut slot = |tex: &Option<Arc<TextureData>>, kind: TexKind, default: u32| {
         let Some(t) = tex else {
             return default;
         };
         references += 1;
-        let key = (Arc::as_ptr(t), srgb);
+        let key = (Arc::as_ptr(t), kind);
         if let Some(&s) = index.get(&key) {
             return s;
         }
@@ -109,7 +111,7 @@ fn plan_texture_slots(materials: &[Material], capacity: usize) -> TexturePlan {
             return default;
         }
         let s = (FIRST_TEXTURE_SLOT + uploads.len()) as u32;
-        uploads.push((t.clone(), srgb));
+        uploads.push((t.clone(), kind));
         index.insert(key, s);
         s
     };
@@ -117,9 +119,9 @@ fn plan_texture_slots(materials: &[Material], capacity: usize) -> TexturePlan {
         .iter()
         .map(|m| {
             [
-                slot(&m.base_color_texture, true, 0),
-                slot(&m.normal_texture, false, 1),
-                slot(&m.metallic_roughness_texture, false, 0),
+                slot(&m.base_color_texture, TexKind::Color, 0),
+                slot(&m.normal_texture, TexKind::Data, 1),
+                slot(&m.metallic_roughness_texture, TexKind::Data, 0),
             ]
         })
         .collect();
@@ -518,34 +520,55 @@ impl MeshRenderer {
         // The shadow map is the one other combined sampler in the set.
         let capacity = renderer.max_bindless_textures().saturating_sub(1);
         let plan = plan_texture_slots(materials, capacity);
-        let (mut baked, mut bytes) = (0usize, 0usize);
-        for (t, srgb) in &plan.uploads {
+        let (mut baked_count, mut bytes) = (0usize, 0usize);
+        for (t, kind) in &plan.uploads {
             // A baked BC7 chain (§17) when the bake has one for exactly this
-            // texture in this colour space and the device can sample BC.
-            // Otherwise raw RGBA8 with GPU-built mips. Never an error.
-            let bc7 = tex_dir
+            // image in this kind and the device can sample BC. It's found by
+            // the source bytes' key, so a baked texture is never decoded.
+            // Otherwise raw RGBA8 with GPU-built mips; never an error.
+            let baked = tex_dir
                 .as_deref()
                 .filter(|_| renderer.texture_compression_bc())
-                .and_then(|dir| BakedTexture::read(&baked_path(dir, texture_key(t, *srgb))).ok())
-                .filter(|b| b.srgb == *srgb && (b.width, b.height) == (t.width, t.height));
-            let image = match &bc7 {
+                .and_then(|dir| BakedTexture::read(&baked_path(dir, texture_key(t, *kind))).ok())
+                .filter(|b| b.kind == *kind && (b.width, b.height) == (t.width, t.height));
+            let image = match &baked {
                 Some(b) => {
-                    baked += 1;
+                    baked_count += 1;
                     bytes += b.levels.iter().map(Vec::len).sum::<usize>();
-                    renderer.create_texture_bc7(&b.levels, b.width, b.height, *srgb)
+                    renderer.create_texture_bc7(&b.levels, b.width, b.height, kind.srgb())
                 }
-                None => {
-                    bytes += rgba8_chain_bytes(t.width, t.height);
-                    renderer.create_texture(&t.pixels, t.width, t.height, *srgb)
-                }
+                None => match t.pixels() {
+                    Some(pixels) => {
+                        bytes += rgba8_chain_bytes(t.width, t.height);
+                        renderer.create_texture(pixels, t.width, t.height, kind.srgb())
+                    }
+                    // Undecodable: a white 1×1 stands in (the factors still
+                    // apply). A broken normal map shades oddly rather than
+                    // failing the load.
+                    None => {
+                        eprintln!("[mesh] a {kind:?} texture doesn't decode; using white");
+                        renderer.create_texture(&[255; 4], 1, 1, kind.srgb())
+                    }
+                },
             };
             textures.push(image);
         }
         let references = plan.references;
-        let raw = plan.uploads.len() - baked;
+        let raw = plan.uploads.len() - baked_count;
+        // Decoded images (shared across kinds, so counted once each): with a
+        // complete bake this is 0, i.e. no JPEG was decoded at all.
+        let mut decoded: Vec<*const TextureData> = plan
+            .uploads
+            .iter()
+            .filter(|(t, _)| t.is_decoded())
+            .map(|(t, _)| Arc::as_ptr(t))
+            .collect();
+        decoded.sort();
+        decoded.dedup();
         eprintln!(
-            "[mesh] {} textures uploaded for {references} references ({baked} baked BC7, {raw} raw), {:.1} MB",
+            "[mesh] {} textures uploaded for {references} references ({baked_count} baked BC7, {raw} raw; {} images decoded), {:.1} MB",
             plan.uploads.len(),
+            decoded.len(),
             bytes as f64 / 1_048_576.0
         );
         if raw > 0 && bake_dir.is_some() {
@@ -1532,20 +1555,20 @@ mod tests {
     use super::*;
 
     fn tex(n: u8) -> Arc<TextureData> {
-        Arc::new(TextureData {
-            pixels: vec![n, n, n, 255],
-            width: 1,
-            height: 1,
-        })
+        Arc::new(TextureData::from_rgba8(vec![n, n, n, 255], 1, 1))
     }
 
     #[test]
-    fn texture_slots_dedup_by_image_and_colour_space() {
+    fn texture_slots_dedup_by_image_and_kind() {
         let shared = tex(1);
         let other = tex(2);
         let with = |base: Option<&Arc<TextureData>>, mr: Option<&Arc<TextureData>>| Material {
             base_color_texture: base.cloned(),
             metallic_roughness_texture: mr.cloned(),
+            ..Material::default()
+        };
+        let normal = Material {
+            normal_texture: Some(shared.clone()),
             ..Material::default()
         };
         let materials = [
@@ -1554,16 +1577,20 @@ mod tests {
             with(Some(&other), None),  // a distinct image: its own slot
             with(None, Some(&shared)), // same pixels as data (UNORM): new slot
             with(None, None),          // no textures: the defaults
+            normal,                    // as a normal map it's data too: shared
         ];
         let plan = plan_texture_slots(&materials, 1024);
         assert_eq!(plan.uploads.len(), 3);
-        assert_eq!(plan.references, 4);
+        assert_eq!(plan.references, 5);
         assert_eq!(plan.overflow, 0);
         let s = &plan.slots;
         assert_eq!(s[0][0], s[1][0], "shared image shares a slot");
         assert_ne!(s[0][0], s[2][0], "distinct images get distinct slots");
         assert_ne!(s[3][2], s[0][0], "sRGB and UNORM views are separate");
         assert_eq!(s[4], [0, 1, 0], "untextured materials use the defaults");
+        assert_eq!(s[5][1], s[3][2], "normal and MR maps are both UNORM data");
+        let kinds: Vec<TexKind> = plan.uploads.iter().map(|(_, k)| *k).collect();
+        assert_eq!(kinds, [TexKind::Color, TexKind::Color, TexKind::Data]);
         assert!(s[..4].iter().flatten().all(|&x| x == 0 || x == 1 || x >= 2));
     }
 
