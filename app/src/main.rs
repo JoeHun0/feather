@@ -27,6 +27,8 @@
 //! drifting orbs now hang above a ground box with a few obstacle boxes to walk
 //! among.
 
+mod config;
+
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -161,6 +163,22 @@ impl ShadowQuality {
             Self::Medium => "MEDIUM",
             Self::High => "HIGH",
         }
+    }
+
+    /// Settings-file form (`config/settings.toml`).
+    fn config_name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    fn from_config_name(name: &str) -> Option<Self> {
+        [Self::Off, Self::Low, Self::Medium, Self::High]
+            .into_iter()
+            .find(|q| q.config_name() == name)
     }
 }
 
@@ -1056,6 +1074,9 @@ struct App {
     window: Option<Window>,
     input: Input,
     settings: GraphicsSettings,
+    /// The settings file, for saving changes; `None` under `--bench` or when it
+    /// could be neither read nor created.
+    config: Option<config::ConfigFile>,
     /// Paused by Esc: the fixed step stops, the cursor is released for the menu,
     /// and look/movement input is ignored. Rendering continues so the frozen
     /// scene stays on screen behind the overlay (§14's UI focus flag).
@@ -1713,7 +1734,12 @@ impl Session {
 impl App {
     /// Starts with **no session**: the app opens on the main menu and only
     /// builds a world when NEW GAME is chosen.
-    fn new(scenes: Vec<String>, settings: GraphicsSettings, bench: bool) -> Self {
+    fn new(
+        scenes: Vec<String>,
+        settings: GraphicsSettings,
+        config: Option<config::ConfigFile>,
+        bench: bool,
+    ) -> Self {
         let light = Vec3::new(-0.4, -1.0, -0.3).normalize();
         Self {
             session: None,
@@ -1724,6 +1750,7 @@ impl App {
             window: None,
             input: Input::default(),
             settings,
+            config,
             paused: false,
             menu: Menu::new(),
             cursor: None,
@@ -1802,6 +1829,7 @@ impl App {
     fn cycle_shadow_quality(&mut self) {
         self.settings.shadows = self.settings.shadows.next();
         self.apply_shadow_quality();
+        self.persist(config::Key::Shadows);
     }
 
     /// Push `settings.fxaa` into the renderer. Cheap: just a flag, since the
@@ -1823,9 +1851,18 @@ impl App {
             MenuOutcome::Stay => {}
             MenuOutcome::Resume => self.set_paused(false),
             MenuOutcome::Quit => event_loop.exit(),
-            MenuOutcome::ApplyShadows => self.apply_shadow_quality(),
-            MenuOutcome::ApplyFxaa => self.apply_fxaa(),
-            MenuOutcome::ApplyMsaa => self.apply_msaa(),
+            MenuOutcome::ApplyShadows => {
+                self.apply_shadow_quality();
+                self.persist(config::Key::Shadows);
+            }
+            MenuOutcome::ApplyFxaa => {
+                self.apply_fxaa();
+                self.persist(config::Key::Fxaa);
+            }
+            MenuOutcome::ApplyMsaa => {
+                self.apply_msaa();
+                self.persist(config::Key::Msaa);
+            }
             MenuOutcome::StartSession => self.start_session(),
             MenuOutcome::EndSession => self.end_session(),
         }
@@ -1878,6 +1915,17 @@ impl App {
         self.set_cursor_captured(false);
     }
 
+    /// Save `key`'s current value to the settings file. Called only where the
+    /// player changed it, so CLI overrides are never written back. A failed
+    /// write is logged, never fatal.
+    fn persist(&mut self, key: config::Key) {
+        if let Some(c) = self.config.as_mut() {
+            if let Err(e) = c.save(key, &self.settings) {
+                eprintln!("[config] couldn't save {}: {e}", c.path().display());
+            }
+        }
+    }
+
     /// Apply `settings.msaa`. Only reachable with no session loaded, because the
     /// mesh and sky pipelines bake the sample count at creation.
     fn apply_msaa(&mut self) {
@@ -1905,8 +1953,14 @@ impl ApplicationHandler for App {
         window.set_cursor_visible(true);
 
         let size = window.inner_size();
-        let renderer = Renderer::new(&window, size.width, size.height, self.settings.msaa)
+        let mut renderer = Renderer::new(&window, size.width, size.height, self.settings.msaa)
             .expect("create renderer");
+        // The renderer starts at its built-in defaults; the settings may come
+        // from the config file. Nothing is in flight yet, but set_shadow_dim's
+        // contract asks for an idle device.
+        renderer.set_fxaa(self.settings.fxaa);
+        renderer.wait_idle();
+        renderer.set_shadow_dim(self.settings.shadows.dim());
 
         // Engine-lifetime passes only. All three are single-sample by design, so
         // none of them cares about the MSAA setting; the two that do (mesh, sky)
@@ -1962,6 +2016,7 @@ impl ApplicationHandler for App {
                         KeyCode::F2 if pressed => {
                             self.settings.fxaa = !self.settings.fxaa;
                             self.apply_fxaa();
+                            self.persist(config::Key::Fxaa);
                         }
                         // V toggles noclip (free flight) for inspecting the scene.
                         KeyCode::KeyV if pressed => {
@@ -2675,7 +2730,17 @@ fn main() {
     // the procedural drifting-orb demo runs instead. `--msaa N` (1/2/4/8) picks
     // the geometry-pass sample count, clamped to device support. `--bench` runs
     // the scripted timing sweep (see `Bench`) instead of the menu.
+    //
+    // Settings: defaults < `config/settings.toml` < CLI flags. `--bench` skips
+    // the file entirely (neither reads nor creates it), so timings never depend
+    // on someone's personal settings.
     let mut settings = GraphicsSettings::default();
+    let config = if std::env::args().skip(1).any(|a| a == "--bench") {
+        eprintln!("[config] ignored (--bench)");
+        None
+    } else {
+        config::load(&mut settings)
+    };
     let mut scenes: Vec<String> = Vec::new();
     let mut bench = false;
     let mut args = std::env::args().skip(1);
@@ -2693,7 +2758,13 @@ fn main() {
 
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(scenes, settings, bench);
+    eprintln!(
+        "[config] effective: shadows {}, msaa {}, fxaa {}",
+        settings.shadows.config_name(),
+        settings.msaa,
+        settings.fxaa
+    );
+    let mut app = App::new(scenes, settings, config, bench);
     event_loop.run_app(&mut app).expect("run app");
 }
 
