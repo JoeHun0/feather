@@ -29,11 +29,9 @@ Engine constraints this respects (all verified against the source)
 * The engine's bindless texture array is sized per level to the textures it
   uses, limited by the device (millions), so --check no longer caps textures;
   --many-textures deliberately exceeds the old fixed 64.
-* NORMAL TRANSFORM: mesh.vert uses mat3(model), which is only correct for
-  uniform scale, or for non-uniform scale with no rotation
-  (render/shaders/mesh.vert:33). So: rotated nodes must be uniformly scaled, and
-  non-uniformly scaled nodes must be unrotated. Meshes are therefore baked at
-  their true size, letting rotated nodes keep scale 1. --check enforces this.
+* Any node TRS is fine for shading: mesh.vert transforms normals by the
+  inverse-transpose (cofactor) of the model matrix, including negative scale.
+  The `normals` zone is the visual check for exactly that.
 """
 
 import argparse
@@ -66,8 +64,8 @@ LEVEL_BOXES = [
 
 # --- Geometry builders ------------------------------------------------------
 # Each returns (positions, normals, uvs, indices) with flat per-face normals
-# where it matters, in LOCAL space. Meshes are baked at true size so that any
-# node needing rotation can keep scale 1 (see the normal-transform note above).
+# where it matters, in LOCAL space. Most are baked at true size, a leftover of
+# the old mat3(model) normal rule, left as is: it costs nothing.
 
 def box(sx, sy, sz):
     """Axis-aligned box centred on the origin, 24 verts / 36 indices."""
@@ -154,8 +152,8 @@ def cylinder(radius, height, sides=12):
 def wedge(run, rise, width):
     """Right triangular prism: a ramp rising along +X over `run`, `width` deep.
 
-    Baked as real geometry rather than a rotated box so the slope normal is
-    correct under mat3(model) and the collider matches what you see.
+    Baked as real geometry rather than a rotated box so the collider matches
+    what you see.
     """
     hw = width / 2.0
     # Profile in XY, extruded along Z.
@@ -395,7 +393,7 @@ class Gltf:
 
 
 def yaw(degrees):
-    """Quaternion (xyzw) about +Y. Only ever paired with uniform scale."""
+    """Quaternion (xyzw) about +Y."""
     h = math.radians(degrees) / 2.0
     return (0.0, math.sin(h), 0.0, math.cos(h))
 
@@ -596,8 +594,7 @@ def zone_aa(s, pal):
                 s.place(pal["pole"], (x, GROUND_Y + 3.0, z), name=f"pole_{row}")
                 x += spacing
             x += 1.2
-    # Diagonal lattice: rotated, so it keeps scale 1 and the mesh is baked at
-    # true size -- mat3(model) stays correct (render/shaders/mesh.vert:33).
+    # Diagonal lattice: rotated beams, baked at true size.
     for i in range(10):
         x = -12.0 + i * 2.6
         for ang in (40, -40):
@@ -652,6 +649,96 @@ def zone_pbr(s, pal, extras_on):
         )
 
 
+def axis_angle(axis, degrees):
+    """Quaternion (xyzw) about an arbitrary axis."""
+    ln = math.sqrt(sum(c * c for c in axis))
+    h = math.radians(degrees) / 2.0
+    return tuple(c / ln * math.sin(h) for c in axis) + (math.cos(h),)
+
+
+def _normalize(v):
+    ln = math.sqrt(sum(c * c for c in v)) or 1.0
+    return tuple(c / ln for c in v)
+
+
+def baked_ellipsoid(rot, scale, radius=0.5, stacks=16, slices=24):
+    """sphere() with rotate(scale(.)) applied to the vertices. The normals come
+    from the ellipsoid's implicit-surface gradient (q_i / s_i^2 at q = S p), not
+    from any matrix formula, so this is an independent reference for the
+    engine's normal transform. Also correct for negative scale: the gradient
+    points outward whatever the mirroring."""
+    m = quat_matrix(rot)
+    pos, nrm, uv, idx = sphere(radius, stacks, slices)
+    out_p, out_n = [], []
+    for p, d in zip(pos, nrm):
+        q = tuple(p[i] * scale[i] for i in range(3))
+        out_p.append(tuple(sum(m[i][k] * q[k] for k in range(3)) for i in range(3)))
+        g = tuple(d[i] / scale[i] for i in range(3))
+        out_n.append(_normalize(tuple(sum(m[i][k] * g[k] for k in range(3)) for i in range(3))))
+    return out_p, out_n, uv, idx
+
+
+def baked_flat(geom, rot, scale):
+    """A flat-faced mesh with rotate(scale(.)) applied to the vertices and each
+    normal recomputed as the transformed triangle's face normal (oriented like
+    the authored one). Independent of any normal matrix; rotation + positive
+    scale only (it relies on the winding being preserved)."""
+    assert all(c > 0 for c in scale)
+    m = quat_matrix(rot)
+    pos, nrm, uv, idx = geom
+    xf = [tuple(sum(m[i][k] * p[k] * scale[k] for k in range(3)) for i in range(3)) for p in pos]
+    out_n = list(nrm)
+
+    def face(ps, a, b, c):
+        e1 = [ps[b][i] - ps[a][i] for i in range(3)]
+        e2 = [ps[c][i] - ps[a][i] for i in range(3)]
+        return (e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0])
+
+    for t in range(0, len(idx), 3):
+        a, b, c = idx[t:t + 3]
+        local = face(pos, a, b, c)
+        sgn = 1.0 if sum(local[i] * nrm[a][i] for i in range(3)) >= 0 else -1.0
+        n = _normalize(tuple(sgn * v for v in face(xf, a, b, c)))
+        for v in (a, b, c):
+            out_n[v] = n
+    return xf, out_n, uv, idx
+
+
+def zone_normals(s, pal, extras_on):
+    """West of spawn, on its z row (x -19..-5). The normal-transform check (§6):
+    each pair is one shape drawn two ways, which must shade identically. The -X
+    member is a node that is rotated AND non-uniformly scaled, so mesh.vert has
+    to transform its normals. The +X member is the same shape baked into the
+    vertices, with normals derived from the geometry itself (see baked_ellipsoid
+    / baked_flat). The last pair is mirrored (negative scale), which checks the
+    normal's sign.
+
+    Props with `collide: false`: they are a visual check, not level geometry.
+    """
+    cases = [
+        ("ellipsoid", pal["normals_sphere"], (2.0, 0.7, 1.2), axis_angle((1.0, 1.0, 0.3), 40.0)),
+        ("wedge", pal["normals_wedge"], (1.0, 2.5, 0.6), axis_angle((0.3, 1.0, 0.5), 35.0)),
+        ("mirrored", pal["normals_sphere"], (-1.6, 0.8, 1.0), axis_angle((0.2, 0.5, 1.0), 50.0)),
+    ]
+    extras = {"prefab": "prop", "params": {"collide": False}} if extras_on else None
+    for ci, (name, (mesh, geom), sc, rot) in enumerate(cases):
+        if name == "wedge":
+            ref_geom = baked_flat(geom, rot, sc)
+        else:
+            ref_geom = baked_ellipsoid(rot, sc)
+        ref = s.g.add_mesh(f"normals_{name}_ref", [(ref_geom, pal["normals_mat"])])
+        x = -19.0 + ci * 5.5
+        # Rest both just above the ground: the node's y from its transformed AABB.
+        lo_y = node_aabb(s.g.mesh_bounds[mesh], (0, 0, 0), rot, sc)[0][1]
+        t = (x, GROUND_Y + 0.2 - lo_y, 8.0)
+        ref_t = (x + 2.5, GROUND_Y + 0.2 - s.g.mesh_bounds[ref][0][1], 8.0)
+        for m_, t_, r_, sc_, tag in ((mesh, t, rot, sc, "xform"), (ref, ref_t, None, None, "ref")):
+            assert s.free(m_, t_, r_, sc_), f"normals_{name}_{tag} site is occupied"
+            s.place(m_, t_, r_, sc_, extras=extras, name=f"normals_{name}_{tag}")
+
+
 def scatter_lights(s, count, radius=14.0):
     """Extra punctual lights spread over the walkable area (§12).
 
@@ -704,12 +791,12 @@ def zone_field(s, pal, count):
         x = s.rng.uniform(-38.0, -20.0)
         z = s.rng.uniform(-34.0, 34.0)
         if kind == "box":
-            # Non-uniform scale is fine here only because there is no rotation.
+            # Non-uniform scale, unrotated.
             sc = (s.rng.uniform(0.5, 2.5), s.rng.uniform(0.6, 4.0), s.rng.uniform(0.5, 2.5))
             t = (x, GROUND_Y + sc[1] / 2.0, z)
             rot = None
         else:
-            # Rotated, so the scale must be uniform.
+            # Yawed, uniform scale.
             u = s.rng.uniform(0.6, 2.0)
             sc = (u, u, u)
             t = (x, GROUND_Y + (u * 0.5 if kind == "sphere" else u * 3.0), z)
@@ -803,6 +890,12 @@ def build_palette(g, use_textures, many_textures=False):
             )
             pal["pbr"].append(g.add_mesh(f"pbr_m{mi}_r{ri}", [(geom, mat)]))
 
+    # The §6 normal-transform pairs: an untextured, fairly glossy material so
+    # the specular highlight shows any error in the normals.
+    pal["normals_mat"] = g.add_material("normals_gloss", (0.8, 0.8, 0.8, 1.0), 0.0, 0.3)
+    for kind, geom_ in (("sphere", sphere(0.5)), ("wedge", wedge(1.2, 0.8, 1.0))):
+        pal[f"normals_{kind}"] = (g.add_mesh(f"normals_{kind}", [(geom_, pal["normals_mat"])]), geom_)
+
     pal["emissive"] = []
     for i, e in enumerate(((3.0, 1.6, 0.5), (0.4, 1.2, 3.0))):
         mat = g.add_material(f"emissive_{i}", (0.05, 0.05, 0.05, 1.0), 0.0, 0.5, emissive=e)
@@ -819,8 +912,8 @@ def check(doc, strict_dedup=True):
     """Re-parse the emitted file and assert the invariants that matter.
 
     This is a permanent feature, not a scratch harness: regenerating with a new
-    seed or density must not silently produce a scene that floats, intersects
-    the app's own level geometry, or shades wrongly.
+    seed or density must not silently produce a scene that floats or intersects
+    the app's own level geometry.
     """
     errors = []
     n_acc, n_mat = len(doc["accessors"]), len(doc["materials"])
@@ -867,11 +960,6 @@ def check(doc, strict_dedup=True):
         name = node.get("name", f"node{ni}")
         rot = node.get("rotation")
         sc = node.get("scale")
-        # mesh.vert uses mat3(model): correct only for uniform scale, or for
-        # non-uniform scale with no rotation (render/shaders/mesh.vert:33).
-        if rot and sc and not (abs(sc[0] - sc[1]) < 1e-6 and abs(sc[1] - sc[2]) < 1e-6):
-            errors.append(f"node {ni} ({name}): rotated AND non-uniformly scaled "
-                          f"{sc} -- mat3(model) would skew its normals")
         aabb = node_aabb(bounds[node["mesh"]], node["translation"], rot, sc)
         for axis in (0, 2):
             if aabb[0][axis] < -GROUND_HALF or aabb[1][axis] > GROUND_HALF:
@@ -921,7 +1009,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("-o", "--out", default="scratch/testscene.gltf")
     ap.add_argument("--zones", default="all",
-                    help="all, or a comma list of: shadow,traversal,aa,field,pbr")
+                    help="all, or a comma list of: shadow,traversal,aa,field,pbr,normals")
     ap.add_argument("--density", choices=sorted(DENSITY), default="med",
                     help="scales the culling/instancing field only")
     ap.add_argument("--seed", type=int, default=7)
@@ -943,7 +1031,7 @@ def main():
     ap.add_argument("--check", action="store_true", help="validate after writing")
     args = ap.parse_args()
 
-    ALL_ZONES = {"shadow", "traversal", "aa", "field", "pbr"}
+    ALL_ZONES = {"shadow", "traversal", "aa", "field", "pbr", "normals"}
     want = ALL_ZONES if args.zones == "all" else set(args.zones.split(","))
     unknown = want - ALL_ZONES
     if unknown:
@@ -962,6 +1050,8 @@ def main():
         zone_aa(s, pal)
     if "pbr" in want:
         zone_pbr(s, pal, extras_on)
+    if "normals" in want:
+        zone_normals(s, pal, extras_on)
     if "field" in want:
         n = zone_field(s, pal, DENSITY[args.density])
         if n < DENSITY[args.density]:

@@ -31,11 +31,17 @@ void main() {
     vec4 world = it.model * vec4(in_pos, 1.0);
     gl_Position = pc.view_proj * world;
     v_world_pos = world.xyz;
-    // mat3(model) is only correct for uniform scale. Orbs are uniformly scaled;
-    // level boxes use non-uniform Scale but are axis-aligned and unrotated, so
-    // their normals still come out right. A real inverse-transpose normal matrix
-    // is the follow-up once anything is both non-uniformly scaled and rotated.
-    v_normal = normalize(mat3(it.model) * in_normal);
+    // Normals transform by the inverse-transpose of the model's 3x3 (mat3(model)
+    // skews them under any non-uniform scale). The cofactor matrix is
+    // det * inverse-transpose: three crosses, no division, and the magnitude
+    // drops out in normalize(). Only det's sign matters: negative (mirrored)
+    // would point normals inward. Not `sign(det)`: a flattened (det = 0)
+    // transform still has a valid cofactor that collapses normals onto the
+    // flattened axis.
+    mat3 m = mat3(it.model);
+    mat3 cof = mat3(cross(m[1], m[2]), cross(m[2], m[0]), cross(m[0], m[1]));
+    float flip = dot(m[0], cof[0]) < 0.0 ? -1.0 : 1.0;
+    v_normal = flip * normalize(cof * in_normal);
     v_material = it.material_id;
     v_uv = in_uv;
 }

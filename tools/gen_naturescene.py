@@ -23,8 +23,9 @@ What the composer does to the kit, and why
   baseColorFactor and becomes metallic 0 / roughness 0.9. They are deduped
   by name across files (the kit shares 23 of them).
 * **Inner transforms are baked into the vertices**, so every placed node is a
-  plain translation + yaw + *uniform* scale. That keeps the engine's
-  mat3(model) normal rule true by construction.
+  plain translation + yaw + *uniform* scale. (The engine would shade any TRS
+  correctly; it is this script's own normal baking, xform_normal, that assumes
+  no non-uniform inner scale.)
 * **Each model is instanced**: its geometry is written once, and every
   placement references it.
 * **Models are seated on the ground** from their true lowest vertex. The

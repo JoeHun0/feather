@@ -196,6 +196,18 @@ struct GpuInstance {
 Pulled from an SSBO (not vertex attributes — a `mat4` would eat 4 attribute
 slots). Vulkan `gl_InstanceIndex` includes `firstInstance`.
 
+**Landed (§26): normal transform.** `mesh.vert` transforms normals by the
+**cofactor** of `mat3(model)` (three cross products; it equals det × the
+inverse-transpose, and the magnitude drops out in `normalize`), negated when
+det < 0 so mirrored nodes keep outward normals. It is computed per vertex
+rather than stored in the instance record as a normal matrix, as originally
+planned: ~15 ALU ops per vertex instead of +48 B per instance (80 → 128) and a
+CPU inverse per instance. Measured on `detail_high` (3 interleaved runs,
+pinned clocks): `geo` median 1.02 ms both ways. The old `mat3(model)` was wrong
+under *any* non-uniform scale, not only rotated + scaled: an unrotated
+(3, 1, 1) scale tilts a 45° normal by 53°. It only held because every
+non-uniformly scaled node was a box, whose normals lie on the scale axes.
+
 ### Extract/batch (what turns ECS transforms into draws)
 
 Per frame, over the culled visible set:
@@ -1349,6 +1361,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   3×3 PCF to occlude the direct sun term. `draw_frame` now runs three passes
   (shadow → geometry → post); the mesh renderer splits into `prepare_frame`
   (CPU sort/stage) + `draw_shadow`/`draw_main` replaying the same instance runs.
+  Normals use the cofactor (inverse-transpose) of the model matrix, so any node
+  TRS shades correctly, mirrored included (§6); the test level's `normals` zone
+  pairs transformed nodes with baked twins as the visual check.
 - **assets**: Vulkan-free CPU mesh types (`Vertex` = pos+normal+uv, `MeshData` +
   bounds + `Material` with optional decoded base-color / normal / MR textures),
   procedural `uv_sphere` + `cube`, and a **glTF/GLB scene loader**
@@ -1462,15 +1477,6 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
 - **Push constants**: currently carry `view_proj` + `light_dir` + `camera_pos`
   (96 B, provisional). Design reserves push constants for tiny per-draw scalars
   and puts camera in a per-frame UBO — revisit when Set 1 lands.
-- **Normal transform (§6)**: `mesh.vert` transforms normals with
-  `mat3(model)`, **not** an inverse-transpose normal matrix. That is correct only
-  for uniform scale, or for non-uniform scale with no rotation. It holds today
-  because orbs are uniformly scaled and level boxes are axis-aligned and
-  unrotated — but it is a real constraint on authored content: anything both
-  rotated *and* non-uniformly scaled will shade wrongly. `tools/gen_testscene.py`
-  therefore bakes meshes at true size so rotated nodes can keep scale 1, and its
-  `--check` asserts the rule. A proper inverse-transpose normal matrix (in the
-  instance record, not recomputed per vertex) is the fix.
 - **Vertex layout (§6)**: pos+normal+uv. Normal mapping uses a screen-space
   **derivative TBN** (no per-vertex tangent); MikkTSpace vertex tangents are the
   higher-quality follow-up (§6 reserves the tangent attribute).

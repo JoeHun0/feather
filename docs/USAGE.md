@@ -131,6 +131,7 @@ data URI). The level is laid out in sectors, each aimed at one system:
 | `aa` | thin poles, a lattice, a picket fence at graded distances |
 | `field` | hundreds of nodes over a few meshes (dedup, instancing, culling) |
 | `pbr` | metallic × roughness sphere grid (IBL, tonemap reference) |
+| `normals` | three pairs west of spawn (x −19…−5, z 8): a rotated, non-uniformly scaled node beside the same shape baked into its vertices. Each pair must shade identically; the last pair is mirrored |
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -147,8 +148,7 @@ data URI). The level is laid out in sectors, each aimed at one system:
 
 **Always pass `--check` when you change the generator.** It enforces the
 constraints that are otherwise silent: bounds, ground contact, no overlap with
-the app's built-in level boxes, and the normal-transform
-rule (see the pitfalls in §9).
+the app's built-in level boxes.
 
 Recipes:
 
@@ -362,9 +362,6 @@ Don't truncate these messages with `cut`: the useful detail is at the end.
 
 ## 9. Pitfalls that bite
 
-- **Content both rotated and non-uniformly scaled shades wrongly**
-  (`mesh.vert` uses `mat3(model)` for normals). The generator's `--check`
-  enforces the rule for its own output; hand-made scenes must follow it too.
 - **UI text is 5×7, A–Z and 0–9 only.** Anything else renders blank. A test
   guards the menu labels, so run it after renaming a row.
 - **`App` field order is load-bearing.** `session` must stay declared before
