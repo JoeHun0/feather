@@ -1048,7 +1048,7 @@ didn't change. `--no-lod` pins LOD0 with the baked vertex order.
 Measured on `detail_high` (pinned clocks, 3 interleaved runs, medians; every
 run gave the same numbers):
 
-| | HEAD | `--no-lod` | LOD |
+| | before (no mesh bake) | `--no-lod` | LOD |
 |---|---|---|---|
 | main Mtris / frame | 3.66 | 3.66 | **0.29** (−92%) |
 | shadow Mtris / frame | 7.06 | 7.06 | **0.61** (−91%) |
