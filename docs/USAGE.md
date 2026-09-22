@@ -80,9 +80,9 @@ use it for timing.
 | Flag | Effect |
 |---|---|
 | `SCENE` (bare path, repeatable) | glTF scene(s) NEW GAME loads. Each node becomes an entity; glTF `extras` become prefabs (§4). |
-| `--msaa N` | Geometry-pass MSAA sample count: 1 / 2 / 4 / 8, clamped to what the device supports. Overrides the settings file for this run only (never saved). Also changeable from the main menu's OPTIONS > GRAPHICS (not mid-game), which *is* saved. |
+| `--msaa N` | Geometry-pass MSAA sample count: 1 / 2 / 4 / 8, clamped to what the device supports. Overrides `config/graphics.toml` for this run only (never saved). Also changeable from the main menu's OPTIONS > GRAPHICS (not mid-game), which *is* saved. |
 | `--no-bake` | Ignore baked textures and upload raw RGBA8, for A/B against the bake (§4). |
-| `--bench` | Scripted timing run: skips the menu, sweeps the camera 360°, prints a summary and exits. Ignores the settings file. See §7. |
+| `--bench` | Scripted timing run: skips the menu, sweeps the camera 360°, prints a summary and exits. Ignores the config files. See §7. |
 
 Typical runs:
 
@@ -92,11 +92,18 @@ cargo run -- --msaa 4 scratch/testscene.gltf         # with 4x MSAA
 cargo run -- --bench scratch/lights120.gltf          # timing sweep
 ```
 
-### Settings file — `config/settings.toml`
+### Config files — `config/`
 
-Graphics settings persist in `config/settings.toml` (gitignored, relative to
-the working directory, so run from the repo root). The first normal run writes
-it with defaults and comments; delete it to reset.
+Settings persist in `config/` (gitignored, relative to the working directory,
+so run from the repo root), one file per concern. The first normal run writes
+each with defaults and comments; delete one to reset it. Both are a flat
+`key = value` subset of TOML parsed by hand (`app/src/config/`), with no
+`[sections]`.
+
+**`graphics.toml`** — saved when you change a setting in the menu or with the
+F1 / F2 bindings. Only that key's value is rewritten; comments, other lines and
+hand edits made while the game runs are kept. (It was `settings.toml` before
+controls got their own file; an old one is renamed on first run.)
 
 | Key | Values | Default |
 |---|---|---|
@@ -104,19 +111,39 @@ it with defaults and comments; delete it to reset.
 | `msaa` | `1`, `2`, `4`, `8` (clamped to the device) | `1` |
 | `fxaa` | `true`, `false` | `false` |
 
+**`controls.toml`** — key bindings and mouse look. Read-only (edit it by hand;
+there's no rebinding screen yet), and read at startup.
+
+- `action = ["Key", ...]`: one or more keys, or `[]` to unbind. Actions:
+  `forward`, `back`, `left`, `right`, `jump` (also fly up in noclip), `down`,
+  `noclip`, `exposure_down`, `exposure_up`, `cycle_shadows`, `toggle_fxaa`.
+  Defaults are in the Controls table below.
+- Key names are physical positions named as on a US QWERTY keyboard, whatever
+  your layout, case-insensitive: `A`–`Z`, `0`–`9`, `F1`–`F12`, `Space`, `Tab`,
+  `Backspace`, `CapsLock`, `LeftShift`/`RightShift`, `LeftCtrl`/`RightCtrl`,
+  `LeftAlt`/`RightAlt`, `Left`/`Right` (arrows), `Insert`, `Delete`, `Home`,
+  `End`, `PageUp`, `PageDown`, `Numpad0`–`Numpad9`, and punctuation by word:
+  `LeftBracket`, `RightBracket`, `Semicolon`, `Quote`, `Comma`, `Period`,
+  `Slash`, `Backslash`, `Minus`, `Equal`, `Backquote`.
+- **Escape, Up, Down and Enter are reserved for the menu** and can't be bound,
+  so a bad file can't lock you out of it.
+- A key on two actions does both (with a warning). Actions missing from the
+  file keep their defaults.
+- `sensitivity` (multiplier, default `1.0`, up to `20`) and `invert_y`
+  (`true` / `false`).
+
+**Both files:**
+
 - **Precedence:** defaults < file < CLI flags. A flag applies to that run only.
-- **Saving:** changing a setting in the menu or with F1/F2 rewrites just that
-  key's value in place. Your comments and other lines are kept, and so is a
-  hand edit made while the game runs.
 - **Mistakes aren't fatal:** a bad line logs `[config] … line N: …; ignored`
-  and that key keeps its default. An unreadable file (e.g. not UTF-8) is left
-  as-is, and the run uses defaults and saves nothing.
-- **`--bench` ignores the file** (neither reads nor creates it), so timings
+  and that key (or action) keeps its default. An unreadable file (e.g. not
+  UTF-8) is left as-is and the run uses defaults.
+- **`--bench` ignores both** (neither reads nor creates them), so timings
   never depend on personal settings.
-- It's a flat `key = value` subset of TOML, parsed by hand (`app/src/config.rs`).
-  Tables (`[section]`) aren't supported yet.
 
 ### Controls
+
+Defaults, rebindable in `config/controls.toml` (Esc isn't).
 
 | In game | |
 |---|---|
@@ -308,7 +335,7 @@ Everything goes to stderr.
 | `[vulkan] …` | validation messages (debug builds), or the "layer not found" warning |
 | `[gpu] shadow … cluster … geo … post … frame …` | smoothed per-pass GPU ms, about once a second |
 | `[quality] shadows / fxaa: …` | a setting changed |
-| `[config] …` | settings file created / loaded / a line ignored, plus the effective settings at startup |
+| `[config] …` | a config file created / loaded / renamed, a line ignored or a key bound twice, plus the effective graphics settings at startup |
 | `[light] N visible lights exceeds MAX_LIGHTS` | lights past 128 were dropped this frame |
 | `[bench] …` | the `--bench` summary |
 
@@ -340,7 +367,7 @@ the report prints the real size). It then waits 120 frames at the spawn point,
 turns 360° at level pitch over 720 frames, and records **raw** per-frame times,
 not the smoothed `[gpu]` line. It prints min / p10 / median / p90 / max for
 each pass plus the visible-light count, then exits. Don't touch the window
-while it runs. It ignores `config/settings.toml`: settings come from the
+while it runs. It ignores `config/`: settings come from the
 defaults and CLI flags only.
 
 ### A/B recipe

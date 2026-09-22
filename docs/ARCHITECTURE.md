@@ -727,17 +727,18 @@ with the device idle — the shadow image is freed and the mesh renderer's
 descriptor re-pointed, which is unsound mid-flight.
 
 **Landed (§26): persistence.** Shadows, MSAA and FXAA live in
-`config/settings.toml` (gitignored, cwd-relative like the bake dir; module
-`app/src/config.rs`). A missing file is written with commented defaults.
+`config/graphics.toml` (gitignored, cwd-relative like the bake dir; module
+`app/src/config/`; controls have their own file, §14. It was `settings.toml`
+until then, and an old one is renamed on first run). A missing file is written with commented defaults.
 Precedence is defaults < file < CLI, and only a key the player changes (menu,
 F1, F2) is written back, so a `--msaa 4` override never leaks into the file.
 Saving edits that key's value in place and leaves every other byte alone
 (comments, unknown lines, hand edits made mid-run). A bad line is a warning;
 an unreadable file is left untouched and the run saves nothing. `--bench`
 neither reads nor creates it, so timings don't depend on someone's settings.
-Hand-parsed flat TOML rather than a crate: three scalar keys don't justify a
-dependency, and one becomes worth it when the file needs tables (bindings,
-§15). Found on the way: the renderer ignored the *initial* settings (it starts
+Hand-parsed flat TOML rather than a crate: a few scalar keys don't justify a
+dependency. One file per concern is what keeps each file flat, so the bindings
+(§14) didn't need tables or a crate either. Found on the way: the renderer ignored the *initial* settings (it starts
 at the High shadow size with FXAA off), which was invisible while those were
 also the defaults; startup now pushes both in.
 
@@ -826,8 +827,26 @@ Two layers (raw events and game meaning change at different rates).
 it at render rate (abstract `wish` direction, latched `jump` edge, vertical axis,
 noclip) and the fixed step consumes it, the controller system clearing the jump
 edge so one press feeds exactly one tick. Look deltas are applied at render rate
-straight to the `Look` component. Still raw winit key polling rather than a
-bindings table; no gamepad, no UI focus flag.
+straight to the `Look` component. No gamepad, no UI focus flag.
+
+**Landed (§26): the bindings table**, in `config/controls.toml`
+(`app/src/config/controls.rs`), separate from graphics by function. Physical
+keys map to 11 actions (movement, jump, noclip down, noclip, exposure ±, the
+shadow and FXAA toggles), each taking a list of keys or `[]`. Keys are named by
+US-QWERTY position with punctuation spelled out (`LeftBracket`), which keeps
+TOML escapes out of the file. **Escape, Up, Down and Enter stay hard-wired to
+the menu** and are refused as bindings, so a broken file can't strand the
+player outside the menu that a rebinding screen will live in. The file also
+carries `sensitivity` (a multiplier on the old hard-coded 0.0025 rad per
+count) and `invert_y`. It's read-only for now: no rebinding UI yet, and the
+GAMEPLAY menu rows are still placeholders. Held state comes from a set of keys
+that are down, so two keys on one action don't cancel each other. An action
+fires when it becomes active, so **key auto-repeat no longer re-toggles** noclip
+or FXAA (holding V used to flicker). Exposure is the deliberate exception and
+repeats. Focus loss clears the held set, since a key released while unfocused
+never reports its release. All of it (parse errors, reserved keys, multi-key
+hold, repeat, rebinding) is unit-tested without a GPU through
+`Controls::key`, a pure function of (bindings, held set, event).
 
 ## 15. FPS controller + physics coupling
 
@@ -1585,7 +1604,8 @@ skinning; UI/HUD (§19's lightweight quad/text renderer + the Esc pause menu
 landed, with keyboard *and* mouse navigation, an OPTIONS screen tree, and live
 shadow-quality/FXAA controls under GRAPHICS — MSAA is changeable there only
 from the main menu, since the session's mesh and sky pipelines bake the sample
-count; all three persist in `config/settings.toml` (§13); egui dev UI, SDF text and
+count; all three persist in `config/graphics.toml` (§13), and key bindings +
+mouse look are read from `config/controls.toml` (§14); egui dev UI, SDF text and
 lower-case/punctuation pending); audio; debug/profiling tooling (per-pass GPU timestamp timing
 landed — stderr log + `Renderer::gpu_times`, plus the `--bench` sweep harness;
 Tracy / RenderDoc / egui overlay and

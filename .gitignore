@@ -3,5 +3,5 @@
 /scratch/
 # Python bytecode (tools/gen_naturescene.py imports gen_testscene)
 __pycache__/
-# Personal settings, created on first run (app/src/config.rs)
+# Personal settings, created on first run (app/src/config/)
 /config/

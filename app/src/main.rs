@@ -29,7 +29,7 @@
 
 mod config;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use bevy_ecs::prelude::*;
@@ -165,7 +165,7 @@ impl ShadowQuality {
         }
     }
 
-    /// Settings-file form (`config/settings.toml`).
+    /// Settings-file form (`config/graphics.toml`).
     fn config_name(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -970,7 +970,7 @@ struct Input {
     right: bool,
     up: bool,
     down: bool,
-    jump: bool, // latched on the Space press edge; consumed by the fixed step
+    jump: bool, // latched on the jump action's press edge; consumed by the fixed step
     mouse_dx: f32,
     mouse_dy: f32,
 }
@@ -1076,7 +1076,12 @@ struct App {
     settings: GraphicsSettings,
     /// The settings file, for saving changes; `None` under `--bench` or when it
     /// could be neither read nor created.
-    config: Option<config::ConfigFile>,
+    config: Option<config::graphics::ConfigFile>,
+    /// Key bindings and mouse look (`config/controls.toml`, §14).
+    controls: config::controls::Controls,
+    /// Keys currently down, so an action bound to several keys stays held
+    /// until the last of them is released.
+    held_keys: HashSet<KeyCode>,
     /// Paused by Esc: the fixed step stops, the cursor is released for the menu,
     /// and look/movement input is ignored. Rendering continues so the frozen
     /// scene stays on screen behind the overlay (§14's UI focus flag).
@@ -1737,7 +1742,8 @@ impl App {
     fn new(
         scenes: Vec<String>,
         settings: GraphicsSettings,
-        config: Option<config::ConfigFile>,
+        config: Option<config::graphics::ConfigFile>,
+        controls: config::controls::Controls,
         bench: bool,
     ) -> Self {
         let light = Vec3::new(-0.4, -1.0, -0.3).normalize();
@@ -1751,6 +1757,8 @@ impl App {
             input: Input::default(),
             settings,
             config,
+            controls,
+            held_keys: HashSet::new(),
             paused: false,
             menu: Menu::new(),
             cursor: None,
@@ -1829,7 +1837,7 @@ impl App {
     fn cycle_shadow_quality(&mut self) {
         self.settings.shadows = self.settings.shadows.next();
         self.apply_shadow_quality();
-        self.persist(config::Key::Shadows);
+        self.persist(config::graphics::Key::Shadows);
     }
 
     /// Push `settings.fxaa` into the renderer. Cheap: just a flag, since the
@@ -1853,15 +1861,15 @@ impl App {
             MenuOutcome::Quit => event_loop.exit(),
             MenuOutcome::ApplyShadows => {
                 self.apply_shadow_quality();
-                self.persist(config::Key::Shadows);
+                self.persist(config::graphics::Key::Shadows);
             }
             MenuOutcome::ApplyFxaa => {
                 self.apply_fxaa();
-                self.persist(config::Key::Fxaa);
+                self.persist(config::graphics::Key::Fxaa);
             }
             MenuOutcome::ApplyMsaa => {
                 self.apply_msaa();
-                self.persist(config::Key::Msaa);
+                self.persist(config::graphics::Key::Msaa);
             }
             MenuOutcome::StartSession => self.start_session(),
             MenuOutcome::EndSession => self.end_session(),
@@ -1915,10 +1923,54 @@ impl App {
         self.set_cursor_captured(false);
     }
 
+    /// A key that isn't one of the fixed menu keys: look it up in the bindings,
+    /// refresh the held movement state and run whatever it fired.
+    fn bound_key(&mut self, code: KeyCode, pressed: bool, repeat: bool) {
+        use config::controls::Action;
+        let fired = self
+            .controls
+            .key(&mut self.held_keys, code, pressed, repeat);
+        self.sync_held_actions();
+        for action in fired {
+            match action {
+                // Latched for the fixed step, which consumes it (§14).
+                Action::Jump => self.input.jump = true,
+                // Free flight, for inspecting the scene.
+                Action::Noclip => {
+                    if let Some(s) = self.session.as_mut() {
+                        s.noclip = !s.noclip;
+                    }
+                }
+                // Exposure control (showcases the HDR/tonemap pipeline).
+                Action::ExposureDown => self.exposure = (self.exposure * 0.8).max(0.05),
+                Action::ExposureUp => self.exposure = (self.exposure * 1.25).min(16.0),
+                Action::CycleShadows => self.cycle_shadow_quality(),
+                Action::ToggleFxaa => {
+                    self.settings.fxaa = !self.settings.fxaa;
+                    self.apply_fxaa();
+                    self.persist(config::graphics::Key::Fxaa);
+                }
+                Action::Forward | Action::Back | Action::Left | Action::Right | Action::Down => {}
+            }
+        }
+    }
+
+    /// Movement flags from the keys currently down.
+    fn sync_held_actions(&mut self) {
+        use config::controls::Action;
+        let (c, held) = (&self.controls, &self.held_keys);
+        self.input.forward = c.held(held, Action::Forward);
+        self.input.back = c.held(held, Action::Back);
+        self.input.left = c.held(held, Action::Left);
+        self.input.right = c.held(held, Action::Right);
+        self.input.up = c.held(held, Action::Jump);
+        self.input.down = c.held(held, Action::Down);
+    }
+
     /// Save `key`'s current value to the settings file. Called only where the
     /// player changed it, so CLI overrides are never written back. A failed
     /// write is logged, never fatal.
-    fn persist(&mut self, key: config::Key) {
+    fn persist(&mut self, key: config::graphics::Key) {
         if let Some(c) = self.config.as_mut() {
             if let Err(e) = c.save(key, &self.settings) {
                 eprintln!("[config] couldn't save {}: {e}", c.path().display());
@@ -1998,39 +2050,6 @@ impl ApplicationHandler for App {
                 let pressed = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match code {
-                        KeyCode::KeyW => self.input.forward = pressed,
-                        KeyCode::KeyS => self.input.back = pressed,
-                        KeyCode::KeyA => self.input.left = pressed,
-                        KeyCode::KeyD => self.input.right = pressed,
-                        KeyCode::Space => {
-                            // Latch the press edge for jump; also drives noclip up.
-                            if pressed && !self.input.up {
-                                self.input.jump = true;
-                            }
-                            self.input.up = pressed;
-                        }
-                        KeyCode::ControlLeft => self.input.down = pressed,
-                        // F1 cycles the shadow-quality preset (§13).
-                        KeyCode::F1 if pressed => self.cycle_shadow_quality(),
-                        // F2 toggles FXAA (§13).
-                        KeyCode::F2 if pressed => {
-                            self.settings.fxaa = !self.settings.fxaa;
-                            self.apply_fxaa();
-                            self.persist(config::Key::Fxaa);
-                        }
-                        // V toggles noclip (free flight) for inspecting the scene.
-                        KeyCode::KeyV if pressed => {
-                            if let Some(s) = self.session.as_mut() {
-                                s.noclip = !s.noclip;
-                            }
-                        }
-                        // Exposure control (showcases the HDR/tonemap pipeline).
-                        KeyCode::BracketLeft if pressed => {
-                            self.exposure = (self.exposure * 0.8).max(0.05);
-                        }
-                        KeyCode::BracketRight if pressed => {
-                            self.exposure = (self.exposure * 1.25).min(16.0);
-                        }
                         // Esc walks back out one screen at a time, and only
                         // unpauses from the root — so leaving a submenu does not
                         // dump you straight into the game.
@@ -2058,9 +2077,17 @@ impl ApplicationHandler for App {
                             let outcome = self.menu.activate(&mut self.settings, in_session);
                             self.handle_menu_outcome(outcome, event_loop);
                         }
-                        _ => {}
+                        // Everything else goes through the bindings (§14).
+                        _ => self.bound_key(code, pressed, event.repeat),
                     }
                 }
+            }
+            // Keys released while unfocused never report a release, so without
+            // this alt-tabbing away while holding W leaves you walking.
+            WindowEvent::Focused(false) => {
+                self.held_keys.clear();
+                self.sync_held_actions();
+                self.input.jump = false;
             }
             // Mouse in the pause menu (§19). Only while paused: mouselook is a
             // DeviceEvent on a separate path, so gameplay is untouched.
@@ -2129,11 +2156,17 @@ impl ApplicationHandler for App {
                 let mut frame_view: Option<FrameView> = None;
                 if let Some(s) = self.session.as_mut() {
                     // Look updates at render rate for responsive aim (§15).
-                    let sens = if self.paused { 0.0 } else { 0.0025 };
+                    let sens = if self.paused {
+                        0.0
+                    } else {
+                        self.controls.look_scale()
+                    };
+                    let pitch_sign = if self.controls.invert_y { -1.0 } else { 1.0 };
                     let look = {
                         let mut look = s.world.get_mut::<Look>(s.player).expect("player has Look");
                         look.yaw += self.input.mouse_dx * sens;
-                        look.pitch = (look.pitch - self.input.mouse_dy * sens).clamp(-1.54, 1.54);
+                        look.pitch = (look.pitch - pitch_sign * self.input.mouse_dy * sens)
+                            .clamp(-1.54, 1.54);
                         if let Some(b) = self.bench.as_mut() {
                             b.drive(&mut look);
                         }
@@ -2731,15 +2764,18 @@ fn main() {
     // the geometry-pass sample count, clamped to device support. `--bench` runs
     // the scripted timing sweep (see `Bench`) instead of the menu.
     //
-    // Settings: defaults < `config/settings.toml` < CLI flags. `--bench` skips
-    // the file entirely (neither reads nor creates it), so timings never depend
-    // on someone's personal settings.
+    // Settings: defaults < `config/graphics.toml` < CLI flags. `config/controls.toml`
+    // holds the bindings. `--bench` skips both (neither reads nor creates them),
+    // so timings never depend on someone's personal settings.
     let mut settings = GraphicsSettings::default();
-    let config = if std::env::args().skip(1).any(|a| a == "--bench") {
+    let (config, controls) = if std::env::args().skip(1).any(|a| a == "--bench") {
         eprintln!("[config] ignored (--bench)");
-        None
+        (None, config::controls::Controls::default())
     } else {
-        config::load(&mut settings)
+        (
+            config::graphics::load(&mut settings),
+            config::controls::load(),
+        )
     };
     let mut scenes: Vec<String> = Vec::new();
     let mut bench = false;
@@ -2764,7 +2800,7 @@ fn main() {
         settings.msaa,
         settings.fxaa
     );
-    let mut app = App::new(scenes, settings, config, bench);
+    let mut app = App::new(scenes, settings, config, controls, bench);
     event_loop.run_app(&mut app).expect("run app");
 }
 

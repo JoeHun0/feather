@@ -1,27 +1,22 @@
-//! Persistent graphics settings (§13): `config/settings.toml`, gitignored.
+//! Persistent graphics settings (§13): `config/graphics.toml`.
 //!
-//! A flat `key = value` subset of TOML, parsed by hand: three keys don't justify
-//! a dependency, and a crate becomes worth it only when the file needs tables
-//! (key bindings). Two rules shape everything here:
-//!
-//! - **Never fatal.** A missing file is created with defaults; a bad line is a
-//!   warning and leaves that key at its default.
-//! - **Never destructive.** Saving edits the matching line's value in place and
-//!   leaves every other byte alone, so comments and lines the parser didn't
-//!   understand survive. An unreadable file is left untouched, not replaced.
-//!
-//! Precedence is defaults < file < CLI. Only a key the player just changed is
-//! ever written back, so a `--msaa 4` override never leaks into the file.
+//! Precedence is defaults < file < CLI. Only a key the player just changed (menu,
+//! F1, F2) is ever written back, so a `--msaa 4` override never leaks into the
+//! file. Saving edits the matching line's value in place and leaves every other
+//! byte alone, so comments and lines the parser didn't understand survive.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{GraphicsSettings, ShadowQuality};
+use super::{comment_start, entries, open_or_create, string, warning, write_atomic};
+use crate::{GraphicsSettings, ShadowQuality};
 
 /// Relative to the working directory, like `BAKE_DIR`: fine while the game is
 /// run via cargo from the repo root.
-pub const CONFIG_PATH: &str = "config/settings.toml";
+pub const CONFIG_PATH: &str = "config/graphics.toml";
+/// Where this file lived before controls got a file of their own.
+const OLD_PATH: &str = "config/settings.toml";
 
 /// A persisted setting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -57,7 +52,8 @@ pub fn default_text() -> String {
     format!(
         "# Feather graphics settings. Written with defaults when missing; the menu,
 # F1 and F2 save changes here. Delete this file to reset. Command-line flags
-# (e.g. --msaa 4) override it for one run and are never saved.
+# (e.g. --msaa 4) override it for one run and are never saved. Key bindings
+# are in controls.toml.
 
 # Shadow quality: \"high\", \"medium\", \"low\" or \"off\". F1 cycles it in game.
 shadows = {}
@@ -75,49 +71,16 @@ fxaa = {}
     )
 }
 
-/// Byte index where a `#` comment starts (outside a quoted string), if any.
-fn comment_start(line: &str) -> Option<usize> {
-    let mut quoted = false;
-    for (i, c) in line.char_indices() {
-        match c {
-            '"' => quoted = !quoted,
-            '#' if !quoted => return Some(i),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// The `key = value` part of a line: comment stripped, trimmed.
-fn code(line: &str) -> &str {
-    line[..comment_start(line).unwrap_or(line.len())].trim()
-}
-
 /// Apply every valid line of `text` to `s`. Returns one warning per line that
 /// was ignored; the keys they named keep whatever `s` already held.
 pub fn parse(text: &str, s: &mut GraphicsSettings) -> Vec<String> {
-    let mut warnings = Vec::new();
-    for (i, raw) in text.lines().enumerate() {
-        let line = code(raw);
-        if line.is_empty() {
-            continue;
-        }
-        let mut warn = |msg: String| warnings.push(format!("line {}: {msg}; ignored", i + 1));
-        if line.starts_with('[') {
-            warn(format!("tables are not supported (`{line}`)"));
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            warn(format!("expected `key = value`, got `{line}`"));
-            continue;
-        };
-        let (k, v) = (k.trim(), v.trim());
+    let (lines, mut warnings) = entries(text);
+    for e in lines {
+        let (k, v) = (e.key, e.value);
+        let mut warn = |msg: String| warnings.push(warning(e.line, msg));
         match k {
             "shadows" => {
-                let q = v
-                    .strip_prefix('"')
-                    .and_then(|v| v.strip_suffix('"'))
-                    .and_then(ShadowQuality::from_config_name);
+                let q = string(v).and_then(ShadowQuality::from_config_name);
                 match q {
                     Some(q) => s.shadows = q,
                     None => warn(format!(
@@ -172,17 +135,6 @@ pub fn set_value(text: &str, key: &str, value: &str) -> String {
     out
 }
 
-/// Write via a temp file + rename, so a crash mid-write never leaves a
-/// truncated settings file (the same pattern as the texture bake, §17).
-fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, text)?;
-    fs::rename(&tmp, path)
-}
-
 /// How `ConfigFile::open` found the file.
 #[derive(Debug, PartialEq)]
 pub enum Opened {
@@ -205,29 +157,22 @@ impl ConfigFile {
     /// An error means it could neither be read nor created; the caller then
     /// runs on defaults and saves nothing (and never overwrites the file).
     pub fn open(path: &Path, s: &mut GraphicsSettings) -> io::Result<(Self, Opened)> {
-        match fs::read_to_string(path) {
-            Ok(text) => {
-                let warnings = parse(&text, s);
-                let file = Self {
-                    path: path.to_owned(),
-                    text,
-                };
-                Ok((file, Opened::Existing(warnings)))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let text = default_text();
-                write_atomic(path, &text)?;
-                // Parse what was written, so the file is the single source of
-                // the values even on first run.
-                parse(&text, s);
-                let file = Self {
-                    path: path.to_owned(),
-                    text,
-                };
-                Ok((file, Opened::Created))
-            }
-            Err(e) => Err(e),
-        }
+        let (text, created) = open_or_create(path, default_text)?;
+        // Parsed even when just created, so the file is the single source of
+        // the values from the first run on.
+        let warnings = parse(&text, s);
+        let file = Self {
+            path: path.to_owned(),
+            text,
+        };
+        Ok((
+            file,
+            if created {
+                Opened::Created
+            } else {
+                Opened::Existing(warnings)
+            },
+        ))
     }
 
     pub fn path(&self) -> &Path {
@@ -251,6 +196,11 @@ impl ConfigFile {
 /// saving (`None` if it can be neither read nor created).
 pub fn load(s: &mut GraphicsSettings) -> Option<ConfigFile> {
     let path = Path::new(CONFIG_PATH);
+    match migrate(Path::new(OLD_PATH), path) {
+        Ok(true) => eprintln!("[config] renamed {OLD_PATH} to {CONFIG_PATH}"),
+        Ok(false) => {}
+        Err(e) => eprintln!("[config] couldn't rename {OLD_PATH} to {CONFIG_PATH}: {e}"),
+    }
     match ConfigFile::open(path, s) {
         Ok((file, Opened::Created)) => {
             eprintln!("[config] wrote defaults to {}", path.display());
@@ -271,6 +221,16 @@ pub fn load(s: &mut GraphicsSettings) -> Option<ConfigFile> {
             None
         }
     }
+}
+
+/// Move the pre-split `settings.toml` to `graphics.toml`, once: only when the
+/// old file exists and the new one doesn't, so it never overwrites anything.
+fn migrate(old: &Path, new: &Path) -> io::Result<bool> {
+    if old.is_file() && !new.exists() {
+        fs::rename(old, new)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -323,12 +283,6 @@ mod tests {
     }
 
     #[test]
-    fn hash_inside_quotes_is_not_a_comment() {
-        assert_eq!(comment_start("a = \"x#y\" # c"), Some(10));
-        assert_eq!(code("  # only a comment"), "");
-    }
-
-    #[test]
     fn set_value_edits_only_the_value() {
         let text = "# top\nshadows = \"high\"   # keep me\r\nmsaa=1\nweird line\n";
         let out = set_value(text, "shadows", "\"off\"");
@@ -357,12 +311,10 @@ mod tests {
         assert_eq!(set_value("", "fxaa", "true"), "fxaa = true\n");
     }
 
-    /// A fresh directory per test under the system temp dir.
+    use crate::config::test_dir;
+
     fn temp_path(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("feather-config-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        dir.join("sub").join("settings.toml")
+        test_dir(name).join("sub").join("graphics.toml")
     }
 
     #[test]
@@ -388,6 +340,24 @@ mod tests {
         assert_eq!((s2.msaa, s2.fxaa), (4, true));
         assert_eq!(fs::read_to_string(&path).unwrap(), on_disk);
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn settings_toml_migrates_once() {
+        let dir = test_dir("migrate");
+        fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("settings.toml"), dir.join("graphics.toml"));
+        let text = default_text().replace("msaa = 1", "msaa = 8");
+        fs::write(&old, &text).unwrap();
+        assert!(migrate(&old, &new).unwrap());
+        assert!(!old.exists());
+        assert_eq!(fs::read_to_string(&new).unwrap(), text);
+        // A second run, or a stray old file next to a new one, changes nothing.
+        assert!(!migrate(&old, &new).unwrap());
+        fs::write(&old, "msaa = 2\n").unwrap();
+        assert!(!migrate(&old, &new).unwrap());
+        assert_eq!(fs::read_to_string(&new).unwrap(), text);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Unreadable (here: not UTF-8) must be an error, and the file must stay
