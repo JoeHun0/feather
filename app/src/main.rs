@@ -3304,9 +3304,14 @@ mod tests {
     // and the layout is a pure function of the framebuffer size, so all of this
     // runs without a GPU or a window.
 
-    /// A few sizes worth covering: a typical window, a wide one, and one small
-    /// enough that `menu_font_px` clamps to its 2.0 floor.
-    const SIZES: [(f32, f32); 3] = [(1280.0, 720.0), (2560.0, 1440.0), (320.0, 200.0)];
+    /// A few sizes worth covering: the default window, a typical one, a wide
+    /// one, and one small enough that `menu_font_px` clamps to its 2.0 floor.
+    const SIZES: [(f32, f32); 4] = [
+        (640.0, 480.0),
+        (1280.0, 720.0),
+        (2560.0, 1440.0),
+        (320.0, 200.0),
+    ];
 
     const SCREENS: [MenuScreen; 7] = [
         MenuScreen::MainRoot,

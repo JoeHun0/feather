@@ -75,7 +75,8 @@ cargo run -- [FLAGS] [SCENE.gltf|.glb ...]
 The app opens on the **main menu** with nothing loaded. **NEW GAME** loads the
 scenes named on the command line; with no scene it runs the procedural
 drifting-orb demo instead. The orb demo is pathological by design, so never
-use it for timing.
+use it for timing. The window opens at **640×480** (logical pixels, so larger
+on a HiDPI desktop) and is resizable; `--bench` uses a fixed 1920×1080.
 
 | Flag | Effect |
 |---|---|
