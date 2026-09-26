@@ -1,19 +1,19 @@
 //! Key bindings and mouse look (§14): `config/controls.toml`.
 //!
 //! The bindings table §14 plans: physical keys → abstract actions, so gameplay
-//! code never names a key. Read-only for now — created with defaults, never
-//! written back — since there is no in-game rebinding screen yet.
+//! code never names a key. Created with defaults, hand-editable, and saved one
+//! value at a time by the OPTIONS > CONTROLS and GAMEPLAY menus (§19), the same
+//! in-place way as `graphics.toml`.
 //!
-//! The menu keys (Escape, Up, Down, Enter) are not bindable, so a bad file can
-//! never lock the player out of the menu (§19) that a rebinding screen would
-//! live in.
+//! The menu keys (Escape, Up, Down, Enter) are not bindable, so neither a bad
+//! file nor a slip in the rebinding screen can lock the player out of the menu.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use feather_platform::winit::keyboard::KeyCode;
 
-use super::{entries, open_or_create, string_list, warning};
+use super::{entries, open_or_create, string_list, warning, ConfigFile};
 
 /// Relative to the working directory, like `graphics::CONFIG_PATH`.
 pub const CONTROLS_PATH: &str = "config/controls.toml";
@@ -22,6 +22,9 @@ pub const CONTROLS_PATH: &str = "config/controls.toml";
 /// value that was hard-coded before this file existed).
 pub const BASE_SENSITIVITY: f32 = 0.0025;
 const MAX_SENSITIVITY: f32 = 20.0;
+/// What the GAMEPLAY menu's SENSITIVITY row steps through, in percent (the
+/// font has no decimal point, so the row shows a percentage).
+const SENSITIVITY_PRESETS: [u32; 9] = [25, 50, 75, 100, 125, 150, 200, 300, 400];
 
 /// Something a key can be bound to.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -57,7 +60,8 @@ impl Action {
         Self::ToggleFxaa,
     ];
 
-    fn name(self) -> &'static str {
+    /// The key it's saved under in `controls.toml`.
+    pub fn name(self) -> &'static str {
         match self {
             Self::Forward => "forward",
             Self::Back => "back",
@@ -104,6 +108,12 @@ impl Action {
             Self::CycleShadows => "cycle shadow quality",
             Self::ToggleFxaa => "FXAA on/off",
         }
+    }
+
+    /// Menu form: upper case, underscores as spaces (the 5x7 font has A-Z,
+    /// 0-9 and space only).
+    pub fn menu_label(self) -> String {
+        self.name().to_ascii_uppercase().replace('_', " ")
     }
 
     /// Fires again on key auto-repeat. Everything else fires once, when the
@@ -225,6 +235,11 @@ fn key_name(code: KeyCode) -> &'static str {
         .map_or("?", |(n, _)| n)
 }
 
+/// Whether the menu owns `code`, so it can never be bound.
+pub fn is_reserved(code: KeyCode) -> bool {
+    RESERVED.contains(&code)
+}
+
 fn key_from_name(name: &str) -> Option<KeyCode> {
     KEY_NAMES
         .iter()
@@ -255,6 +270,63 @@ impl Default for Controls {
 }
 
 impl Controls {
+    /// Bind `action` to exactly `key`, taking `key` away from any other
+    /// action (which may be left unbound). Refuses, returning `false`, a
+    /// reserved menu key or one with no name, which the file couldn't store.
+    pub fn rebind(&mut self, action: Action, key: KeyCode) -> bool {
+        if is_reserved(key) || key_name(key) == "?" {
+            return false;
+        }
+        for keys in self.keys.values_mut() {
+            keys.retain(|&k| k != key);
+        }
+        self.keys.insert(action, vec![key]);
+        true
+    }
+
+    /// Default bindings again; sensitivity and invert are kept.
+    pub fn reset_keys(&mut self) {
+        self.keys = Controls::default().keys;
+    }
+
+    /// The menu's view of an action's keys: `W`, `W I`, or `NONE`.
+    pub fn keys_label(&self, a: Action) -> String {
+        let keys = self.keys(a);
+        if keys.is_empty() {
+            return "NONE".into();
+        }
+        keys.iter()
+            .map(|&k| key_name(k).to_ascii_uppercase())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The TOML value `controls.toml` stores for an action: `["W", "I"]`.
+    pub fn keys_literal(&self, a: Action) -> String {
+        let names: Vec<String> = self
+            .keys(a)
+            .iter()
+            .map(|&k| format!("\"{}\"", key_name(k)))
+            .collect();
+        format!("[{}]", names.join(", "))
+    }
+
+    /// Sensitivity as the menu shows it, in percent.
+    pub fn sensitivity_percent(&self) -> u32 {
+        (self.sensitivity * 100.0).round() as u32
+    }
+
+    /// The next SENSITIVITY preset up, wrapping. A value that isn't a preset
+    /// (typed into the file) goes to the next preset above it.
+    pub fn step_sensitivity(&mut self) {
+        let now = self.sensitivity_percent();
+        let next = SENSITIVITY_PRESETS
+            .into_iter()
+            .find(|&p| p > now)
+            .unwrap_or(SENSITIVITY_PRESETS[0]);
+        self.sensitivity = next as f32 / 100.0;
+    }
+
     /// Radians of look per raw mouse count.
     pub fn look_scale(&self) -> f32 {
         BASE_SENSITIVITY * self.sensitivity
@@ -306,8 +378,9 @@ impl Controls {
 pub fn default_text() -> String {
     let d = Controls::default();
     let mut t = String::from(
-        "# Feather controls. Written with defaults when missing; delete it to reset.
-# Graphics settings are in graphics.toml.
+        "# Feather controls. Written with defaults when missing; the OPTIONS >
+# CONTROLS and GAMEPLAY menus save changes here. Delete it to reset. Graphics
+# settings are in graphics.toml.
 #
 # action = [\"Key\", ...]: one or more keys, or [] to unbind. Keys are physical
 # positions named as on a US QWERTY keyboard, whatever your layout:
@@ -417,9 +490,10 @@ pub fn parse(text: &str) -> (Controls, Vec<String>) {
     (c, warnings)
 }
 
-/// Startup entry point: read (or create) the file and log what happened. Any
-/// failure falls back to the defaults.
-pub fn load() -> Controls {
+/// Startup entry point: read (or create) the file and log what happened.
+/// Returns the file for saving, or `None` if it can be neither read nor
+/// created; the controls then fall back to the defaults and nothing is saved.
+pub fn load() -> (Controls, Option<ConfigFile>) {
     let path = Path::new(CONTROLS_PATH);
     match open_or_create(path, default_text) {
         Ok((text, created)) => {
@@ -432,14 +506,14 @@ pub fn load() -> Controls {
             } else {
                 eprintln!("[config] loaded {}", path.display());
             }
-            c
+            (c, Some(ConfigFile::new(path, text)))
         }
         Err(e) => {
             eprintln!(
-                "[config] can't use {}: {e}; using default controls",
+                "[config] can't use {}: {e}; using default controls, not saving",
                 path.display()
             );
-            Controls::default()
+            (Controls::default(), None)
         }
     }
 }
@@ -572,6 +646,111 @@ mod tests {
         // A second jump key while the first is down is not a new jump.
         assert!(c.key(&mut held, KeyCode::Space, true, false).is_empty());
         assert!(c.held(&held, Action::Jump));
+    }
+
+    #[test]
+    fn rebind_takes_the_key_from_other_actions() {
+        let mut c = Controls::default();
+        assert!(c.rebind(Action::Forward, KeyCode::KeyV));
+        assert_eq!(c.keys(Action::Forward), &[KeyCode::KeyV]);
+        assert!(c.keys(Action::Noclip).is_empty(), "V was NOCLIP's");
+        assert_eq!(c.keys_label(Action::Noclip), "NONE");
+        assert_eq!(c.keys_label(Action::Forward), "V");
+        // Reserved and unnameable keys are refused, and nothing changes.
+        let before = c.clone();
+        assert!(!c.rebind(Action::Jump, KeyCode::Enter));
+        assert!(!c.rebind(Action::Jump, KeyCode::PrintScreen));
+        assert_eq!(c, before);
+        // A multi-key action becomes the one key.
+        let (mut c, _) = parsed("forward = [\"W\", \"I\"]");
+        assert_eq!(c.keys_label(Action::Forward), "W I");
+        c.rebind(Action::Forward, KeyCode::KeyK);
+        assert_eq!(c.keys_literal(Action::Forward), "[\"K\"]");
+    }
+
+    #[test]
+    fn reset_keys_keeps_mouse_look() {
+        let (mut c, _) = parsed("jump = [\"J\"]\nsensitivity = 2.5\ninvert_y = true");
+        c.reset_keys();
+        assert_eq!(c.keys(Action::Jump), &[KeyCode::Space]);
+        assert_eq!((c.sensitivity, c.invert_y), (2.5, true));
+    }
+
+    #[test]
+    fn sensitivity_steps_through_presets_and_wraps() {
+        let mut c = Controls::default();
+        let mut seen = vec![c.sensitivity_percent()];
+        for _ in 0..SENSITIVITY_PRESETS.len() {
+            c.step_sensitivity();
+            seen.push(c.sensitivity_percent());
+        }
+        assert_eq!(seen, [100, 125, 150, 200, 300, 400, 25, 50, 75, 100]);
+        // A hand-typed value goes to the next preset above it.
+        let (mut c, _) = parsed("sensitivity = 1.37");
+        c.step_sensitivity();
+        assert_eq!(c.sensitivity_percent(), 150);
+    }
+
+    #[test]
+    fn saved_literals_parse_back() {
+        let mut c = Controls::default();
+        c.rebind(Action::ExposureDown, KeyCode::Numpad4);
+        c.step_sensitivity();
+        let text = format!(
+            "exposure_down = {}\nsensitivity = {:?}\n",
+            c.keys_literal(Action::ExposureDown),
+            c.sensitivity
+        );
+        let (back, w) = parsed(&text);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(back.keys(Action::ExposureDown), &[KeyCode::Numpad4]);
+        assert_eq!(back.sensitivity, c.sensitivity);
+    }
+
+    #[test]
+    fn menu_labels_are_drawable() {
+        let drawable = |s: &str| {
+            s.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == ' ')
+        };
+        for a in Action::ALL {
+            assert!(drawable(&a.menu_label()), "{:?}", a.menu_label());
+        }
+        let mut c = Controls::default();
+        for (_, code) in KEY_NAMES.iter().filter(|(_, k)| !is_reserved(*k)) {
+            c.rebind(Action::Jump, *code);
+            let label = c.keys_label(Action::Jump);
+            assert!(drawable(&label), "{label:?}");
+        }
+    }
+
+    /// What the menu's save does to a real file: every action line rewritten
+    /// in place, comments untouched, and the file parses back to the same
+    /// controls.
+    #[test]
+    fn saving_bindings_keeps_the_file_readable_and_commented() {
+        let dir = crate::config::test_dir("controls-save");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("controls.toml");
+        std::fs::write(&path, default_text()).unwrap();
+        let mut file = ConfigFile::new(&path, default_text());
+        let mut c = Controls::default();
+        c.rebind(Action::Forward, KeyCode::KeyV); // leaves NOCLIP unbound
+        c.rebind(Action::ExposureUp, KeyCode::Numpad8);
+        c.step_sensitivity();
+        for a in Action::ALL {
+            file.save_value(a.name(), &c.keys_literal(a)).unwrap();
+        }
+        file.save_value("sensitivity", &format!("{:?}", c.sensitivity))
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (back, w) = parse(&text);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(back, c);
+        let comments = |t: &str| t.lines().filter(|l| l.contains('#')).count();
+        assert_eq!(comments(&text), comments(&default_text()));
+        assert!(text.contains("noclip = []"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

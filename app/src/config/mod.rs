@@ -10,14 +10,14 @@
 //! - **Never fatal.** A missing file is created with defaults; a bad line is a
 //!   warning and leaves that key at its default.
 //! - **Never destructive.** An unreadable file is left untouched, not replaced,
-//!   and saving (graphics only) edits one value in place.
+//!   and saving edits one value in place (`ConfigFile`).
 
 pub mod controls;
 pub mod graphics;
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Byte index where a `#` comment starts (outside a quoted string), if any.
 fn comment_start(line: &str) -> Option<usize> {
@@ -127,6 +127,73 @@ fn open_or_create(path: &Path, default: impl FnOnce() -> String) -> io::Result<(
     }
 }
 
+/// `text` with `key`'s value replaced by `value` on every line that sets it,
+/// every other byte (spacing, comments, other lines) unchanged. Appends
+/// `key = value` when no line sets it.
+pub fn set_value(text: &str, key: &str, value: &str) -> String {
+    let mut out = String::with_capacity(text.len() + key.len() + value.len() + 4);
+    let mut found = false;
+    for raw in text.split_inclusive('\n') {
+        let body = raw.trim_end_matches(['\n', '\r']);
+        let code_end = comment_start(body).unwrap_or(body.len());
+        let eq = body[..code_end].find('=');
+        match eq {
+            Some(eq) if body[..eq].trim() == key => {
+                found = true;
+                let region = &body[eq + 1..code_end];
+                let lead = region.len() - region.trim_start().len();
+                let trail = region.len() - region.trim_end().len();
+                out.push_str(&body[..eq + 1 + lead]);
+                out.push_str(value);
+                out.push_str(&raw[code_end - trail..]);
+            }
+            _ => out.push_str(raw),
+        }
+    }
+    if !found {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("{key} = {value}\n"));
+    }
+    out
+}
+
+/// A config file kept for saving. Only a value the player just changed is
+/// ever written, and it's written in place (`set_value`), so comments, other
+/// lines and hand edits survive.
+pub struct ConfigFile {
+    path: PathBuf,
+    /// Last text read or written, the base for a save if the file has since
+    /// become unreadable.
+    text: String,
+}
+
+impl ConfigFile {
+    fn new(path: &Path, text: String) -> Self {
+        Self {
+            path: path.to_owned(),
+            text,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Set `key = literal`. Edits the file as it is on disk now, so a hand
+    /// edit made while the game runs is kept (except for this one key).
+    pub fn save_value(&mut self, key: &str, literal: &str) -> io::Result<()> {
+        let base = fs::read_to_string(&self.path).unwrap_or_else(|_| self.text.clone());
+        let text = set_value(&base, key, literal);
+        if text != base {
+            write_atomic(&self.path, &text)?;
+        }
+        self.text = text;
+        Ok(())
+    }
+}
+
 /// A fresh, empty directory per test under the system temp dir.
 #[cfg(test)]
 fn test_dir(name: &str) -> std::path::PathBuf {
@@ -161,6 +228,35 @@ mod tests {
         ] {
             assert_eq!(string_list(bad), None, "`{bad}` should not parse");
         }
+    }
+
+    #[test]
+    fn set_value_edits_only_the_value() {
+        let text = "# top\nshadows = \"high\"   # keep me\r\nmsaa=1\nweird line\n";
+        let out = set_value(text, "shadows", "\"off\"");
+        assert_eq!(
+            out,
+            "# top\nshadows = \"off\"   # keep me\r\nmsaa=1\nweird line\n"
+        );
+        let out = set_value(&out, "msaa", "8");
+        assert_eq!(
+            out,
+            "# top\nshadows = \"off\"   # keep me\r\nmsaa=8\nweird line\n"
+        );
+        // A key named inside a comment is not a setting.
+        assert_eq!(
+            set_value("# fxaa = true\n", "fxaa", "false"),
+            "# fxaa = true\nfxaa = false\n"
+        );
+    }
+
+    #[test]
+    fn set_value_appends_a_missing_key() {
+        assert_eq!(
+            set_value("msaa = 2", "fxaa", "true"),
+            "msaa = 2\nfxaa = true\n"
+        );
+        assert_eq!(set_value("", "fxaa", "true"), "fxaa = true\n");
     }
 
     #[test]

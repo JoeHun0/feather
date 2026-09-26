@@ -837,10 +837,10 @@ shadow and FXAA toggles), each taking a list of keys or `[]`. Keys are named by
 US-QWERTY position with punctuation spelled out (`LeftBracket`), which keeps
 TOML escapes out of the file. **Escape, Up, Down and Enter stay hard-wired to
 the menu** and are refused as bindings, so a broken file can't strand the
-player outside the menu that a rebinding screen will live in. The file also
+player outside the menu the rebinding screen lives in. The file also
 carries `sensitivity` (a multiplier on the old hard-coded 0.0025 rad per
-count) and `invert_y`. It's read-only for now: no rebinding UI yet, and the
-GAMEPLAY menu rows are still placeholders. Held state comes from a set of keys
+count) and `invert_y`. The menu edits it (§19: OPTIONS > CONTROLS and
+GAMEPLAY) and saves each change in place, like `graphics.toml`. Held state comes from a set of keys
 that are down, so two keys on one action don't cancel each other. An action
 fires when it becomes active, so **key auto-repeat no longer re-toggles** noclip
 or FXAA (holding V used to flicker). Exposure is the deliberate exception and
@@ -1146,20 +1146,45 @@ specified **linear**, since the `_SRGB` swapchain encodes on store and Vulkan
 blends `_SRGB` attachments in linear space.
 
 Its first consumer is the **Esc pause menu**, now a small screen tree: root
-(CONTINUE / OPTIONS / EXIT) → OPTIONS (GRAPHICS / SOUND / GAMEPLAY) → each
-submenu. **GRAPHICS carries real settings** — shadow quality cycles and FXAA
+(CONTINUE / OPTIONS / EXIT) → OPTIONS (GRAPHICS / CONTROLS / SOUND / GAMEPLAY) →
+each submenu. **GRAPHICS carries real settings** — shadow quality cycles and FXAA
 toggles live, both sharing the exact code path F1/F2 use, so the two cannot
 drift. MSAA is shown with its current sample count and a RESTART note but is
 **inert**: the count is baked into every geometry pipeline, so changing it live
 means rebuilding them all. Showing the value honestly beats offering a control
-that silently does nothing. SOUND and GAMEPLAY are placeholder rows — §20 audio
-is unstarted and there are no gameplay settings to bind to yet.
+that silently does nothing. SOUND is placeholder rows (§20 audio is unstarted).
+
+**Landed (§26): CONTROLS and GAMEPLAY are live.** GAMEPLAY's SENSITIVITY cycles
+presets and shows a percentage (the font has no decimal point); INVERT Y
+toggles; FIELD OF VIEW is still a placeholder. CONTROLS lists every action
+(§14) with its keys. Rebinding is a small state machine inside `Menu`:
+activating a row sets `capturing`, the app hands the next key press to
+`Menu::capture_key` **and consumes it**, so pressing V to bind JUMP doesn't
+also toggle noclip. Escape cancels. Up, Down and Enter are ignored while it
+waits, so a held Enter can't bind itself, and so are keys the file couldn't
+name. Any other key becomes the action's only key, taken from whichever
+action had it, which then shows NONE (the conflict rule chosen over swapping or
+double-binding). Leaving the row, activating another or BACK ends the wait;
+hovering the same row doesn't, so mouse jitter can't. Every change returns
+`MenuOutcome::SaveControls(part)`, and the app writes just that part of
+`controls.toml` in place. The save machinery (`ConfigFile`, `set_value`) moved
+from `graphics.rs` to `config/mod.rs` so both files share it.
+
+CONTROLS has 13 rows, more than fit a small window, so the layout gained
+**scrolling**. `menu_layout` shows as many rows as fit below the title, and
+moves the first visible row only as far as needed to keep the selection in
+view. `Menu` stores that position, so hovering a visible row never scrolls
+the list under the mouse. Dim bars mark rows hidden above or below. The title
+now sits just above the rows instead of at a fixed 28% of the height, so a
+tall screen can't run into it. Drawing, hover and click all use the one
+layout, and tests cover every screen at three window sizes and every selected
+row.
 
 Navigation state lives in a `Menu` struct that depends on **neither the renderer
 nor the event loop**: it mutates settings and returns a `MenuOutcome` the app
 acts on. That keeps the whole thing unit-testable without a GPU, which is how
-the screen tree, wrap-around, BACK-restores-selection and the inert rows are all
-covered. Esc walks back one screen at a time and only unpauses from the root.
+the screen tree, wrap-around, BACK-restores-selection, the inert rows and the
+rebind flow are all covered. Esc walks back one screen at a time and only unpauses from the root.
 
 Row labels use **A-Z, 0-9 and spaces only** — the 5x7 font renders anything else
 blank, so a colon would silently become whitespace; a test guards this.
@@ -1711,7 +1736,8 @@ landed, with keyboard *and* mouse navigation, an OPTIONS screen tree, and live
 shadow-quality/FXAA controls under GRAPHICS — MSAA is changeable there only
 from the main menu, since the session's mesh and sky pipelines bake the sample
 count; all three persist in `config/graphics.toml` (§13), and key bindings +
-mouse look are read from `config/controls.toml` (§14); egui dev UI, SDF text and
+mouse look live in `config/controls.toml` (§14), edited from OPTIONS >
+CONTROLS / GAMEPLAY, whose lists scroll when the window is short; egui dev UI, SDF text and
 lower-case/punctuation pending); audio; debug/profiling tooling (per-pass GPU timestamp timing
 landed — stderr log + `Renderer::gpu_times`, plus the `--bench` sweep harness;
 Tracy / RenderDoc / egui overlay and

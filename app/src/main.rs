@@ -29,6 +29,8 @@
 
 mod config;
 
+use config::controls::{Action, Controls};
+
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -234,6 +236,8 @@ enum MenuScreen {
     Graphics,
     Sound,
     Gameplay,
+    /// Key bindings (§14): one row per action, Enter to rebind.
+    Controls,
 }
 
 impl MenuScreen {
@@ -245,6 +249,7 @@ impl MenuScreen {
             Self::Graphics => "GRAPHICS",
             Self::Sound => "SOUND",
             Self::Gameplay => "GAMEPLAY",
+            Self::Controls => "CONTROLS",
         }
     }
 }
@@ -262,6 +267,13 @@ enum MenuAction {
     CycleMsaa,
     NewGame,
     ToMainMenu,
+    /// Next SENSITIVITY preset (§14).
+    CycleSensitivity,
+    ToggleInvertY,
+    /// Wait for a key to bind to this action.
+    Rebind(Action),
+    /// Default key bindings again.
+    ResetKeys,
     Inert,
 }
 
@@ -305,15 +317,32 @@ enum MenuOutcome {
     ApplyMsaa,
     StartSession,
     EndSession,
+    /// Controls changed; save the named part of `controls.toml`.
+    SaveControls(ControlsSave),
 }
 
-/// The rows of one screen, given the settings they display and whether a world
-/// is currently loaded.
+/// Which part of `controls.toml` a menu change touched. Bindings are saved
+/// together, because a rebind can take a key from another action too.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ControlsSave {
+    Sensitivity,
+    InvertY,
+    Keys,
+}
+
+/// The rows of one screen, given the settings they display, whether a world
+/// is currently loaded, and which action (if any) is waiting for a key.
 ///
 /// `in_session` is not cosmetic: it decides whether MSAA is changeable. The
 /// sample count is baked into the mesh and sky pipelines at creation, so it can
 /// only move while no session owns them.
-fn screen_rows(screen: MenuScreen, s: &GraphicsSettings, in_session: bool) -> Vec<MenuRow> {
+fn screen_rows(
+    screen: MenuScreen,
+    s: &GraphicsSettings,
+    c: &Controls,
+    in_session: bool,
+    capturing: Option<Action>,
+) -> Vec<MenuRow> {
     match screen {
         MenuScreen::MainRoot => vec![
             MenuRow::new("NEW GAME", MenuAction::NewGame),
@@ -328,6 +357,7 @@ fn screen_rows(screen: MenuScreen, s: &GraphicsSettings, in_session: bool) -> Ve
         ],
         MenuScreen::Options => vec![
             MenuRow::new("GRAPHICS", MenuAction::Enter(MenuScreen::Graphics)),
+            MenuRow::new("CONTROLS", MenuAction::Enter(MenuScreen::Controls)),
             MenuRow::new("SOUND", MenuAction::Enter(MenuScreen::Sound)),
             MenuRow::new("GAMEPLAY", MenuAction::Enter(MenuScreen::Gameplay)),
             MenuRow::new("BACK", MenuAction::Back),
@@ -352,31 +382,61 @@ fn screen_rows(screen: MenuScreen, s: &GraphicsSettings, in_session: bool) -> Ve
             },
             MenuRow::new("BACK", MenuAction::Back),
         ],
-        // Placeholders: §20 audio is unstarted, and there are no gameplay
-        // settings to bind to yet.
+        // Placeholders: §20 audio is unstarted.
         MenuScreen::Sound => vec![
             MenuRow::new("MASTER VOLUME", MenuAction::Inert),
             MenuRow::new("MUSIC", MenuAction::Inert),
             MenuRow::new("SFX", MenuAction::Inert),
             MenuRow::new("BACK", MenuAction::Back),
         ],
+        // Saved to controls.toml (§14). Sensitivity is a percentage: the font
+        // has no decimal point. FIELD OF VIEW is still a placeholder.
         MenuScreen::Gameplay => vec![
-            MenuRow::new("SENSITIVITY", MenuAction::Inert),
+            MenuRow::new(
+                format!("SENSITIVITY  {}", c.sensitivity_percent()),
+                MenuAction::CycleSensitivity,
+            ),
             MenuRow::new("FIELD OF VIEW", MenuAction::Inert),
-            MenuRow::new("INVERT Y", MenuAction::Inert),
+            MenuRow::new(
+                format!("INVERT Y  {}", if c.invert_y { "ON" } else { "OFF" }),
+                MenuAction::ToggleInvertY,
+            ),
             MenuRow::new("BACK", MenuAction::Back),
         ],
+        // One row per action; Enter waits for the key to bind.
+        MenuScreen::Controls => Action::ALL
+            .into_iter()
+            .map(|a| {
+                let keys = if capturing == Some(a) {
+                    "PRESS A KEY".to_string()
+                } else {
+                    c.keys_label(a)
+                };
+                MenuRow::new(format!("{}  {keys}", a.menu_label()), MenuAction::Rebind(a))
+            })
+            .chain([
+                MenuRow::new("RESET KEYS", MenuAction::ResetKeys),
+                MenuRow::new("BACK", MenuAction::Back),
+            ])
+            .collect(),
     }
 }
 
 /// Pause-menu navigation state. Deliberately knows nothing about the renderer
-/// or the window: it mutates `GraphicsSettings` and reports a `MenuOutcome`.
+/// or the window: it mutates `GraphicsSettings` / `Controls` and reports a
+/// `MenuOutcome`.
 struct Menu {
     screen: MenuScreen,
     index: usize,
     /// `(screen, index)` of each ancestor, so BACK restores the row you
     /// descended from instead of snapping to the top.
     stack: Vec<(MenuScreen, usize)>,
+    /// The action waiting for a key on the CONTROLS screen (`capture_key`).
+    capturing: Option<Action>,
+    /// First visible row when a screen is taller than the window
+    /// (`menu_layout`). Kept here so it only moves to follow the selection:
+    /// hovering a visible row never scrolls the list under the mouse.
+    scroll: usize,
 }
 
 impl Menu {
@@ -385,6 +445,8 @@ impl Menu {
             screen: MenuScreen::MainRoot,
             index: 0,
             stack: Vec::new(),
+            capturing: None,
+            scroll: 0,
         }
     }
 
@@ -395,24 +457,36 @@ impl Menu {
         self.screen = root;
         self.index = 0;
         self.stack.clear();
+        self.capturing = None;
+        self.scroll = 0;
     }
 
-    fn rows(&self, s: &GraphicsSettings, in_session: bool) -> Vec<MenuRow> {
-        screen_rows(self.screen, s, in_session)
+    fn rows(&self, s: &GraphicsSettings, c: &Controls, in_session: bool) -> Vec<MenuRow> {
+        screen_rows(self.screen, s, c, in_session, self.capturing)
+    }
+
+    /// Point the selection at `index`. Leaving the row that is waiting for a
+    /// key cancels the wait; staying on it doesn't, so mouse jitter over the
+    /// row you just clicked can't.
+    fn select(&mut self, index: usize) {
+        if index != self.index {
+            self.capturing = None;
+        }
+        self.index = index;
     }
 
     /// Move the selection, wrapping at both ends.
-    fn move_by(&mut self, delta: isize, s: &GraphicsSettings, in_session: bool) {
-        let n = self.rows(s, in_session).len() as isize;
+    fn move_by(&mut self, delta: isize, s: &GraphicsSettings, c: &Controls, in_session: bool) {
+        let n = self.rows(s, c, in_session).len() as isize;
         if n > 0 {
-            self.index = (self.index as isize + delta).rem_euclid(n) as usize;
+            self.select((self.index as isize + delta).rem_euclid(n) as usize);
         }
     }
 
     /// Point the selection at `index` if it is a real row (used by the mouse).
-    fn hover(&mut self, index: usize, s: &GraphicsSettings, in_session: bool) {
-        if index < self.rows(s, in_session).len() {
-            self.index = index;
+    fn hover(&mut self, index: usize, s: &GraphicsSettings, c: &Controls, in_session: bool) {
+        if index < self.rows(s, c, in_session).len() {
+            self.select(index);
         }
     }
 
@@ -420,12 +494,35 @@ impl Menu {
         self.stack.push((self.screen, self.index));
         self.screen = screen;
         self.index = 0;
+        self.scroll = 0;
+    }
+
+    /// A key pressed while an action waits for one (the app routes presses
+    /// here first, and consumes them). Escape cancels. The other menu keys
+    /// (Up, Down, Enter) and keys the file can't name keep it waiting, so a
+    /// held Enter can't bind itself. Any other key becomes the action's only
+    /// binding, taken from whatever action had it.
+    fn capture_key(&mut self, c: &mut Controls, code: KeyCode) -> MenuOutcome {
+        let Some(action) = self.capturing else {
+            return MenuOutcome::Stay;
+        };
+        if code == KeyCode::Escape {
+            self.capturing = None;
+            return MenuOutcome::Stay;
+        }
+        if c.rebind(action, code) {
+            self.capturing = None;
+            return MenuOutcome::SaveControls(ControlsSave::Keys);
+        }
+        MenuOutcome::Stay
     }
 
     /// Up one level. At the pause root that means resuming; at the *main* root
     /// there is nothing to resume into, so it stays put. This is what makes Esc
     /// walk back out one screen at a time.
     fn back(&mut self) -> MenuOutcome {
+        self.capturing = None;
+        self.scroll = 0;
         match self.stack.pop() {
             Some((screen, index)) => {
                 self.screen = screen;
@@ -437,11 +534,19 @@ impl Menu {
         }
     }
 
-    fn activate(&mut self, s: &mut GraphicsSettings, in_session: bool) -> MenuOutcome {
-        let action = match self.rows(s, in_session).get(self.index) {
+    fn activate(
+        &mut self,
+        s: &mut GraphicsSettings,
+        c: &mut Controls,
+        in_session: bool,
+    ) -> MenuOutcome {
+        let action = match self.rows(s, c, in_session).get(self.index) {
             Some(row) => row.action,
             None => return MenuOutcome::Stay,
         };
+        // Activating anything ends a wait for a key; activating the waiting
+        // row again restarts it.
+        self.capturing = None;
         match action {
             MenuAction::Resume => MenuOutcome::Resume,
             MenuAction::Quit => MenuOutcome::Quit,
@@ -472,6 +577,22 @@ impl Menu {
             }
             MenuAction::NewGame => MenuOutcome::StartSession,
             MenuAction::ToMainMenu => MenuOutcome::EndSession,
+            MenuAction::CycleSensitivity => {
+                c.step_sensitivity();
+                MenuOutcome::SaveControls(ControlsSave::Sensitivity)
+            }
+            MenuAction::ToggleInvertY => {
+                c.invert_y = !c.invert_y;
+                MenuOutcome::SaveControls(ControlsSave::InvertY)
+            }
+            MenuAction::Rebind(a) => {
+                self.capturing = Some(a);
+                MenuOutcome::Stay
+            }
+            MenuAction::ResetKeys => {
+                c.reset_keys();
+                MenuOutcome::SaveControls(ControlsSave::Keys)
+            }
             MenuAction::Inert => MenuOutcome::Stay,
         }
     }
@@ -483,44 +604,85 @@ fn menu_font_px(h: f32) -> f32 {
     (h / 220.0).max(2.0).floor()
 }
 
-/// Screen-space rect `(x, y, w, h)` of each row, in **physical** pixels.
+/// Where one screen of the menu goes, in **physical** pixels.
 ///
-/// Single source of truth: the redraw handler draws the highlight bar from
-/// these and the mouse hit-tests against them, so the visible target and the
-/// clickable target can never drift apart. This is the padded bar rather than
-/// the tight text box, which also makes a comfortably larger click target than
-/// the glyphs alone.
-///
-/// The block is centred vertically rather than pinned to a fixed fraction,
-/// because row counts now vary per screen — that keeps every screen balanced
-/// and keeps a four-row screen on-screen at small window sizes.
-fn menu_item_rects(w: f32, h: f32, rows: &[MenuRow]) -> Vec<(f32, f32, f32, f32)> {
+/// Single source of truth: the redraw handler draws the title, the rows and
+/// the highlight bar from it and the mouse hit-tests against it, so the
+/// visible target and the clickable target can never drift apart. Row rects
+/// are the padded bar rather than the tight text box, which also makes a
+/// comfortably larger click target than the glyphs alone.
+struct MenuLayout {
+    px: f32,
+    title_y: f32,
+    /// Index of the first visible row.
+    first: usize,
+    /// `(x, y, w, h)` of each *visible* row, from `first` on.
+    rects: Vec<(f32, f32, f32, f32)>,
+    /// Rows hidden above / below the visible window.
+    more_above: bool,
+    more_below: bool,
+}
+
+/// Lay out a screen: the title, then as many rows as fit, the two centred
+/// together. A screen taller than the window scrolls: the visible window
+/// starts at `scroll`, moved only as far as needed to keep row `index` in it.
+/// The caller stores `first` back as the new `scroll`, so the list moves when
+/// the selection leaves it and not otherwise.
+fn menu_layout(w: f32, h: f32, rows: &[MenuRow], index: usize, scroll: usize) -> MenuLayout {
     let px = menu_font_px(h);
-    let line = UiPass::text_height(px) * 2.2;
+    let text_h = UiPass::text_height(px);
+    let line = text_h * 2.2;
     let pad = px * 4.0;
-    let top = (h - line * rows.len() as f32) * 0.5;
-    rows.iter()
+    let title_h = UiPass::text_height(px * 1.6);
+    // Room for the rows once the title, a line of gap under it and a margin
+    // top and bottom are taken out.
+    let avail = h - title_h - line - pad * 2.0;
+    let cap = ((avail / line).floor() as usize).max(1);
+    let n = rows.len();
+    let visible = n.min(cap);
+    let first = if n <= cap {
+        0
+    } else {
+        let mut first = scroll.min(n - cap);
+        if index < first {
+            first = index;
+        } else if index >= first + cap {
+            first = index + 1 - cap;
+        }
+        first
+    };
+    // Centre title + rows as one block.
+    let block = title_h + line + line * visible as f32;
+    let title_y = ((h - block) * 0.5).max(pad);
+    let top = title_y + title_h + line;
+    let rects = rows[first..first + visible]
+        .iter()
         .enumerate()
         .map(|(i, row)| {
             let tw = UiPass::text_width(&row.label, px);
             let x = (w - tw) * 0.5;
             let y = top + line * i as f32;
-            (
-                x - pad,
-                y - pad * 0.5,
-                tw + pad * 2.0,
-                UiPass::text_height(px) + pad,
-            )
+            (x - pad, y - pad * 0.5, tw + pad * 2.0, text_h + pad)
         })
-        .collect()
+        .collect();
+    MenuLayout {
+        px,
+        title_y,
+        first,
+        rects,
+        more_above: first > 0,
+        more_below: first + visible < n,
+    }
 }
 
 /// Index of the row under `(cx, cy)`, if any. Physical pixels, matching both
 /// `Window::inner_size` and winit's `CursorMoved` position.
-fn menu_hit(w: f32, h: f32, rows: &[MenuRow], cx: f32, cy: f32) -> Option<usize> {
-    menu_item_rects(w, h, rows)
+fn menu_hit(layout: &MenuLayout, cx: f32, cy: f32) -> Option<usize> {
+    layout
+        .rects
         .iter()
         .position(|&(x, y, rw, rh)| cx >= x && cx < x + rw && cy >= y && cy < y + rh)
+        .map(|i| layout.first + i)
 }
 
 // ---- ECS data ----
@@ -1113,9 +1275,11 @@ struct App {
     settings: GraphicsSettings,
     /// The settings file, for saving changes; `None` under `--bench` or when it
     /// could be neither read nor created.
-    config: Option<config::graphics::ConfigFile>,
+    config: Option<config::ConfigFile>,
     /// Key bindings and mouse look (`config/controls.toml`, §14).
     controls: config::controls::Controls,
+    /// `controls.toml`, for saving menu changes; `None` like `config`.
+    controls_file: Option<config::ConfigFile>,
     /// Keys currently down, so an action bound to several keys stays held
     /// until the last of them is released.
     held_keys: HashSet<KeyCode>,
@@ -1793,8 +1957,9 @@ impl App {
     fn new(
         scenes: Vec<String>,
         settings: GraphicsSettings,
-        config: Option<config::graphics::ConfigFile>,
+        config: Option<config::ConfigFile>,
         controls: config::controls::Controls,
+        controls_file: Option<config::ConfigFile>,
         bench: bool,
     ) -> Self {
         let light = Vec3::new(-0.4, -1.0, -0.3).normalize();
@@ -1809,6 +1974,7 @@ impl App {
             settings,
             config,
             controls,
+            controls_file,
             held_keys: HashSet::new(),
             paused: false,
             menu: Menu::new(),
@@ -1924,6 +2090,13 @@ impl App {
             }
             MenuOutcome::StartSession => self.start_session(),
             MenuOutcome::EndSession => self.end_session(),
+            MenuOutcome::SaveControls(part) => {
+                // New bindings can change what the keys already down mean.
+                if part == ControlsSave::Keys {
+                    self.sync_held_actions();
+                }
+                self.persist_controls(part);
+            }
         }
     }
 
@@ -1982,7 +2155,6 @@ impl App {
     /// A key that isn't one of the fixed menu keys: look it up in the bindings,
     /// refresh the held movement state and run whatever it fired.
     fn bound_key(&mut self, code: KeyCode, pressed: bool, repeat: bool) {
-        use config::controls::Action;
         let fired = self
             .controls
             .key(&mut self.held_keys, code, pressed, repeat);
@@ -2013,7 +2185,6 @@ impl App {
 
     /// Movement flags from the keys currently down.
     fn sync_held_actions(&mut self) {
-        use config::controls::Action;
         let (c, held) = (&self.controls, &self.held_keys);
         self.input.forward = c.held(held, Action::Forward);
         self.input.back = c.held(held, Action::Back);
@@ -2026,9 +2197,33 @@ impl App {
     /// Save `key`'s current value to the settings file. Called only where the
     /// player changed it, so CLI overrides are never written back. A failed
     /// write is logged, never fatal.
+    /// Save the part of `controls.toml` a menu change touched, in place. Like
+    /// `persist`, a failed write is logged, never fatal, and there's no file
+    /// to write under `--bench`.
+    fn persist_controls(&mut self, part: ControlsSave) {
+        let Some(file) = self.controls_file.as_mut() else {
+            return;
+        };
+        let c = &self.controls;
+        let values: Vec<(&str, String)> = match part {
+            ControlsSave::Sensitivity => vec![("sensitivity", format!("{:?}", c.sensitivity))],
+            ControlsSave::InvertY => vec![("invert_y", c.invert_y.to_string())],
+            ControlsSave::Keys => Action::ALL
+                .into_iter()
+                .map(|a| (a.name(), c.keys_literal(a)))
+                .collect(),
+        };
+        for (key, literal) in values {
+            if let Err(e) = file.save_value(key, &literal) {
+                eprintln!("[config] couldn't save {}: {e}", file.path().display());
+                return;
+            }
+        }
+    }
+
     fn persist(&mut self, key: config::graphics::Key) {
         if let Some(c) = self.config.as_mut() {
-            if let Err(e) = c.save(key, &self.settings) {
+            if let Err(e) = config::graphics::save(c, key, &self.settings) {
                 eprintln!("[config] couldn't save {}: {e}", c.path().display());
             }
         }
@@ -2105,6 +2300,17 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    // An action on the CONTROLS screen is waiting for a key:
+                    // the press goes there and nowhere else, so binding V to
+                    // JUMP doesn't also toggle noclip. Repeats are dropped.
+                    // Releases still reach the bindings below, harmlessly.
+                    if pressed && self.menu_active() && self.menu.capturing.is_some() {
+                        if !event.repeat {
+                            let outcome = self.menu.capture_key(&mut self.controls, code);
+                            self.handle_menu_outcome(outcome, event_loop);
+                        }
+                        return;
+                    }
                     match code {
                         // Esc walks back out one screen at a time, and only
                         // unpauses from the root — so leaving a submenu does not
@@ -2122,15 +2328,21 @@ impl ApplicationHandler for App {
                         }
                         KeyCode::ArrowUp if pressed && self.menu_active() => {
                             let in_session = self.in_session();
-                            self.menu.move_by(-1, &self.settings, in_session);
+                            self.menu
+                                .move_by(-1, &self.settings, &self.controls, in_session);
                         }
                         KeyCode::ArrowDown if pressed && self.menu_active() => {
                             let in_session = self.in_session();
-                            self.menu.move_by(1, &self.settings, in_session);
+                            self.menu
+                                .move_by(1, &self.settings, &self.controls, in_session);
                         }
                         KeyCode::Enter if pressed && self.menu_active() => {
                             let in_session = self.in_session();
-                            let outcome = self.menu.activate(&mut self.settings, in_session);
+                            let outcome = self.menu.activate(
+                                &mut self.settings,
+                                &mut self.controls,
+                                in_session,
+                            );
                             self.handle_menu_outcome(outcome, event_loop);
                         }
                         // Everything else goes through the bindings (§14).
@@ -2158,15 +2370,17 @@ impl ApplicationHandler for App {
                         // interchangeable mid-interaction. Off the entries the
                         // selection is left alone, so something is always
                         // selected for Enter.
-                        let rows = self.menu.rows(&self.settings, in_session);
-                        if let Some(i) = menu_hit(
+                        let rows = self.menu.rows(&self.settings, &self.controls, in_session);
+                        let layout = menu_layout(
                             size.width as f32,
                             size.height as f32,
                             &rows,
-                            position.x as f32,
-                            position.y as f32,
-                        ) {
-                            self.menu.hover(i, &self.settings, in_session);
+                            self.menu.index,
+                            self.menu.scroll,
+                        );
+                        if let Some(i) = menu_hit(&layout, position.x as f32, position.y as f32) {
+                            self.menu
+                                .hover(i, &self.settings, &self.controls, in_session);
                         }
                     }
                 }
@@ -2181,12 +2395,22 @@ impl ApplicationHandler for App {
                         // Activate only when actually over an entry: a stray
                         // click on the dimmed backdrop should do nothing.
                         let in_session = self.session.is_some();
-                        let rows = self.menu.rows(&self.settings, in_session);
-                        if let Some(i) =
-                            menu_hit(size.width as f32, size.height as f32, &rows, cx, cy)
-                        {
-                            self.menu.hover(i, &self.settings, in_session);
-                            let outcome = self.menu.activate(&mut self.settings, in_session);
+                        let rows = self.menu.rows(&self.settings, &self.controls, in_session);
+                        let layout = menu_layout(
+                            size.width as f32,
+                            size.height as f32,
+                            &rows,
+                            self.menu.index,
+                            self.menu.scroll,
+                        );
+                        if let Some(i) = menu_hit(&layout, cx, cy) {
+                            self.menu
+                                .hover(i, &self.settings, &self.controls, in_session);
+                            let outcome = self.menu.activate(
+                                &mut self.settings,
+                                &mut self.controls,
+                                in_session,
+                            );
                             self.handle_menu_outcome(outcome, event_loop);
                         }
                     }
@@ -2452,27 +2676,45 @@ impl ApplicationHandler for App {
                         // pass's clear — the same rect darkens it to a backdrop.
                         ui.rect(0.0, 0.0, w, h, [0.0, 0.0, 0.0, 0.55]);
 
-                        let px = menu_font_px(h);
+                        // Rows, title and rects come from the same layout the
+                        // mouse hit-tests against, so highlight and click target
+                        // match. Its `first` becomes the menu's scroll position.
+                        let rows =
+                            self.menu
+                                .rows(&self.settings, &self.controls, self.session.is_some());
+                        let layout = menu_layout(w, h, &rows, self.menu.index, self.menu.scroll);
+                        self.menu.scroll = layout.first;
+                        let px = layout.px;
                         let title_px = px * 1.6;
                         // Title names the current screen, so a submenu is
                         // self-identifying.
                         let title = self.menu.screen.title();
                         ui.text(
                             (w - UiPass::text_width(title, title_px)) * 0.5,
-                            h * 0.28,
+                            layout.title_y,
                             title_px,
                             [0.9, 0.9, 0.9, 1.0],
                             title,
                         );
 
-                        // Rows and rects come from the same functions the mouse
-                        // hit-tests against, so highlight and click target match.
-                        let rows = self.menu.rows(&self.settings, self.session.is_some());
-                        let rects = menu_item_rects(w, h, &rows);
                         let pad = px * 4.0;
-                        for (i, row) in rows.iter().enumerate() {
+                        // Short dim bars where rows are scrolled out of view
+                        // (the font has no arrow glyphs).
+                        let marker = [0.55, 0.55, 0.55, 0.9];
+                        if let (true, Some(&(_, ry, _, _))) =
+                            (layout.more_above, layout.rects.first())
+                        {
+                            ui.rect(w * 0.5 - px * 8.0, ry - px * 2.0, px * 16.0, px, marker);
+                        }
+                        if let (true, Some(&(_, ry, _, rh))) =
+                            (layout.more_below, layout.rects.last())
+                        {
+                            ui.rect(w * 0.5 - px * 8.0, ry + rh + px, px * 16.0, px, marker);
+                        }
+                        for (vi, &(rx, ry, rw, rh)) in layout.rects.iter().enumerate() {
+                            let i = layout.first + vi;
+                            let row = &rows[i];
                             let selected = i == self.menu.index;
-                            let (rx, ry, rw, rh) = rects[i];
                             if selected {
                                 // Highlight bar behind the current entry.
                                 ui.rect(rx, ry, rw, rh, [0.25, 0.45, 0.85, 0.85]);
@@ -2826,9 +3068,9 @@ fn main() {
     // holds the bindings. `--bench` skips both (neither reads nor creates them),
     // so timings never depend on someone's personal settings.
     let mut settings = GraphicsSettings::default();
-    let (config, controls) = if std::env::args().skip(1).any(|a| a == "--bench") {
+    let (config, (controls, controls_file)) = if std::env::args().skip(1).any(|a| a == "--bench") {
         eprintln!("[config] ignored (--bench)");
-        (None, config::controls::Controls::default())
+        (None, (config::controls::Controls::default(), None))
     } else {
         (
             config::graphics::load(&mut settings),
@@ -2859,7 +3101,7 @@ fn main() {
         settings.msaa,
         settings.fxaa
     );
-    let mut app = App::new(scenes, settings, config, controls, bench);
+    let mut app = App::new(scenes, settings, config, controls, controls_file, bench);
     event_loop.run_app(&mut app).expect("run app");
 }
 
@@ -3066,56 +3308,101 @@ mod tests {
     /// enough that `menu_font_px` clamps to its 2.0 floor.
     const SIZES: [(f32, f32); 3] = [(1280.0, 720.0), (2560.0, 1440.0), (320.0, 200.0)];
 
-    const SCREENS: [MenuScreen; 6] = [
+    const SCREENS: [MenuScreen; 7] = [
         MenuScreen::MainRoot,
         MenuScreen::Root,
         MenuScreen::Options,
         MenuScreen::Graphics,
         MenuScreen::Sound,
         MenuScreen::Gameplay,
+        MenuScreen::Controls,
     ];
 
-    #[test]
-    fn menu_rect_centres_hit_their_own_row() {
+    fn rows_of(screen: MenuScreen) -> Vec<MenuRow> {
         let s = GraphicsSettings::default();
+        screen_rows(screen, &s, &Controls::default(), true, None)
+    }
+
+    /// Every screen, every size, every selected row: the layout keeps what it
+    /// shows on screen, ordered, disjoint and centred, and the selected row is
+    /// always among the visible ones. CONTROLS (13 rows) has to scroll at the
+    /// small sizes; that is what this pins down.
+    #[test]
+    fn menu_layout_keeps_rows_onscreen_and_the_selection_visible() {
         for screen in SCREENS {
-            let rows = screen_rows(screen, &s, true);
+            let rows = rows_of(screen);
             assert!(!rows.is_empty(), "{screen:?} has no rows");
             for (w, h) in SIZES {
-                for (i, &(x, y, rw, rh)) in menu_item_rects(w, h, &rows).iter().enumerate() {
-                    let (cx, cy) = (x + rw * 0.5, y + rh * 0.5);
-                    assert_eq!(
-                        menu_hit(w, h, &rows, cx, cy),
-                        Some(i),
-                        "{screen:?} row {i} at {w}x{h} did not hit itself"
+                for index in 0..rows.len() {
+                    let l = menu_layout(w, h, &rows, index, 0);
+                    let visible = l.first..l.first + l.rects.len();
+                    assert!(
+                        visible.contains(&index),
+                        "{screen:?} row {index} hidden at {w}x{h}"
                     );
+                    assert_eq!(l.more_above, l.first > 0);
+                    assert_eq!(l.more_below, visible.end < rows.len());
+                    assert!(l.title_y >= 0.0, "{screen:?} title off screen at {w}x{h}");
+                    for pair in l.rects.windows(2) {
+                        let (_, y0, _, h0) = pair[0];
+                        let (_, y1, _, _) = pair[1];
+                        assert!(y1 >= y0 + h0, "{screen:?} rows overlap at {w}x{h}");
+                    }
+                    let title_bottom = l.title_y + UiPass::text_height(l.px * 1.6);
+                    for &(x, y, rw, rh) in &l.rects {
+                        assert!(
+                            y >= title_bottom,
+                            "{screen:?} row under the title at {w}x{h}"
+                        );
+                        assert!(
+                            y >= 0.0 && y + rh <= h,
+                            "{screen:?} row off screen at {w}x{h}"
+                        );
+                        assert!(
+                            ((x + rw * 0.5) - w * 0.5).abs() < 0.001,
+                            "{screen:?} not centred"
+                        );
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn menu_rows_are_ordered_disjoint_and_onscreen() {
-        let s = GraphicsSettings::default();
+    fn a_tall_screen_scrolls_only_as_far_as_the_selection_needs() {
+        let rows = rows_of(MenuScreen::Controls);
+        let (w, h) = (320.0, 200.0);
+        let cap = menu_layout(w, h, &rows, 0, 0).rects.len();
+        assert!(cap < rows.len(), "CONTROLS should scroll at {w}x{h}");
+        // Stepping down scrolls one row at a time once past the window...
+        let mut scroll = 0;
+        for index in 0..rows.len() {
+            let l = menu_layout(w, h, &rows, index, scroll);
+            assert_eq!(l.first, index.saturating_sub(cap - 1), "row {index}");
+            scroll = l.first;
+        }
+        // ...and selecting any visible row (the mouse) doesn't move it.
+        for index in scroll..scroll + cap {
+            assert_eq!(menu_layout(w, h, &rows, index, scroll).first, scroll);
+        }
+        // A stale scroll past the end is clamped.
+        let l = menu_layout(w, h, &rows, rows.len() - 1, 999);
+        assert_eq!(l.first + l.rects.len(), rows.len());
+    }
+
+    #[test]
+    fn menu_rect_centres_hit_their_own_row() {
         for screen in SCREENS {
-            let rows = screen_rows(screen, &s, true);
+            let rows = rows_of(screen);
             for (w, h) in SIZES {
-                let rects = menu_item_rects(w, h, &rows);
-                for pair in rects.windows(2) {
-                    let (_, y0, _, h0) = pair[0];
-                    let (_, y1, _, _) = pair[1];
-                    assert!(y1 > y0, "{screen:?} rows out of order at {w}x{h}");
-                    assert!(y1 >= y0 + h0, "{screen:?} rows overlap at {w}x{h}");
-                }
-                // Vertical centring must keep even the longest screen on screen.
-                for (x, y, rw, rh) in rects {
-                    assert!(
-                        y >= 0.0 && y + rh <= h,
-                        "{screen:?} row off screen at {w}x{h}"
-                    );
-                    assert!(
-                        ((x + rw * 0.5) - w * 0.5).abs() < 0.001,
-                        "{screen:?} not centred"
+                // Scrolled to the bottom, so hits must add `first` back.
+                let l = menu_layout(w, h, &rows, rows.len() - 1, 0);
+                for (vi, &(x, y, rw, rh)) in l.rects.iter().enumerate() {
+                    let (cx, cy) = (x + rw * 0.5, y + rh * 0.5);
+                    assert_eq!(
+                        menu_hit(&l, cx, cy),
+                        Some(l.first + vi),
+                        "{screen:?} row {vi} at {w}x{h} did not hit itself"
                     );
                 }
             }
@@ -3124,24 +3411,16 @@ mod tests {
 
     #[test]
     fn menu_misses_gaps_and_backdrop() {
-        let s = GraphicsSettings::default();
-        let rows = screen_rows(MenuScreen::Root, &s, true);
+        let rows = rows_of(MenuScreen::Root);
         let (w, h) = (1280.0, 720.0);
-        let rects = menu_item_rects(w, h, &rows);
-        let gap_y = (rects[0].1 + rects[0].3 + rects[1].1) * 0.5;
-        assert_eq!(menu_hit(w, h, &rows, w * 0.5, gap_y), None, "gap hit");
-        assert_eq!(menu_hit(w, h, &rows, w * 0.5, 0.0), None, "top hit");
-        assert_eq!(menu_hit(w, h, &rows, w * 0.5, h - 1.0), None, "bottom hit");
-        assert_eq!(
-            menu_hit(w, h, &rows, 0.0, rects[0].1 + 1.0),
-            None,
-            "left hit"
-        );
-        assert_eq!(
-            menu_hit(w, h, &rows, w - 1.0, rects[0].1 + 1.0),
-            None,
-            "right hit"
-        );
+        let l = menu_layout(w, h, &rows, 0, 0);
+        let r = &l.rects;
+        let gap_y = (r[0].1 + r[0].3 + r[1].1) * 0.5;
+        assert_eq!(menu_hit(&l, w * 0.5, gap_y), None, "gap hit");
+        assert_eq!(menu_hit(&l, w * 0.5, 0.0), None, "top hit");
+        assert_eq!(menu_hit(&l, w * 0.5, h - 1.0), None, "bottom hit");
+        assert_eq!(menu_hit(&l, 0.0, r[0].1 + 1.0), None, "left hit");
+        assert_eq!(menu_hit(&l, w - 1.0, r[0].1 + 1.0), None, "right hit");
     }
 
     /// A menu as it exists with a world loaded: the app resets to `Root` when a
@@ -3155,12 +3434,171 @@ mod tests {
     /// Select the row whose action matches, then activate it.
     fn activate(m: &mut Menu, s: &mut GraphicsSettings, want: MenuAction) -> MenuOutcome {
         let i = m
-            .rows(s, true)
+            .rows(s, &Controls::default(), true)
             .iter()
             .position(|r| r.action == want)
             .unwrap_or_else(|| panic!("no {want:?} row on {:?}", m.screen));
         m.index = i;
-        m.activate(s, true)
+        m.activate(s, &mut Controls::default(), true)
+    }
+
+    /// Like `activate`, with the controls the GAMEPLAY / CONTROLS rows change.
+    fn activate_c(
+        m: &mut Menu,
+        s: &mut GraphicsSettings,
+        c: &mut Controls,
+        want: MenuAction,
+    ) -> MenuOutcome {
+        let i = m
+            .rows(s, c, true)
+            .iter()
+            .position(|r| r.action == want)
+            .unwrap_or_else(|| panic!("no {want:?} row on {:?}", m.screen));
+        m.select(i);
+        m.activate(s, c, true)
+    }
+
+    fn label_of(m: &Menu, s: &GraphicsSettings, c: &Controls, want: MenuAction) -> String {
+        m.rows(s, c, true)
+            .into_iter()
+            .find(|r| r.action == want)
+            .map(|r| r.label)
+            .unwrap_or_else(|| panic!("no {want:?} row"))
+    }
+
+    /// OPTIONS > CONTROLS, as a player gets there from the pause menu.
+    fn controls_menu() -> (Menu, GraphicsSettings, Controls) {
+        let (mut s, mut c) = (GraphicsSettings::default(), Controls::default());
+        let mut m = in_game_menu();
+        activate_c(
+            &mut m,
+            &mut s,
+            &mut c,
+            MenuAction::Enter(MenuScreen::Options),
+        );
+        activate_c(
+            &mut m,
+            &mut s,
+            &mut c,
+            MenuAction::Enter(MenuScreen::Controls),
+        );
+        (m, s, c)
+    }
+
+    #[test]
+    fn gameplay_rows_change_and_save_the_controls() {
+        let (mut s, mut c) = (GraphicsSettings::default(), Controls::default());
+        let mut m = in_game_menu();
+        activate_c(
+            &mut m,
+            &mut s,
+            &mut c,
+            MenuAction::Enter(MenuScreen::Options),
+        );
+        activate_c(
+            &mut m,
+            &mut s,
+            &mut c,
+            MenuAction::Enter(MenuScreen::Gameplay),
+        );
+        assert_eq!(
+            label_of(&m, &s, &c, MenuAction::CycleSensitivity),
+            "SENSITIVITY  100"
+        );
+        assert_eq!(
+            activate_c(&mut m, &mut s, &mut c, MenuAction::CycleSensitivity),
+            MenuOutcome::SaveControls(ControlsSave::Sensitivity)
+        );
+        assert_eq!(c.sensitivity, 1.25);
+        assert_eq!(
+            label_of(&m, &s, &c, MenuAction::CycleSensitivity),
+            "SENSITIVITY  125"
+        );
+        assert_eq!(
+            activate_c(&mut m, &mut s, &mut c, MenuAction::ToggleInvertY),
+            MenuOutcome::SaveControls(ControlsSave::InvertY)
+        );
+        assert!(c.invert_y);
+        assert_eq!(
+            label_of(&m, &s, &c, MenuAction::ToggleInvertY),
+            "INVERT Y  ON"
+        );
+    }
+
+    #[test]
+    fn rebinding_waits_for_a_key_and_takes_it_from_others() {
+        let (mut m, s, mut c) = controls_menu();
+        let jump = MenuAction::Rebind(Action::Jump);
+        assert_eq!(label_of(&m, &s, &c, jump), "JUMP  SPACE");
+        let mut s2 = GraphicsSettings::default();
+        assert_eq!(activate_c(&mut m, &mut s2, &mut c, jump), MenuOutcome::Stay);
+        assert_eq!(m.capturing, Some(Action::Jump));
+        assert_eq!(label_of(&m, &s, &c, jump), "JUMP  PRESS A KEY");
+
+        // Menu keys and keys the file can't name keep it waiting.
+        for key in [
+            KeyCode::Enter,
+            KeyCode::ArrowUp,
+            KeyCode::ArrowDown,
+            KeyCode::PrintScreen,
+        ] {
+            assert_eq!(m.capture_key(&mut c, key), MenuOutcome::Stay, "{key:?}");
+            assert_eq!(m.capturing, Some(Action::Jump), "{key:?} ended the wait");
+        }
+        assert_eq!(c, Controls::default(), "nothing bound yet");
+
+        // V was NOCLIP's: JUMP gets it, NOCLIP is left unbound.
+        assert_eq!(
+            m.capture_key(&mut c, KeyCode::KeyV),
+            MenuOutcome::SaveControls(ControlsSave::Keys)
+        );
+        assert_eq!(m.capturing, None);
+        assert_eq!(label_of(&m, &s, &c, jump), "JUMP  V");
+        assert_eq!(
+            label_of(&m, &s, &c, MenuAction::Rebind(Action::Noclip)),
+            "NOCLIP  NONE"
+        );
+        // Not waiting any more: further keys do nothing.
+        assert_eq!(m.capture_key(&mut c, KeyCode::KeyK), MenuOutcome::Stay);
+        assert_eq!(label_of(&m, &s, &c, jump), "JUMP  V");
+    }
+
+    #[test]
+    fn escape_moving_or_back_cancel_the_wait() {
+        let (mut m, mut s, mut c) = controls_menu();
+        let jump = MenuAction::Rebind(Action::Jump);
+
+        activate_c(&mut m, &mut s, &mut c, jump);
+        assert_eq!(m.capture_key(&mut c, KeyCode::Escape), MenuOutcome::Stay);
+        assert_eq!((m.capturing, m.screen), (None, MenuScreen::Controls));
+        assert_eq!(c, Controls::default());
+
+        // Hovering the waiting row (mouse jitter) keeps waiting; another row
+        // doesn't.
+        activate_c(&mut m, &mut s, &mut c, jump);
+        let i = m.index;
+        m.hover(i, &s, &c, true);
+        assert_eq!(m.capturing, Some(Action::Jump));
+        m.move_by(1, &s, &c, true);
+        assert_eq!(m.capturing, None);
+
+        activate_c(&mut m, &mut s, &mut c, jump);
+        m.back();
+        assert_eq!((m.capturing, m.screen), (None, MenuScreen::Options));
+    }
+
+    #[test]
+    fn reset_keys_restores_the_defaults() {
+        let (mut m, mut s, mut c) = controls_menu();
+        c.rebind(Action::Forward, KeyCode::KeyV);
+        c.sensitivity = 2.0;
+        assert_eq!(
+            activate_c(&mut m, &mut s, &mut c, MenuAction::ResetKeys),
+            MenuOutcome::SaveControls(ControlsSave::Keys)
+        );
+        assert_eq!(c.keys_label(Action::Forward), "W");
+        assert_eq!(c.keys_label(Action::Noclip), "V");
+        assert_eq!(c.sensitivity, 2.0, "mouse look isn't a key binding");
     }
 
     #[test]
@@ -3177,7 +3615,7 @@ mod tests {
 
         assert_eq!(m.back(), MenuOutcome::Stay);
         assert_eq!(m.screen, MenuScreen::Options);
-        let gameplay_row = screen_rows(MenuScreen::Options, &s, true)
+        let gameplay_row = screen_rows(MenuScreen::Options, &s, &Controls::default(), true, None)
             .iter()
             .position(|r| r.action == MenuAction::Enter(MenuScreen::Gameplay))
             .unwrap();
@@ -3229,7 +3667,7 @@ mod tests {
             let mut s = GraphicsSettings::default();
             m.screen = screen;
             m.stack.clear();
-            let inert: Vec<usize> = screen_rows(screen, &s, true)
+            let inert: Vec<usize> = screen_rows(screen, &s, &Controls::default(), true, None)
                 .iter()
                 .enumerate()
                 .filter(|(_, r)| !r.enabled())
@@ -3238,7 +3676,10 @@ mod tests {
             assert!(!inert.is_empty(), "{screen:?} has no inert row to check");
             for i in inert {
                 m.index = i;
-                assert_eq!(m.activate(&mut s, true), MenuOutcome::Stay);
+                assert_eq!(
+                    m.activate(&mut s, &mut Controls::default(), true),
+                    MenuOutcome::Stay
+                );
                 // The MSAA row in particular must not quietly mutate anything.
                 assert_eq!(s.shadows, ShadowQuality::High);
                 assert!(!s.fxaa);
@@ -3253,11 +3694,11 @@ mod tests {
         let s = GraphicsSettings::default();
         let mut m = in_game_menu();
         m.screen = MenuScreen::Graphics;
-        let n = m.rows(&s, true).len();
+        let n = m.rows(&s, &Controls::default(), true).len();
         m.index = 0;
-        m.move_by(-1, &s, true);
+        m.move_by(-1, &s, &Controls::default(), true);
         assert_eq!(m.index, n - 1, "up from the top did not wrap");
-        m.move_by(1, &s, true);
+        m.move_by(1, &s, &Controls::default(), true);
         assert_eq!(m.index, 0, "down from the bottom did not wrap");
     }
 
@@ -3280,7 +3721,7 @@ mod tests {
     fn menu_labels_are_drawable() {
         let s = GraphicsSettings::default();
         for screen in SCREENS {
-            for row in screen_rows(screen, &s, true) {
+            for row in screen_rows(screen, &s, &Controls::default(), true, None) {
                 for c in row.label.chars() {
                     assert!(
                         c.is_ascii_uppercase() || c.is_ascii_digit() || c == ' ',
@@ -3298,11 +3739,17 @@ mod tests {
     fn msaa_is_changeable_only_outside_a_session() {
         let s = GraphicsSettings::default();
         let row_action = |in_session: bool| {
-            screen_rows(MenuScreen::Graphics, &s, in_session)
-                .into_iter()
-                .find(|r| r.label.starts_with("MSAA"))
-                .expect("graphics has an MSAA row")
-                .action
+            screen_rows(
+                MenuScreen::Graphics,
+                &s,
+                &Controls::default(),
+                in_session,
+                None,
+            )
+            .into_iter()
+            .find(|r| r.label.starts_with("MSAA"))
+            .expect("graphics has an MSAA row")
+            .action
         };
         // In game the pipelines have baked the sample count, so the row must be
         // inert — this is the guard that stops MSAA changing under live pipelines.
@@ -3318,12 +3765,15 @@ mod tests {
         assert_eq!(s.msaa, 1);
         for want in [2, 4, 8, 1] {
             let i = m
-                .rows(&s, false)
+                .rows(&s, &Controls::default(), false)
                 .iter()
                 .position(|r| r.action == MenuAction::CycleMsaa)
                 .expect("msaa row");
             m.index = i;
-            assert_eq!(m.activate(&mut s, false), MenuOutcome::ApplyMsaa);
+            assert_eq!(
+                m.activate(&mut s, &mut Controls::default(), false),
+                MenuOutcome::ApplyMsaa
+            );
             assert_eq!(s.msaa, want);
         }
     }
@@ -3335,22 +3785,28 @@ mod tests {
         assert_eq!(m.screen, MenuScreen::MainRoot, "app opens on the main menu");
 
         let i = m
-            .rows(&s, false)
+            .rows(&s, &Controls::default(), false)
             .iter()
             .position(|r| r.action == MenuAction::NewGame)
             .expect("new game row");
         m.index = i;
-        assert_eq!(m.activate(&mut s, false), MenuOutcome::StartSession);
+        assert_eq!(
+            m.activate(&mut s, &mut Controls::default(), false),
+            MenuOutcome::StartSession
+        );
 
         // The app resets to Root when the session starts.
         m.reset(MenuScreen::Root);
         let i = m
-            .rows(&s, true)
+            .rows(&s, &Controls::default(), true)
             .iter()
             .position(|r| r.action == MenuAction::ToMainMenu)
             .expect("main menu row");
         m.index = i;
-        assert_eq!(m.activate(&mut s, true), MenuOutcome::EndSession);
+        assert_eq!(
+            m.activate(&mut s, &mut Controls::default(), true),
+            MenuOutcome::EndSession
+        );
     }
 
     #[test]
@@ -3369,12 +3825,15 @@ mod tests {
             let mut m = Menu::new();
             m.reset(root);
             let i = m
-                .rows(&s, in_session)
+                .rows(&s, &Controls::default(), in_session)
                 .iter()
                 .position(|r| r.action == MenuAction::Enter(MenuScreen::Options))
                 .unwrap_or_else(|| panic!("{root:?} has no OPTIONS row"));
             m.index = i;
-            assert_eq!(m.activate(&mut s, in_session), MenuOutcome::Stay);
+            assert_eq!(
+                m.activate(&mut s, &mut Controls::default(), in_session),
+                MenuOutcome::Stay
+            );
             assert_eq!(m.screen, MenuScreen::Options);
             // And back returns to the root it came from, not a hardcoded one.
             assert_eq!(m.back(), MenuOutcome::Stay);

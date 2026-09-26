@@ -7,9 +7,9 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use super::{comment_start, entries, open_or_create, string, warning, write_atomic};
+use super::{entries, open_or_create, string, warning, ConfigFile};
 use crate::{GraphicsSettings, ShadowQuality};
 
 /// Relative to the working directory, like `BAKE_DIR`: fine while the game is
@@ -103,39 +103,7 @@ pub fn parse(text: &str, s: &mut GraphicsSettings) -> Vec<String> {
     warnings
 }
 
-/// `text` with `key`'s value replaced by `value` on every line that sets it,
-/// every other byte (spacing, comments, other lines) unchanged. Appends
-/// `key = value` when no line sets it.
-pub fn set_value(text: &str, key: &str, value: &str) -> String {
-    let mut out = String::with_capacity(text.len() + key.len() + value.len() + 4);
-    let mut found = false;
-    for raw in text.split_inclusive('\n') {
-        let body = raw.trim_end_matches(['\n', '\r']);
-        let code_end = comment_start(body).unwrap_or(body.len());
-        let eq = body[..code_end].find('=');
-        match eq {
-            Some(eq) if body[..eq].trim() == key => {
-                found = true;
-                let region = &body[eq + 1..code_end];
-                let lead = region.len() - region.trim_start().len();
-                let trail = region.len() - region.trim_end().len();
-                out.push_str(&body[..eq + 1 + lead]);
-                out.push_str(value);
-                out.push_str(&raw[code_end - trail..]);
-            }
-            _ => out.push_str(raw),
-        }
-    }
-    if !found {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(&format!("{key} = {value}\n"));
-    }
-    out
-}
-
-/// How `ConfigFile::open` found the file.
+/// How `open` found the file.
 #[derive(Debug, PartialEq)]
 pub enum Opened {
     /// It existed; these lines were ignored.
@@ -144,52 +112,28 @@ pub enum Opened {
     Created,
 }
 
-/// The settings file, kept open for saving.
-pub struct ConfigFile {
-    path: PathBuf,
-    /// Last text read or written, the base for a save if the file has since
-    /// become unreadable.
-    text: String,
+/// Read `path` into `s`, or write a default file there if it doesn't exist.
+/// An error means it could neither be read nor created; the caller then runs
+/// on defaults and saves nothing (and never overwrites the file).
+pub fn open(path: &Path, s: &mut GraphicsSettings) -> io::Result<(ConfigFile, Opened)> {
+    let (text, created) = open_or_create(path, default_text)?;
+    // Parsed even when just created, so the file is the single source of the
+    // values from the first run on.
+    let warnings = parse(&text, s);
+    let file = ConfigFile::new(path, text);
+    Ok((
+        file,
+        if created {
+            Opened::Created
+        } else {
+            Opened::Existing(warnings)
+        },
+    ))
 }
 
-impl ConfigFile {
-    /// Read `path` into `s`, or write a default file there if it doesn't exist.
-    /// An error means it could neither be read nor created; the caller then
-    /// runs on defaults and saves nothing (and never overwrites the file).
-    pub fn open(path: &Path, s: &mut GraphicsSettings) -> io::Result<(Self, Opened)> {
-        let (text, created) = open_or_create(path, default_text)?;
-        // Parsed even when just created, so the file is the single source of
-        // the values from the first run on.
-        let warnings = parse(&text, s);
-        let file = Self {
-            path: path.to_owned(),
-            text,
-        };
-        Ok((
-            file,
-            if created {
-                Opened::Created
-            } else {
-                Opened::Existing(warnings)
-            },
-        ))
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Write `key`'s value from `s`. Edits the file as it is on disk now, so a
-    /// hand edit made while the game runs is kept (except for this one key).
-    pub fn save(&mut self, key: Key, s: &GraphicsSettings) -> io::Result<()> {
-        let base = fs::read_to_string(&self.path).unwrap_or_else(|_| self.text.clone());
-        let text = set_value(&base, key.name(), &key.value(s));
-        if text != base {
-            write_atomic(&self.path, &text)?;
-        }
-        self.text = text;
-        Ok(())
-    }
+/// Write `key`'s current value from `s` (see `ConfigFile::save_value`).
+pub fn save(file: &mut ConfigFile, key: Key, s: &GraphicsSettings) -> io::Result<()> {
+    file.save_value(key.name(), &key.value(s))
 }
 
 /// Startup entry point: open the file, log what happened, and return it for
@@ -201,7 +145,7 @@ pub fn load(s: &mut GraphicsSettings) -> Option<ConfigFile> {
         Ok(false) => {}
         Err(e) => eprintln!("[config] couldn't rename {OLD_PATH} to {CONFIG_PATH}: {e}"),
     }
-    match ConfigFile::open(path, s) {
+    match open(path, s) {
         Ok((file, Opened::Created)) => {
             eprintln!("[config] wrote defaults to {}", path.display());
             Some(file)
@@ -282,36 +226,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn set_value_edits_only_the_value() {
-        let text = "# top\nshadows = \"high\"   # keep me\r\nmsaa=1\nweird line\n";
-        let out = set_value(text, "shadows", "\"off\"");
-        assert_eq!(
-            out,
-            "# top\nshadows = \"off\"   # keep me\r\nmsaa=1\nweird line\n"
-        );
-        let out = set_value(&out, "msaa", "8");
-        assert_eq!(
-            out,
-            "# top\nshadows = \"off\"   # keep me\r\nmsaa=8\nweird line\n"
-        );
-        // A key named inside a comment is not a setting.
-        assert_eq!(
-            set_value("# fxaa = true\n", "fxaa", "false"),
-            "# fxaa = true\nfxaa = false\n"
-        );
-    }
-
-    #[test]
-    fn set_value_appends_a_missing_key() {
-        assert_eq!(
-            set_value("msaa = 2", "fxaa", "true"),
-            "msaa = 2\nfxaa = true\n"
-        );
-        assert_eq!(set_value("", "fxaa", "true"), "fxaa = true\n");
-    }
-
     use crate::config::test_dir;
+    use std::path::PathBuf;
 
     fn temp_path(name: &str) -> PathBuf {
         test_dir(name).join("sub").join("graphics.toml")
@@ -321,7 +237,7 @@ mod tests {
     fn open_creates_once_then_reads_and_saves() {
         let path = temp_path("create");
         let mut s = GraphicsSettings::default();
-        let (mut file, how) = ConfigFile::open(&path, &mut s).unwrap();
+        let (mut file, how) = open(&path, &mut s).unwrap();
         assert_eq!(how, Opened::Created);
         assert_eq!(fs::read_to_string(&path).unwrap(), default_text());
 
@@ -329,13 +245,13 @@ mod tests {
         let edited = default_text().replace("msaa = 1", "msaa = 4");
         fs::write(&path, &edited).unwrap();
         s.fxaa = true;
-        file.save(Key::Fxaa, &s).unwrap();
+        save(&mut file, Key::Fxaa, &s).unwrap();
         let on_disk = fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains("msaa = 4") && on_disk.contains("fxaa = true"));
 
         // Reopening reads, never rewrites.
         let mut s2 = GraphicsSettings::default();
-        let (_, how) = ConfigFile::open(&path, &mut s2).unwrap();
+        let (_, how) = open(&path, &mut s2).unwrap();
         assert_eq!(how, Opened::Existing(vec![]));
         assert_eq!((s2.msaa, s2.fxaa), (4, true));
         assert_eq!(fs::read_to_string(&path).unwrap(), on_disk);
@@ -369,7 +285,7 @@ mod tests {
         let junk = [0xffu8, 0xfe, b'x'];
         fs::write(&path, junk).unwrap();
         let mut s = GraphicsSettings::default();
-        assert!(ConfigFile::open(&path, &mut s).is_err());
+        assert!(open(&path, &mut s).is_err());
         assert_eq!(fs::read(&path).unwrap(), junk);
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
