@@ -727,12 +727,12 @@ merely cleared and every fragment compares against 1.0 as lit. Switching happens
 with the device idle — the shadow image is freed and the mesh renderer's
 descriptor re-pointed, which is unsound mid-flight.
 
-**Landed (§26): persistence.** Shadows, MSAA and FXAA live in
+**Landed (§26): persistence.** Display mode, shadows, MSAA and FXAA live in
 `config/graphics.toml` (gitignored, cwd-relative like the bake dir; module
 `app/src/config/`; controls have their own file, §14. It was `settings.toml`
 until then, and an old one is renamed on first run). A missing file is written with commented defaults.
 Precedence is defaults < file < CLI, and only a key the player changes (menu,
-F1, F2) is written back, so a `--msaa 4` override never leaks into the file.
+F1, F2, F11) is written back, so a `--msaa 4` override never leaks into the file.
 Saving edits that key's value in place and leaves every other byte alone
 (comments, unknown lines, hand edits made mid-run). A bad line is a warning;
 an unreadable file is left untouched and the run saves nothing. `--bench`
@@ -742,6 +742,18 @@ dependency. One file per concern is what keeps each file flat, so the bindings
 (§14) didn't need tables or a crate either. Found on the way: the renderer ignored the *initial* settings (it starts
 at the High shadow size with FXAA off), which was invisible while those were
 also the defaults; startup now pushes both in.
+
+**Landed (§26): display mode.** `display = "windowed" | "fullscreen"`, live
+from GRAPHICS > DISPLAY and the rebindable `toggle_fullscreen` action (F11).
+Fullscreen is **borderless** on the current monitor
+(`Fullscreen::Borderless(None)`). Exclusive fullscreen (a video-mode change)
+is ignored by winit on Wayland, so it would be a setting that does nothing
+there. Switching is `window.set_fullscreen`; the compositor's `Resized` event
+recreates the swapchain like any resize, so the renderer didn't change. The
+window opens straight into the saved mode (`with_fullscreen`), default
+windowed at 640×480 logical; `--bench` has no config and stays windowed at its
+fixed size. Checked with a temporary harness that toggled it live:
+640×480 → 1920×1080 → 640×480, sync validation clean.
 
 **MSAA landed** and is selected at startup with `--msaa N` (1/2/4/8), clamped to
 device support. The geometry pass renders into a multisampled HDR + depth pair and
@@ -1147,7 +1159,8 @@ blends `_SRGB` attachments in linear space.
 
 Its first consumer is the **Esc pause menu**, now a small screen tree: root
 (CONTINUE / OPTIONS / EXIT) → OPTIONS (GRAPHICS / CONTROLS / SOUND / GAMEPLAY) →
-each submenu. **GRAPHICS carries real settings** — shadow quality cycles and FXAA
+each submenu. **GRAPHICS carries real settings** — display mode toggles (§13),
+shadow quality cycles and FXAA
 toggles live, both sharing the exact code path F1/F2 use, so the two cannot
 drift. MSAA is shown with its current sample count and a RESTART note but is
 **inert**: the count is baked into every geometry pipeline, so changing it live
@@ -1733,9 +1746,9 @@ colliders and the ECS↔rapier sync systems landed — dynamic bodies and collis
 layers pending);
 skinning; UI/HUD (§19's lightweight quad/text renderer + the Esc pause menu
 landed, with keyboard *and* mouse navigation, an OPTIONS screen tree, and live
-shadow-quality/FXAA controls under GRAPHICS — MSAA is changeable there only
-from the main menu, since the session's mesh and sky pipelines bake the sample
-count; all three persist in `config/graphics.toml` (§13), and key bindings +
+display-mode/shadow-quality/FXAA controls under GRAPHICS — MSAA is changeable
+there only from the main menu, since the session's mesh and sky pipelines bake
+the sample count; all of them persist in `config/graphics.toml` (§13), and key bindings +
 mouse look live in `config/controls.toml` (§14), edited from OPTIONS >
 CONTROLS / GAMEPLAY, whose lists scroll when the window is short; egui dev UI, SDF text and
 lower-case/punctuation pending); audio; debug/profiling tooling (per-pass GPU timestamp timing

@@ -109,6 +109,7 @@ controls got their own file; an old one is renamed on first run.)
 
 | Key | Values | Default |
 |---|---|---|
+| `display` | `"windowed"`, `"fullscreen"` (borderless, current monitor) | `"windowed"` |
 | `shadows` | `"high"`, `"medium"`, `"low"`, `"off"` | `"high"` |
 | `msaa` | `1`, `2`, `4`, `8` (clamped to the device) | `1` |
 | `fxaa` | `true`, `false` | `false` |
@@ -119,7 +120,9 @@ something in OPTIONS > CONTROLS or OPTIONS > GAMEPLAY (same in-place editing as
 
 - `action = ["Key", ...]`: one or more keys, or `[]` to unbind. Actions:
   `forward`, `back`, `left`, `right`, `jump` (also fly up in noclip), `down`,
-  `noclip`, `exposure_down`, `exposure_up`, `cycle_shadows`, `toggle_fxaa`.
+  `noclip`, `exposure_down`, `exposure_up`, `cycle_shadows`, `toggle_fxaa`,
+  `toggle_fullscreen`. A file from before an action existed still gets its
+  default key.
   Defaults are in the Controls table below.
 - Key names are physical positions named as on a US QWERTY keyboard, whatever
   your layout, case-insensitive: `A`–`Z`, `0`–`9`, `F1`–`F12`, `Space`, `Tab`,
@@ -160,6 +163,7 @@ Defaults, rebindable in OPTIONS > CONTROLS or `config/controls.toml` (Esc isn't)
 | `[` / `]` | exposure down / up |
 | F1 | cycle shadow quality: OFF → LOW (4×512) → MEDIUM (4×1024) → HIGH (4×2048) |
 | F2 | FXAA on/off |
+| F11 | windowed / fullscreen |
 | Esc | pause |
 
 **Menus:** mouse (hover + click) or arrows + Enter. **Esc** steps back one
@@ -168,7 +172,8 @@ screen, and resumes play only from the pause menu's top level.
 - **Main menu:** NEW GAME / OPTIONS / QUIT
 - **Pause menu:** CONTINUE / OPTIONS / MAIN MENU / EXIT
 - **OPTIONS:** GRAPHICS / CONTROLS / SOUND / GAMEPLAY / BACK.
-- **OPTIONS > GRAPHICS:** shadows and FXAA are live; MSAA can change only from
+- **OPTIONS > GRAPHICS:** DISPLAY (windowed / fullscreen), shadows and FXAA
+  are live; MSAA can change only from
   the main menu, because the mesh and sky pipelines bake the sample count
   (in-game it reads `MENU ONLY`).
 - **OPTIONS > CONTROLS:** one row per action with its keys (`JUMP  SPACE`).
@@ -336,13 +341,13 @@ and distant shadows should look unchanged.
 
 ## 5. Tests — what exists and what it guards
 
-`cargo test --workspace`: 101 tests, all CPU-side (none needs a GPU).
+`cargo test --workspace`: 103 tests, all CPU-side (none needs a GPU).
 
 | Area | Crate | What the tests pin down |
 |---|---|---|
 | Character controller | app | settling, walking speed, jumps and head bumps, no air-jump, autostep lip vs wall, sliding along box faces, noclip |
 | Collision proxies | app | the `collider` param picks mesh/hull/box/none, `auto` switches to a hull past 2048 triangles, `collide: false` still wins; a dense 30 cm prop is walkable as a hull; a flat hull still holds the player |
-| Menus | app | row layout and hit-testing at several window sizes, including scrolling a screen taller than the window (the selection stays visible, hovering a visible row never scrolls, hits map back to the right row); wraparound, Esc/back behaviour, OPTIONS reachable from both menus, MSAA only outside a session; SENSITIVITY / INVERT Y change and save; rebinding waits for a key, ignores menu keys, takes the key from its old action (which shows NONE), and is cancelled by Esc, moving away or BACK; RESET KEYS; **every label drawable by the 5×7 A–Z/0–9 font** |
+| Menus | app | row layout and hit-testing at several window sizes, including scrolling a screen taller than the window (the selection stays visible, hovering a visible row never scrolls, hits map back to the right row); wraparound, Esc/back behaviour, OPTIONS reachable from both menus, MSAA only outside a session, DISPLAY toggles windowed/fullscreen; SENSITIVITY / INVERT Y change and save; rebinding waits for a key, ignores menu keys, takes the key from its old action (which shows NONE), and is cancelled by Esc, moving away or BACK; RESET KEYS; **every label drawable by the 5×7 A–Z/0–9 font** |
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
 | Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs |
@@ -350,8 +355,8 @@ and distant shadows should look unchanged.
 | Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |
 | Texture bake | assets, bake | keys separate content and kind (sRGB colour vs data), and are computed from the encoded bytes without decoding; BC7 level sizes round partial blocks up; baked files round-trip and reject truncation, wrong sizes or an unknown kind; sRGB mips average *light* (black/white → 188, not 128); chains end at 1×1; every baked level has exactly the blocks Vulkan copies |
 | Mesh bake + LOD | assets, bake, render | baked meshes round-trip and reject damage (truncation, trailing bytes, bad magic, out-of-range index, decreasing or NaN error, partial triangle, no LODs); the mesh key ignores the material; a sphere gets a chain with fewer triangles and growing error per level and LOD0 is the input reordered; small meshes stay LOD0; disconnected parts prune; the pixel and texel rules (distance, scale, non-uniform scale, inside the sphere); runs split per (mesh, LOD) |
-| Config files | app | both templates parse back to the defaults; each bad line warns and keeps the default; saving edits one value in place; create-once, the `settings.toml` → `graphics.toml` migration, an unreadable file is left alone |
-| Controls | app | key names round-trip; reserved menu keys are refused; a key on two actions warns; two keys on one action hold until both are released; toggles ignore auto-repeat but exposure repeats; a rebound jump moves; `rebind` steals the key and refuses menu/unnamed keys; sensitivity presets step and wrap; saved literals parse back, and saving every binding into the template keeps its comments; every key's menu label is drawable |
+| Config files | app | both templates parse back to the defaults; `display` parses and rejects anything but `"windowed"` / `"fullscreen"`; each bad line warns and keeps the default; saving edits one value in place; create-once, the `settings.toml` → `graphics.toml` migration, an unreadable file is left alone |
+| Controls | app | key names round-trip; reserved menu keys are refused; a key on two actions warns; two keys on one action hold until both are released; toggles ignore auto-repeat but exposure repeats; a rebound jump moves; `toggle_fullscreen` defaults to F11 (also in files that predate it) and ignores auto-repeat; `rebind` steals the key and refuses menu/unnamed keys; sensitivity presets step and wrap; saved literals parse back, and saving every binding into the template keeps its comments; every key's menu label is drawable |
 | Texture slots | render | one slot per unique image × colour space; sRGB and UNORM uses of the same pixels stay separate; overflow past the capacity is counted and falls back to the defaults |
 | Light clusters | render | GLSL grid constants + `MAX_LIGHTS` match the Rust ones |
 

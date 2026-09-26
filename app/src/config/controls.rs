@@ -42,11 +42,12 @@ pub enum Action {
     ExposureUp,
     CycleShadows,
     ToggleFxaa,
+    ToggleFullscreen,
 }
 
 impl Action {
     /// File order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Forward,
         Self::Back,
         Self::Left,
@@ -58,6 +59,7 @@ impl Action {
         Self::ExposureUp,
         Self::CycleShadows,
         Self::ToggleFxaa,
+        Self::ToggleFullscreen,
     ];
 
     /// The key it's saved under in `controls.toml`.
@@ -74,6 +76,7 @@ impl Action {
             Self::ExposureUp => "exposure_up",
             Self::CycleShadows => "cycle_shadows",
             Self::ToggleFxaa => "toggle_fxaa",
+            Self::ToggleFullscreen => "toggle_fullscreen",
         }
     }
 
@@ -90,6 +93,7 @@ impl Action {
             Self::ExposureUp => KeyCode::BracketRight,
             Self::CycleShadows => KeyCode::F1,
             Self::ToggleFxaa => KeyCode::F2,
+            Self::ToggleFullscreen => KeyCode::F11,
         }
     }
 
@@ -107,6 +111,7 @@ impl Action {
             Self::ExposureUp => "exposure up (repeats while held)",
             Self::CycleShadows => "cycle shadow quality",
             Self::ToggleFxaa => "FXAA on/off",
+            Self::ToggleFullscreen => "windowed / fullscreen",
         }
     }
 
@@ -618,6 +623,21 @@ mod tests {
         assert!(c.held(&held, Action::Forward), "releasing W cancelled I");
         c.key(&mut held, KeyCode::KeyI, false, false);
         assert!(!c.held(&held, Action::Forward));
+    }
+
+    #[test]
+    fn fullscreen_toggle_is_f11_and_fires_once() {
+        let c = Controls::default();
+        let mut held = HashSet::new();
+        assert_eq!(
+            c.key(&mut held, KeyCode::F11, true, false),
+            vec![Action::ToggleFullscreen]
+        );
+        assert!(c.key(&mut held, KeyCode::F11, true, true).is_empty());
+        // Older files without the line still get it.
+        let (c, w) = parsed("forward = [\"W\"]");
+        assert!(w.is_empty());
+        assert_eq!(c.keys(Action::ToggleFullscreen), &[KeyCode::F11]);
     }
 
     #[test]

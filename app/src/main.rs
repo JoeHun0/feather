@@ -184,6 +184,54 @@ impl ShadowQuality {
     }
 }
 
+/// Windowed or fullscreen (§13). Fullscreen is **borderless** on the current
+/// monitor: exclusive fullscreen (a video-mode change) is ignored by winit on
+/// Wayland, and borderless switches instantly with nothing to rebuild.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DisplayMode {
+    Windowed,
+    Fullscreen,
+}
+
+impl DisplayMode {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Windowed => Self::Fullscreen,
+            Self::Fullscreen => Self::Windowed,
+        }
+    }
+
+    /// What winit's `set_fullscreen` / `with_fullscreen` take.
+    fn fullscreen(self) -> Option<winit::window::Fullscreen> {
+        match self {
+            Self::Windowed => None,
+            Self::Fullscreen => Some(winit::window::Fullscreen::Borderless(None)),
+        }
+    }
+
+    /// Settings-file form (`config/graphics.toml`), also used in the log.
+    fn config_name(self) -> &'static str {
+        match self {
+            Self::Windowed => "windowed",
+            Self::Fullscreen => "fullscreen",
+        }
+    }
+
+    fn from_config_name(name: &str) -> Option<Self> {
+        [Self::Windowed, Self::Fullscreen]
+            .into_iter()
+            .find(|d| d.config_name() == name)
+    }
+
+    /// Menu form: the UI font is A-Z/0-9 only.
+    fn menu_label(self) -> &'static str {
+        match self {
+            Self::Windowed => "WINDOWED",
+            Self::Fullscreen => "FULLSCREEN",
+        }
+    }
+}
+
 /// Runtime graphics settings (§13). Render configuration, deliberately *not* an
 /// ECS resource — §1 scopes the `World` to simulation state.
 ///
@@ -193,6 +241,8 @@ impl ShadowQuality {
 /// be a setting that does nothing.
 struct GraphicsSettings {
     shadows: ShadowQuality,
+    /// Windowed or borderless fullscreen; live (menu, F11), saved.
+    display: DisplayMode,
     /// MSAA sample count for the geometry pass (§13), `--msaa N` at startup.
     /// Startup-only rather than live: the sample count is baked into every
     /// geometry pipeline, so changing it means rebuilding them all — the usual
@@ -217,6 +267,7 @@ impl Default for GraphicsSettings {
     fn default() -> Self {
         Self {
             shadows: ShadowQuality::High,
+            display: DisplayMode::Windowed,
             msaa: 1,
             fxaa: false,
             bake: true,
@@ -265,6 +316,7 @@ enum MenuAction {
     ToggleFxaa,
     CycleShadows,
     CycleMsaa,
+    ToggleDisplay,
     NewGame,
     ToMainMenu,
     /// Next SENSITIVITY preset (§14).
@@ -315,6 +367,7 @@ enum MenuOutcome {
     ApplyShadows,
     ApplyFxaa,
     ApplyMsaa,
+    ApplyDisplay,
     StartSession,
     EndSession,
     /// Controls changed; save the named part of `controls.toml`.
@@ -363,6 +416,10 @@ fn screen_rows(
             MenuRow::new("BACK", MenuAction::Back),
         ],
         MenuScreen::Graphics => vec![
+            MenuRow::new(
+                format!("DISPLAY  {}", s.display.menu_label()),
+                MenuAction::ToggleDisplay,
+            ),
             MenuRow::new(
                 format!("SHADOWS  {}", s.shadows.menu_label()),
                 MenuAction::CycleShadows,
@@ -562,6 +619,10 @@ impl Menu {
             MenuAction::CycleShadows => {
                 s.shadows = s.shadows.next();
                 MenuOutcome::ApplyShadows
+            }
+            MenuAction::ToggleDisplay => {
+                s.display = s.display.toggled();
+                MenuOutcome::ApplyDisplay
             }
             MenuAction::CycleMsaa => {
                 // 1 -> 2 -> 4 -> 8 -> 1. `Renderer::set_msaa` clamps to what the
@@ -2057,6 +2118,16 @@ impl App {
         self.persist(config::graphics::Key::Shadows);
     }
 
+    /// Put the window in `settings.display`. The compositor answers with a
+    /// `Resized` event, which recreates the swapchain like any other resize,
+    /// so nothing else needs to know.
+    fn apply_display(&mut self) {
+        if let Some(window) = self.window.as_ref() {
+            window.set_fullscreen(self.settings.display.fullscreen());
+        }
+        eprintln!("[quality] display: {}", self.settings.display.config_name());
+    }
+
     /// Push `settings.fxaa` into the renderer. Cheap: just a flag, since the
     /// LDR intermediate is always allocated.
     fn apply_fxaa(&mut self) {
@@ -2087,6 +2158,10 @@ impl App {
             MenuOutcome::ApplyMsaa => {
                 self.apply_msaa();
                 self.persist(config::graphics::Key::Msaa);
+            }
+            MenuOutcome::ApplyDisplay => {
+                self.apply_display();
+                self.persist(config::graphics::Key::Display);
             }
             MenuOutcome::StartSession => self.start_session(),
             MenuOutcome::EndSession => self.end_session(),
@@ -2178,6 +2253,11 @@ impl App {
                     self.apply_fxaa();
                     self.persist(config::graphics::Key::Fxaa);
                 }
+                Action::ToggleFullscreen => {
+                    self.settings.display = self.settings.display.toggled();
+                    self.apply_display();
+                    self.persist(config::graphics::Key::Display);
+                }
                 Action::Forward | Action::Back | Action::Left | Action::Right | Action::Down => {}
             }
         }
@@ -2250,6 +2330,10 @@ impl ApplicationHandler for App {
             attrs = attrs
                 .with_inner_size(winit::dpi::PhysicalSize::new(1920, 1080))
                 .with_resizable(false);
+        } else {
+            // Open straight into the saved mode rather than flashing a
+            // window first. (`--bench` has no config, so it stays windowed.)
+            attrs = attrs.with_fullscreen(self.settings.display.fullscreen());
         }
         let window = event_loop.create_window(attrs).expect("create window");
         // Opens on the main menu, so the cursor starts free rather than grabbed.
@@ -3096,7 +3180,8 @@ fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     eprintln!(
-        "[config] effective: shadows {}, msaa {}, fxaa {}",
+        "[config] effective: display {}, shadows {}, msaa {}, fxaa {}",
+        settings.display.config_name(),
         settings.shadows.config_name(),
         settings.msaa,
         settings.fxaa
@@ -3488,6 +3573,38 @@ mod tests {
             MenuAction::Enter(MenuScreen::Controls),
         );
         (m, s, c)
+    }
+
+    #[test]
+    fn display_row_toggles_windowed_and_fullscreen() {
+        let (mut s, mut c) = (GraphicsSettings::default(), Controls::default());
+        let mut m = in_game_menu();
+        activate_c(
+            &mut m,
+            &mut s,
+            &mut c,
+            MenuAction::Enter(MenuScreen::Options),
+        );
+        activate_c(
+            &mut m,
+            &mut s,
+            &mut c,
+            MenuAction::Enter(MenuScreen::Graphics),
+        );
+        let label = |m: &Menu, s: &GraphicsSettings| {
+            label_of(m, s, &Controls::default(), MenuAction::ToggleDisplay)
+        };
+        assert_eq!(label(&m, &s), "DISPLAY  WINDOWED");
+        assert_eq!(
+            activate_c(&mut m, &mut s, &mut c, MenuAction::ToggleDisplay),
+            MenuOutcome::ApplyDisplay
+        );
+        assert_eq!(s.display, DisplayMode::Fullscreen);
+        assert!(s.display.fullscreen().is_some());
+        assert_eq!(label(&m, &s), "DISPLAY  FULLSCREEN");
+        activate_c(&mut m, &mut s, &mut c, MenuAction::ToggleDisplay);
+        assert_eq!(s.display, DisplayMode::Windowed);
+        assert!(s.display.fullscreen().is_none());
     }
 
     #[test]

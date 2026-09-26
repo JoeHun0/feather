@@ -10,7 +10,7 @@ use std::io;
 use std::path::Path;
 
 use super::{entries, open_or_create, string, warning, ConfigFile};
-use crate::{GraphicsSettings, ShadowQuality};
+use crate::{DisplayMode, GraphicsSettings, ShadowQuality};
 
 /// Relative to the working directory, like `BAKE_DIR`: fine while the game is
 /// run via cargo from the repo root.
@@ -21,6 +21,7 @@ const OLD_PATH: &str = "config/settings.toml";
 /// A persisted setting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Key {
+    Display,
     Shadows,
     Msaa,
     Fxaa,
@@ -29,6 +30,7 @@ pub enum Key {
 impl Key {
     fn name(self) -> &'static str {
         match self {
+            Self::Display => "display",
             Self::Shadows => "shadows",
             Self::Msaa => "msaa",
             Self::Fxaa => "fxaa",
@@ -38,6 +40,7 @@ impl Key {
     /// The TOML literal for this key's current value in `s`.
     fn value(self, s: &GraphicsSettings) -> String {
         match self {
+            Self::Display => format!("\"{}\"", s.display.config_name()),
             Self::Shadows => format!("\"{}\"", s.shadows.config_name()),
             Self::Msaa => s.msaa.to_string(),
             Self::Fxaa => s.fxaa.to_string(),
@@ -55,6 +58,10 @@ pub fn default_text() -> String {
 # (e.g. --msaa 4) override it for one run and are never saved. Key bindings
 # are in controls.toml.
 
+# Window: \"windowed\" or \"fullscreen\" (borderless, on the current monitor).
+# F11 toggles it.
+display = {}
+
 # Shadow quality: \"high\", \"medium\", \"low\" or \"off\". F1 cycles it in game.
 shadows = {}
 
@@ -65,6 +72,7 @@ msaa = {}
 # FXAA post-process anti-aliasing: true or false. F2 toggles it in game.
 fxaa = {}
 ",
+        Key::Display.value(&d),
         Key::Shadows.value(&d),
         Key::Msaa.value(&d),
         Key::Fxaa.value(&d),
@@ -79,6 +87,12 @@ pub fn parse(text: &str, s: &mut GraphicsSettings) -> Vec<String> {
         let (k, v) = (e.key, e.value);
         let mut warn = |msg: String| warnings.push(warning(e.line, msg));
         match k {
+            "display" => match string(v).and_then(DisplayMode::from_config_name) {
+                Some(d) => s.display = d,
+                None => warn(format!(
+                    "display must be \"windowed\" or \"fullscreen\", got {v}"
+                )),
+            },
             "shadows" => {
                 let q = string(v).and_then(ShadowQuality::from_config_name);
                 match q {
@@ -188,8 +202,8 @@ mod tests {
     }
 
     /// Settings fields compared as a tuple (the struct has no PartialEq).
-    fn key(s: &GraphicsSettings) -> (ShadowQuality, u32, bool, bool, bool) {
-        (s.shadows, s.msaa, s.fxaa, s.bake, s.lod)
+    fn key(s: &GraphicsSettings) -> (DisplayMode, ShadowQuality, u32, bool, bool, bool) {
+        (s.display, s.shadows, s.msaa, s.fxaa, s.bake, s.lod)
     }
 
     #[test]
@@ -201,9 +215,11 @@ mod tests {
 
     #[test]
     fn values_apply() {
-        let (s, w) = parsed("shadows = \"low\"  # cheap\nmsaa = 4\n  fxaa=true\n");
+        let (s, w) =
+            parsed("shadows = \"low\"  # cheap\nmsaa = 4\n  fxaa=true\ndisplay = \"fullscreen\"\n");
         assert!(w.is_empty(), "{w:?}");
         assert_eq!((s.shadows, s.msaa, s.fxaa), (ShadowQuality::Low, 4, true));
+        assert_eq!(s.display, DisplayMode::Fullscreen);
     }
 
     /// Each bad line must warn *and* leave its key at the default.
@@ -216,6 +232,8 @@ mod tests {
             "fxaa = maybe",
             "shadows = \"ultra\"",
             "shadows = low",
+            "display = \"borderless\"",
+            "display = fullscreen",
             "[graphics]",
             "vsync = true",
             "just words",
