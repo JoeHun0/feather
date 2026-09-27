@@ -1530,6 +1530,8 @@ struct SpawnArgs<'a> {
     material: u32,
     /// Local-space geometry, for building a collider.
     mesh_data: Option<&'a MeshData>,
+    /// Its bake (§17), whose LODs can stand in for an over-budget mesh.
+    baked: Option<&'a feather_assets::bake::BakedMesh>,
     spec: Option<&'a feather_assets::PrefabSpec>,
 }
 
@@ -1621,6 +1623,53 @@ fn spawn_static_prop(world: &mut World, args: &SpawnArgs) {
 /// into seconds per frame. Props of a few hundred triangles cost nothing
 /// measurable, so they keep exact collision.
 const TRIMESH_MAX_TRIS: usize = 2048;
+/// Largest geometric error, in world units, of a baked LOD used as a prop's
+/// collider in place of its over-budget full mesh (§17). Far below what the
+/// player can feel (capsule radius 0.35, autostep 0.4), and far closer than
+/// the convex hull it replaces, whose error is the depth of every concavity.
+const COLLISION_TOLERANCE: f32 = 0.05;
+
+/// The finest baked LOD usable as a collider: within `TRIMESH_MAX_TRIS` and
+/// within `COLLISION_TOLERANCE` once its error is scaled to the node
+/// (`world_scale`, its largest axis scale). `None` if none is. LOD errors
+/// never decrease and triangle counts never grow along the chain, so the first
+/// level under the budget is the only candidate: if it's too coarse, every
+/// later one is too.
+fn collision_lod(lods: &[feather_assets::bake::Lod], world_scale: f32) -> Option<usize> {
+    let i = lods
+        .iter()
+        .position(|l| l.indices.len() / 3 <= TRIMESH_MAX_TRIS)?;
+    (lods[i].error * world_scale <= COLLISION_TOLERANCE).then_some(i)
+}
+
+/// A transform's largest axis scale: how much it can stretch an error.
+fn max_axis_scale(m: &Mat4) -> f32 {
+    m.x_axis
+        .truncate()
+        .length()
+        .max(m.y_axis.truncate().length())
+        .max(m.z_axis.truncate().length())
+}
+
+/// What `build_collider` actually built, for the load-time `[scene]` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuiltCollider {
+    /// The full mesh (or a baked LOD0, which is the same triangles).
+    Mesh,
+    /// A coarser baked LOD standing in for an over-budget mesh.
+    Lod(usize),
+    Hull,
+    Box,
+}
+
+/// Collider counts for a session, logged once after spawning.
+#[derive(Resource, Default, Debug)]
+struct ColliderStats {
+    mesh: usize,
+    lod: usize,
+    hull: usize,
+    boxes: usize,
+}
 
 /// How a scene node collides (§15), from the `collider` prefab param.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1654,60 +1703,82 @@ impl ColliderKind {
     }
 }
 
-/// Build one primitive's static collider in world space. Flat geometry still
-/// gets a (zero-thickness) hull, which collides fine (tested). Only points with
-/// no hull at all, too few or collinear, fall back to the exact mesh.
+/// Build one primitive's static collider in world space, and say what it
+/// built. `auto` uses the exact mesh within `TRIMESH_MAX_TRIS`; above it, a
+/// baked LOD within `COLLISION_TOLERANCE` if there is one (§17), and a convex
+/// hull otherwise. Flat geometry still gets a (zero-thickness) hull, which
+/// collides fine (tested). Only points with no hull at all, too few or
+/// collinear, fall back to the exact mesh.
 fn build_collider(
     physics: &mut Physics,
     data: &MeshData,
+    baked: Option<&feather_assets::bake::BakedMesh>,
     transform: Mat4,
     kind: ColliderKind,
-) -> Option<ColliderHandle> {
-    let kind = match kind {
-        ColliderKind::Auto if data.indices.len() / 3 > TRIMESH_MAX_TRIS => ColliderKind::Hull,
-        ColliderKind::Auto => ColliderKind::Mesh,
-        k => k,
-    };
+) -> Option<(ColliderHandle, BuiltCollider)> {
     let world = |p: Vec3| to_rapier(transform.transform_point3(p));
-    let trimesh = |physics: &mut Physics| {
-        let verts: Vec<Vector> = data
-            .vertices
-            .iter()
-            .map(|v| world(Vec3::from(v.pos)))
-            .collect();
-        let tris: Vec<[u32; 3]> = data
-            .indices
+    let trimesh = |physics: &mut Physics, vertices: &[feather_assets::Vertex], indices: &[u32]| {
+        let verts: Vec<Vector> = vertices.iter().map(|v| world(Vec3::from(v.pos))).collect();
+        let tris: Vec<[u32; 3]> = indices
             .chunks_exact(3)
             .map(|t| [t[0], t[1], t[2]])
             .collect();
         physics.add_static_trimesh(verts, tris)
     };
-    let points: Vec<Vector> = match kind {
+    let exact = |physics: &mut Physics| {
+        trimesh(physics, &data.vertices, &data.indices).map(|h| (h, BuiltCollider::Mesh))
+    };
+    let kind = match kind {
+        ColliderKind::Auto if data.indices.len() / 3 <= TRIMESH_MAX_TRIS => ColliderKind::Mesh,
+        ColliderKind::Auto => {
+            let lod = baked
+                .and_then(|b| collision_lod(&b.lods, max_axis_scale(&transform)).map(|i| (b, i)));
+            if let Some((b, i)) = lod {
+                let built = if i == 0 {
+                    BuiltCollider::Mesh
+                } else {
+                    BuiltCollider::Lod(i)
+                };
+                return trimesh(physics, &b.vertices, &b.lods[i].indices).map(|h| (h, built));
+            }
+            ColliderKind::Hull
+        }
+        k => k,
+    };
+    let (points, built): (Vec<Vector>, _) = match kind {
         ColliderKind::None => return None,
-        ColliderKind::Mesh | ColliderKind::Auto => return trimesh(physics),
-        ColliderKind::Hull => data
-            .vertices
-            .iter()
-            .map(|v| world(Vec3::from(v.pos)))
-            .collect(),
+        ColliderKind::Mesh | ColliderKind::Auto => return exact(physics),
+        ColliderKind::Hull => (
+            data.vertices
+                .iter()
+                .map(|v| world(Vec3::from(v.pos)))
+                .collect(),
+            BuiltCollider::Hull,
+        ),
         ColliderKind::Box => {
             let (lo, hi) = data.bounds();
-            (0..8)
-                .map(|i| {
-                    let pick = |bit: usize, a: f32, b: f32| if i & bit == 0 { a } else { b };
-                    world(Vec3::new(
-                        pick(1, lo.x, hi.x),
-                        pick(2, lo.y, hi.y),
-                        pick(4, lo.z, hi.z),
-                    ))
-                })
-                .collect()
+            (
+                (0..8)
+                    .map(|i| {
+                        let pick = |bit: usize, a: f32, b: f32| if i & bit == 0 { a } else { b };
+                        world(Vec3::new(
+                            pick(1, lo.x, hi.x),
+                            pick(2, lo.y, hi.y),
+                            pick(4, lo.z, hi.z),
+                        ))
+                    })
+                    .collect(),
+                BuiltCollider::Box,
+            )
         }
     };
-    physics.add_static_hull(&points).or_else(|| {
-        eprintln!("[scene] degenerate {kind:?} collider; using the exact mesh");
-        trimesh(physics)
-    })
+    match physics.add_static_hull(&points) {
+        Some(h) => Some((h, built)),
+        None => {
+            eprintln!("[scene] degenerate {kind:?} collider; using the exact mesh");
+            exact(physics)
+        }
+    }
 }
 
 fn spawn_scene_node(
@@ -1722,10 +1793,25 @@ fn spawn_scene_node(
         build_collider(
             &mut world.resource_mut::<Physics>(),
             data,
+            args.baked,
             args.transform,
             kind,
         )
     });
+    if let (Some((_, built)), Some(mut stats)) =
+        (collider, world.get_resource_mut::<ColliderStats>())
+    {
+        match built {
+            BuiltCollider::Mesh => stats.mesh += 1,
+            BuiltCollider::Lod(_) => {
+                stats.mesh += 1;
+                stats.lod += 1;
+            }
+            BuiltCollider::Hull => stats.hull += 1,
+            BuiltCollider::Box => stats.boxes += 1,
+        }
+    }
+    let collider = collider.map(|(h, _)| h);
     let mut e = world.spawn((
         Transform(args.transform),
         Mesh(mesh),
@@ -1849,11 +1935,18 @@ impl Session {
         // where the player goes and the player is built below.
         let t_start = Instant::now();
         let (meshes, scene_nodes) = load_scenes(scenes);
+        // The bake (§17), read once: the renderer draws its LODs and the
+        // colliders built below can use them too.
+        let bake_dir = bake.then(|| std::path::Path::new(BAKE_DIR));
+        let baked = bake_dir.map_or_else(Vec::new, |d| {
+            feather_assets::bake::load_baked_meshes(d, &meshes)
+        });
         let t_scenes = t_start.elapsed();
         let (start_pos, start_yaw) = player_start(&scene_nodes);
 
         let mut world = World::new();
         world.insert_resource(FrameCount::default());
+        world.insert_resource(ColliderStats::default());
         let mut physics = Physics::new();
         // Feet on the ground. The player is a normal ECS entity: sim state in
         // `Player`, render-rate angles in `Look` (§15).
@@ -1990,6 +2083,7 @@ impl Session {
                 mesh: mesh_idx.map(|i| MeshId(i as u32)),
                 material: mesh_idx.map_or(0, |i| PALETTE + i as u32),
                 mesh_data: mesh_idx.map(|i| &meshes[i]),
+                baked: mesh_idx.and_then(|i| baked.get(i)).and_then(Option::as_ref),
                 spec: node.prefab.as_ref(),
             };
             match node.prefab.as_ref() {
@@ -2012,16 +2106,26 @@ impl Session {
         if spawned > 0 {
             let colliders = world.resource::<Physics>().colliders.len() - colliders_before;
             eprintln!("scene: {spawned} nodes spawned, {colliders} colliders built");
+            let st = world.resource::<ColliderStats>();
+            eprintln!(
+                "[scene] colliders: {} mesh ({} from LODs), {} hull, {} box",
+                st.mesh, st.lod, st.hull, st.boxes
+            );
         }
 
         // One step so the broad-phase BVH the character controller shape-casts
         // against contains the level before the first fixed tick.
         world.resource_mut::<Physics>().step();
 
-        let bake_dir = bake.then(|| std::path::Path::new(BAKE_DIR));
         let t_renderer = Instant::now();
-        let (mut mesh, _ids) =
-            MeshRenderer::new(renderer, &meshes, &materials, MAX_INSTANCES, bake_dir);
+        let (mut mesh, _ids) = MeshRenderer::new(
+            renderer,
+            &meshes,
+            &baked,
+            &materials,
+            MAX_INSTANCES,
+            bake_dir,
+        );
         mesh.set_lod_enabled(lod);
         // Where a session's load time goes (§17): parse + images + meshes, then
         // spawning + colliders, then the GPU upload.
@@ -4266,6 +4370,7 @@ mod tests {
             mesh: Some(MeshId(0)),
             material: 0,
             mesh_data: Some(cube),
+            baked: None,
             spec,
         };
         match spec.and_then(|s| prefab_registry().get(s.id.as_str()).copied()) {
@@ -4441,7 +4546,7 @@ mod tests {
         };
         let at = Mat4::from_translation(Vec3::new(0.0, GROUND_Y + 1.0, 0.0));
         let (mut physics, _) = setup(&[], Vec3::new(20.0, GROUND_Y, 20.0));
-        build_collider(&mut physics, &quad, at, ColliderKind::Hull).expect("collider");
+        build_collider(&mut physics, &quad, None, at, ColliderKind::Hull).expect("collider");
         let mut p = Player::new(&mut physics, Vec3::new(0.0, GROUND_Y + 2.0, 0.0));
         physics.step();
         for _ in 0..90 {
@@ -4463,7 +4568,9 @@ mod tests {
         assert!(ball.indices.len() / 3 > TRIMESH_MAX_TRIS);
         let at = Mat4::from_translation(Vec3::new(0.0, GROUND_Y + 0.3, 0.0));
         let (mut physics, _) = setup(&[], Vec3::new(20.0, GROUND_Y, 20.0));
-        let c = build_collider(&mut physics, &ball, at, ColliderKind::Auto).expect("collider");
+        let (c, built) =
+            build_collider(&mut physics, &ball, None, at, ColliderKind::Auto).expect("collider");
+        assert_eq!(built, BuiltCollider::Hull, "no bake: over budget is a hull");
         assert_eq!(
             physics.colliders.get(c).unwrap().shape().shape_type(),
             rapier3d::parry::shape::ShapeType::ConvexPolyhedron
@@ -4487,6 +4594,148 @@ mod tests {
             "landed at {}",
             p.pos.y
         );
+    }
+
+    fn lod(error: f32, tris: usize) -> feather_assets::bake::Lod {
+        feather_assets::bake::Lod {
+            error,
+            indices: vec![0; tris * 3],
+        }
+    }
+
+    #[test]
+    fn collision_lod_takes_the_finest_level_within_budget_and_tolerance() {
+        let chain = [
+            lod(0.0, 8000),
+            lod(0.01, 4000),
+            lod(0.03, 2000),
+            lod(0.2, 1000),
+        ];
+        // LOD1 is too big; LOD2 is the first under the budget, 3 cm off.
+        assert_eq!(collision_lod(&chain, 1.0), Some(2));
+        // At 2x its error is 6 cm, over tolerance, and so is every later level.
+        assert_eq!(collision_lod(&chain, 2.0), None);
+        // A small mesh qualifies as itself.
+        assert_eq!(
+            collision_lod(&[lod(0.0, 500), lod(0.02, 250)], 10.0),
+            Some(0)
+        );
+        // Nothing under the budget at all.
+        assert_eq!(
+            collision_lod(&[lod(0.0, 9000), lod(0.001, 5000)], 1.0),
+            None
+        );
+        assert_eq!(collision_lod(&[], 1.0), None);
+    }
+
+    /// A dense dish, 6 m wide and 1 m deep: a concave prop, over the triangle
+    /// budget. Returns the fine mesh and a bake whose LOD1 is every 4th grid
+    /// line (the same vertex array, as a real bake shares it).
+    fn dish() -> (MeshData, feather_assets::bake::BakedMesh) {
+        const N: usize = 64;
+        let (r, depth) = (3.0f32, 1.0f32);
+        let mut m = MeshData::cube(1.0);
+        m.vertices.clear();
+        m.indices.clear();
+        for i in 0..=N {
+            for j in 0..=N {
+                let x = -r + 2.0 * r * j as f32 / N as f32;
+                let z = -r + 2.0 * r * i as f32 / N as f32;
+                let y = depth * ((x * x + z * z) / (r * r)).min(1.0);
+                m.vertices.push(feather_assets::Vertex {
+                    pos: [x, y, z],
+                    normal: [0.0, 1.0, 0.0],
+                    uv: [0.0, 0.0],
+                });
+            }
+        }
+        // Counter-clockwise from above, so every triangle faces up.
+        let grid = |step: usize| {
+            let mut idx = Vec::new();
+            for i in (0..N).step_by(step) {
+                for j in (0..N).step_by(step) {
+                    let v = |i: usize, j: usize| (i * (N + 1) + j) as u32;
+                    let (a, b, c, d) = (
+                        v(i, j),
+                        v(i + step, j),
+                        v(i, j + step),
+                        v(i + step, j + step),
+                    );
+                    idx.extend_from_slice(&[a, b, c, c, b, d]);
+                }
+            }
+            idx
+        };
+        m.indices = grid(1);
+        let baked = feather_assets::bake::BakedMesh {
+            vertices: m.vertices.clone(),
+            lods: vec![
+                feather_assets::bake::Lod {
+                    error: 0.0,
+                    indices: m.indices.clone(),
+                },
+                feather_assets::bake::Lod {
+                    error: 0.01,
+                    indices: grid(4),
+                },
+            ],
+        };
+        (m, baked)
+    }
+
+    /// Drop the player into the dish; where do its feet come to rest?
+    fn rest_height_in_dish(
+        baked: Option<&feather_assets::bake::BakedMesh>,
+    ) -> (f32, BuiltCollider) {
+        let (mesh, bake) = dish();
+        assert!(mesh.indices.len() / 3 > TRIMESH_MAX_TRIS);
+        let baked = baked.map(|_| &bake);
+        let at = Mat4::from_translation(Vec3::new(0.0, GROUND_Y + 0.2, 0.0));
+        let (mut physics, _) = setup(&[], Vec3::new(20.0, GROUND_Y, 20.0));
+        let (_, built) =
+            build_collider(&mut physics, &mesh, baked, at, ColliderKind::Auto).expect("collider");
+        let mut p = Player::new(&mut physics, Vec3::new(0.0, GROUND_Y + 2.5, 0.0));
+        physics.step();
+        for _ in 0..90 {
+            step(&mut p, &mut physics, Vec3::ZERO, false, 0.0, false);
+        }
+        assert!(p.on_ground, "never landed ({built:?})");
+        (p.pos.y - GROUND_Y, built)
+    }
+
+    /// The point of LOD collision: a hull fills the dish up to its rim, a LOD
+    /// trimesh lets you stand in it.
+    #[test]
+    fn a_baked_lod_keeps_a_concave_prop_concave() {
+        let (y, built) = rest_height_in_dish(Some(&dish().1));
+        println!("dish, LOD1 trimesh: feet at {y:.3} above ground");
+        assert_eq!(built, BuiltCollider::Lod(1));
+        assert!(
+            y < 0.5,
+            "stood at {y}, not down in the dish (bottom at 0.2)"
+        );
+        let (y, built) = rest_height_in_dish(None);
+        println!("dish, hull: feet at {y:.3} above ground");
+        assert_eq!(built, BuiltCollider::Hull);
+        assert!(
+            y > 1.1,
+            "stood at {y}, but the hull's lid is at the rim (1.2)"
+        );
+    }
+
+    #[test]
+    fn explicit_mesh_collider_stays_exact() {
+        let (mesh, bake) = dish();
+        let (mut physics, _) = setup(&[], Vec3::new(20.0, GROUND_Y, 20.0));
+        let (_, built) = build_collider(
+            &mut physics,
+            &mesh,
+            Some(&bake),
+            Mat4::IDENTITY,
+            ColliderKind::Mesh,
+        )
+        .expect("collider");
+        assert_eq!(built, BuiltCollider::Mesh);
     }
 
     #[test]

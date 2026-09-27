@@ -111,6 +111,17 @@ fn pod_bytes<T: Copy>(s: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
 }
 
+/// The baked version of each mesh (`None` where there isn't a valid one),
+/// read from the mesh directory of a bake root. Loaded once per session: the
+/// renderer draws from it and the app builds colliders from its LODs.
+pub fn load_baked_meshes(root: &Path, meshes: &[MeshData]) -> Vec<Option<BakedMesh>> {
+    let dir = root.join(MESH_DIR);
+    meshes
+        .iter()
+        .map(|m| BakedMesh::read(&baked_mesh_path(&dir, mesh_key(m))).ok())
+        .collect()
+}
+
 /// One level of detail: an index list into the shared vertex array.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lod {

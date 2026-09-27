@@ -11,8 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use feather_assets::bake::{
-    baked_mesh_path, baked_path, mesh_key, texture_key, BakedMesh, BakedTexture, TexKind, MESH_DIR,
-    MIN_LOD_TRIS, TEX_DIR,
+    baked_path, texture_key, BakedMesh, BakedTexture, TexKind, MIN_LOD_TRIS, TEX_DIR,
 };
 use feather_assets::{Material, MeshData, TextureData, Vertex};
 use feather_gfx::{Buffer, Image, MappedBuffer, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
@@ -410,9 +409,15 @@ impl MeshRenderer {
     /// `materials` table (indexed by `material_id` on each instance). Returns the
     /// renderer and a `MeshId` per input mesh (same order). Both slices must be
     /// non-empty.
+    ///
+    /// `baked[i]` is mesh `i`'s bake (§17: optimised order + LODs), loaded by
+    /// the caller once (`feather_assets::bake::load_baked_meshes`) since the
+    /// app builds colliders from the same LODs. Empty or `None` = draw the raw
+    /// mesh as its only LOD. `bake_dir` is still read for textures.
     pub fn new(
         renderer: &Renderer,
         meshes: &[MeshData],
+        baked: &[Option<BakedMesh>],
         materials: &[Material],
         max_instances: u32,
         bake_dir: Option<&std::path::Path>,
@@ -422,17 +427,14 @@ impl MeshRenderer {
         // Merge every mesh into one vertex + one index buffer; record each slice.
         // A baked mesh (§17) brings its optimised vertex order and LOD chain;
         // otherwise the loader's mesh goes in as its only LOD. Never an error.
-        let mesh_dir = bake_dir.map(|d| d.join(MESH_DIR));
         let mut vertices: Vec<Vertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         let mut slices: Vec<MeshSlice> = Vec::with_capacity(meshes.len());
         let mut ids: Vec<MeshId> = Vec::with_capacity(meshes.len());
         let (mut baked_meshes, mut lod_count, mut would_gain) = (0usize, 0usize, 0usize);
         for (i, mesh) in meshes.iter().enumerate() {
-            let baked = mesh_dir
-                .as_deref()
-                .and_then(|d| BakedMesh::read(&baked_mesh_path(d, mesh_key(mesh))).ok());
-            let (verts, lods): (&[Vertex], Vec<(f32, &[u32])>) = match &baked {
+            let bake = baked.get(i).and_then(Option::as_ref);
+            let (verts, lods): (&[Vertex], Vec<(f32, &[u32])>) = match bake {
                 Some(b) => {
                     baked_meshes += 1;
                     let lods = b.lods.iter().take(MAX_LODS);

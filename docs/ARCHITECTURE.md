@@ -902,6 +902,33 @@ hold, repeat, rebinding) is unit-tested without a GPU through
   points with no hull at all fall back to the exact mesh. `collide: false`
   still wins, so older scenes keep their meaning.
 
+  **Landed (§26): colliders from the baked LODs.** Between those two, `auto`
+  now tries the mesh bake (§17) first. An over-budget mesh uses the *finest*
+  LOD with at most `TRIMESH_MAX_TRIS` triangles whose error, scaled by the
+  node's largest axis scale, is within `COLLISION_TOLERANCE` = 5 cm (the
+  capsule is 35 cm, autostep 40 cm), as an exact trimesh. Only when no LOD
+  qualifies (no bake, `--no-bake`, or a node scaled up past the tolerance)
+  does it fall back to the hull. `collider: "mesh"` still means the full mesh.
+  The baked meshes are read once per session and shared with the renderer.
+  A `[scene] colliders: …` line reports what a scene got. On `detail_high`,
+  all 373 colliders (busts, lanterns, rocks) went from hulls to LOD trimeshes
+  (lantern and bust at LOD4, rocks at LOD2–3). The load's "world" phase went
+  0.50 → 0.33 s (predicted −10…40%): quickhull over every vertex of a full
+  mesh costs more than a BVH over ~2k triangles. A unit test drops the
+  player into a dense dish: as a LOD trimesh its feet rest at 0.22 m, at the
+  bottom (0.2); as a hull, at 1.22 m, on the lid the hull puts at rim height
+  (1.2).
+
+  Per-tick cost, standing on the lantern scaled 8× (debug, a temporary
+  harness): full trimesh 0.25 ms, LOD4 trimesh 0.023 ms, hull 0.012 ms. The
+  LOD is well under a millisecond and 1.9× the hull (predicted: under 1 ms,
+  within 2×). But the full mesh is no longer the 27 ms quoted above, which
+  predates optimising dependencies in debug builds (`[profile.dev.package."*"]`
+  in `Cargo.toml`). So the 2048 budget's
+  original rationale is stale. It's still a sensible bound (11× cheaper than
+  the full lantern), but worth re-measuring before anyone relies on the 27 ms
+  figure.
+
 ## 16. Skinned / animated meshes
 
 - **Second vertex layout** (joints+weights) → skinned-opaque / skinned-masked
@@ -1079,8 +1106,8 @@ unchanged at 2.7 MB. The testscene (nothing ≥ 256 triangles) is unchanged,
 and the bake takes 0.1 s for `detail_high`'s 27 meshes.
 Open risk, not measured: a caster drawn coarser than its own receiver could
 self-shadow. It's bounded to one texel, inside the existing bias, but it's
-a thing to look at. Collision still uses the loader's full meshes; a coarse
-LOD for trimesh colliders is a follow-up.
+a thing to look at. Colliders use these LODs too (§15): over-budget props get
+a LOD trimesh within 5 cm instead of a convex hull.
 Not yet: materials and scenes as baked blobs (the rest of this section).
 
 ## 18. Scene spawning + save/load
@@ -1593,8 +1620,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   bounded only by the device's descriptor limits (deduplicated per image ×
   colour space; past the limit, references use the defaults with a `[mesh]`
   warning), a collider is built per node at load (an
-  exact trimesh up to 2048 triangles and a convex hull above that, overridable
-  per node, §15; no convex *decomposition*), scenes land at their authored
+  exact trimesh up to 2048 triangles; above that, a baked LOD trimesh within
+  5 cm, else a convex hull; overridable per node, §15; no convex
+  *decomposition*), scenes land at their authored
   coordinates so a model authored around the origin floats above the demo ground
   at `GROUND_Y`, and there is still no broad phase, so a large scene leans on
   the per-entity cull (and on LODs, §17, for its triangle count).

@@ -255,7 +255,7 @@ if absent. A node's `extras` can name a prefab:
 | Prefab | Params (defaults) | Notes |
 |---|---|---|
 | `player_start` | `yaw` degrees (keep the default look direction) | where NEW GAME spawns the player; first one wins |
-| `prop` | `collide` (true), `shadow` (true), `collider` (`auto`) | a mesh with optional collider / shadow casting. `collider`: `auto` (exact mesh up to 2048 triangles, convex hull above), `mesh`, `hull`, `box`, `none`. Detailed props should never collide as exact meshes: a 34k-triangle one cost 27 ms per physics tick |
+| `prop` | `collide` (true), `shadow` (true), `collider` (`auto`) | a mesh with optional collider / shadow casting. `collider`: `auto` (exact mesh up to 2048 triangles; above that, the finest baked LOD under 2048 triangles within 5 cm, else a convex hull), `mesh` (always the full mesh), `hull`, `box`, `none`. Bake a scene so its detailed props get LOD collision instead of hulls, which fill every hollow |
 | `point_light` | `color` [1,1,1], `intensity` 12, `radius` 10, `source_radius` 0.1 | on a bare marker or on geometry (a lamp that also renders). `source_radius` is the emitter's physical size, clamped to [0, radius]: it sets the size of the highlight on shiny surfaces. Match it to the lamp's geometry; 0 is a true point, which makes a pinprick-bright highlight on smooth metal |
 
 An unknown prefab name falls back to static geometry. Up to 128 point lights
@@ -345,12 +345,12 @@ and distant shadows should look unchanged.
 
 ## 5. Tests — what exists and what it guards
 
-`cargo test --workspace`: 105 tests, all CPU-side (none needs a GPU).
+`cargo test --workspace`: 108 tests, all CPU-side (none needs a GPU).
 
 | Area | Crate | What the tests pin down |
 |---|---|---|
 | Character controller | app | settling, walking speed, jumps and head bumps, no air-jump, autostep lip vs wall, sliding along box faces, noclip |
-| Collision proxies | app | the `collider` param picks mesh/hull/box/none, `auto` switches to a hull past 2048 triangles, `collide: false` still wins; a dense 30 cm prop is walkable as a hull; a flat hull still holds the player |
+| Collision proxies | app | the `collider` param picks mesh/hull/box/none, `auto` switches to a hull past 2048 triangles without a bake, `collide: false` still wins; a dense 30 cm prop is walkable as a hull; a flat hull still holds the player; with a bake, `auto` picks the finest LOD within the triangle budget and 5 cm (scaled by the node), and a concave dish keeps the player *in* it as a LOD trimesh but on its rim as a hull; `mesh` stays exact |
 | Menus | app | row layout and hit-testing at several window sizes, including scrolling a screen taller than the window (the selection stays visible, hovering a visible row never scrolls, hits map back to the right row); wraparound, Esc/back behaviour, OPTIONS reachable from both menus, MSAA only outside a session, DISPLAY toggles windowed/fullscreen, FIELD OF VIEW steps its presets (and the projection really uses it); SENSITIVITY / INVERT Y change and save; rebinding waits for a key, ignores menu keys, takes the key from its old action (which shows NONE), and is cancelled by Esc, moving away or BACK; RESET KEYS; **every label drawable by the 5×7 A–Z/0–9 font** |
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice at every FOV from 30° to 120°; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
@@ -390,6 +390,7 @@ Everything goes to stderr.
 | `[light] N visible lights exceeds MAX_LIGHTS` | lights past 128 were dropped this frame |
 | `[mesh] N meshes (B baked, L LODs): …` | geometry uploaded at load, and how much of it came from the bake |
 | `[mesh] N textures uploaded … (B baked BC7, R raw; D images decoded)` | textures at load; with a complete bake D is 0 |
+| `[scene] colliders: N mesh (M from LODs), H hull, B box` | the colliders a session built; with a bake, detailed props should be LODs, not hulls |
 | `[load] scenes … world … renderer … total …` | where a session's load time went: parsing + reading images + meshes, spawning + colliders, GPU upload |
 | `[bench] …` | the `--bench` summary, including triangles submitted per frame (`Mtris main/shadow`) and the share of instances at each LOD (`LOD mix`) |
 
