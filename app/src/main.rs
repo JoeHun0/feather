@@ -47,12 +47,15 @@ use feather_render::{
 };
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
-use rapier3d::parry::query::ShapeCastOptions;
-use rapier3d::parry::shape::Ball;
+use rapier3d::geometry::ContactManifold;
+use rapier3d::parry::bounding_volume::BoundingVolume;
+use rapier3d::parry::query::{DefaultQueryDispatcher, PersistentQueryDispatcher, ShapeCastOptions};
+use rapier3d::parry::shape::{Ball, Shape};
 use rapier3d::prelude::{
     BroadPhaseBvh, CCDSolver, Collider, ColliderBuilder, ColliderHandle, ColliderSet,
     ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet, NarrowPhase,
-    PhysicsPipeline, Pose, QueryFilter, RigidBodyBuilder, RigidBodyHandle, RigidBodySet, Vector,
+    PhysicsPipeline, Pose, QueryFilter, QueryPipeline, RigidBodyBuilder, RigidBodyHandle,
+    RigidBodySet, Vector,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
@@ -90,6 +93,10 @@ const FLY_SPEED: f32 = 14.0; // noclip movement speed
 /// controller holds the capsule ~2 cm off the ground and counts contacts
 /// within ~7 cm as grounded, so 10 cm finds whatever it counted.
 const GROUND_PROBE: f32 = 0.1;
+/// How close a downward-facing surface must be to count as touching the
+/// capsule, for the overhang clip in `player_target` (§15). The controller
+/// keeps the capsule ~2 cm off everything.
+const OVERHANG_REACH: f32 = 0.05;
 
 // Sun shadow frustum (§11). The ortho follows the player, so these are relative
 // to them: half-extent of the covered square, how far back along the sun the
@@ -1077,6 +1084,9 @@ struct Player {
     /// What the feet were last on (§20): refreshed every grounded tick, kept
     /// while airborne, so the steps after a landing use the new ground.
     surface: Surface,
+    /// How many times the controller's slide hit something this tick, a
+    /// diagnostic (§15). rapier's slide loop gives up after 20.
+    slide_hits: u32,
     body: RigidBodyHandle,
     collider: ColliderHandle,
     controller: KinematicCharacterController,
@@ -1176,6 +1186,7 @@ impl Player {
             vel: Vec3::ZERO,
             on_ground: true, // feet start resting on the ground
             surface: Surface::default(),
+            slide_hits: 0,
             body,
             collider,
             controller: KinematicCharacterController {
@@ -1211,6 +1222,7 @@ fn player_target(p: &mut Player, physics: &mut Physics, input: &InputState) {
         let dir = wish + Vec3::new(0.0, vgo, 0.0);
         p.vel = dir.normalize_or_zero() * FLY_SPEED;
         p.on_ground = false;
+        p.slide_hits = 0;
         p.vel * FIXED_DT
     } else {
         // Horizontal velocity chases the target speed; vertical is gravity + jump.
@@ -1231,21 +1243,29 @@ fn player_target(p: &mut Player, physics: &mut Physics, input: &InputState) {
             p.vel.y = JUMP_SPEED;
         }
 
-        let desired = p.vel * FIXED_DT;
         let queries = physics.broad_phase.as_query_pipeline(
             physics.narrow_phase.query_dispatcher(),
             &physics.bodies,
             &physics.colliders,
             QueryFilter::default().exclude_rigid_body(p.body), // don't collide with ourselves
         );
-        let moved = p.controller.move_shape(
-            FIXED_DT,
-            &queries,
-            physics.colliders[p.collider].shape(),
-            &Pose::from_translation(to_rapier(p.pos + Player::CENTER)),
-            to_rapier(desired),
-            |_| {},
-        );
+        let shape = physics.colliders[p.collider].shape();
+        let at = Pose::from_translation(to_rapier(p.pos + Player::CENTER));
+        // Walking into something that hangs lower than the player's head (a
+        // tree's canopy, a roof's edge) wedges the capsule between the ground
+        // and that thing's underside. rapier's slide then bounces between the
+        // two for all 20 of its passes, every tick, without moving (§15). So
+        // first take out the part of the motion that goes into any underside
+        // the capsule touches: blocked head-on, it then asks for nothing.
+        let overhangs = overhangs_touching(&queries, p.pos);
+        let desired = clip_horizontal(p.vel * FIXED_DT, &overhangs);
+        let mut hits = 0;
+        let moved =
+            p.controller
+                .move_shape(FIXED_DT, &queries, shape, &at, to_rapier(desired), |_| {
+                    hits += 1
+                });
+        p.slide_hits = hits;
         let actual = from_rapier(moved.translation);
 
         // Velocity follows what actually happened, so a blocked axis loses its
@@ -1282,6 +1302,63 @@ fn player_target(p: &mut Player, physics: &mut Physics, input: &InputState) {
 
     physics.bodies[p.body]
         .set_next_kinematic_translation(to_rapier(p.pos + Player::CENTER + motion));
+}
+
+/// The horizontal directions out of every downward-facing surface (an
+/// overhang, §15) within `OVERHANG_REACH` of the player whose feet are at
+/// `feet`. Only the capsule's top sphere can meet a surface that faces down
+/// (anywhere on the straight part, the contact normal is horizontal), so the
+/// test uses that sphere alone: nothing below head height costs anything.
+/// Read from contact manifolds the way rapier's own ground test does.
+fn overhangs_touching(queries: &QueryPipeline, feet: Vec3) -> Vec<Vec3> {
+    let head = Ball::new(PLAYER_RADIUS);
+    let at = Pose::from_translation(to_rapier(feet + Vec3::Y * (PLAYER_HEIGHT - PLAYER_RADIUS)));
+    let aabb = head.compute_aabb(&at).loosened(OVERHANG_REACH);
+    let mut manifolds: Vec<ContactManifold> = Vec::new();
+    let mut out = Vec::new();
+    for (_, collider) in queries.intersect_aabb_conservative(aabb) {
+        manifolds.clear();
+        let pos12 = at.inv_mul(collider.position());
+        let _ = DefaultQueryDispatcher.contact_manifolds(
+            &pos12,
+            &head,
+            collider.shape(),
+            OVERHANG_REACH,
+            &mut manifolds,
+            &mut None,
+        );
+        for m in &manifolds {
+            // Out of the collider, towards the capsule.
+            let n = from_rapier(-(at.rotation * m.local_n1));
+            let side = Vec3::new(n.x, 0.0, n.z);
+            let touching = m.points.iter().any(|c| c.dist <= OVERHANG_REACH);
+            // Facing down by more than ~12°, with enough of a side to clip
+            // against: a flat ceiling can't wedge the capsule.
+            if touching && n.y < -0.2 && side.length() > 0.1 {
+                out.push(side.normalize());
+            }
+        }
+    }
+    out
+}
+
+/// `motion` without the horizontal part that goes into any of `walls`
+/// (unit horizontal normals pointing out of them). If what's left still goes
+/// into one, as in a corner between two, no horizontal motion is left.
+fn clip_horizontal(mut motion: Vec3, walls: &[Vec3]) -> Vec3 {
+    let into = |m: Vec3, n: Vec3| m.x * n.x + m.z * n.z;
+    for &n in walls {
+        let d = into(motion, n);
+        if d < 0.0 {
+            motion.x -= n.x * d;
+            motion.z -= n.z * d;
+        }
+    }
+    if walls.iter().any(|&n| into(motion, n) < -1e-6) {
+        motion.x = 0.0;
+        motion.z = 0.0;
+    }
+    motion
 }
 
 /// **rapier → ECS** (§15's second sync half): after `Physics::step`, write the
@@ -3838,6 +3915,64 @@ mod tests {
         run(&mut p, &mut ph, 150, -Vec3::Z);
         assert!(p.pos.z < -1.5, "stuck at z = {}", p.pos.z);
         assert!((p.pos.y - GROUND_Y).abs() < 0.03, "y = {}", p.pos.y);
+    }
+
+    /// Walk from z = 3 in `wish` towards something that hangs lower than the
+    /// player's head: a 1.5 m ball, as a hull or a trimesh, whose bottom is
+    /// 1.3 m up at the origin (a tree's canopy, say). Returns where the player
+    /// ended, how many ticks it was held (under 1 mm of progress) and the most
+    /// slide hits any of those ticks took.
+    fn push_into_low_canopy(kind: ColliderKind, wish: Vec3) -> (Vec3, u32, u32) {
+        let (mut ph, _) = setup(&[], Vec3::new(30.0, GROUND_Y, 30.0));
+        let at = Mat4::from_translation(Vec3::new(0.0, GROUND_Y + 1.3 + 1.5, 0.0));
+        build_collider(&mut ph, &MeshData::uv_sphere(16, 24, 1.5), None, at, kind).expect("canopy");
+        let mut p = Player::new(&mut ph, Vec3::new(0.0, GROUND_Y, 3.0));
+        ph.step();
+        let (mut held, mut worst) = (0, 0);
+        for _ in 0..120 {
+            let before = p.pos;
+            step(&mut p, &mut ph, wish, false, 0.0, false);
+            if ((p.pos - before) * Vec3::new(1.0, 0.0, 1.0)).length() < 0.001 {
+                held += 1;
+                worst = worst.max(p.slide_hits);
+            }
+        }
+        (p.pos, held, worst)
+    }
+
+    /// The stall of §15: pushing into a low overhang wedges the capsule
+    /// between the ground and the overhang's underside, and rapier's slide
+    /// took its full 20 passes every tick, alternating between the two,
+    /// without moving. The player must still be held there, cheaply.
+    #[test]
+    fn a_low_overhang_holds_the_player_cheaply() {
+        for kind in [ColliderKind::Hull, ColliderKind::Mesh] {
+            let (end, held, worst) = push_into_low_canopy(kind, -Vec3::Z);
+            assert!(
+                held > 60,
+                "{kind:?}: not held at the canopy ({held} ticks, z {})",
+                end.z
+            );
+            assert!(end.z > 1.0, "{kind:?}: got under the canopy, z = {}", end.z);
+            assert!(worst <= 3, "{kind:?}: {worst} slide hits in a tick");
+        }
+    }
+
+    /// Glancing off the same overhang slides past it, as along a wall.
+    #[test]
+    fn a_low_overhang_is_slid_along() {
+        let wish = Vec3::new(0.5, 0.0, -0.866); // 30° off the canopy's centre
+        for kind in [ColliderKind::Hull, ColliderKind::Mesh] {
+            let (end, held, worst) = push_into_low_canopy(kind, wish);
+            assert!(
+                end.z < -1.5,
+                "{kind:?}: didn't get past, stopped at {end:?}"
+            );
+            assert!(
+                worst <= 3,
+                "{kind:?}: {worst} slide hits in a tick ({held} held)"
+            );
+        }
     }
 
     #[test]

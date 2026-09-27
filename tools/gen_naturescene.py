@@ -400,10 +400,9 @@ def build(density, seed):
     # Ground cover: 4 m grass tiles over the whole 80 x 80 slab, lifted
     # TILE_LIFT so they don't z-fight the app's ground. They collide, because
     # they are what you walk on and they carry the grass surface (§20); the
-    # slab under them would sound like concrete. As flat boxes, not their
-    # two-triangle trimesh: standing on a trimesh tile while pushing into a
-    # prop ran rapier's slide loop to its 20-pass cap every tick (0.24 ms in
-    # debug, vs 0.02 ms on the slab), and a box tile doesn't (0.03 ms). No
+    # slab under them would sound like concrete. As flat boxes, which
+    # measured the same as their two-triangle trimeshes (ARCHITECTURE.md §15
+    # corrects an earlier claim that trimesh tiles stall the controller). No
     # shadow casting (a flat floor shadows nothing; see §11's note on the
     # ground rasterising the whole map).
     tile = SCALE

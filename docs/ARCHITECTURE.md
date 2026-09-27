@@ -960,17 +960,53 @@ hold, repeat, rebinding) is unit-tested without a GPU through
   `Physics` but no `World`. If something needs collider → entity later, the
   entity belongs in `user_data` and the surface moves to a component.
 
-  **Known cost: pushing into props.** Measured on the nature scene (debug,
-  same harness): holding a direction into a tree trunk runs the controller's
-  slide loop to its internal cap of 20 casts every tick, about 0.41 ms a
-  tick, against 8–18 µs walking in the open. That predates this work (it
-  happens on the plain cuboid ground); nearby floor colliders add to it
-  (0.58 ms with the scene's 400 floor tiles in range). Floor *trimeshes*
-  trigger it more easily: standing on a two-triangle trimesh tile and
-  pushing into a camp prop hit the cap too (0.24 ms, vs 0.02 ms on the
-  cuboid ground), which the same tile as a flat box does not (1 cast,
-  0.03 ms). Hence the nature scene's tiles collide as boxes. Uninvestigated
-  beyond that.
+  **Landed (§26): low overhangs no longer stall the controller.**
+  - **Symptom:** in the nature scene, holding a direction into a tree ran
+    the controller's slide loop to its internal cap of 20 passes every
+    tick: 0.41 ms a tick in debug (0.56 ms with floor tiles in range),
+    against 8–18 µs walking in the open. The player didn't move.
+  - **Cause, traced pass by pass:** it wasn't the trunk.
+    - The canopy hangs lower than the 1.8 m capsule, so the capsule wedged
+      between the ground and the canopy's underside, whose normal points
+      down (y = −0.90).
+    - rapier's slide projects the motion onto one surface at a time.
+      Sliding along the underside tilts it into the ground; sliding along the
+      ground tilts it forward into the underside again.
+    - In that ~26° wedge each round only shrinks what's left a little, so all
+      20 passes run and nothing moves.
+    - Any overhang below head height does it: a ball or a tilted slab, as a
+      hull or a trimesh. Walls don't: sliding along a wall and along the
+      floor don't undo each other.
+  - **Fix:** before calling the controller, `player_target` removes the
+    horizontal part of the motion that goes into any downward-facing surface
+    the capsule touches (`overhangs_touching`, `clip_horizontal`).
+    - Head-on, nothing is left, so the loop never starts.
+    - At an angle, the player slides along the overhang as along a wall.
+      Before, it stood still, because the loop gave up.
+    - The check is a ball at the capsule's top sphere, the only part a
+      downward-facing surface can touch: on the straight part every contact
+      normal is horizontal. Contacts come from contact manifolds, as in
+      rapier's own ground test. Only things at head height cost anything.
+  - **Measured (debug, temporary harness, the same binary with the fix on
+    and off):**
+    - pushing into the tree: 419 → 16 µs a tick (1.4 passes), and 560 →
+      26 µs with the floor tiles;
+    - walking in the open: +0.3–1.1 µs.
+    - Predicted ≤ 50 µs, and unchanged in the open.
+  - **What doesn't help:**
+    - rapier's `normal_nudge_factor`: up to 1e-3 nothing changes, and from
+      1e-2 the player squeezes under the canopy (tunnelling, not a fix);
+    - rapier 0.36, which doesn't touch the slide loop.
+  - `Player.slide_hits` counts a tick's passes. `a_low_overhang_holds_the_player_cheaply`
+    and `a_low_overhang_is_slid_along` pin the behaviour down.
+  - **Correction:** this section used to blame a second stall on trimesh
+    floor tiles plus a camp prop (0.24 ms), and the nature tiles became flat
+    boxes for it. That obstacle was a player capsule the measuring harness
+    had left in the world. What it did show: pushing into another
+    *kinematic* body can still stall, because rapier's moving-platform code
+    strips the retry's nudge on every pass. Nothing in the game is one yet;
+    NPCs would be. The tiles stay boxes, which measured the same as
+    trimeshes.
 
 ## 16. Skinned / animated meshes
 
@@ -1798,8 +1834,10 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   Input arrives as the §14 `InputState` resource rather than being read off `App`.
   Level entities carry a `ColliderRef` handle. Scene colliders also carry their
   §20 footstep surface in rapier's `user_data`, and a grounded player sweeps its
-  bottom sphere down each tick to read it into `Player.surface` (§15). The
-  controller maths stay plain functions (`player_target`/`player_readback`) that
+  bottom sphere down each tick to read it into `Player.surface` (§15). Before
+  each move, the motion loses any part going into a downward-facing surface
+  touching the top of the capsule, which otherwise stalled the controller
+  (§15). The controller maths stay plain functions (`player_target`/`player_readback`) that
   the systems wrap, so the physics tests drive the real logic. Still open: no `InteractionGroups` layers
   (nothing to separate yet); the drifting orbs and their spin are still
   non-physical (cosmetic, not rigid bodies). Known limits: the ground is a finite 80×80 box, so walking
@@ -1809,8 +1847,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   up rather than continuing the arc; turning noclip off while standing inside
   geometry only depenetrates when not moving; default rapier features (no
   `enhanced-determinism`), so cross-machine replay isn't guaranteed yet; pushing
-  into a prop can run the controller's slide loop to its 20-cast cap every tick
-  (0.4–0.6 ms in debug against a tree, §15).
+  into another kinematic body can still run the controller's slide loop to its
+  20-pass cap (§15), though there are none yet.
 - **Descriptors (§9)**: one set with three bindings — per-frame instances
   (binding 0), resident materials (binding 1), and a resident
   `sampler2D textures[]` (binding 2) sized per level, as N discrete per-frame
