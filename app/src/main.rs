@@ -2084,207 +2084,16 @@ impl Session {
     /// Build a world and the GPU resources that serve it. `scenes` are the CLI
     /// glTF paths; empty means the procedural orb demo, exactly as before.
     fn new(renderer: &Renderer, scenes: &[String], bake: bool, lod: bool) -> Self {
-        // Scenes load *first*, because a `player_start` marker (§18) decides
-        // where the player goes and the player is built below.
         let t_start = Instant::now();
-        let (meshes, scene_nodes) = load_scenes(scenes);
-        // The bake (§17), read once: the renderer draws its LODs and the
-        // colliders built below can use them too.
         let bake_dir = bake.then(|| std::path::Path::new(BAKE_DIR));
-        let baked = bake_dir.map_or_else(Vec::new, |d| {
-            feather_assets::bake::load_baked_meshes(d, &meshes)
-        });
-        let t_scenes = t_start.elapsed();
-        let (start_pos, start_yaw) = player_start(&scene_nodes);
-        let (surfaces, unknown_surfaces) = mesh_surfaces(&meshes);
-        for name in unknown_surfaces {
-            eprintln!(
-                "[scene] unknown surface {name:?}; using {}",
-                Surface::default().name()
-            );
-        }
-
-        let mut world = World::new();
-        world.insert_resource(FrameCount::default());
-        world.insert_resource(ColliderStats::default());
-        let mut physics = Physics::new();
-        // Feet on the ground. The player is a normal ECS entity: sim state in
-        // `Player`, render-rate angles in `Look` (§15).
-        let body = Player::new(&mut physics, start_pos);
-        world.insert_resource(physics);
-        world.insert_resource(InputState::default());
-        let mut look = Look::new();
-        if let Some(yaw) = start_yaw {
-            look.yaw = yaw;
-        }
-        let player = world.spawn((body, look)).id();
-
-        // The drifting orb demo only runs when no scene was given — a loaded level
-        // is what you want to look at, and 1000 orbs would bury it.
-        let half = (GRID as f32 - 1.0) / 2.0;
-        let orb_count = if scenes.is_empty() {
-            GRID * GRID * GRID
-        } else {
-            0
-        };
-        for i in 0..orb_count {
-            let (x, y, z) = (i % GRID, (i / GRID) % GRID, i / (GRID * GRID));
-            let pos = Vec3::new(x as f32 - half, y as f32 - half, z as f32 - half) * 1.6;
-            let u = i as u32;
-            let vel = Vec3::new(
-                rand01(u * 3) - 0.5,
-                rand01(u * 3 + 1) - 0.5,
-                rand01(u * 3 + 2) - 0.5,
-            ) * 1.5;
-            let spin = (rand01(u * 7 + 11) - 0.5) * 3.0;
-            // Procedural sphere or cube, with a random shared palette material.
-            let mesh = if rand01(u * 17 + 5) < 0.5 {
-                MESH_SPHERE
-            } else {
-                MESH_CUBE
-            };
-            let material = (rand01(u * 23 + 7) * PALETTE as f32) as u32 % PALETTE;
-            world.spawn((
-                Position(pos),
-                PrevPosition(pos), // prev == curr on frame 0: first interp is a no-op
-                Velocity(vel),
-                Rotation(0.0),
-                PrevRotation(0.0),
-                Spin(spin),
-                Scale(Vec3::splat(0.6)),
-                Mesh(MeshId(mesh)),
-                Material(material),
-            ));
-        }
-
-        let mut schedule = Schedule::default();
-        schedule.set_executor_kind(ExecutorKind::MultiThreaded);
-        schedule.add_systems((integrate, tick));
-        // §15's coupling: ECS -> rapier, the step, then rapier -> ECS. Chained so
-        // the bracket order is explicit (they all touch `Physics`, so bevy_ecs
-        // would serialise them regardless).
-        schedule.add_systems((player_target_sys, physics_step_sys, player_readback_sys).chain());
-
-        // Built-ins get the demo fit (centre + unit-scale); scene meshes keep their
-        // authored transform, so identity.
-        let fits: Vec<Mat4> = meshes
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                if (i as u32) < MESH_BUILTIN_COUNT {
-                    fit_transform(m)
-                } else {
-                    Mat4::IDENTITY
-                }
-            })
-            .collect();
-        let mesh_spheres: Vec<(Vec3, f32)> = meshes.iter().map(local_sphere).collect();
-
-        // Material table: shared palette first (indices 0..PALETTE), then each
-        // mesh's own material (index PALETTE + mesh_id) — matches the ids that
-        // the world build above assigned to entities.
-        let mut materials: Vec<feather_assets::Material> =
-            (0..PALETTE).map(palette_material).collect();
-        materials.extend(meshes.iter().map(|m| m.material.clone()));
-
-        // Two dedicated level materials, appended after everything else.
-        let ground_mat = materials.len() as u32;
-        materials.push(level_material([0.20, 0.21, 0.23], 0.95));
-        let box_mat = materials.len() as u32;
-        materials.push(level_material([0.45, 0.22, 0.14], 0.7));
-
-        // Static level. The ground and the obstacle boxes are each rendered as a
-        // scaled unit cube and given a matching cuboid collider (`spawn_static`).
-        // Level pieces carry no Velocity/Spin, so `integrate` skips them and they
-        // never wrap.
-        let ground = spawn_static(
-            &mut world,
-            Vec3::new(0.0, GROUND_Y - 0.5, 0.0),
-            Vec3::new(80.0, 1.0, 80.0),
-            MESH_LEVEL_CUBE,
-            ground_mat,
-        );
-        // This ground is a flat slab: it casts nothing useful but would rasterize
-        // the whole shadow map. It still *receives* shadows (receiving is sampling
-        // the map, not being in it). Relief terrain would drop this marker.
-        world.entity_mut(ground).insert(NoShadowCast);
-        // (x, half-height as y, z), size — y offset keeps each box resting on the
-        // ground (center = GROUND_Y + size.y/2).
-        let boxes = [
-            (Vec3::new(-3.0, 0.75, 2.0), Vec3::new(1.5, 1.5, 1.5)),
-            (Vec3::new(3.5, 1.0, -1.0), Vec3::new(2.0, 2.0, 2.0)),
-            (Vec3::new(0.0, 0.5, -4.5), Vec3::new(3.0, 1.0, 1.0)),
-            (Vec3::new(-5.0, 1.5, -3.0), Vec3::new(1.0, 3.0, 1.0)),
-            (Vec3::new(5.0, 0.5, 4.0), Vec3::new(1.0, 1.0, 4.0)),
-        ];
-        for (offset, size) in boxes {
-            let center = Vec3::new(offset.x, GROUND_Y + offset.y, offset.z);
-            spawn_static(&mut world, center, size, MESH_LEVEL_CUBE, box_mat);
-        }
-        // Scene geometry from the CLI glTF files (§18): one entity per node,
-        // carrying that node's world transform, so nodes sharing a mesh draw as
-        // instances. Each also gets a fixed trimesh collider so the level is
-        // walkable. Material ids follow the same `PALETTE + mesh index` rule the
-        // table below is built with.
-        let registry = prefab_registry();
-        let mut unknown: Vec<&str> = Vec::new();
-        // Counted so the effect of `collide: false` is visible in the log rather
-        // than having to be taken on trust.
-        let colliders_before = world.resource::<Physics>().colliders.len();
-        let mut spawned = 0usize;
-        for node in &scene_nodes {
-            // `player_start` was consumed before the world was built.
-            if node.prefab.as_ref().is_some_and(|s| s.id == "player_start") {
-                continue;
-            }
-            let mesh_idx = node.mesh;
-            let args = SpawnArgs {
-                transform: node.transform,
-                mesh: mesh_idx.map(|i| MeshId(i as u32)),
-                material: mesh_idx.map_or(0, |i| PALETTE + i as u32),
-                mesh_data: mesh_idx.map(|i| &meshes[i]),
-                baked: mesh_idx.and_then(|i| baked.get(i)).and_then(Option::as_ref),
-                spec: node.prefab.as_ref(),
-                surface: mesh_idx.map_or(Surface::default(), |i| surfaces[i]),
-            };
-            match node.prefab.as_ref() {
-                Some(spec) => match registry.get(spec.id.as_str()) {
-                    Some(f) => f(&mut world, &args),
-                    None => {
-                        // Unknown ids are authorable-ahead-of-time, not errors:
-                        // fall back to static geometry and say so once.
-                        if !unknown.contains(&spec.id.as_str()) {
-                            eprintln!("unknown prefab {:?}; spawning as static geometry", spec.id);
-                            unknown.push(spec.id.as_str());
-                        }
-                        spawn_static_prop(&mut world, &args);
-                    }
-                },
-                None => spawn_static_prop(&mut world, &args),
-            }
-            spawned += 1;
-        }
-        if spawned > 0 {
-            let colliders = world.resource::<Physics>().colliders.len() - colliders_before;
-            eprintln!("scene: {spawned} nodes spawned, {colliders} colliders built");
-            let st = world.resource::<ColliderStats>();
-            eprintln!(
-                "[scene] colliders: {} mesh ({} from LODs), {} hull, {} box",
-                st.mesh, st.lod, st.hull, st.boxes
-            );
-            eprintln!("[scene] surfaces: {}", st.surfaces_line());
-        }
-
-        // One step so the broad-phase BVH the character controller shape-casts
-        // against contains the level before the first fixed tick.
-        world.resource_mut::<Physics>().step();
+        let b = build_world(scenes, bake_dir);
 
         let t_renderer = Instant::now();
         let (mut mesh, _ids) = MeshRenderer::new(
             renderer,
-            &meshes,
-            &baked,
-            &materials,
+            &b.meshes,
+            &b.baked,
+            &b.materials,
             MAX_INSTANCES,
             bake_dir,
         );
@@ -2294,24 +2103,252 @@ impl Session {
         let (t_renderer, t_total) = (t_renderer.elapsed(), t_start.elapsed());
         eprintln!(
             "[load] scenes {:.2} s, world {:.2} s, renderer {:.2} s, total {:.2} s",
-            t_scenes.as_secs_f32(),
-            (t_total - t_scenes - t_renderer).as_secs_f32(),
+            b.t_scenes.as_secs_f32(),
+            (t_total - b.t_scenes - t_renderer).as_secs_f32(),
             t_renderer.as_secs_f32(),
             t_total.as_secs_f32(),
         );
         let sky = SkyPass::new(renderer);
 
         Self {
-            world,
-            schedule,
-            player,
+            world: b.world,
+            schedule: b.schedule,
+            player: b.player,
             mesh,
             sky,
-            fits,
-            mesh_spheres,
+            fits: b.fits,
+            mesh_spheres: b.mesh_spheres,
             accumulator: 0.0,
             noclip: false,
         }
+    }
+}
+
+/// A session before it touches the GPU: the scenes it loaded, the simulated
+/// world with its level, and the tables the renderer is built from.
+/// `Session::new` is this plus the upload, so a test that builds this runs
+/// the game's own scene → world path, without a device.
+struct WorldBuild {
+    world: World,
+    schedule: Schedule,
+    /// The player entity in `world`.
+    player: Entity,
+    meshes: Vec<MeshData>,
+    baked: Vec<Option<feather_assets::bake::BakedMesh>>,
+    materials: Vec<feather_assets::Material>,
+    fits: Vec<Mat4>,
+    mesh_spheres: Vec<(Vec3, f32)>,
+    /// Time spent loading the scenes and bake, for the `[load]` line.
+    t_scenes: std::time::Duration,
+}
+
+/// The CPU half of `Session::new`: load the CLI `scenes` (empty means the orb
+/// demo) and the bake from `bake_dir` (`None` ignores it), then build the
+/// world, the player, the level and the schedule.
+fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> WorldBuild {
+    // Scenes load *first*, because a `player_start` marker (§18) decides
+    // where the player goes and the player is built below.
+    let t_start = Instant::now();
+    let (meshes, scene_nodes) = load_scenes(scenes);
+    // The bake (§17), read once: the renderer draws its LODs and the
+    // colliders built below can use them too.
+    let baked = bake_dir.map_or_else(Vec::new, |d| {
+        feather_assets::bake::load_baked_meshes(d, &meshes)
+    });
+    let t_scenes = t_start.elapsed();
+    let (start_pos, start_yaw) = player_start(&scene_nodes);
+    let (surfaces, unknown_surfaces) = mesh_surfaces(&meshes);
+    for name in unknown_surfaces {
+        eprintln!(
+            "[scene] unknown surface {name:?}; using {}",
+            Surface::default().name()
+        );
+    }
+
+    let mut world = World::new();
+    world.insert_resource(FrameCount::default());
+    world.insert_resource(ColliderStats::default());
+    let mut physics = Physics::new();
+    // Feet on the ground. The player is a normal ECS entity: sim state in
+    // `Player`, render-rate angles in `Look` (§15).
+    let body = Player::new(&mut physics, start_pos);
+    world.insert_resource(physics);
+    world.insert_resource(InputState::default());
+    let mut look = Look::new();
+    if let Some(yaw) = start_yaw {
+        look.yaw = yaw;
+    }
+    let player = world.spawn((body, look)).id();
+
+    // The drifting orb demo only runs when no scene was given — a loaded level
+    // is what you want to look at, and 1000 orbs would bury it.
+    let half = (GRID as f32 - 1.0) / 2.0;
+    let orb_count = if scenes.is_empty() {
+        GRID * GRID * GRID
+    } else {
+        0
+    };
+    for i in 0..orb_count {
+        let (x, y, z) = (i % GRID, (i / GRID) % GRID, i / (GRID * GRID));
+        let pos = Vec3::new(x as f32 - half, y as f32 - half, z as f32 - half) * 1.6;
+        let u = i as u32;
+        let vel = Vec3::new(
+            rand01(u * 3) - 0.5,
+            rand01(u * 3 + 1) - 0.5,
+            rand01(u * 3 + 2) - 0.5,
+        ) * 1.5;
+        let spin = (rand01(u * 7 + 11) - 0.5) * 3.0;
+        // Procedural sphere or cube, with a random shared palette material.
+        let mesh = if rand01(u * 17 + 5) < 0.5 {
+            MESH_SPHERE
+        } else {
+            MESH_CUBE
+        };
+        let material = (rand01(u * 23 + 7) * PALETTE as f32) as u32 % PALETTE;
+        world.spawn((
+            Position(pos),
+            PrevPosition(pos), // prev == curr on frame 0: first interp is a no-op
+            Velocity(vel),
+            Rotation(0.0),
+            PrevRotation(0.0),
+            Spin(spin),
+            Scale(Vec3::splat(0.6)),
+            Mesh(MeshId(mesh)),
+            Material(material),
+        ));
+    }
+
+    let mut schedule = Schedule::default();
+    schedule.set_executor_kind(ExecutorKind::MultiThreaded);
+    schedule.add_systems((integrate, tick));
+    // §15's coupling: ECS -> rapier, the step, then rapier -> ECS. Chained so
+    // the bracket order is explicit (they all touch `Physics`, so bevy_ecs
+    // would serialise them regardless).
+    schedule.add_systems((player_target_sys, physics_step_sys, player_readback_sys).chain());
+
+    // Built-ins get the demo fit (centre + unit-scale); scene meshes keep their
+    // authored transform, so identity.
+    let fits: Vec<Mat4> = meshes
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if (i as u32) < MESH_BUILTIN_COUNT {
+                fit_transform(m)
+            } else {
+                Mat4::IDENTITY
+            }
+        })
+        .collect();
+    let mesh_spheres: Vec<(Vec3, f32)> = meshes.iter().map(local_sphere).collect();
+
+    // Material table: shared palette first (indices 0..PALETTE), then each
+    // mesh's own material (index PALETTE + mesh_id) — matches the ids that
+    // the world build above assigned to entities.
+    let mut materials: Vec<feather_assets::Material> = (0..PALETTE).map(palette_material).collect();
+    materials.extend(meshes.iter().map(|m| m.material.clone()));
+
+    // Two dedicated level materials, appended after everything else.
+    let ground_mat = materials.len() as u32;
+    materials.push(level_material([0.20, 0.21, 0.23], 0.95));
+    let box_mat = materials.len() as u32;
+    materials.push(level_material([0.45, 0.22, 0.14], 0.7));
+
+    // Static level. The ground and the obstacle boxes are each rendered as a
+    // scaled unit cube and given a matching cuboid collider (`spawn_static`).
+    // Level pieces carry no Velocity/Spin, so `integrate` skips them and they
+    // never wrap.
+    let ground = spawn_static(
+        &mut world,
+        Vec3::new(0.0, GROUND_Y - 0.5, 0.0),
+        Vec3::new(80.0, 1.0, 80.0),
+        MESH_LEVEL_CUBE,
+        ground_mat,
+    );
+    // This ground is a flat slab: it casts nothing useful but would rasterize
+    // the whole shadow map. It still *receives* shadows (receiving is sampling
+    // the map, not being in it). Relief terrain would drop this marker.
+    world.entity_mut(ground).insert(NoShadowCast);
+    // (x, half-height as y, z), size — y offset keeps each box resting on the
+    // ground (center = GROUND_Y + size.y/2).
+    let boxes = [
+        (Vec3::new(-3.0, 0.75, 2.0), Vec3::new(1.5, 1.5, 1.5)),
+        (Vec3::new(3.5, 1.0, -1.0), Vec3::new(2.0, 2.0, 2.0)),
+        (Vec3::new(0.0, 0.5, -4.5), Vec3::new(3.0, 1.0, 1.0)),
+        (Vec3::new(-5.0, 1.5, -3.0), Vec3::new(1.0, 3.0, 1.0)),
+        (Vec3::new(5.0, 0.5, 4.0), Vec3::new(1.0, 1.0, 4.0)),
+    ];
+    for (offset, size) in boxes {
+        let center = Vec3::new(offset.x, GROUND_Y + offset.y, offset.z);
+        spawn_static(&mut world, center, size, MESH_LEVEL_CUBE, box_mat);
+    }
+    // Scene geometry from the CLI glTF files (§18): one entity per node,
+    // carrying that node's world transform, so nodes sharing a mesh draw as
+    // instances. Each also gets a fixed trimesh collider so the level is
+    // walkable. Material ids follow the same `PALETTE + mesh index` rule the
+    // table below is built with.
+    let registry = prefab_registry();
+    let mut unknown: Vec<&str> = Vec::new();
+    // Counted so the effect of `collide: false` is visible in the log rather
+    // than having to be taken on trust.
+    let colliders_before = world.resource::<Physics>().colliders.len();
+    let mut spawned = 0usize;
+    for node in &scene_nodes {
+        // `player_start` was consumed before the world was built.
+        if node.prefab.as_ref().is_some_and(|s| s.id == "player_start") {
+            continue;
+        }
+        let mesh_idx = node.mesh;
+        let args = SpawnArgs {
+            transform: node.transform,
+            mesh: mesh_idx.map(|i| MeshId(i as u32)),
+            material: mesh_idx.map_or(0, |i| PALETTE + i as u32),
+            mesh_data: mesh_idx.map(|i| &meshes[i]),
+            baked: mesh_idx.and_then(|i| baked.get(i)).and_then(Option::as_ref),
+            spec: node.prefab.as_ref(),
+            surface: mesh_idx.map_or(Surface::default(), |i| surfaces[i]),
+        };
+        match node.prefab.as_ref() {
+            Some(spec) => match registry.get(spec.id.as_str()) {
+                Some(f) => f(&mut world, &args),
+                None => {
+                    // Unknown ids are authorable-ahead-of-time, not errors:
+                    // fall back to static geometry and say so once.
+                    if !unknown.contains(&spec.id.as_str()) {
+                        eprintln!("unknown prefab {:?}; spawning as static geometry", spec.id);
+                        unknown.push(spec.id.as_str());
+                    }
+                    spawn_static_prop(&mut world, &args);
+                }
+            },
+            None => spawn_static_prop(&mut world, &args),
+        }
+        spawned += 1;
+    }
+    if spawned > 0 {
+        let colliders = world.resource::<Physics>().colliders.len() - colliders_before;
+        eprintln!("scene: {spawned} nodes spawned, {colliders} colliders built");
+        let st = world.resource::<ColliderStats>();
+        eprintln!(
+            "[scene] colliders: {} mesh ({} from LODs), {} hull, {} box",
+            st.mesh, st.lod, st.hull, st.boxes
+        );
+        eprintln!("[scene] surfaces: {}", st.surfaces_line());
+    }
+
+    // One step so the broad-phase BVH the character controller shape-casts
+    // against contains the level before the first fixed tick.
+    world.resource_mut::<Physics>().step();
+
+    WorldBuild {
+        world,
+        schedule,
+        player,
+        meshes,
+        baked,
+        materials,
+        fits,
+        mesh_spheres,
+        t_scenes,
     }
 }
 
@@ -4982,6 +5019,177 @@ mod tests {
         stats.surfaces[Concrete.index()] = 2;
         stats.surfaces[Snow.index()] = 1;
         assert_eq!(stats.surfaces_line(), "2 concrete, 1 snow");
+    }
+
+    // ---- end to end: a scene file through the game's own world build ----
+
+    /// Where the end-to-end level's pads go: a row along +X at this z, clear
+    /// of the built-in boxes, pad `i` centred at `pad_x(i)`, 4 m long with
+    /// 1 m of ground between pads. The player starts at `PAD_START`.
+    const PAD_Z: f32 = 9.75;
+    const PAD_START: Vec3 = Vec3::new(1.0, GROUND_Y, PAD_Z);
+
+    fn pad_x(i: usize) -> f32 {
+        5.5 + 5.0 * i as f32
+    }
+
+    /// A glTF level: one flat pad (4 x 0.05 x 3.5 m) per `(material name,
+    /// extras.surface)`, placed by `pad_x`, and a `player_start` marker at
+    /// `PAD_START` facing +X. Written as a real .gltf + .bin in `dir`. The
+    /// pads share the unit cube's geometry, scaled by their nodes, but each
+    /// has its own mesh, since the app derives one material per mesh.
+    fn write_pad_level(dir: &std::path::Path, pads: &[(&str, Option<&str>)]) -> String {
+        use serde_json::json;
+        let cube = MeshData::cube(1.0);
+        let mut bin: Vec<u8> = cube
+            .vertices
+            .iter()
+            .flat_map(|v| v.pos)
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let positions = bin.len();
+        bin.extend(cube.indices.iter().flat_map(|i| i.to_le_bytes()));
+        std::fs::write(dir.join("pads.bin"), &bin).unwrap();
+
+        let mut nodes: Vec<serde_json::Value> = (0..pads.len())
+            .map(|i| {
+                json!({
+                    "mesh": i,
+                    "translation": [pad_x(i), GROUND_Y + 0.025, PAD_Z],
+                    "scale": [4.0, 0.05, 3.5],
+                })
+            })
+            .collect();
+        nodes.push(json!({
+            "translation": PAD_START.to_array(),
+            "extras": { "prefab": "player_start", "params": { "yaw": 0.0 } },
+        }));
+        let meshes: Vec<serde_json::Value> = (0..pads.len())
+            .map(|i| json!({ "primitives": [{ "attributes": { "POSITION": 0 }, "indices": 1, "material": i }] }))
+            .collect();
+        let materials: Vec<serde_json::Value> = pads
+            .iter()
+            .map(|&(name, surface)| match surface {
+                Some(s) => json!({ "name": name, "extras": { "surface": s } }),
+                None => json!({ "name": name }),
+            })
+            .collect();
+        let doc = json!({
+            "asset": { "version": "2.0" },
+            "scene": 0,
+            "scenes": [{ "nodes": (0..nodes.len()).collect::<Vec<_>>() }],
+            "nodes": nodes,
+            "meshes": meshes,
+            "materials": materials,
+            "accessors": [
+                {
+                    "bufferView": 0, "componentType": 5126, "type": "VEC3",
+                    "count": cube.vertices.len(),
+                    "min": [-0.5, -0.5, -0.5], "max": [0.5, 0.5, 0.5],
+                },
+                {
+                    "bufferView": 1, "componentType": 5125, "type": "SCALAR",
+                    "count": cube.indices.len(),
+                },
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": positions },
+                { "buffer": 0, "byteOffset": positions, "byteLength": bin.len() - positions },
+            ],
+            "buffers": [{ "byteLength": bin.len(), "uri": "pads.bin" }],
+        });
+        let path = dir.join("pads.gltf");
+        std::fs::write(&path, doc.to_string()).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Build the level at `path` the way `Session::new` does, then walk +X
+    /// along the pads on the game's real schedule, feeding the player to a
+    /// `StepTracker` once per tick as the app does once per frame. Returns
+    /// each step's x and surface, and the load's colliders per surface.
+    fn walk_pad_level(path: String) -> (Vec<(f32, Surface)>, String) {
+        let mut b = build_world(&[path], None);
+        let start = b.world.get::<Player>(b.player).expect("player").pos;
+        assert_eq!(start, PAD_START, "the player starts at the scene's marker");
+        let surfaces = b.world.resource::<ColliderStats>().surfaces_line();
+        b.world.resource_mut::<InputState>().wish = Vec3::X;
+        let mut tracker = StepTracker::default();
+        let mut steps = Vec::new();
+        for _ in 0..600 {
+            b.schedule.run(&mut b.world);
+            let p = b.world.get::<Player>(b.player).expect("player");
+            for e in tracker.update(p.pos, p.vel, p.on_ground, false, p.surface) {
+                if let crate::audio::SoundEvent::Step(s) = e {
+                    steps.push((p.pos.x, s));
+                }
+            }
+            // The last pad ends at 32.5 and the ground at 40.
+            if p.pos.x > 34.0 {
+                return (steps, surfaces);
+            }
+        }
+        panic!("never got past the pads: {steps:?}");
+    }
+
+    /// Every step well inside pad `i` must sound like `want[i]`, every step
+    /// well clear of the pads like the concrete ground, and every pad must get
+    /// a step, so an empty walk can't pass. Within 0.4 m of a pad's edge (the
+    /// capsule's radius and a bit) either answer is right, so those steps
+    /// aren't judged.
+    fn check_steps(steps: &[(f32, Surface)], want: &[Surface]) {
+        const EDGE: f32 = 0.4;
+        let mut inside = vec![0; want.len()];
+        for &(x, got) in steps {
+            match (0..want.len()).find(|&i| (x - pad_x(i)).abs() < 2.0 + EDGE) {
+                Some(i) if (x - pad_x(i)).abs() <= 2.0 - EDGE => {
+                    assert_eq!(got, want[i], "step at x {x:.2} on pad {i}: {steps:?}");
+                    inside[i] += 1;
+                }
+                Some(_) => {}
+                None => assert_eq!(got, Surface::Concrete, "step at x {x:.2}: {steps:?}"),
+            }
+        }
+        assert!(
+            inside.iter().all(|&n| n > 0),
+            "steps inside each pad: {inside:?}, {steps:?}"
+        );
+    }
+
+    /// The whole chain on a real file: glTF material extras → the loader →
+    /// per-mesh surfaces → spawned colliders → the controller's probe →
+    /// `StepTracker`, all through `build_world` and the real schedule. (From
+    /// the step event on, `each_surface_plays_its_own_steps` has it.)
+    #[test]
+    fn a_scene_steps_like_its_materials() {
+        use Surface::{Carpet, Concrete, Grass, Snow, Wood};
+        let pads = [
+            ("turf", Some("grass"), Grass),
+            ("planks", Some("wood"), Wood),
+            ("rug", Some("Carpet"), Carpet), // any case
+            ("drift", Some("snow"), Snow),
+            ("magma", Some("lava"), Concrete), // not a surface
+            ("plain", None, Concrete),         // untagged
+        ];
+        let dir = crate::config::test_dir("e2e-tagged");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tags: Vec<(&str, Option<&str>)> = pads.iter().map(|&(n, t, _)| (n, t)).collect();
+        let (steps, surfaces) = walk_pad_level(write_pad_level(&dir, &tags));
+        assert_eq!(surfaces, "2 concrete, 1 grass, 1 wood, 1 carpet, 1 snow");
+        check_steps(&steps, &pads.map(|p| p.2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same level with no tags: nothing but concrete, so what the tagged
+    /// walk heard came from the tags.
+    #[test]
+    fn an_untagged_scene_steps_on_concrete() {
+        let dir = crate::config::test_dir("e2e-untagged");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pads = ["turf", "planks", "rug", "drift", "magma", "plain"].map(|n| (n, None));
+        let (steps, surfaces) = walk_pad_level(write_pad_level(&dir, &pads));
+        assert_eq!(surfaces, "6 concrete");
+        check_steps(&steps, &[Surface::Concrete; 6]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- §12 punctual lights ----

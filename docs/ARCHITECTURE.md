@@ -1726,7 +1726,10 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   loaded as scenes** appended after them — one entity per node with a `Transform`,
   its primitive's own material, and a trimesh `ColliderRef`, so a loaded level is
   walkable. The app opens on the main menu with nothing loaded (§19); NEW GAME
-  builds a session from the CLI scenes. Giving a scene suppresses the orb demo
+  builds a session from the CLI scenes. A session is `build_world` (scenes,
+  bake, world, player, level, schedule: all CPU) plus the GPU upload, so the
+  end-to-end tests build exactly the game's world from a glTF file with no
+  device. Giving a scene suppresses the orb demo
   (1000 orbs would bury it); with no scene arguments NEW GAME builds the orb demo,
   each orb taking a random built-in mesh + palette material. The orb demo is a *pathological* workload and is no
   longer what perf work should be measured against — `tools/gen_testscene.py`
