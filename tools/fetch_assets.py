@@ -10,7 +10,8 @@ refused rather than used, so a moved or altered file can never silently change
 a test scene. Two kinds:
 
 * **zip**: one archive pinned by SHA-256. Only the members the tools use are
-  extracted, along with the pack's own licence.
+  extracted, along with the pack's own licence. Adding to a pack's keep list
+  re-fetches it: a cached pack must have a file for every keep prefix.
 * **files**: individual files, each pinned by the MD5 its publisher lists (Poly
   Haven's API publishes one per file), and stored at their relative paths,
   since a .gltf references its .bin and textures/ that way.
@@ -53,11 +54,17 @@ PACKS = {
                "kenney_impact-sounds.zip",
         "sha256": "029d734af1582474edf3a694d1b0cebc97c1c152f2f39fa34d4c2bafc5de77f8",
         "license": "CC0 1.0 (Creative Commons Zero), per the pack's License.txt",
-        # Footsteps (concrete: the levels are concrete and boxes) and the soft
-        # impacts used for jump and landing. The pack's other 110 sounds
-        # (metal, glass, wood, other surfaces) aren't used yet.
+        # Footsteps for each surface the pack records (§20 picks one per
+        # material) and the soft impacts used for jump and landing. The pack's
+        # other 90 sounds (metal, glass, wood and other impacts) aren't used
+        # yet. One prefix per surface, so that `missing_keeps` can tell
+        # whether each one was extracted.
         "keep": [
+            "Audio/footstep_carpet_",
             "Audio/footstep_concrete_",
+            "Audio/footstep_grass_",
+            "Audio/footstep_snow_",
+            "Audio/footstep_wood_",
             "Audio/impactSoft_",
             "License.txt",
         ],
@@ -170,6 +177,17 @@ def fetch_files(name, pack, force=False):
     return True
 
 
+def missing_keeps(dest, keep):
+    """Keep prefixes with no extracted file in `dest`. Members are extracted
+    flat, so a prefix is matched on its last path component; a directory
+    prefix ("Models/GLTF format/") has none and is covered by the stamp. The
+    stamp pins the archive, not the keep list, so this is what notices a pack
+    extracted before its keep list grew."""
+    files = os.listdir(dest)
+    return [k for k in keep
+            if not any(f.startswith(os.path.basename(k)) for f in files)]
+
+
 def fetch(name, pack, zip_path=None, force=False):
     if "files" in pack:
         return fetch_files(name, pack, force)
@@ -177,9 +195,14 @@ def fetch(name, pack, zip_path=None, force=False):
     stamp = os.path.join(dest, ".sha256")
     if not force and os.path.exists(stamp):
         with open(stamp) as f:
-            if f.read().strip() == pack["sha256"]:
-                print(f"{name}: cached in {dest}")
-                return True
+            pinned = f.read().strip() == pack["sha256"]
+        missing = missing_keeps(dest, pack["keep"])
+        if pinned and not missing:
+            print(f"{name}: cached in {dest}")
+            return True
+        if pinned:
+            print(f"{name}: cached, but nothing matches {', '.join(missing)}; "
+                  "fetching again")
 
     if zip_path:
         with open(zip_path, "rb") as f:

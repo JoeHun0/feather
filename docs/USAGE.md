@@ -297,16 +297,18 @@ cargo run -- scratch/nature.glb
 `fetch_assets.py` downloads the pinned archive, **refuses it if the SHA-256
 doesn't match**, and extracts only the `.glb` models and the licence into
 `scratch/assets/kenney_nature_kit/` (gitignored, like all of `scratch/`). Run
-it again and it's a no-op. `--zip PATH` uses an archive you already have
-(still hash-checked); `--force` re-extracts.
+it again and it's a no-op, unless the tool now keeps more of a pack than your
+copy has (it checks for a file per kept prefix): then it fetches that pack
+again and says why. `--zip PATH` uses an archive you already have (still
+hash-checked); `--force` re-extracts.
 
 The kit is **CC0** (Creative Commons Zero, see its `License.txt`): free for any
 use, with credit to Kenney (kenney.nl) appreciated but not required.
 
 The same command also fetches **Kenney Impact Sounds** (0.76 MB, CC0) into
-`scratch/assets/kenney_impact_sounds/`: only the 15 sounds the game plays
-(concrete footsteps, soft impacts) plus the licence. Fetch just that pack with
-`python3 tools/fetch_assets.py kenney_impact_sounds`.
+`scratch/assets/kenney_impact_sounds/`: only its footsteps (carpet, concrete,
+grass, snow, wood) and soft impacts, 35 sounds, plus the licence. Fetch just
+that pack with `python3 tools/fetch_assets.py kenney_impact_sounds`.
 
 `gen_naturescene.py` builds a grass meadow, forest, rocks, a cliff ridge on the
 east edge, a camp with a fire light (you spawn at its edge, facing the fire), and a
