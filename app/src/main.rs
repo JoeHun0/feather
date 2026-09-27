@@ -1257,7 +1257,14 @@ fn player_target(p: &mut Player, physics: &mut Physics, input: &InputState) {
         // two for all 20 of its passes, every tick, without moving (§15). So
         // first take out the part of the motion that goes into any underside
         // the capsule touches: blocked head-on, it then asks for nothing.
-        let overhangs = overhangs_touching(&queries, p.pos);
+        // Only on the ground and not on a jump: in the air there's no floor
+        // to wedge against, and sliding up over undersides is how hopping at
+        // a tree climbs its branches, which clipping would stop.
+        let overhangs = if p.on_ground && p.vel.y <= 0.0 {
+            overhangs_touching(&queries, p.pos)
+        } else {
+            Vec::new()
+        };
         let desired = clip_horizontal(p.vel * FIXED_DT, &overhangs);
         let mut hits = 0;
         let moved =
@@ -3956,6 +3963,57 @@ mod tests {
             assert!(end.z > 1.0, "{kind:?}: got under the canopy, z = {}", end.z);
             assert!(worst <= 3, "{kind:?}: {worst} slide hits in a tick");
         }
+    }
+
+    /// Hopping at a tree climbs it, jump by jump, over the stubs sticking out
+    /// of its trunk. Two triangles of one of the nature scene's Kenney trees
+    /// (CC0) are enough to show it: a sliver of trunk with a stub at ~1 m,
+    /// and a branch's flat top above. (Found by recording every triangle a
+    /// climb touched, then dropping each one the result didn't need.) The
+    /// overhang clip must leave jumps alone: applied in the air as well, it
+    /// kept the player on the ground here (§15).
+    #[test]
+    fn hopping_at_a_tree_climbs_its_branches() {
+        const TREE: [[[f32; 3]; 3]; 2] = [
+            [
+                [0.014, -0.03, -2.076],
+                [0.08, 0.987, -2.224],
+                [-0.007, 2.807, -2.2],
+            ],
+            [
+                [-0.143, 2.807, -1.377],
+                [0.905, 2.807, -2.85],
+                [0.806, 2.807, -1.811],
+            ],
+        ];
+        let vertex = |pos: [f32; 3]| feather_assets::Vertex {
+            pos,
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0, 0.0],
+        };
+        let tree = MeshData {
+            vertices: TREE.iter().flatten().map(|&p| vertex(p)).collect(),
+            indices: (0..TREE.len() as u32 * 3).collect(),
+            material: Default::default(),
+        };
+        // Recorded with the feet 3 cm up, on the scene's floor tiles.
+        let (mut ph, _) = setup(&[], Vec3::new(30.0, GROUND_Y, 30.0));
+        let at = Mat4::from_translation(Vec3::new(0.0, GROUND_Y + 0.03, 0.0));
+        build_collider(&mut ph, &tree, None, at, ColliderKind::Mesh).expect("tree");
+        let mut p = Player::new(&mut ph, Vec3::new(0.0, GROUND_Y, 0.0));
+        ph.step();
+        let mut stood = f32::MIN;
+        for _ in 0..300 {
+            let jump = p.on_ground;
+            step(&mut p, &mut ph, -Vec3::Z, jump, 0.0, false);
+            if p.on_ground {
+                stood = stood.max(p.pos.y - GROUND_Y);
+            }
+        }
+        assert!(
+            stood > 0.9,
+            "never got onto a branch: stood at most {stood:.2} m up"
+        );
     }
 
     /// Glancing off the same overhang slides past it, as along a wall.

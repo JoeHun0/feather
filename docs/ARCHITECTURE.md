@@ -983,6 +983,17 @@ hold, repeat, rebinding) is unit-tested without a GPU through
     - Head-on, nothing is left, so the loop never starts.
     - At an angle, the player slides along the overhang as along a wall.
       Before, it stood still, because the loop gave up.
+    - Only on the ground, and not on a jump. The stall needs the floor as
+      one side of the wedge, and in the air sliding up over undersides is
+      how hopping at a tree climbs it, stub by stub. The first version also
+      clipped in the air, and that stopped the climb; it was noticed in
+      play.
+      - A sweep hopped at every prop in `nature.glb` from four sides. With
+        the ground-only rule, every prop gets exactly as high as with the old
+        code. Clipping in the air had changed the outcome for 12 tree
+        models (2–12 runs each), mostly by losing the climb.
+      - `hopping_at_a_tree_climbs_its_branches` pins it, with two
+        triangles cut from a real Kenney tree.
     - The check is a ball at the capsule's top sphere, the only part a
       downward-facing surface can touch: on the straight part every contact
       normal is horizontal. Contacts come from contact manifolds, as in
@@ -999,6 +1010,9 @@ hold, repeat, rebinding) is unit-tested without a GPU through
     - rapier 0.36, which doesn't touch the slide loop.
   - `Player.slide_hits` counts a tick's passes. `a_low_overhang_holds_the_player_cheaply`
     and `a_low_overhang_is_slid_along` pin the behaviour down.
+  - **Still open:** the same sweep, walking only, counted ticks that ran all
+    20 passes. The clip cut them from 26,772 to 7,133, so other shapes still
+    stall while walking. They're not yet diagnosed.
   - **Correction:** this section used to blame a second stall on trimesh
     floor tiles plus a camp prop (0.24 ms), and the nature tiles became flat
     boxes for it. That obstacle was a player capsule the measuring harness
