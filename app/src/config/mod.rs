@@ -12,6 +12,7 @@
 //! - **Never destructive.** An unreadable file is left untouched, not replaced,
 //!   and saving edits one value in place (`ConfigFile`).
 
+pub mod audio;
 pub mod controls;
 pub mod graphics;
 

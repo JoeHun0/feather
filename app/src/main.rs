@@ -27,8 +27,10 @@
 //! drifting orbs now hang above a ground box with a few obstacle boxes to walk
 //! among.
 
+mod audio;
 mod config;
 
+use audio::{Audio, AudioSettings, StepTracker};
 use config::controls::{Action, Controls};
 
 use std::collections::{HashMap, HashSet};
@@ -296,6 +298,15 @@ impl Default for GraphicsSettings {
     }
 }
 
+/// What `main` loaded from `config/` (defaults and no files under `--bench`).
+struct Configs {
+    graphics: Option<config::ConfigFile>,
+    controls: Controls,
+    controls_file: Option<config::ConfigFile>,
+    audio: AudioSettings,
+    audio_file: Option<config::ConfigFile>,
+}
+
 /// One screen of the pause menu (§19). Screens form a tree rooted at `Root`;
 /// `Menu` walks it with an explicit stack.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -344,6 +355,8 @@ enum MenuAction {
     ToggleInvertY,
     /// Next FIELD OF VIEW preset.
     CycleFov,
+    /// Next step of one SOUND volume.
+    CycleVolume(config::audio::Key),
     /// Wait for a key to bind to this action.
     Rebind(Action),
     /// Default key bindings again.
@@ -392,6 +405,8 @@ enum MenuOutcome {
     ApplyDisplay,
     /// The FOV changed: nothing to rebuild (the next frame uses it), just save.
     ApplyFov,
+    /// A volume changed: set it on the mixer and save it.
+    ApplyAudio(config::audio::Key),
     StartSession,
     EndSession,
     /// Controls changed; save the named part of `controls.toml`.
@@ -417,6 +432,7 @@ fn screen_rows(
     screen: MenuScreen,
     s: &GraphicsSettings,
     c: &Controls,
+    a: &AudioSettings,
     in_session: bool,
     capturing: Option<Action>,
 ) -> Vec<MenuRow> {
@@ -463,13 +479,19 @@ fn screen_rows(
             },
             MenuRow::new("BACK", MenuAction::Back),
         ],
-        // Placeholders: §20 audio is unstarted.
-        MenuScreen::Sound => vec![
-            MenuRow::new("MASTER VOLUME", MenuAction::Inert),
-            MenuRow::new("MUSIC", MenuAction::Inert),
-            MenuRow::new("SFX", MenuAction::Inert),
-            MenuRow::new("BACK", MenuAction::Back),
-        ],
+        // Volumes in percent, saved to audio.toml (§20).
+        MenuScreen::Sound => {
+            use config::audio::Key;
+            let row = |label: &str, k: Key| {
+                MenuRow::new(format!("{label}  {}", k.get(a)), MenuAction::CycleVolume(k))
+            };
+            vec![
+                row("MASTER VOLUME", Key::Master),
+                row("SFX", Key::Sfx),
+                row("AMBIENCE", Key::Ambience),
+                MenuRow::new("BACK", MenuAction::Back),
+            ]
+        }
         // Sensitivity and invert are saved to controls.toml (§14), the FOV
         // (vertical degrees) to graphics.toml. Sensitivity is a percentage:
         // the font has no decimal point.
@@ -546,8 +568,14 @@ impl Menu {
         self.scroll = 0;
     }
 
-    fn rows(&self, s: &GraphicsSettings, c: &Controls, in_session: bool) -> Vec<MenuRow> {
-        screen_rows(self.screen, s, c, in_session, self.capturing)
+    fn rows(
+        &self,
+        s: &GraphicsSettings,
+        c: &Controls,
+        a: &AudioSettings,
+        in_session: bool,
+    ) -> Vec<MenuRow> {
+        screen_rows(self.screen, s, c, a, in_session, self.capturing)
     }
 
     /// Point the selection at `index`. Leaving the row that is waiting for a
@@ -561,16 +589,30 @@ impl Menu {
     }
 
     /// Move the selection, wrapping at both ends.
-    fn move_by(&mut self, delta: isize, s: &GraphicsSettings, c: &Controls, in_session: bool) {
-        let n = self.rows(s, c, in_session).len() as isize;
+    fn move_by(
+        &mut self,
+        delta: isize,
+        s: &GraphicsSettings,
+        c: &Controls,
+        a: &AudioSettings,
+        in_session: bool,
+    ) {
+        let n = self.rows(s, c, a, in_session).len() as isize;
         if n > 0 {
             self.select((self.index as isize + delta).rem_euclid(n) as usize);
         }
     }
 
     /// Point the selection at `index` if it is a real row (used by the mouse).
-    fn hover(&mut self, index: usize, s: &GraphicsSettings, c: &Controls, in_session: bool) {
-        if index < self.rows(s, c, in_session).len() {
+    fn hover(
+        &mut self,
+        index: usize,
+        s: &GraphicsSettings,
+        c: &Controls,
+        a: &AudioSettings,
+        in_session: bool,
+    ) {
+        if index < self.rows(s, c, a, in_session).len() {
             self.select(index);
         }
     }
@@ -623,9 +665,10 @@ impl Menu {
         &mut self,
         s: &mut GraphicsSettings,
         c: &mut Controls,
+        a: &mut AudioSettings,
         in_session: bool,
     ) -> MenuOutcome {
-        let action = match self.rows(s, c, in_session).get(self.index) {
+        let action = match self.rows(s, c, a, in_session).get(self.index) {
             Some(row) => row.action,
             None => return MenuOutcome::Stay,
         };
@@ -655,6 +698,10 @@ impl Menu {
             MenuAction::CycleFov => {
                 s.step_fov();
                 MenuOutcome::ApplyFov
+            }
+            MenuAction::CycleVolume(k) => {
+                k.set(a, audio::step_volume(k.get(a)));
+                MenuOutcome::ApplyAudio(k)
             }
             MenuAction::CycleMsaa => {
                 // 1 -> 2 -> 4 -> 8 -> 1. `Renderer::set_msaa` clamps to what the
@@ -1378,6 +1425,13 @@ struct App {
     controls: config::controls::Controls,
     /// `controls.toml`, for saving menu changes; `None` like `config`.
     controls_file: Option<config::ConfigFile>,
+    /// Volumes (`config/audio.toml`, §20) and the file to save them to.
+    audio_settings: AudioSettings,
+    audio_file: Option<config::ConfigFile>,
+    /// The mixer; `None` = silent (no device, or `--bench`).
+    audio: Option<Audio<kira::DefaultBackend>>,
+    /// Turns the player's motion into footsteps / jump / landing sounds.
+    steps: StepTracker,
     /// Keys currently down, so an action bound to several keys stays held
     /// until the last of them is released.
     held_keys: HashSet<KeyCode>,
@@ -1928,6 +1982,17 @@ struct Session {
 }
 
 impl Session {
+    /// Position and radius of every point light attached to geometry: the
+    /// visible lamps (§20 gives each a hum).
+    fn world_lamps(&mut self) -> Vec<(Vec3, f32)> {
+        let mut q = self
+            .world
+            .query_filtered::<(&Transform, &PointLight), With<Mesh>>();
+        q.iter(&self.world)
+            .map(|(t, l)| (t.0.transform_point3(Vec3::ZERO), l.radius))
+            .collect()
+    }
+
     /// Build a world and the GPU resources that serve it. `scenes` are the CLI
     /// glTF paths; empty means the procedural orb demo, exactly as before.
     fn new(renderer: &Renderer, scenes: &[String], bake: bool, lod: bool) -> Self {
@@ -2159,11 +2224,17 @@ impl App {
     fn new(
         scenes: Vec<String>,
         settings: GraphicsSettings,
-        config: Option<config::ConfigFile>,
-        controls: config::controls::Controls,
-        controls_file: Option<config::ConfigFile>,
+        configs: Configs,
+        audio: Option<Audio<kira::DefaultBackend>>,
         bench: bool,
     ) -> Self {
+        let Configs {
+            graphics: config,
+            controls,
+            controls_file,
+            audio: audio_settings,
+            audio_file,
+        } = configs;
         let light = Vec3::new(-0.4, -1.0, -0.3).normalize();
         Self {
             session: None,
@@ -2177,6 +2248,10 @@ impl App {
             config,
             controls,
             controls_file,
+            audio_settings,
+            audio_file,
+            audio,
+            steps: StepTracker::default(),
             held_keys: HashSet::new(),
             paused: false,
             menu: Menu::new(),
@@ -2305,6 +2380,16 @@ impl App {
                 self.persist(config::graphics::Key::Display);
             }
             MenuOutcome::ApplyFov => self.persist(config::graphics::Key::Fov),
+            MenuOutcome::ApplyAudio(key) => {
+                if let Some(a) = self.audio.as_mut() {
+                    a.set_volumes(&self.audio_settings);
+                }
+                if let Some(file) = self.audio_file.as_mut() {
+                    if let Err(e) = config::audio::save(file, key, &self.audio_settings) {
+                        eprintln!("[config] couldn't save {}: {e}", file.path().display());
+                    }
+                }
+            }
             MenuOutcome::StartSession => self.start_session(),
             MenuOutcome::EndSession => self.end_session(),
             MenuOutcome::SaveControls(part) => {
@@ -2340,12 +2425,21 @@ impl App {
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
-        let session = Session::new(
+        let mut session = Session::new(
             renderer,
             &self.scenes,
             self.settings.bake,
             self.settings.lod,
         );
+        // Every visible lamp hums (§20): point lights on geometry. Bare light
+        // markers stay silent.
+        if let Some(a) = self.audio.as_mut() {
+            for (pos, radius) in session.world_lamps() {
+                a.add_lamp(pos, radius);
+            }
+            eprintln!("[audio] {} lamps humming", a.lamp_count());
+        }
+        self.steps = StepTracker::default();
         self.session = Some(session);
         self.paused = false;
         self.menu.reset(MenuScreen::Root);
@@ -2364,6 +2458,9 @@ impl App {
             r.wait_idle();
         }
         self.session = None;
+        if let Some(a) = self.audio.as_mut() {
+            a.clear_lamps();
+        }
         self.paused = false;
         self.menu.reset(MenuScreen::MainRoot);
         self.set_cursor_captured(false);
@@ -2554,19 +2651,30 @@ impl ApplicationHandler for App {
                         }
                         KeyCode::ArrowUp if pressed && self.menu_active() => {
                             let in_session = self.in_session();
-                            self.menu
-                                .move_by(-1, &self.settings, &self.controls, in_session);
+                            self.menu.move_by(
+                                -1,
+                                &self.settings,
+                                &self.controls,
+                                &self.audio_settings,
+                                in_session,
+                            );
                         }
                         KeyCode::ArrowDown if pressed && self.menu_active() => {
                             let in_session = self.in_session();
-                            self.menu
-                                .move_by(1, &self.settings, &self.controls, in_session);
+                            self.menu.move_by(
+                                1,
+                                &self.settings,
+                                &self.controls,
+                                &self.audio_settings,
+                                in_session,
+                            );
                         }
                         KeyCode::Enter if pressed && self.menu_active() => {
                             let in_session = self.in_session();
                             let outcome = self.menu.activate(
                                 &mut self.settings,
                                 &mut self.controls,
+                                &mut self.audio_settings,
                                 in_session,
                             );
                             self.handle_menu_outcome(outcome, event_loop);
@@ -2596,7 +2704,12 @@ impl ApplicationHandler for App {
                         // interchangeable mid-interaction. Off the entries the
                         // selection is left alone, so something is always
                         // selected for Enter.
-                        let rows = self.menu.rows(&self.settings, &self.controls, in_session);
+                        let rows = self.menu.rows(
+                            &self.settings,
+                            &self.controls,
+                            &self.audio_settings,
+                            in_session,
+                        );
                         let layout = menu_layout(
                             size.width as f32,
                             size.height as f32,
@@ -2605,8 +2718,13 @@ impl ApplicationHandler for App {
                             self.menu.scroll,
                         );
                         if let Some(i) = menu_hit(&layout, position.x as f32, position.y as f32) {
-                            self.menu
-                                .hover(i, &self.settings, &self.controls, in_session);
+                            self.menu.hover(
+                                i,
+                                &self.settings,
+                                &self.controls,
+                                &self.audio_settings,
+                                in_session,
+                            );
                         }
                     }
                 }
@@ -2621,7 +2739,12 @@ impl ApplicationHandler for App {
                         // Activate only when actually over an entry: a stray
                         // click on the dimmed backdrop should do nothing.
                         let in_session = self.session.is_some();
-                        let rows = self.menu.rows(&self.settings, &self.controls, in_session);
+                        let rows = self.menu.rows(
+                            &self.settings,
+                            &self.controls,
+                            &self.audio_settings,
+                            in_session,
+                        );
                         let layout = menu_layout(
                             size.width as f32,
                             size.height as f32,
@@ -2630,11 +2753,17 @@ impl ApplicationHandler for App {
                             self.menu.scroll,
                         );
                         if let Some(i) = menu_hit(&layout, cx, cy) {
-                            self.menu
-                                .hover(i, &self.settings, &self.controls, in_session);
+                            self.menu.hover(
+                                i,
+                                &self.settings,
+                                &self.controls,
+                                &self.audio_settings,
+                                in_session,
+                            );
                             let outcome = self.menu.activate(
                                 &mut self.settings,
                                 &mut self.controls,
+                                &mut self.audio_settings,
                                 in_session,
                             );
                             self.handle_menu_outcome(outcome, event_loop);
@@ -2746,6 +2875,19 @@ impl ApplicationHandler for App {
                     // One FOV for the frame: projection, clusters, LOD budget
                     // and cascades all read this.
                     let fov_y = self.settings.fov_y();
+                    // Audio on the render clock (§20): the listener is the
+                    // camera, and the player's motion makes the SFX. Nothing
+                    // new plays while paused.
+                    if let Some(a) = self.audio.as_mut() {
+                        let (fwd, _, up) = look.camera_basis();
+                        a.set_listener(eye, fwd, up);
+                        if !self.paused {
+                            let p = s.world.get::<Player>(s.player).expect("player body");
+                            for e in self.steps.update(p.pos, p.vel, p.on_ground, s.noclip) {
+                                a.play(e);
+                            }
+                        }
+                    }
                     let view_proj = look.view_proj(eye, aspect, fov_y);
                     let cluster_view = ClusterView {
                         view: look.view(eye),
@@ -2908,9 +3050,12 @@ impl ApplicationHandler for App {
                         // Rows, title and rects come from the same layout the
                         // mouse hit-tests against, so highlight and click target
                         // match. Its `first` becomes the menu's scroll position.
-                        let rows =
-                            self.menu
-                                .rows(&self.settings, &self.controls, self.session.is_some());
+                        let rows = self.menu.rows(
+                            &self.settings,
+                            &self.controls,
+                            &self.audio_settings,
+                            self.session.is_some(),
+                        );
                         let layout = menu_layout(w, h, &rows, self.menu.index, self.menu.scroll);
                         self.menu.scroll = layout.first;
                         let px = layout.px;
@@ -3297,14 +3442,44 @@ fn main() {
     // holds the bindings. `--bench` skips both (neither reads nor creates them),
     // so timings never depend on someone's personal settings.
     let mut settings = GraphicsSettings::default();
-    let (config, (controls, controls_file)) = if std::env::args().skip(1).any(|a| a == "--bench") {
+    let bench_run = std::env::args().skip(1).any(|a| a == "--bench");
+    let configs = if bench_run {
         eprintln!("[config] ignored (--bench)");
-        (None, (config::controls::Controls::default(), None))
+        Configs {
+            graphics: None,
+            controls: Controls::default(),
+            controls_file: None,
+            audio: AudioSettings::default(),
+            audio_file: None,
+        }
     } else {
-        (
-            config::graphics::load(&mut settings),
-            config::controls::load(),
-        )
+        let graphics = config::graphics::load(&mut settings);
+        let (controls, controls_file) = config::controls::load();
+        let mut audio = AudioSettings::default();
+        let audio_file = config::audio::load(&mut audio);
+        Configs {
+            graphics,
+            controls,
+            controls_file,
+            audio,
+            audio_file,
+        }
+    };
+    // Audio never stops a run: no device means silence. `--bench` is silent
+    // too, so timings don't include an audio thread.
+    let audio = if bench_run {
+        None
+    } else {
+        match Audio::new(kira::AudioManagerSettings::default(), &configs.audio) {
+            Ok(a) => {
+                eprintln!("[audio] started on the default output device");
+                Some(a)
+            }
+            Err(e) => {
+                eprintln!("[audio] unavailable: {e}; running silent");
+                None
+            }
+        }
     };
     let mut scenes: Vec<String> = Vec::new();
     let mut bench = false;
@@ -3332,7 +3507,7 @@ fn main() {
         settings.msaa,
         settings.fxaa
     );
-    let mut app = App::new(scenes, settings, config, controls, controls_file, bench);
+    let mut app = App::new(scenes, settings, configs, audio, bench);
     event_loop.run_app(&mut app).expect("run app");
 }
 
@@ -3556,7 +3731,14 @@ mod tests {
 
     fn rows_of(screen: MenuScreen) -> Vec<MenuRow> {
         let s = GraphicsSettings::default();
-        screen_rows(screen, &s, &Controls::default(), true, None)
+        screen_rows(
+            screen,
+            &s,
+            &Controls::default(),
+            &AudioSettings::default(),
+            true,
+            None,
+        )
     }
 
     /// Every screen, every size, every selected row: the layout keeps what it
@@ -3670,12 +3852,17 @@ mod tests {
     /// Select the row whose action matches, then activate it.
     fn activate(m: &mut Menu, s: &mut GraphicsSettings, want: MenuAction) -> MenuOutcome {
         let i = m
-            .rows(s, &Controls::default(), true)
+            .rows(s, &Controls::default(), &AudioSettings::default(), true)
             .iter()
             .position(|r| r.action == want)
             .unwrap_or_else(|| panic!("no {want:?} row on {:?}", m.screen));
         m.index = i;
-        m.activate(s, &mut Controls::default(), true)
+        m.activate(
+            s,
+            &mut Controls::default(),
+            &mut AudioSettings::default(),
+            true,
+        )
     }
 
     /// Like `activate`, with the controls the GAMEPLAY / CONTROLS rows change.
@@ -3686,16 +3873,16 @@ mod tests {
         want: MenuAction,
     ) -> MenuOutcome {
         let i = m
-            .rows(s, c, true)
+            .rows(s, c, &AudioSettings::default(), true)
             .iter()
             .position(|r| r.action == want)
             .unwrap_or_else(|| panic!("no {want:?} row on {:?}", m.screen));
         m.select(i);
-        m.activate(s, c, true)
+        m.activate(s, c, &mut AudioSettings::default(), true)
     }
 
     fn label_of(m: &Menu, s: &GraphicsSettings, c: &Controls, want: MenuAction) -> String {
-        m.rows(s, c, true)
+        m.rows(s, c, &AudioSettings::default(), true)
             .into_iter()
             .find(|r| r.action == want)
             .map(|r| r.label)
@@ -3751,6 +3938,49 @@ mod tests {
         activate_c(&mut m, &mut s, &mut c, MenuAction::ToggleDisplay);
         assert_eq!(s.display, DisplayMode::Windowed);
         assert!(s.display.fullscreen().is_none());
+    }
+
+    #[test]
+    fn sound_rows_step_volumes_and_save() {
+        use config::audio::Key;
+        let (mut s, mut c, mut a) = (
+            GraphicsSettings::default(),
+            Controls::default(),
+            AudioSettings::default(),
+        );
+        let mut m = in_game_menu();
+        let mut go = |m: &mut Menu, a: &mut AudioSettings, want: MenuAction| {
+            let i = m
+                .rows(&s, &c, a, true)
+                .iter()
+                .position(|r| r.action == want)
+                .unwrap_or_else(|| panic!("no {want:?} row"));
+            m.select(i);
+            m.activate(&mut s, &mut c, a, true)
+        };
+        go(&mut m, &mut a, MenuAction::Enter(MenuScreen::Options));
+        go(&mut m, &mut a, MenuAction::Enter(MenuScreen::Sound));
+        let labels: Vec<String> = m
+            .rows(&GraphicsSettings::default(), &Controls::default(), &a, true)
+            .into_iter()
+            .map(|r| r.label)
+            .collect();
+        assert_eq!(
+            labels,
+            ["MASTER VOLUME  80", "SFX  100", "AMBIENCE  100", "BACK"]
+        );
+        // Master starts between steps (80): up to 100, then wraps to 0.
+        let mut seen = vec![];
+        for _ in 0..3 {
+            assert_eq!(
+                go(&mut m, &mut a, MenuAction::CycleVolume(Key::Master)),
+                MenuOutcome::ApplyAudio(Key::Master)
+            );
+            seen.push(a.master);
+        }
+        assert_eq!(seen, [100, 0, 25]);
+        go(&mut m, &mut a, MenuAction::CycleVolume(Key::Sfx));
+        assert_eq!((a.sfx, a.ambience), (0, 100), "only SFX moved");
     }
 
     #[test]
@@ -3845,9 +4075,9 @@ mod tests {
         // doesn't.
         activate_c(&mut m, &mut s, &mut c, jump);
         let i = m.index;
-        m.hover(i, &s, &c, true);
+        m.hover(i, &s, &c, &AudioSettings::default(), true);
         assert_eq!(m.capturing, Some(Action::Jump));
-        m.move_by(1, &s, &c, true);
+        m.move_by(1, &s, &c, &AudioSettings::default(), true);
         assert_eq!(m.capturing, None);
 
         activate_c(&mut m, &mut s, &mut c, jump);
@@ -3883,10 +4113,17 @@ mod tests {
 
         assert_eq!(m.back(), MenuOutcome::Stay);
         assert_eq!(m.screen, MenuScreen::Options);
-        let gameplay_row = screen_rows(MenuScreen::Options, &s, &Controls::default(), true, None)
-            .iter()
-            .position(|r| r.action == MenuAction::Enter(MenuScreen::Gameplay))
-            .unwrap();
+        let gameplay_row = screen_rows(
+            MenuScreen::Options,
+            &s,
+            &Controls::default(),
+            &AudioSettings::default(),
+            true,
+            None,
+        )
+        .iter()
+        .position(|r| r.action == MenuAction::Enter(MenuScreen::Gameplay))
+        .unwrap();
         assert_eq!(m.index, gameplay_row, "BACK did not restore the selection");
 
         assert_eq!(m.back(), MenuOutcome::Stay);
@@ -3927,23 +4164,35 @@ mod tests {
     #[test]
     fn inert_rows_change_nothing() {
         let mut m = in_game_menu();
-        // GAMEPLAY had placeholders until FIELD OF VIEW went live; it has
-        // none left to check.
-        for screen in [MenuScreen::Graphics, MenuScreen::Sound] {
+        // GAMEPLAY and SOUND had placeholders until FIELD OF VIEW and audio
+        // went live; only GRAPHICS (MSAA, locked in game) still has one.
+        for screen in [MenuScreen::Graphics] {
             let mut s = GraphicsSettings::default();
             m.screen = screen;
             m.stack.clear();
-            let inert: Vec<usize> = screen_rows(screen, &s, &Controls::default(), true, None)
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| !r.enabled())
-                .map(|(i, _)| i)
-                .collect();
+            let inert: Vec<usize> = screen_rows(
+                screen,
+                &s,
+                &Controls::default(),
+                &AudioSettings::default(),
+                true,
+                None,
+            )
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.enabled())
+            .map(|(i, _)| i)
+            .collect();
             assert!(!inert.is_empty(), "{screen:?} has no inert row to check");
             for i in inert {
                 m.index = i;
                 assert_eq!(
-                    m.activate(&mut s, &mut Controls::default(), true),
+                    m.activate(
+                        &mut s,
+                        &mut Controls::default(),
+                        &mut AudioSettings::default(),
+                        true
+                    ),
                     MenuOutcome::Stay
                 );
                 // The MSAA row in particular must not quietly mutate anything.
@@ -3960,11 +4209,19 @@ mod tests {
         let s = GraphicsSettings::default();
         let mut m = in_game_menu();
         m.screen = MenuScreen::Graphics;
-        let n = m.rows(&s, &Controls::default(), true).len();
+        let n = m
+            .rows(&s, &Controls::default(), &AudioSettings::default(), true)
+            .len();
         m.index = 0;
-        m.move_by(-1, &s, &Controls::default(), true);
+        m.move_by(
+            -1,
+            &s,
+            &Controls::default(),
+            &AudioSettings::default(),
+            true,
+        );
         assert_eq!(m.index, n - 1, "up from the top did not wrap");
-        m.move_by(1, &s, &Controls::default(), true);
+        m.move_by(1, &s, &Controls::default(), &AudioSettings::default(), true);
         assert_eq!(m.index, 0, "down from the bottom did not wrap");
     }
 
@@ -3987,7 +4244,14 @@ mod tests {
     fn menu_labels_are_drawable() {
         let s = GraphicsSettings::default();
         for screen in SCREENS {
-            for row in screen_rows(screen, &s, &Controls::default(), true, None) {
+            for row in screen_rows(
+                screen,
+                &s,
+                &Controls::default(),
+                &AudioSettings::default(),
+                true,
+                None,
+            ) {
                 for c in row.label.chars() {
                     assert!(
                         c.is_ascii_uppercase() || c.is_ascii_digit() || c == ' ',
@@ -4009,6 +4273,7 @@ mod tests {
                 MenuScreen::Graphics,
                 &s,
                 &Controls::default(),
+                &AudioSettings::default(),
                 in_session,
                 None,
             )
@@ -4031,13 +4296,18 @@ mod tests {
         assert_eq!(s.msaa, 1);
         for want in [2, 4, 8, 1] {
             let i = m
-                .rows(&s, &Controls::default(), false)
+                .rows(&s, &Controls::default(), &AudioSettings::default(), false)
                 .iter()
                 .position(|r| r.action == MenuAction::CycleMsaa)
                 .expect("msaa row");
             m.index = i;
             assert_eq!(
-                m.activate(&mut s, &mut Controls::default(), false),
+                m.activate(
+                    &mut s,
+                    &mut Controls::default(),
+                    &mut AudioSettings::default(),
+                    false
+                ),
                 MenuOutcome::ApplyMsaa
             );
             assert_eq!(s.msaa, want);
@@ -4051,26 +4321,36 @@ mod tests {
         assert_eq!(m.screen, MenuScreen::MainRoot, "app opens on the main menu");
 
         let i = m
-            .rows(&s, &Controls::default(), false)
+            .rows(&s, &Controls::default(), &AudioSettings::default(), false)
             .iter()
             .position(|r| r.action == MenuAction::NewGame)
             .expect("new game row");
         m.index = i;
         assert_eq!(
-            m.activate(&mut s, &mut Controls::default(), false),
+            m.activate(
+                &mut s,
+                &mut Controls::default(),
+                &mut AudioSettings::default(),
+                false
+            ),
             MenuOutcome::StartSession
         );
 
         // The app resets to Root when the session starts.
         m.reset(MenuScreen::Root);
         let i = m
-            .rows(&s, &Controls::default(), true)
+            .rows(&s, &Controls::default(), &AudioSettings::default(), true)
             .iter()
             .position(|r| r.action == MenuAction::ToMainMenu)
             .expect("main menu row");
         m.index = i;
         assert_eq!(
-            m.activate(&mut s, &mut Controls::default(), true),
+            m.activate(
+                &mut s,
+                &mut Controls::default(),
+                &mut AudioSettings::default(),
+                true
+            ),
             MenuOutcome::EndSession
         );
     }
@@ -4091,13 +4371,23 @@ mod tests {
             let mut m = Menu::new();
             m.reset(root);
             let i = m
-                .rows(&s, &Controls::default(), in_session)
+                .rows(
+                    &s,
+                    &Controls::default(),
+                    &AudioSettings::default(),
+                    in_session,
+                )
                 .iter()
                 .position(|r| r.action == MenuAction::Enter(MenuScreen::Options))
                 .unwrap_or_else(|| panic!("{root:?} has no OPTIONS row"));
             m.index = i;
             assert_eq!(
-                m.activate(&mut s, &mut Controls::default(), in_session),
+                m.activate(
+                    &mut s,
+                    &mut Controls::default(),
+                    &mut AudioSettings::default(),
+                    in_session
+                ),
                 MenuOutcome::Stay
             );
             assert_eq!(m.screen, MenuScreen::Options);

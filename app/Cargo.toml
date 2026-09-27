@@ -17,6 +17,8 @@ feather-game.workspace = true
 bevy_ecs.workspace = true
 glam.workspace = true
 rapier3d.workspace = true
+kira.workspace = true
+mint.workspace = true
 
 [dev-dependencies]
 # Tests only: constructing PrefabSpec params. The runtime reads them through

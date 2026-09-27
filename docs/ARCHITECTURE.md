@@ -1192,7 +1192,7 @@ toggles live, both sharing the exact code path F1/F2 use, so the two cannot
 drift. MSAA is shown with its current sample count and a RESTART note but is
 **inert**: the count is baked into every geometry pipeline, so changing it live
 means rebuilding them all. Showing the value honestly beats offering a control
-that silently does nothing. SOUND is placeholder rows (§20 audio is unstarted).
+that silently does nothing. SOUND holds live volumes since audio landed (§20).
 
 **Landed (§26): CONTROLS and GAMEPLAY are live.** GAMEPLAY's SENSITIVITY cycles
 presets and shows a percentage (the font has no decimal point); INVERT Y
@@ -1290,6 +1290,37 @@ and punctuation.
   short SFX.
 - **Zone feel first:** positional 3D SFX + layered ambient beds. Occlusion,
   reverb zones, dynamic music are later refinements.
+
+**Landed (§26): the mixer, first sounds, and the SOUND menu.**
+- **Setup:** kira 0.12 on cpal, with default features off: no decoding (the
+  sounds are synthesised as raw frames) and no realtime-dbus, which would be a
+  second system library. On Linux it needs `libasound2-dev`.
+- **Buses:** SFX and AMBIENCE sub-tracks under the main (master) track.
+  Volumes are built into the tracks at creation, because a `set_volume` tweens
+  from 0 dB, so the first sounds would play too loud; live menu changes use
+  the 10 ms tween to avoid zipper clicks.
+- **The mixer isn't an ECS `Resource` yet:** it sits on `App` next to the
+  renderer, since sessions come and go and the mixer spans them.
+- **Render clock:** the listener follows the camera, and a pure `StepTracker`
+  turns the player's motion into footsteps (per 1.6 m on the ground), jump
+  (leaving the ground while rising; walking off a ledge is silent) and landing
+  (after falling faster than 3 m/s, louder the harder). All non-spatial, on SFX.
+- **Lamps:** every visible lamp (a point light on geometry) gets a *spatial*
+  AMBIENCE sub-track looping a seamless 60 Hz hum, attenuated out to the
+  light's radius. Bare light markers stay silent, which also keeps the
+  120-light stress scenes to zero emitters.
+- **No device, no problem:** the run logs `[audio] unavailable` and stays
+  silent. `--bench` is silent too, and its timings were unchanged.
+- **Tests:** `Audio<B: Backend>` is generic, so tests drive the *real* mixer
+  through a capture backend (kira's `Backend` trait is public) and assert on
+  its output. A landing is audible; master and SFX at 50% halve the peak; a
+  lamp on the right is louder in the right ear; past its radius it's silent.
+  That test caught two real bugs before any listening: the start-of-run
+  volume tween (master 50% measured 0.82) and a click at the end of the
+  landing sound (it now fades its last 5 ms).
+- **Checked on the real device:** PipeWire lists a `feather` stream on the
+  analog output while the game runs.
+- **Not yet:** sound files (Ogg decode), music, occlusion and reverb.
 
 ## 21. Debug / profiling
 
@@ -1785,7 +1816,9 @@ the sample count; all of them, plus the GAMEPLAY field of view, persist in
 `config/graphics.toml` (§13), and key bindings + mouse look live in
 `config/controls.toml` (§14), edited from OPTIONS > CONTROLS / GAMEPLAY, whose
 lists scroll when the window is short; egui dev UI, SDF text and
-lower-case/punctuation pending); audio; debug/profiling tooling (per-pass GPU timestamp timing
+lower-case/punctuation pending); audio (**landed**, §20: kira mixer, synthesised
+footsteps/jump/landing, spatial lamp hums, live SOUND volumes; sound files,
+music and occlusion pending); debug/profiling tooling (per-pass GPU timestamp timing
 landed — stderr log + `Renderer::gpu_times`, plus the `--bench` sweep harness;
 Tracy / RenderDoc / egui overlay and
 CPU-side zones pending); GPU-driven culling; streaming; stage pipelining;

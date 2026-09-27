@@ -16,6 +16,7 @@ implemented.
 | Validation layers | correctness signal on debug builds (optional since `025d3c6`) | `vulkan-validationlayers` |
 | cmake, python3, C++ compiler, ninja | `shaderc` builds from source | `cmake python3 g++ ninja-build` |
 | python3 (stdlib only) | the test-scene generator | — |
+| ALSA headers | audio (kira → cpal) links ALSA; without them the build fails in `alsa-sys` | `libasound2-dev` |
 
 Two gotchas:
 
@@ -98,7 +99,7 @@ cargo run -- --bench scratch/lights120.gltf          # timing sweep
 
 Settings persist in `config/` (gitignored, relative to the working directory,
 so run from the repo root), one file per concern. The first normal run writes
-each with defaults and comments; delete one to reset it. Both are a flat
+each with defaults and comments; delete one to reset it. All are a flat
 `key = value` subset of TOML parsed by hand (`app/src/config/`), with no
 `[sections]`.
 
@@ -142,14 +143,23 @@ something in OPTIONS > CONTROLS or OPTIONS > GAMEPLAY (same in-place editing as
 - Rebinding in the menu gives the action exactly one key, so a hand-written
   multi-key line (`["W", "I"]`) becomes a single key once you rebind it.
 
-**Both files:**
+**`audio.toml`** — volumes in whole percent (0–100), saved when you change
+them in OPTIONS > SOUND.
+
+| Key | What it scales | Default |
+|---|---|---|
+| `master` | everything | `80` |
+| `sfx` | footsteps, jumps, landings | `100` |
+| `ambience` | the hum of visible lamps | `100` |
+
+**All files:**
 
 - **Precedence:** defaults < file < CLI flags. A flag applies to that run only.
 - **Mistakes aren't fatal:** a bad line logs `[config] … line N: …; ignored`
   and that key (or action) keeps its default. An unreadable file (e.g. not
   UTF-8) is left as-is and the run uses defaults.
-- **`--bench` ignores both** (neither reads nor creates them), so timings
-  never depend on personal settings.
+- **`--bench` ignores all of them** (neither reads nor creates them), and runs
+  silent, so timings never depend on personal settings or an audio thread.
 
 ### Controls
 
@@ -187,10 +197,19 @@ screen, and resumes play only from the pause menu's top level.
   → 200 → 300 → 400 (percent) and wraps; INVERT Y toggles; FIELD OF VIEW
   cycles 50 → 60 → 70 → 80 → 90 (vertical degrees) and wraps. All three are
   live in game.
-- **SOUND:** placeholders; its rows do nothing yet.
+- **OPTIONS > SOUND:** MASTER VOLUME, SFX and AMBIENCE each cycle 0 → 25 → 50
+  → 75 → 100 (percent) and wrap, live, saved to `config/audio.toml`.
 - Changes save straight away: CONTROLS, SENSITIVITY and INVERT Y to
   `config/controls.toml`, FIELD OF VIEW (a view setting) to
-  `config/graphics.toml`.
+  `config/graphics.toml`, volumes to `config/audio.toml`.
+
+**What you hear** (all synthesised at startup, no sound files yet):
+footsteps every ~1.6 m walked, a jump sound, a thump on landings from more
+than a small step down (louder the harder), nothing in noclip, and a 60 Hz
+hum from every *visible* lamp (a point light on geometry, e.g. the
+testscene's two glowing orbs) that pans as you turn and fades out at the
+light's radius. With no audio device the game logs `[audio] unavailable` and
+runs silent.
 
 Defaults: shadows HIGH, FXAA off, MSAA 1×.
 
@@ -345,11 +364,12 @@ and distant shadows should look unchanged.
 
 ## 5. Tests — what exists and what it guards
 
-`cargo test --workspace`: 108 tests, all CPU-side (none needs a GPU).
+`cargo test --workspace`: 118 tests, all CPU-side (none needs a GPU).
 
 | Area | Crate | What the tests pin down |
 |---|---|---|
 | Character controller | app | settling, walking speed, jumps and head bumps, no air-jump, autostep lip vs wall, sliding along box faces, noclip |
+| Audio | app | synthesised sounds are finite, within ±1, end at zero (no click) and are deterministic, and the hum loops without a seam; footsteps per stride, silent in noclip, jump vs walking off a ledge, the landing threshold, teleports ignored; percent → dB; **through the real kira mixer** (a capture backend, no sound card): a landing is audible, master and SFX at 50% halve its peak and 0% silences it, a lamp to the listener's right is louder in the right ear (and vice versa), and one past its radius is silent; `audio.toml` parse/warn/save; the SOUND rows step and save |
 | Collision proxies | app | the `collider` param picks mesh/hull/box/none, `auto` switches to a hull past 2048 triangles without a bake, `collide: false` still wins; a dense 30 cm prop is walkable as a hull; a flat hull still holds the player; with a bake, `auto` picks the finest LOD within the triangle budget and 5 cm (scaled by the node), and a concave dish keeps the player *in* it as a LOD trimesh but on its rim as a hull; `mesh` stays exact |
 | Menus | app | row layout and hit-testing at several window sizes, including scrolling a screen taller than the window (the selection stays visible, hovering a visible row never scrolls, hits map back to the right row); wraparound, Esc/back behaviour, OPTIONS reachable from both menus, MSAA only outside a session, DISPLAY toggles windowed/fullscreen, FIELD OF VIEW steps its presets (and the projection really uses it); SENSITIVITY / INVERT Y change and save; rebinding waits for a key, ignores menu keys, takes the key from its old action (which shows NONE), and is cancelled by Esc, moving away or BACK; RESET KEYS; **every label drawable by the 5×7 A–Z/0–9 font** |
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice at every FOV from 30° to 120°; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
@@ -388,6 +408,7 @@ Everything goes to stderr.
 | `[quality] shadows / fxaa: …` | a setting changed |
 | `[config] …` | a config file created / loaded / renamed, a line ignored or a key bound twice, plus the effective graphics settings at startup |
 | `[light] N visible lights exceeds MAX_LIGHTS` | lights past 128 were dropped this frame |
+| `[audio] started … / unavailable: … / N lamps humming` | the mixer came up (or why not; the game then runs silent), and how many lamps a session gave a hum |
 | `[mesh] N meshes (B baked, L LODs): …` | geometry uploaded at load, and how much of it came from the bake |
 | `[mesh] N textures uploaded … (B baked BC7, R raw; D images decoded)` | textures at load; with a complete bake D is 0 |
 | `[scene] colliders: N mesh (M from LODs), H hull, B box` | the colliders a session built; with a bake, detailed props should be LODs, not hulls |
