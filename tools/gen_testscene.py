@@ -284,7 +284,8 @@ class Gltf:
         self.accessors.append(a)
         return len(self.accessors) - 1
 
-    def add_material(self, name, base, metallic, roughness, emissive=None, tex=None):
+    def add_material(self, name, base, metallic, roughness, emissive=None, tex=None,
+                     surface=None):
         m = {
             "name": name,
             "pbrMetallicRoughness": {
@@ -295,6 +296,9 @@ class Gltf:
         }
         if emissive:
             m["emissiveFactor"] = list(emissive)
+        if surface:
+            # Gameplay, not looks: which footsteps it plays (§20).
+            m["extras"] = {"surface": surface}
         if tex:
             base_t, normal_t, mr_t = tex
             if base_t is not None:
@@ -739,6 +743,22 @@ def zone_normals(s, pal, extras_on):
             s.place(m_, t_, r_, sc_, extras=extras, name=f"normals_{name}_{tag}")
 
 
+def zone_surfaces(s, pal, extras_on):
+    """East of spawn, on z ~9.75 (x 3.5..27.5): one pad per footstep surface
+    (§20), west to east concrete, grass, wood, carpet, snow. Each pad's
+    *material* names its surface (`extras.surface`), so walking the strip
+    plays each set of footsteps in turn; the 1 m gaps are the (concrete)
+    ground. 5 cm tall, well under the 0.4 autostep, so it's walked, not
+    climbed, and no shadow: a flat pad casts nothing useful. Spawn faces
+    west, so turn around.
+    """
+    extras = {"prefab": "prop", "params": {"shadow": False}} if extras_on else None
+    for i, (name, mesh) in enumerate(pal["surfaces"]):
+        t = (5.5 + i * 5.0, GROUND_Y + 0.025, 9.75)
+        assert s.free(mesh, t), f"surface_{name} site is occupied"
+        s.place(mesh, t, extras=extras, name=f"surface_{name}")
+
+
 def scatter_lights(s, count, radius=14.0):
     """Extra punctual lights spread over the walkable area (§12).
 
@@ -900,6 +920,19 @@ def build_palette(g, use_textures, many_textures=False):
     for i, e in enumerate(((3.0, 1.6, 0.5), (0.4, 1.2, 3.0))):
         mat = g.add_material(f"emissive_{i}", (0.05, 0.05, 0.05, 1.0), 0.0, 0.5, emissive=e)
         pal["emissive"].append(g.add_mesh(f"emissive_{i}", [(geom, mat)]))
+
+    # The footstep-surface pads (§20): a mesh each, since the app derives one
+    # material per mesh. Names are the engine's `audio::Surface` names.
+    pal["surfaces"] = []
+    for name, base in (
+        ("concrete", (0.30, 0.30, 0.30, 1.0)),
+        ("grass", (0.08, 0.25, 0.05, 1.0)),
+        ("wood", (0.32, 0.17, 0.07, 1.0)),
+        ("carpet", (0.30, 0.03, 0.05, 1.0)),
+        ("snow", (0.85, 0.87, 0.90, 1.0)),
+    ):
+        mat = g.add_material(f"surface_{name}", base, 0.0, 0.9, surface=name)
+        pal["surfaces"].append((name, g.add_mesh(f"surface_{name}", [(box(4.0, 0.05, 3.5), mat)])))
     return pal
 
 
@@ -1009,7 +1042,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("-o", "--out", default="scratch/testscene.gltf")
     ap.add_argument("--zones", default="all",
-                    help="all, or a comma list of: shadow,traversal,aa,field,pbr,normals")
+                    help="all, or a comma list of: shadow,traversal,aa,field,pbr,normals,surfaces")
     ap.add_argument("--density", choices=sorted(DENSITY), default="med",
                     help="scales the culling/instancing field only")
     ap.add_argument("--seed", type=int, default=7)
@@ -1031,7 +1064,7 @@ def main():
     ap.add_argument("--check", action="store_true", help="validate after writing")
     args = ap.parse_args()
 
-    ALL_ZONES = {"shadow", "traversal", "aa", "field", "pbr", "normals"}
+    ALL_ZONES = {"shadow", "traversal", "aa", "field", "pbr", "normals", "surfaces"}
     want = ALL_ZONES if args.zones == "all" else set(args.zones.split(","))
     unknown = want - ALL_ZONES
     if unknown:
@@ -1052,6 +1085,8 @@ def main():
         zone_pbr(s, pal, extras_on)
     if "normals" in want:
         zone_normals(s, pal, extras_on)
+    if "surfaces" in want:
+        zone_surfaces(s, pal, extras_on)
     if "field" in want:
         n = zone_field(s, pal, DENSITY[args.density])
         if n < DENSITY[args.density]:

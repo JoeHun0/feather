@@ -203,15 +203,19 @@ screen, and resumes play only from the pause menu's top level.
   `config/controls.toml`, FIELD OF VIEW (a view setting) to
   `config/graphics.toml`, volumes to `config/audio.toml`.
 
-**What you hear:** footsteps every ~1.6 m walked, a jump sound, a thump on landings from more
-than a small step down (louder the harder), nothing in noclip, and a 60 Hz
-hum from every *visible* lamp (a point light on geometry, e.g. the
+**What you hear:** footsteps every ~1.6 m walked, sounding like what you
+stand on (concrete, grass, wood, carpet or snow, from the material's
+`surface` tag, §4; untagged is concrete), a jump sound, a thump on landings
+from more than a small step down (louder the harder), nothing in noclip, and
+a 60 Hz hum from every *visible* lamp (a point light on geometry, e.g. the
 testscene's two glowing orbs) that pans as you turn and fades out at the
 light's radius. Footsteps, jump and landing are **recorded** (Kenney Impact
-Sounds, CC0: concrete footsteps, soft impacts) once
+Sounds, CC0: footsteps for each surface, soft impacts) once
 `python3 tools/fetch_assets.py kenney_impact_sounds` has run (0.76 MB); without
 the pack, or for any file that won't decode, each falls back to a synthesised
-sound, so audio never needs the download. The lamp hum is always synthesised.
+sound, so audio never needs the download. A surface other than concrete
+whose files are missing uses the concrete steps instead, with an `[audio]`
+note naming the fetch command. The lamp hum is always synthesised.
 Every clip is normalised to its event's level, so recorded and synthesised
 sounds play equally loud. With no audio device the game logs
 `[audio] unavailable` and runs silent.
@@ -233,6 +237,7 @@ data URI). The level is laid out in sectors, each aimed at one system:
 | `field` | hundreds of nodes over a few meshes (dedup, instancing, culling) |
 | `pbr` | metallic × roughness sphere grid (IBL, tonemap reference) |
 | `normals` | three pairs west of spawn (x −19…−5, z 8): a rotated, non-uniformly scaled node beside the same shape baked into its vertices. Each pair must shade identically; the last pair is mirrored |
+| `surfaces` | footsteps (§3): a strip of five 5 cm pads east of spawn (x 3.5…27.5, z ≈ 9.75; spawn faces west, so turn around), west to east concrete (grey), grass (green), wood (brown), carpet (red), snow (white), 1 m of plain ground between them. Walk along it and each pad's steps should sound different |
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -286,6 +291,19 @@ An unknown prefab name falls back to static geometry. Up to 128 point lights
 can be *visible* at once; lights past that are dropped for the frame with a
 `[light]` warning.
 
+**Footstep surfaces** belong to *materials*, not nodes: a material's `extras`
+names one, and everything drawn with it (every placement, every face) steps
+like it:
+
+```json
+"materials": [ { "name": "planks", "extras": { "surface": "wood" } } ]
+```
+
+Surfaces: `concrete` (the default, also for untagged materials and the
+built-in ground), `grass`, `wood`, `carpet`, `snow`, in any case. An unknown
+name logs `[scene] unknown surface "…"; using concrete` once. Only geometry
+that collides matters: the surface is read from the collider under your feet.
+
 ### A scene from real CC0 models — Kenney Nature Kit
 
 ```bash
@@ -314,8 +332,13 @@ that pack with `python3 tools/fetch_assets.py kenney_impact_sounds`.
 east edge, a camp with a fire light (you spawn at its edge, facing the fire), and a
 stone path lit by lamps. Options: `--density low|med|high`, `--seed N`,
 `-o PATH`, `--check` (the same engine constraints as the procedural
-generator). Grass, flowers and ground tiles have no collider and cast no
-shadow; trees, rocks, the tent and fences do both.
+generator). Grass tufts, flowers and the stone path have no collider; the
+ground tiles collide (as flat boxes) because they are the meadow you walk on
+and carry its grass surface, and none of those cast a shadow. Trees, rocks,
+the tent and fences do both. Footsteps: grass on the meadow and on the grass
+tops of rocks and cliffs, wood on logs and stumps (jump on), concrete on bare
+rock and the campfire stones. The path sounds like grass, since its stones
+don't collide.
 
 ### A detail stress scene — Poly Haven scans
 
@@ -376,18 +399,19 @@ and distant shadows should look unchanged.
 
 ## 5. Tests — what exists and what it guards
 
-`cargo test --workspace`: 121 tests, all CPU-side (none needs a GPU).
+`cargo test --workspace`: 129 tests, all CPU-side (none needs a GPU).
 
 | Area | Crate | What the tests pin down |
 |---|---|---|
 | Character controller | app | settling, walking speed, jumps and head bumps, no air-jump, autostep lip vs wall, sliding along box faces, noclip |
-| Audio | app | a missing sound pack falls back to 15 synthesised clips with one note (naming the fetch command); a file that doesn't decode falls back for that sound only, with a note; every clip is normalised to its event's peak; synthesised sounds are finite, within ±1, end at zero (no click) and are deterministic, and the hum loops without a seam; footsteps per stride, silent in noclip, jump vs walking off a ledge, the landing threshold, teleports ignored; percent → dB; **through the real kira mixer** (a capture backend, no sound card): a landing is audible, master and SFX at 50% halve its peak and 0% silences it, a lamp to the listener's right is louder in the right ear (and vice versa), and one past its radius is silent; `audio.toml` parse/warn/save; the SOUND rows step and save |
+| Audio | app | a missing sound pack falls back to 15 synthesised clips with one note (naming the fetch command), and every surface steps like concrete; a file that doesn't decode falls back for that sound only, with a note; a surface whose files are missing or broken uses the concrete steps, one note each; surface names round-trip (any case; unknown is `None`, index 0 is concrete); every clip is normalised to its event's peak; synthesised sounds are finite, within ±1, end at zero (no click) and are deterministic, and the hum loops without a seam; footsteps per stride, each carrying the surface underfoot, silent in noclip, jump vs walking off a ledge, the landing threshold, teleports ignored; percent → dB; **through the real kira mixer** (a capture backend, no sound card): a landing is audible, master and SFX at 50% halve its peak and 0% silences it, a lamp to the listener's right is louder in the right ear (and vice versa), and one past its radius is silent, and each surface's step plays that surface's clip; `audio.toml` parse/warn/save; the SOUND rows step and save |
 | Collision proxies | app | the `collider` param picks mesh/hull/box/none, `auto` switches to a hull past 2048 triangles without a bake, `collide: false` still wins; a dense 30 cm prop is walkable as a hull; a flat hull still holds the player; with a bake, `auto` picks the finest LOD within the triangle budget and 5 cm (scaled by the node), and a concave dish keeps the player *in* it as a LOD trimesh but on its rim as a hull; `mesh` stays exact |
+| Surfaces underfoot | app | a material's surface tag reaches its collider (untagged and unknown are concrete, each unknown name reported once); walking over a tagged pad reads concrete → pad → concrete, and over an untagged one only concrete; on a ledge held by the rim (centre over the drop, where a ray finds nothing) the probe still finds the ledge |
 | Menus | app | row layout and hit-testing at several window sizes, including scrolling a screen taller than the window (the selection stays visible, hovering a visible row never scrolls, hits map back to the right row); wraparound, Esc/back behaviour, OPTIONS reachable from both menus, MSAA only outside a session, DISPLAY toggles windowed/fullscreen, FIELD OF VIEW steps its presets (and the projection really uses it); SENSITIVITY / INVERT Y change and save; rebinding waits for a key, ignores menu keys, takes the key from its old action (which shows NONE), and is cancelled by Esc, moving away or BACK; RESET KEYS; **every label drawable by the 5×7 A–Z/0–9 font** |
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice at every FOV from 30° to 120°; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
 | Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs |
-| Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one texture, which isn't decoded until asked and then matches the old RGB→RGBA expansion |
+| Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one texture, which isn't decoded until asked and then matches the old RGB→RGBA expansion; a material's `extras.surface` is read (a non-string one warns and is dropped) |
 | Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |
 | Texture bake | assets, bake | keys separate content and kind (sRGB colour vs data), and are computed from the encoded bytes without decoding; BC7 level sizes round partial blocks up; baked files round-trip and reject truncation, wrong sizes or an unknown kind; sRGB mips average *light* (black/white → 188, not 128); chains end at 1×1; every baked level has exactly the blocks Vulkan copies |
 | Mesh bake + LOD | assets, bake, render | baked meshes round-trip and reject damage (truncation, trailing bytes, bad magic, out-of-range index, decreasing or NaN error, partial triangle, no LODs); the mesh key ignores the material; a sphere gets a chain with fewer triangles and growing error per level and LOD0 is the input reordered; small meshes stay LOD0; disconnected parts prune; the pixel and texel rules (distance, scale, non-uniform scale, inside the sphere); runs split per (mesh, LOD) |
@@ -420,10 +444,11 @@ Everything goes to stderr.
 | `[quality] shadows / fxaa: …` | a setting changed |
 | `[config] …` | a config file created / loaded / renamed, a line ignored or a key bound twice, plus the effective graphics settings at startup |
 | `[light] N visible lights exceeds MAX_LIGHTS` | lights past 128 were dropped this frame |
-| `[audio] started …; sounds: R recorded, S synthesised` / `… not found (…fetch_assets.py…)` / `unavailable: …` / `N lamps humming` | the mixer came up (or why not; the game then runs silent), and how many lamps a session gave a hum |
+| `[audio] started …; sounds: R recorded, S synthesised` / `… not found (…fetch_assets.py…)` / `footstep_grass_000.ogg: …; grass steps use the concrete ones (…)` / `unavailable: …` / `N lamps humming` | the mixer came up (or why not; the game then runs silent), which surfaces lack their own steps, and how many lamps a session gave a hum. With the whole pack: 35 recorded, 0 synthesised |
 | `[mesh] N meshes (B baked, L LODs): …` | geometry uploaded at load, and how much of it came from the bake |
 | `[mesh] N textures uploaded … (B baked BC7, R raw; D images decoded)` | textures at load; with a complete bake D is 0 |
 | `[scene] colliders: N mesh (M from LODs), H hull, B box` | the colliders a session built; with a bake, detailed props should be LODs, not hulls |
+| `[scene] surfaces: N concrete, M grass, …` / `[scene] unknown surface "x"; using concrete` | the same colliders by footstep surface (only surfaces that have any), and any material tag that isn't a surface |
 | `[load] scenes … world … renderer … total …` | where a session's load time went: parsing + reading images + meshes, spawning + colliders, GPU upload |
 | `[bench] …` | the `--bench` summary, including triangles submitted per frame (`Mtris main/shadow`) and the share of instances at each LOD (`LOD mix`) |
 

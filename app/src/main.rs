@@ -30,7 +30,7 @@
 mod audio;
 mod config;
 
-use audio::{Audio, AudioSettings, StepTracker};
+use audio::{Audio, AudioSettings, StepTracker, Surface};
 use config::controls::{Action, Controls};
 
 use std::collections::{HashMap, HashSet};
@@ -47,10 +47,12 @@ use feather_render::{
 };
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
+use rapier3d::parry::query::ShapeCastOptions;
+use rapier3d::parry::shape::Ball;
 use rapier3d::prelude::{
-    BroadPhaseBvh, CCDSolver, ColliderBuilder, ColliderHandle, ColliderSet, ImpulseJointSet,
-    IntegrationParameters, IslandManager, MultibodyJointSet, NarrowPhase, PhysicsPipeline, Pose,
-    QueryFilter, RigidBodyBuilder, RigidBodyHandle, RigidBodySet, Vector,
+    BroadPhaseBvh, CCDSolver, Collider, ColliderBuilder, ColliderHandle, ColliderSet,
+    ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet, NarrowPhase,
+    PhysicsPipeline, Pose, QueryFilter, RigidBodyBuilder, RigidBodyHandle, RigidBodySet, Vector,
 };
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
@@ -84,6 +86,10 @@ const MOVE_ACCEL: f32 = 14.0; // how fast horizontal velocity chases the target
 const GRAVITY: f32 = 26.0;
 const JUMP_SPEED: f32 = 9.0; // ~1.5 units apex
 const FLY_SPEED: f32 = 14.0; // noclip movement speed
+/// How far below a grounded player the surface probe looks (§20). The
+/// controller holds the capsule ~2 cm off the ground and counts contacts
+/// within ~7 cm as grounded, so 10 cm finds whatever it counted.
+const GROUND_PROBE: f32 = 0.1;
 
 // Sun shadow frustum (§11). The ortho follows the player, so these are relative
 // to them: half-extent of the covered square, how far back along the sun the
@@ -1038,6 +1044,19 @@ impl Physics {
     }
 }
 
+/// A collider's §20 surface lives in its rapier `user_data`, as the
+/// surface's index. Concrete is 0, rapier's default, so a collider nobody
+/// tagged is concrete. `user_data` has no other use yet; if something comes
+/// to need collider → entity, the entity belongs there and the surface moves
+/// to a component.
+fn tag_surface(c: &mut Collider, surface: Surface) {
+    c.user_data = surface.index() as u128;
+}
+
+fn collider_surface(c: &Collider) -> Surface {
+    Surface::from_index(usize::try_from(c.user_data).unwrap_or(usize::MAX))
+}
+
 // ---- First-person player + input ----
 
 /// The player's simulation state, as a component on the player entity (§1: the
@@ -1055,6 +1074,9 @@ struct Player {
     prev_pos: Vec3,
     vel: Vec3,
     on_ground: bool,
+    /// What the feet were last on (§20): refreshed every grounded tick, kept
+    /// while airborne, so the steps after a landing use the new ground.
+    surface: Surface,
     body: RigidBodyHandle,
     collider: ColliderHandle,
     controller: KinematicCharacterController,
@@ -1153,6 +1175,7 @@ impl Player {
             prev_pos: feet,
             vel: Vec3::ZERO,
             on_ground: true, // feet start resting on the ground
+            surface: Surface::default(),
             body,
             collider,
             controller: KinematicCharacterController {
@@ -1234,6 +1257,25 @@ fn player_target(p: &mut Player, physics: &mut Physics, input: &InputState) {
         p.vel.z = actual.z / FIXED_DT;
         if p.on_ground || (desired.y > 0.0 && actual.y < desired.y - 1e-4) {
             p.vel.y = 0.0;
+        }
+        // What is underfoot (§20)? The controller knows it is grounded but
+        // not on what, so sweep the capsule's bottom sphere a little way
+        // down. Unlike a ray from the centre, that finds a ledge the capsule
+        // rests on by its rim; unlike the whole capsule, it doesn't also test
+        // the trunk it's leaning on (§15 has the numbers). No hit (grounded
+        // on a near-vertical contact) keeps the last surface.
+        if p.on_ground {
+            let feet = Ball::new(PLAYER_RADIUS);
+            let at = Pose::from_translation(to_rapier(p.pos + actual + Vec3::Y * PLAYER_RADIUS));
+            let options = ShapeCastOptions {
+                max_time_of_impact: GROUND_PROBE,
+                target_distance: 0.0,
+                stop_at_penetration: false,
+                compute_impact_geometry_on_penetration: false,
+            };
+            if let Some((ground, _)) = queries.cast_shape(&at, -Vector::Y, &feet, options) {
+                p.surface = collider_surface(&physics.colliders[ground]);
+            }
         }
         actual
     };
@@ -1587,6 +1629,8 @@ struct SpawnArgs<'a> {
     /// Its bake (§17), whose LODs can stand in for an over-budget mesh.
     baked: Option<&'a feather_assets::bake::BakedMesh>,
     spec: Option<&'a feather_assets::PrefabSpec>,
+    /// What the mesh's material sounds like underfoot (§20), for its collider.
+    surface: Surface,
 }
 
 impl SpawnArgs<'_> {
@@ -1723,6 +1767,20 @@ struct ColliderStats {
     lod: usize,
     hull: usize,
     boxes: usize,
+    /// Per surface (§20), indexed by `Surface::index`.
+    surfaces: [usize; Surface::ALL.len()],
+}
+
+impl ColliderStats {
+    /// "12 concrete, 400 grass": the surfaces that have colliders.
+    fn surfaces_line(&self) -> String {
+        let parts: Vec<String> = Surface::ALL
+            .into_iter()
+            .filter(|s| self.surfaces[s.index()] > 0)
+            .map(|s| format!("{} {}", self.surfaces[s.index()], s.name()))
+            .collect();
+        parts.join(", ")
+    }
 }
 
 /// How a scene node collides (§15), from the `collider` prefab param.
@@ -1852,6 +1910,12 @@ fn spawn_scene_node(
             kind,
         )
     });
+    if let Some((h, _)) = collider {
+        tag_surface(
+            &mut world.resource_mut::<Physics>().colliders[h],
+            args.surface,
+        );
+    }
     if let (Some((_, built)), Some(mut stats)) =
         (collider, world.get_resource_mut::<ColliderStats>())
     {
@@ -1864,6 +1928,7 @@ fn spawn_scene_node(
             BuiltCollider::Hull => stats.hull += 1,
             BuiltCollider::Box => stats.boxes += 1,
         }
+        stats.surfaces[args.surface.index()] += 1;
     }
     let collider = collider.map(|(h, _)| h);
     let mut e = world.spawn((
@@ -1922,6 +1987,29 @@ fn load_scenes(scenes: &[String]) -> (Vec<MeshData>, Vec<feather_assets::SceneNo
         }
     }
     (meshes, nodes)
+}
+
+/// Each mesh's footstep surface (§20), from its material's `surface` tag,
+/// plus the tag names that aren't surfaces (each once, for the caller to
+/// report). Resolved per mesh rather than per node, so a typo on a tile used
+/// 400 times is one warning. Unknown and untagged both mean concrete.
+fn mesh_surfaces(meshes: &[MeshData]) -> (Vec<Surface>, Vec<&str>) {
+    let mut unknown: Vec<&str> = Vec::new();
+    let surfaces = meshes
+        .iter()
+        .map(|m| {
+            let Some(name) = m.material.surface.as_deref() else {
+                return Surface::default();
+            };
+            Surface::from_name(name).unwrap_or_else(|| {
+                if !unknown.contains(&name) {
+                    unknown.push(name);
+                }
+                Surface::default()
+            })
+        })
+        .collect();
+    (surfaces, unknown)
 }
 
 /// Where the player starts: a `player_start` marker's position and yaw, or the
@@ -2008,6 +2096,13 @@ impl Session {
         });
         let t_scenes = t_start.elapsed();
         let (start_pos, start_yaw) = player_start(&scene_nodes);
+        let (surfaces, unknown_surfaces) = mesh_surfaces(&meshes);
+        for name in unknown_surfaces {
+            eprintln!(
+                "[scene] unknown surface {name:?}; using {}",
+                Surface::default().name()
+            );
+        }
 
         let mut world = World::new();
         world.insert_resource(FrameCount::default());
@@ -2150,6 +2245,7 @@ impl Session {
                 mesh_data: mesh_idx.map(|i| &meshes[i]),
                 baked: mesh_idx.and_then(|i| baked.get(i)).and_then(Option::as_ref),
                 spec: node.prefab.as_ref(),
+                surface: mesh_idx.map_or(Surface::default(), |i| surfaces[i]),
             };
             match node.prefab.as_ref() {
                 Some(spec) => match registry.get(spec.id.as_str()) {
@@ -2176,6 +2272,7 @@ impl Session {
                 "[scene] colliders: {} mesh ({} from LODs), {} hull, {} box",
                 st.mesh, st.lod, st.hull, st.boxes
             );
+            eprintln!("[scene] surfaces: {}", st.surfaces_line());
         }
 
         // One step so the broad-phase BVH the character controller shape-casts
@@ -2883,7 +2980,10 @@ impl ApplicationHandler for App {
                         a.set_listener(eye, fwd, up);
                         if !self.paused {
                             let p = s.world.get::<Player>(s.player).expect("player body");
-                            for e in self.steps.update(p.pos, p.vel, p.on_ground, s.noclip) {
+                            let events =
+                                self.steps
+                                    .update(p.pos, p.vel, p.on_ground, s.noclip, p.surface);
+                            for e in events {
                                 a.play(e);
                             }
                         }
@@ -3321,6 +3421,7 @@ fn level_material(base_linear: [f32; 3], roughness: f32) -> feather_assets::Mate
         base_color_texture: None,
         normal_texture: None,
         metallic_roughness_texture: None,
+        surface: None,
     }
 }
 
@@ -3428,6 +3529,7 @@ fn palette_material(k: u32) -> feather_assets::Material {
         base_color_texture: None,
         normal_texture: None,
         metallic_roughness_texture: None,
+        surface: None,
     }
 }
 
@@ -4674,6 +4776,7 @@ mod tests {
             mesh_data: Some(cube),
             baked: None,
             spec,
+            surface: mesh_surfaces(std::slice::from_ref(cube)).0[0],
         };
         match spec.and_then(|s| prefab_registry().get(s.id.as_str()).copied()) {
             Some(f) => f(w, &args),
@@ -4763,6 +4866,122 @@ mod tests {
         m.prefab.as_mut().unwrap().params = serde_json::json!({});
         let (_, yaw) = player_start(std::slice::from_ref(&m));
         assert_eq!(yaw, None);
+    }
+
+    // ---- §20 surfaces underfoot ----
+
+    /// Walk -Z from the concrete ground over a pad (4 x 4 m, 5 cm tall, so
+    /// autostep takes it) and off its far side, and list what the probe said,
+    /// merging repeats.
+    fn surfaces_walking_over_a_pad(tag: Option<Surface>) -> Vec<Surface> {
+        let (mut ph, mut p) = setup(&[], START);
+        let pad = ph.add_static_box(
+            Vec3::new(0.0, GROUND_Y + 0.025, 2.0),
+            Vec3::new(4.0, 0.05, 4.0),
+        );
+        if let Some(s) = tag {
+            tag_surface(&mut ph.colliders[pad], s);
+        }
+        ph.step();
+        let mut seen = vec![p.surface];
+        for _ in 0..150 {
+            step(&mut p, &mut ph, -Vec3::Z, false, 0.0, false);
+            if seen.last() != Some(&p.surface) {
+                seen.push(p.surface);
+            }
+        }
+        assert!(
+            p.pos.z < -2.0,
+            "should have crossed the pad, z = {}",
+            p.pos.z
+        );
+        seen
+    }
+
+    #[test]
+    fn the_probe_names_the_surface_underfoot() {
+        use Surface::{Concrete, Wood};
+        assert_eq!(
+            surfaces_walking_over_a_pad(Some(Wood)),
+            [Concrete, Wood, Concrete]
+        );
+        // The same walk over an untagged pad: concrete, like the ground.
+        assert_eq!(surfaces_walking_over_a_pad(None), [Concrete]);
+    }
+
+    /// Standing on a ledge by the capsule's rim, centre out over the drop:
+    /// sweeping the capsule's bottom sphere finds the ledge where a ray from
+    /// the centre finds nothing, which is why the probe is a shape cast.
+    #[test]
+    fn the_probe_finds_a_ledge_under_the_rim() {
+        let (mut ph, _) = setup(&[], Vec3::new(20.0, GROUND_Y, 20.0));
+        // A 0.3 m block whose +Z face is at z = 0; the player 0.2 m past it.
+        let block = ph.add_static_box(
+            Vec3::new(0.0, GROUND_Y + 0.15, -1.0),
+            Vec3::new(4.0, 0.3, 2.0),
+        );
+        tag_surface(&mut ph.colliders[block], Surface::Wood);
+        let mut p = Player::new(&mut ph, Vec3::new(0.0, GROUND_Y + 0.32, 0.2));
+        ph.step();
+        for _ in 0..30 {
+            step(&mut p, &mut ph, Vec3::ZERO, false, 0.0, false);
+        }
+        assert!(
+            p.on_ground && p.pos.y > GROUND_Y + 0.2,
+            "fell off: y = {}",
+            p.pos.y
+        );
+        assert_eq!(p.surface, Surface::Wood);
+        let queries = ph.broad_phase.as_query_pipeline(
+            ph.narrow_phase.query_dispatcher(),
+            &ph.bodies,
+            &ph.colliders,
+            QueryFilter::default().exclude_rigid_body(p.body),
+        );
+        let ray = rapier3d::prelude::Ray::new(to_rapier(p.pos), -Vector::Y);
+        assert!(
+            queries.cast_ray(&ray, GROUND_PROBE, true).is_none(),
+            "the centre is over the block, so this isn't the rim case"
+        );
+    }
+
+    #[test]
+    fn a_material_surface_tags_the_collider() {
+        use Surface::{Concrete, Grass, Snow};
+        let cube = |surface: Option<&str>| {
+            let mut m = MeshData::cube(1.0);
+            m.material.surface = surface.map(str::to_string);
+            m
+        };
+        let meshes = [
+            cube(Some("grass")),
+            cube(Some("Snow")),
+            cube(None),
+            cube(Some("lava")),
+            cube(Some("lava")),
+        ];
+        let (surfaces, unknown) = mesh_surfaces(&meshes);
+        assert_eq!(surfaces, [Grass, Snow, Concrete, Concrete, Concrete]);
+        assert_eq!(unknown, ["lava"], "each unknown name is reported once");
+
+        // Spawned as a scene node, the collider carries it.
+        for (mesh, want) in meshes.iter().zip(surfaces) {
+            let mut w = prefab_world();
+            spawn_one(&mut w, None, mesh);
+            let c = w
+                .query::<&ColliderRef>()
+                .iter(&w)
+                .next()
+                .expect("collider")
+                .0;
+            let got = collider_surface(&w.resource::<Physics>().colliders[c]);
+            assert_eq!(got, want);
+        }
+
+        let mut stats = ColliderStats::default();
+        stats.surfaces[Concrete.index()] = 2;
+        stats.surfaces[Snow.index()] = 1;
+        assert_eq!(stats.surfaces_line(), "2 concrete, 1 snow");
     }
 
     // ---- §12 punctual lights ----

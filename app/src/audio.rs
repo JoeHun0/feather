@@ -1,10 +1,11 @@
 //! Audio (§20): a kira mixer with SFX and AMBIENCE buses under the master
-//! track, a listener that follows the camera, and sounds synthesised at
-//! startup (no sound files yet).
+//! track, a listener that follows the camera, and the sounds, loaded or
+//! synthesised at startup.
 //!
-//! - **SFX** is the player's own: footsteps, jump, landing. Not spatial.
-//!   Recorded (Kenney Impact Sounds, CC0, via `tools/fetch_assets.py`) when
-//!   the pack is fetched, synthesised otherwise: see `SoundSet`.
+//! - **SFX** is the player's own: footsteps (a set per [`Surface`]), jump,
+//!   landing. Not spatial. Recorded (Kenney Impact Sounds, CC0, via
+//!   `tools/fetch_assets.py`) when the pack is fetched, synthesised
+//!   otherwise: see `SoundSet`.
 //! - **AMBIENCE** holds one spatial sub-track per visible lamp, looping a hum
 //!   that pans with the listener and fades out to the light's radius.
 //!
@@ -67,10 +68,67 @@ pub fn percent_to_db(p: u32) -> Decibels {
     }
 }
 
+/// What the player is standing on, which picks the footstep sounds. A glTF
+/// material names it in `extras.surface`, and each scene collider carries it
+/// in rapier's `user_data` (see `main.rs`). The five are the Kenney pack's
+/// footstep sets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Surface {
+    /// Index 0, which is also rapier's default `user_data`: every collider
+    /// nobody tagged (the built-in level, untagged scenes) is concrete.
+    #[default]
+    Concrete = 0,
+    Grass,
+    Wood,
+    Carpet,
+    Snow,
+}
+
+impl Surface {
+    /// Every surface, in index order.
+    pub const ALL: [Surface; 5] = [
+        Surface::Concrete,
+        Surface::Grass,
+        Surface::Wood,
+        Surface::Carpet,
+        Surface::Snow,
+    ];
+
+    /// The name scenes use, which is also the pack's file stem.
+    pub fn name(self) -> &'static str {
+        match self {
+            Surface::Concrete => "concrete",
+            Surface::Grass => "grass",
+            Surface::Wood => "wood",
+            Surface::Carpet => "carpet",
+            Surface::Snow => "snow",
+        }
+    }
+
+    /// A surface named in a scene, in any case.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|s| s.name().eq_ignore_ascii_case(name))
+    }
+
+    /// Its position in [`Surface::ALL`]: per-surface tables use it, and it's
+    /// the value colliders store.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Back from [`Surface::index`]; anything out of range is concrete.
+    pub fn from_index(i: usize) -> Self {
+        Self::ALL.get(i).copied().unwrap_or_default()
+    }
+}
+
 /// A sound the game asks for.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SoundEvent {
-    Step,
+    /// A footstep on this surface.
+    Step(Surface),
     Jump,
     /// Touching down after falling at this speed (m/s).
     Land(f32),
@@ -224,10 +282,18 @@ impl Clip {
     }
 }
 
-/// The SFX clips, five variants per event (cycled, so repeats don't sound
-/// identical).
+/// Variants per event in the pack, cycled so repeats don't sound identical.
+const VARIANTS: u32 = 5;
+
+/// A surface's footstep file in the pack.
+fn step_file(surface: Surface, variant: u32) -> String {
+    format!("footstep_{}_{variant:03}.ogg", surface.name())
+}
+
+/// The SFX clips: `VARIANTS` per event, and footsteps per surface.
 pub struct SoundSet {
-    steps: Vec<Clip>,
+    /// Indexed by [`Surface::index`].
+    steps: [Vec<Clip>; Surface::ALL.len()],
     jumps: Vec<Clip>,
     lands: Vec<Clip>,
     pub recorded: usize,
@@ -245,13 +311,14 @@ impl SoundSet {
 
     /// Recorded clips from `dir`; each file that's missing or doesn't decode
     /// falls back to its synthesised sound, so audio never needs the fetch.
+    /// Surfaces other than concrete fall back to the concrete steps instead.
     pub fn load(dir: &Path) -> Self {
         Self::load_with(Some(dir))
     }
 
     fn load_with(dir: Option<&Path>) -> Self {
         let mut set = Self {
-            steps: Vec::new(),
+            steps: Default::default(),
             jumps: Vec::new(),
             lands: Vec::new(),
             recorded: 0,
@@ -269,14 +336,12 @@ impl SoundSet {
             }
             None => None,
         };
-        for i in 0..5u32 {
-            let step = set.clip(
-                dir,
-                &format!("footstep_concrete_{i:03}.ogg"),
-                STEP_PEAK,
-                || footstep(i),
-            );
-            set.steps.push(step);
+        let concrete = Surface::Concrete.index();
+        for i in 0..VARIANTS {
+            let step = set.clip(dir, &step_file(Surface::Concrete, i), STEP_PEAK, || {
+                footstep(i)
+            });
+            set.steps[concrete].push(step);
             let jump = set.clip(
                 dir,
                 &format!("impactSoft_medium_{i:03}.ogg"),
@@ -292,7 +357,39 @@ impl SoundSet {
             );
             set.lands.push(land);
         }
+        // The other surfaces are recorded or nothing: if any file is missing
+        // or broken, the whole surface uses the concrete steps, so a pack
+        // fetched before the surfaces were kept sounds as it always did. No
+        // pack at all needs no further note.
+        for surface in Surface::ALL {
+            if surface == Surface::Concrete {
+                continue;
+            }
+            let recorded = dir.and_then(|d| set.recorded_steps(d, surface));
+            set.steps[surface.index()] = recorded.unwrap_or_else(|| set.steps[concrete].clone());
+        }
         set
+    }
+
+    /// All of `surface`'s recorded footsteps, or `None`, with a note, when one
+    /// is missing or doesn't decode.
+    fn recorded_steps(&mut self, dir: &Path, surface: Surface) -> Option<Vec<Clip>> {
+        let mut clips = Vec::new();
+        for i in 0..VARIANTS {
+            let file = step_file(surface, i);
+            match StaticSoundData::from_file(dir.join(&file)) {
+                Ok(data) => clips.push(Clip::new(data, STEP_PEAK)),
+                Err(e) => {
+                    self.notes.push(format!(
+                        "{file}: {e}; {} steps use the concrete ones (`python3 tools/fetch_assets.py kenney_impact_sounds`)",
+                        surface.name()
+                    ));
+                    return None;
+                }
+            }
+        }
+        self.recorded += clips.len();
+        Some(clips)
     }
 
     fn clip(
@@ -343,12 +440,14 @@ pub struct StepTracker {
 }
 
 impl StepTracker {
+    /// `surface` is what the player stands on now; a step sounds like it.
     pub fn update(
         &mut self,
         pos: Vec3,
         vel: Vec3,
         on_ground: bool,
         noclip: bool,
+        surface: Surface,
     ) -> Vec<SoundEvent> {
         let mut out = Vec::new();
         let Some((last_pos, was_ground)) = self.last.replace((pos, on_ground)) else {
@@ -381,7 +480,7 @@ impl StepTracker {
                 self.walked += dist;
                 if self.walked >= STRIDE {
                     self.walked -= STRIDE;
-                    out.push(SoundEvent::Step);
+                    out.push(SoundEvent::Step(surface));
                 }
             }
             _ => {}
@@ -481,7 +580,7 @@ impl<B: Backend> Audio<B> {
 
     pub fn play(&mut self, event: SoundEvent) {
         let (slot, clips, extra_db) = match event {
-            SoundEvent::Step => (0, &self.sounds.steps, 0.0),
+            SoundEvent::Step(surface) => (0, &self.sounds.steps[surface.index()], 0.0),
             SoundEvent::Jump => (1, &self.sounds.jumps, 0.0),
             SoundEvent::Land(speed) => {
                 // Louder the harder the landing, from a third up to full.
@@ -576,12 +675,39 @@ mod tests {
             .expect("capture backend starts")
     }
 
+    /// Does every surface play exactly concrete's clips?
+    fn all_steps_are_concrete(set: &SoundSet) -> bool {
+        let concrete = &set.steps[Surface::Concrete.index()];
+        set.steps.iter().all(|clips| {
+            clips.len() == concrete.len()
+                && clips
+                    .iter()
+                    .zip(concrete)
+                    .all(|(a, b)| Arc::ptr_eq(&a.data.frames, &b.data.frames))
+        })
+    }
+
+    #[test]
+    fn surface_names_round_trip() {
+        for (i, s) in Surface::ALL.into_iter().enumerate() {
+            assert_eq!(s.index(), i);
+            assert_eq!(Surface::from_index(i), s);
+            assert_eq!(Surface::from_name(s.name()), Some(s));
+        }
+        assert_eq!(Surface::from_name("Grass"), Some(Surface::Grass));
+        assert_eq!(Surface::from_name("lava"), None);
+        assert_eq!(Surface::from_index(99), Surface::Concrete);
+        assert_eq!(Surface::default(), Surface::Concrete);
+    }
+
     #[test]
     fn a_missing_pack_falls_back_to_synthesised_sounds() {
         let set = SoundSet::load(Path::new("/nonexistent/feather-sounds"));
         assert_eq!((set.recorded, set.synthesised), (0, 15));
         assert_eq!(set.notes.len(), 1, "one note, not fifteen: {:?}", set.notes);
         assert!(set.notes[0].contains("fetch_assets.py kenney_impact_sounds"));
+        // The other surfaces step like concrete, without a note each.
+        assert!(all_steps_are_concrete(&set));
     }
 
     /// A file that's there but doesn't decode falls back for that sound only,
@@ -593,7 +719,8 @@ mod tests {
         std::fs::write(dir.join("footstep_concrete_000.ogg"), b"not an ogg").unwrap();
         let set = SoundSet::load(&dir);
         assert_eq!((set.recorded, set.synthesised), (0, 15));
-        assert_eq!(set.notes.len(), 15, "{:?}", set.notes);
+        // 15 synthesised sounds, each with a note, plus one per other surface.
+        assert_eq!(set.notes.len(), 15 + 4, "{:?}", set.notes);
         assert!(
             set.notes[0].starts_with("footstep_concrete_000.ogg:"),
             "{}",
@@ -602,11 +729,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A pack fetched before the other surfaces were kept: they step like
+    /// concrete, and each says how to get its own.
+    #[test]
+    fn surfaces_without_recordings_use_the_concrete_steps() {
+        let dir = crate::config::test_dir("sounds-no-surfaces");
+        std::fs::create_dir_all(&dir).unwrap();
+        // One grass file is there but broken: grass still falls back whole.
+        std::fs::write(dir.join("footstep_grass_000.ogg"), b"not an ogg").unwrap();
+        let set = SoundSet::load(&dir);
+        assert!(all_steps_are_concrete(&set));
+        let notes: Vec<&String> = set
+            .notes
+            .iter()
+            .filter(|n| n.contains("steps use the concrete ones"))
+            .collect();
+        assert_eq!(notes.len(), 4, "{notes:?}");
+        for (s, note) in Surface::ALL[1..].iter().zip(&notes) {
+            assert!(
+                note.starts_with(&format!("footstep_{}_000.ogg:", s.name())),
+                "{note}"
+            );
+            assert!(note.contains("fetch_assets.py kenney_impact_sounds"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn clips_are_normalised_to_their_events_peak() {
         let set = SoundSet::synthesised();
+        let steps: Vec<Clip> = set.steps.concat();
         for (clips, target) in [
-            (&set.steps, STEP_PEAK),
+            (&steps, STEP_PEAK),
             (&set.jumps, JUMP_PEAK),
             (&set.lands, LAND_PEAK),
         ] {
@@ -664,46 +818,79 @@ mod tests {
         assert_eq!(step_volume(80), 100, "off-step values go up to the next");
     }
 
+    const CONCRETE: Surface = Surface::Concrete;
+
     #[test]
     fn steps_follow_the_stride_and_ignore_noclip() {
         let mut t = StepTracker::default();
         let mut steps = 0;
         for i in 0..=100 {
             let pos = Vec3::new(i as f32 * 0.1, 0.0, 0.0); // 10 m on the ground
-            steps += t.update(pos, Vec3::ZERO, true, false).len();
+            steps += t.update(pos, Vec3::ZERO, true, false, CONCRETE).len();
         }
         assert_eq!(steps, (10.0 / STRIDE) as usize);
         let mut t = StepTracker::default();
         for i in 0..=100 {
             let pos = Vec3::new(i as f32 * 0.1, 0.0, 0.0);
-            assert!(t.update(pos, Vec3::ZERO, true, true).is_empty());
+            assert!(t.update(pos, Vec3::ZERO, true, true, CONCRETE).is_empty());
         }
+    }
+
+    #[test]
+    fn steps_carry_the_surface_underfoot() {
+        // 5 m on grass, then 5 m on wood: each step names what it's on.
+        let mut t = StepTracker::default();
+        let mut events = Vec::new();
+        for i in 0..=100 {
+            let surface = if i <= 50 {
+                Surface::Grass
+            } else {
+                Surface::Wood
+            };
+            let pos = Vec3::new(i as f32 * 0.1, 0.0, 0.0);
+            events.extend(t.update(pos, Vec3::ZERO, true, false, surface));
+        }
+        let on = |s| events.iter().filter(|&&e| e == SoundEvent::Step(s)).count();
+        assert_eq!(
+            (on(Surface::Grass), on(Surface::Wood)),
+            (3, 3),
+            "{events:?}"
+        );
+        assert_eq!(on(Surface::Grass) + on(Surface::Wood), events.len());
+        assert_eq!(events[0], SoundEvent::Step(Surface::Grass));
+        assert_eq!(events[5], SoundEvent::Step(Surface::Wood));
     }
 
     #[test]
     fn jumps_and_landings_but_not_ledges_or_steps_down() {
         let up = Vec3::Y * 5.0;
         let mut t = StepTracker::default();
-        t.update(Vec3::ZERO, Vec3::ZERO, true, false);
+        t.update(Vec3::ZERO, Vec3::ZERO, true, false, CONCRETE);
         assert_eq!(
-            t.update(Vec3::Y * 0.1, up, false, false),
+            t.update(Vec3::Y * 0.1, up, false, false, CONCRETE),
             [SoundEvent::Jump]
         );
-        t.update(Vec3::Y, -Vec3::Y * 5.0, false, false);
+        t.update(Vec3::Y, -Vec3::Y * 5.0, false, false, CONCRETE);
         assert_eq!(
-            t.update(Vec3::ZERO, Vec3::ZERO, true, false),
+            t.update(Vec3::ZERO, Vec3::ZERO, true, false, CONCRETE),
             [SoundEvent::Land(5.0)]
         );
         // Walking off a ledge: no jump; a small drop: no landing either.
         let mut t = StepTracker::default();
-        t.update(Vec3::ZERO, Vec3::ZERO, true, false);
-        assert!(t.update(Vec3::X * 0.1, Vec3::ZERO, false, false).is_empty());
-        t.update(Vec3::X * 0.2, -Vec3::Y * 2.0, false, false);
-        assert!(t.update(Vec3::X * 0.3, Vec3::ZERO, true, false).is_empty());
+        t.update(Vec3::ZERO, Vec3::ZERO, true, false, CONCRETE);
+        assert!(t
+            .update(Vec3::X * 0.1, Vec3::ZERO, false, false, CONCRETE)
+            .is_empty());
+        t.update(Vec3::X * 0.2, -Vec3::Y * 2.0, false, false, CONCRETE);
+        assert!(t
+            .update(Vec3::X * 0.3, Vec3::ZERO, true, false, CONCRETE)
+            .is_empty());
         // A teleport isn't walking.
         let mut t = StepTracker::default();
-        t.update(Vec3::ZERO, Vec3::ZERO, true, false);
-        assert!(t.update(Vec3::X * 50.0, Vec3::ZERO, true, false).is_empty());
+        t.update(Vec3::ZERO, Vec3::ZERO, true, false, CONCRETE);
+        assert!(t
+            .update(Vec3::X * 50.0, Vec3::ZERO, true, false, CONCRETE)
+            .is_empty());
     }
 
     #[test]
@@ -736,6 +923,40 @@ mod tests {
         );
         assert_eq!(full(0, 100), 0.0);
         assert_eq!(full(100, 0), 0.0);
+    }
+
+    /// A step reaches the mixer as its own surface's clip. Each surface gets
+    /// a test clip of a different length, so the length of what the mixer
+    /// renders says which one played.
+    #[test]
+    fn each_surface_plays_its_own_steps() {
+        let len = |s: Surface| seconds(0.01) * (s.index() + 1);
+        let mut sounds = SoundSet::synthesised();
+        for s in Surface::ALL {
+            let clip = Clip::new(sound(vec![STEP_PEAK; len(s)]), STEP_PEAK);
+            sounds.steps[s.index()] = vec![clip; VARIANTS as usize];
+        }
+        let volumes = AudioSettings {
+            master: 100,
+            sfx: 100,
+            ambience: 100,
+        };
+        let mut a: Audio<Capture> = Audio::new(AudioManagerSettings::default(), &volumes, sounds)
+            .expect("capture backend starts");
+        for s in Surface::ALL {
+            a.play(SoundEvent::Step(s));
+            let heard = a
+                .backend()
+                .render(seconds(0.1))
+                .iter()
+                .filter(|f| f.left.abs() > 0.01)
+                .count();
+            assert!(
+                heard.abs_diff(len(s)) <= 2,
+                "{s:?}: heard {heard} frames, its clip is {}",
+                len(s)
+            );
+        }
     }
 
     #[test]

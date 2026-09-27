@@ -120,6 +120,10 @@ pub struct Material {
     pub base_color_texture: Option<Arc<TextureData>>,
     pub normal_texture: Option<Arc<TextureData>>,
     pub metallic_roughness_texture: Option<Arc<TextureData>>,
+    /// Gameplay, not rendering: what the material sounds like underfoot
+    /// (§20), from its glTF `extras.surface`. Passed through unchecked; the
+    /// app knows which surfaces exist.
+    pub surface: Option<String>,
 }
 
 impl Default for Material {
@@ -134,6 +138,7 @@ impl Default for Material {
             base_color_texture: None,
             normal_texture: None,
             metallic_roughness_texture: None,
+            surface: None,
         }
     }
 }
@@ -457,6 +462,42 @@ fn read_material(m: &gltf::Material, images: &ImageCache) -> Material {
         base_color_texture,
         normal_texture,
         metallic_roughness_texture,
+        surface: read_surface(m),
+    }
+}
+
+/// A material's footstep surface (§20) from its `extras`, as in
+/// `{"surface": "wood"}`. Lenient like [`read_prefab`]: a value that isn't a
+/// string warns and is ignored, and extras without the key belong to other
+/// tools.
+fn read_surface(m: &gltf::Material) -> Option<String> {
+    let raw = m.extras().as_ref()?;
+    let value: serde_json::Value = match serde_json::from_str(raw.get()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "material {}: extras is not valid JSON ({e}); ignored",
+                material_label(m)
+            );
+            return None;
+        }
+    };
+    let surface = value.get("surface")?;
+    let Some(name) = surface.as_str() else {
+        eprintln!(
+            "material {}: extras.surface is not a string; ignored",
+            material_label(m)
+        );
+        return None;
+    };
+    Some(name.to_string())
+}
+
+fn material_label(m: &gltf::Material) -> String {
+    match (m.name(), m.index()) {
+        (Some(n), Some(i)) => format!("{n} (#{i})"),
+        (None, Some(i)) => format!("#{i}"),
+        (_, None) => "(default)".to_string(),
     }
 }
 
@@ -833,6 +874,49 @@ mod tests {
         assert_eq!(tex[2].pixels(), Some(&[0, 0, 255, 255][..]));
         assert!(tex[0].is_decoded() && !tex[2].encoded.is_empty());
         assert_ne!(tex[0].source_key, tex[2].source_key);
+    }
+
+    #[test]
+    fn material_extras_name_a_surface() {
+        // One primitive per case: a surface, a surface that isn't a string
+        // (warns, ignored), some other tool's extras, and no material at all.
+        let dir = fixture_dir("surfaces");
+        let positions: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let bin: Vec<u8> = positions.iter().flat_map(|f| f.to_le_bytes()).collect();
+        std::fs::write(dir.join("tri.bin"), &bin).unwrap();
+        let gltf = r#"{
+  "asset": { "version": "2.0" },
+  "scene": 0,
+  "scenes": [ { "nodes": [0] } ],
+  "nodes": [ { "mesh": 0 } ],
+  "meshes": [ { "primitives": [
+    { "attributes": { "POSITION": 0 }, "material": 0 },
+    { "attributes": { "POSITION": 0 }, "material": 1 },
+    { "attributes": { "POSITION": 0 }, "material": 2 },
+    { "attributes": { "POSITION": 0 } }
+  ] } ],
+  "materials": [
+    { "name": "planks", "extras": { "surface": "wood" } },
+    { "name": "odd", "extras": { "surface": 3 } },
+    { "name": "other", "extras": { "exporter": "someone" } }
+  ],
+  "accessors": [ {
+    "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+    "min": [0, 0, 0], "max": [1, 1, 0]
+  } ],
+  "bufferViews": [ { "buffer": 0, "byteOffset": 0, "byteLength": 36 } ],
+  "buffers": [ { "byteLength": 36, "uri": "tri.bin" } ]
+}"#;
+        let path = dir.join("surfaces.gltf");
+        std::fs::write(&path, gltf).unwrap();
+        let scene = load_gltf_scene(&path).unwrap();
+        let surfaces: Vec<Option<&str>> = scene
+            .meshes
+            .iter()
+            .map(|m| m.material.surface.as_deref())
+            .collect();
+        assert_eq!(surfaces, [Some("wood"), None, None, None]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

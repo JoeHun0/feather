@@ -929,6 +929,39 @@ hold, repeat, rebinding) is unit-tested without a GPU through
   the full lantern), but worth re-measuring before anyone relies on the 27 ms
   figure.
 
+  **Landed (§26): what's underfoot.** rapier's controller reports *that* the
+  player is grounded, not on what (its ground contact is private). So after
+  each grounded move, `player_target` sweeps the capsule's bottom sphere
+  `GROUND_PROBE` = 10 cm down and stores the hit collider's §20 surface in
+  `Player.surface`; airborne ticks keep the last one. A sphere rather than a
+  ray from the centre, because on a ledge held by the rim, centre over the
+  drop, the ray finds nothing (tested). And rather than the whole capsule,
+  which also tests whatever trunk it leans on: along three walks through the
+  nature scene the sphere cost 20–40% less than the capsule and hit the same
+  collider at 573–600 of 600 poses. The rest were walks that ended on the seam
+  between two floor tiles, where either tile is right. A probe costs 1.3 µs
+  in the open on the cuboid ground, 3.6 µs on the nature scene's floor tiles
+  and 6–12 µs beside props (debug, a temporary harness). I predicted ≤ 5 µs:
+  right in the open, wrong beside props.
+
+  The surface lives in the collider's rapier `user_data`, as its `Surface`
+  index. Concrete is 0, rapier's default, so anything untagged (the built-in
+  level) is concrete. It's there because the probe runs where there is
+  `Physics` but no `World`. If something needs collider → entity later, the
+  entity belongs in `user_data` and the surface moves to a component.
+
+  **Known cost: pushing into props.** Measured on the nature scene (debug,
+  same harness): holding a direction into a tree trunk runs the controller's
+  slide loop to its internal cap of 20 casts every tick, about 0.41 ms a
+  tick, against 8–18 µs walking in the open. That predates this work (it
+  happens on the plain cuboid ground); nearby floor colliders add to it
+  (0.58 ms with the scene's 400 floor tiles in range). Floor *trimeshes*
+  trigger it more easily: standing on a two-triangle trimesh tile and
+  pushing into a camp prop hit the cap too (0.24 ms, vs 0.02 ms on the
+  cuboid ground), which the same tile as a flat box does not (1 cast,
+  0.03 ms). Hence the nature scene's tiles collide as boxes. Uninvestigated
+  beyond that.
+
 ## 16. Skinned / animated meshes
 
 - **Second vertex layout** (joints+weights) → skinned-opaque / skinned-masked
@@ -1154,6 +1187,12 @@ Implemented prefabs are deliberately only those that do something today:
 which is what lets a scene be authored ahead of the engine. Extras parsing is
 lenient for the same reason: malformed data costs one prop, not the level.
 
+**Materials carry gameplay too:** a glTF material's `extras` can name its
+footstep `surface` (§20), as in `{"surface": "wood"}`. It's per material, not
+per node, so it follows the geometry into every placement. The loader passes
+the name through unchecked (`Material::surface`) and the app resolves it once
+per mesh, just as leniently: an unknown name warns once and means concrete.
+
 **Pending:** chunk membership; the bake path (§17), since glTF is still parsed
 at runtime; and prefabs for lights and triggers, both blocked on the systems
 that would consume them. The registry lives in `app` beside the components it
@@ -1321,16 +1360,51 @@ and punctuation.
 - **Checked on the real device:** PipeWire lists a `feather` stream on the
   analog output while the game runs.
 - **Recorded SFX (landed):** footsteps, jump and landing come from Kenney
-  Impact Sounds (CC0, 0.76 MB, pinned in `tools/fetch_assets.py`: concrete
-  footsteps, soft medium/heavy impacts, five variants each, cycled) when the
-  pack is fetched. `SoundSet` falls back per file to the synthesised sound, so
+  Impact Sounds (CC0, 0.76 MB, pinned in `tools/fetch_assets.py`: footsteps
+  for five surfaces, soft medium/heavy impacts, five variants each, cycled)
+  when the pack is fetched. `SoundSet` falls back per file to the synthesised sound, so
   audio never needs the download; a missing pack is one log line naming the
   fetch command. Every clip, recorded or not, is normalised to its event's
   target peak (0.5 / 0.35 / 0.8) at load. A temporary harness put the real
   clips through the mixer at 0.503 / 0.350 / 0.800, so they sit exactly where
   the synthesised ones did. The hum stays synthesised (the pack has no loops).
-- **Not yet:** music, more surfaces (the pack has grass, wood, carpet and snow
-  footsteps; picking one needs a surface tag per material), occlusion, reverb.
+- **Footsteps per surface (landed).** There are five surfaces, the pack's
+  footstep sets: concrete (the default), grass, wood, carpet and snow.
+  - **Where the surface comes from:** a glTF material names one in its
+    `extras` (§18). Every scene collider carries its mesh's surface, the
+    grounded player probes what it stands on each tick (§15), and
+    `StepTracker` stamps each step with it (`SoundEvent::Step(Surface)`).
+  - **Why per material, not per node:** one tag covers every placement, and
+    a multi-material model gets the answer per face (Kenney's cliff blocks
+    have grass tops and rock sides).
+  - **Load line:** `[scene] surfaces: …` counts the colliders per surface.
+  - **Clips:** each surface has five recorded steps, normalised to the step
+    peak like concrete. A surface with any file missing or broken reuses the
+    concrete steps (recorded or synthesised), with one note per surface
+    naming the fetch command. So a pack fetched before the surfaces were
+    kept sounds exactly as it did, and a missing pack is still one note.
+    There are no synthesised surfaces.
+  - **Measured (temporary harnesses):**
+    - The 25 recorded steps peak within 0.3 dB of each other. Kenney
+      peak-normalises to about −1 dBFS; I predicted within 3 dB. Through the
+      mixer they all play at 0.494–0.503, against 0.87–0.91 without the gain.
+    - Grass steps last 0.6–0.8 s, but their energy is in the first 50 ms, so
+      a walk (a step every 0.2 s) peaks at 0.50 on every surface.
+    - Density differs, though. A walk's steady RMS is 0.034–0.041 on concrete,
+      grass and carpet, but 0.061 on wood and 0.072 on snow (5.1 and 6.5 dB
+      above concrete). If those sound too loud, a per-surface trim is the fix.
+  - **Content:**
+    - The test level's `surfaces` zone: a strip of five pads east of spawn.
+    - The nature scene: materials tagged by name, and grass tiles that now
+      collide, as flat boxes (§15).
+    - End to end, a harness walked the real scenes through the real spawn
+      path. The strip steps concrete → grass → wood → carpet → snow; the
+      meadow is grass, stumps and logs wood, stone concrete. The pre-change
+      files stay concrete throughout (the negative control). Loading nature
+      builds 400 more (box) colliders: world time 0.01 → 0.02 s, the log
+      line's resolution (predicted +5–15 ms).
+- **Not yet:** music, per-surface jump and landing sounds, stone or metal
+  steps (not in the pack), occlusion, reverb.
 
 ## 21. Debug / profiling
 
@@ -1541,9 +1615,10 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   in `assets` — the latter for §18 prefab params, already in the tree via gltf.
   `app` has `serde_json` as a dev-dependency only. `xxhash-rust` (xxh3) in
   `assets` for the baked-texture content key; `intel_tex_2` (Intel's ISPC BCn
-  encoder) in `bake` only, so the engine never links it. Dependencies build
-  optimised even in debug (`[profile.dev.package."*"]`). Not yet added: kira,
-  egui, tracy.
+  encoder) in `bake` only, so the engine never links it. `kira =0.12.5` (on
+  cpal, Ogg Vorbis decoding only) and `mint` in `app`, for §20 audio.
+  Dependencies build optimised even in debug (`[profile.dev.package."*"]`).
+  Not yet added: egui, tracy.
 - **gfx**: instance/debug messenger/surface/device/queues (on debug builds the
   validation layer + messenger are enabled only when
   `VK_LAYER_KHRONOS_validation` is installed; if missing, a warning is printed
@@ -1708,9 +1783,11 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   run the controller, push the kinematic target) → `physics_step_sys` →
   `player_readback_sys` (rapier→ECS: body translation back into the component).
   Input arrives as the §14 `InputState` resource rather than being read off `App`.
-  Level entities carry a `ColliderRef` handle. The controller maths stay plain
-  functions (`player_target`/`player_readback`) that the systems wrap, so the
-  physics tests drive the real logic. Still open: no `InteractionGroups` layers
+  Level entities carry a `ColliderRef` handle. Scene colliders also carry their
+  §20 footstep surface in rapier's `user_data`, and a grounded player sweeps its
+  bottom sphere down each tick to read it into `Player.surface` (§15). The
+  controller maths stay plain functions (`player_target`/`player_readback`) that
+  the systems wrap, so the physics tests drive the real logic. Still open: no `InteractionGroups` layers
   (nothing to separate yet); the drifting orbs and their spin are still
   non-physical (cosmetic, not rigid bodies). Known limits: the ground is a finite 80×80 box, so walking
   off the edge falls forever (no kill-plane/respawn); slope climbing/sliding uses
@@ -1718,7 +1795,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   box rim counts as grounded (vertical speed zeroed) and the capsule clambers
   up rather than continuing the arc; turning noclip off while standing inside
   geometry only depenetrates when not moving; default rapier features (no
-  `enhanced-determinism`), so cross-machine replay isn't guaranteed yet.
+  `enhanced-determinism`), so cross-machine replay isn't guaranteed yet; pushing
+  into a prop can run the controller's slide loop to its 20-cast cap every tick
+  (0.4–0.6 ms in debug against a tree, §15).
 - **Descriptors (§9)**: one set with three bindings — per-frame instances
   (binding 0), resident materials (binding 1), and a resident
   `sampler2D textures[]` (binding 2) sized per level, as N discrete per-frame
@@ -1826,9 +1905,10 @@ the sample count; all of them, plus the GAMEPLAY field of view, persist in
 `config/graphics.toml` (§13), and key bindings + mouse look live in
 `config/controls.toml` (§14), edited from OPTIONS > CONTROLS / GAMEPLAY, whose
 lists scroll when the window is short; egui dev UI, SDF text and
-lower-case/punctuation pending); audio (**landed**, §20: kira mixer, synthesised
-footsteps/jump/landing, spatial lamp hums, live SOUND volumes; sound files,
-music and occlusion pending); debug/profiling tooling (per-pass GPU timestamp timing
+lower-case/punctuation pending); audio (**landed**, §20: kira mixer, recorded
+footsteps/jump/landing (Kenney, CC0) with synthesised fallbacks, footsteps per
+surface from glTF material tags, spatial lamp hums, live SOUND volumes; music
+and occlusion pending); debug/profiling tooling (per-pass GPU timestamp timing
 landed — stderr log + `Renderer::gpu_times`, plus the `--bench` sweep harness;
 Tracy / RenderDoc / egui overlay and
 CPU-side zones pending); GPU-driven culling; streaming; stage pipelining;

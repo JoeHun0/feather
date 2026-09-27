@@ -22,6 +22,10 @@ What the composer does to the kit, and why
   would render as dark, tinted, fully rough *metal*. Each material keeps its
   baseColorFactor and becomes metallic 0 / roughness 0.9. They are deduped
   by name across files (the kit shares 23 of them).
+* **Materials name their footstep surface** (§20, `extras.surface`), by
+  material name: see SURFACES.
+* **The grass tiles collide.** They are the meadow you walk on, so their
+  grass is what you hear; the app's slab underneath would be concrete.
 * **Inner transforms are baked into the vertices**, so every placed node is a
   plain translation + yaw + *uniform* scale. (The engine would shade any TRS
   correctly; it is this script's own normal baking, xform_normal, that assumes
@@ -73,6 +77,18 @@ SMALL = ["grass", "grass_large", "grass_leafs", "flower_redA", "flower_yellowB",
          "mushroom_tanGroup", "rock_smallA", "rock_smallFlatB"]
 # Small scatter that is big enough to matter keeps its shadow.
 SMALL_CASTS = {"plant_bush"}
+
+# Footstep surface (§20) per kit material name. Untagged means the engine's
+# default, concrete, which is right for stone and for "dirt": despite the
+# name, that's the brown body of the kit's rocks and cliff sides (the pack has
+# no stone steps). What nobody stands on (leaves, cloth) needs no tag either.
+SURFACES = {
+    "grass": "grass",
+    "wood": "wood", "woodDark": "wood", "woodBark": "wood",
+    "woodBarkDark": "wood", "woodBirch": "wood", "woodInner": "wood",
+}
+# Ground tiles sit this far above the app's ground, so they don't z-fight it.
+TILE_LIFT = 0.02
 
 CAMP = (0.0, 20.0)  # the clearing, north of the default spawn (z = 8)
 CAMP_CLEAR = 9.0
@@ -228,14 +244,17 @@ class Level:
         if name not in self.materials:
             pbr = mat.get("pbrMetallicRoughness", {})
             # Unlit flat colour -> lit dielectric (see the module docstring).
-            self.doc["materials"].append({
+            entry = {
                 "name": name,
                 "pbrMetallicRoughness": {
                     "baseColorFactor": pbr.get("baseColorFactor", [1, 1, 1, 1]),
                     "metallicFactor": 0.0,
                     "roughnessFactor": 0.9,
                 },
-            })
+            }
+            if name in SURFACES:
+                entry["extras"] = {"surface": SURFACES[name]}
+            self.doc["materials"].append(entry)
             self.materials[name] = len(self.doc["materials"]) - 1
         return self.materials[name]
 
@@ -378,17 +397,23 @@ def build(density, seed):
     pl = Placer(level, rng)
     counts = DENSITY[density]
 
-    # Ground cover: 4 m grass tiles over the whole 80 x 80 slab. Lifted 2 cm so
-    # they don't z-fight the app's ground; no collider (the slab already
-    # collides) and no shadow casting (a flat floor shadows nothing; see §11's
-    # note on the ground rasterising the whole map).
+    # Ground cover: 4 m grass tiles over the whole 80 x 80 slab, lifted
+    # TILE_LIFT so they don't z-fight the app's ground. They collide, because
+    # they are what you walk on and they carry the grass surface (§20); the
+    # slab under them would sound like concrete. As flat boxes, not their
+    # two-triangle trimesh: standing on a trimesh tile while pushing into a
+    # prop ran rapier's slide loop to its 20-pass cap every tick (0.24 ms in
+    # debug, vs 0.02 ms on the slab), and a box tile doesn't (0.03 ms). No
+    # shadow casting (a flat floor shadows nothing; see §11's note on the
+    # ground rasterising the whole map).
     tile = SCALE
     n = int(2 * HALF / tile)
+    ground = {"prefab": "prop", "params": {"collide": True, "shadow": False, "collider": "box"}}
     for i in range(n):
         for j in range(n):
             x, z = -HALF + tile * (i + 0.5), -HALF + tile * (j + 0.5)
             pl.put("ground_grass", x, z, yaw=0.0, scale=SCALE, reserve=False,
-                   extras=prop(collide=False, shadow=False), lift=0.02)
+                   extras=ground, lift=TILE_LIFT)
 
     # The camp: a tent, a fire with a warm light, seats around it.
     cx, cz = CAMP
@@ -404,7 +429,8 @@ def build(density, seed):
         pl.put("log" if i % 2 else "stump_round", cx + 3.2 * math.cos(a), cz + 3.2 * math.sin(a),
                yaw=a + math.pi / 2)
     pl.put("log_stack", cx + 5.0, cz + 4.5, yaw=math.radians(-30))
-    level.node(None, (0.0, GROUND_Y, 13.0), label="player_start",
+    # On the tiles, not in them: they collide.
+    level.node(None, (0.0, GROUND_Y + TILE_LIFT, 13.0), label="player_start",
                extras={"prefab": "player_start", "params": {"yaw": 90.0}})
 
     # The path: stone slabs from the camp through the forest, a fence along one
