@@ -979,7 +979,8 @@ hold, repeat, rebinding) is unit-tested without a GPU through
       floor don't undo each other.
   - **Fix:** before calling the controller, `player_target` removes the
     horizontal part of the motion that goes into any downward-facing surface
-    the capsule touches (`overhangs_touching`, `clip_horizontal`).
+    the capsule touches (now `overhangs_near`, `clip_horizontal`; it also
+    looks ahead, see below).
     - Head-on, nothing is left, so the loop never starts.
     - At an angle, the player slides along the overhang as along a wall.
       Before, it stood still, because the loop gave up.
@@ -1010,9 +1011,96 @@ hold, repeat, rebinding) is unit-tested without a GPU through
     - rapier 0.36, which doesn't touch the slide loop.
   - `Player.slide_hits` counts a tick's passes. `a_low_overhang_holds_the_player_cheaply`
     and `a_low_overhang_is_slid_along` pin the behaviour down.
-  - **Still open:** the same sweep, walking only, counted ticks that ran all
-    20 passes. The clip cut them from 26,772 to 7,133, so other shapes still
-    stall while walking. They're not yet diagnosed.
+
+  **Landed (§26): the rest of the grounded stalls.**
+  - **Re-measured:** a new sweep walked into every `nature.glb` prop.
+    - 8 directions, each aimed at the centre and 0.4 m to one side:
+      2,832 runs of 180 ticks, 509,760 ticks in all (debug, a temporary
+      harness).
+    - 257 ticks ran all 20 passes.
+    - **Correction:** about 3,000 more came from 19 runs that *started
+      inside* a neighbouring tree. A capsule inside a trimesh bounces
+      between the two faces of the same triangles for the whole run.
+      That's an artefact of placing starts blindly, and probably most of
+      the 7,133 this section used to quote. Turning noclip off inside a
+      tree would do the same.
+  - **Cause, traced:** all 257 were the ground + underside wedge above.
+    The clip missed it in three ways:
+    - the underside was only reached *during* the tick. 161 ticks were
+      the slide carrying the player from one canopy facet onto the next,
+      and 44 were arriving at a canopy. The clip only knew what touched
+      when the tick began.
+    - the underside was shallower than the clip's ~12° (30 ticks): 9–10°
+      past vertical, like a fat trunk's bulge. It wedges only when the
+      push along it is blocked too.
+    - 22 unseen by the head ball at the tick's start. They went with the
+      first fix below.
+  - **Predicted wrong:** I expected creases between two side walls (rocks,
+    cliff blocks) to dominate and trees to add little. No stall had two
+    side walls. All but 5 happened pushing at a tree, and the one of those
+    5 traced (a log) wedged under a neighbouring tree's canopy.
+  - **Fix 1, look ahead.** `around_overhangs` bends the tick's motion
+    round what it would reach.
+    - `overhangs_near` also returns undersides within this tick's travel,
+      each with the room left before the head is `OVERHANG_REACH` away.
+    - A leg goes that far *in its own direction*. The rest is then clipped
+      against that underside, now touching, as before.
+    - Up to 3 bends, summed into one move for the controller.
+    - A grounded player now stops 4–5 cm short of an underside instead of
+      the controller's ~2 cm (3.9 cm further out in the canopy test).
+  - **Versions that failed**, each caught by a test or by the sweep's
+    outcome check (did each run get past its prop?):
+    - clipping far undersides like touching ones steered the player
+      sideways along facets it hadn't reached. On a ball canopy that drift
+      fed itself until the player slid round it
+      (`a_low_overhang_holds_the_player_cheaply` failed);
+    - stopping at the underside ahead, without going on along it, held
+      612 runs that used to slide round pines and cones;
+    - a leg aimed exactly at the reach left float noise. The next tick
+      then found that underside "still ahead" with microscopic room, and
+      stopped the player dead. Legs now aim 1 cm inside the reach.
+  - **Fix 2, shallow undersides, only after a wedge.**
+    - Clipping them up front (to ~1°) removed their stalls, but held
+      players whom the slide used to carry along a trunk: 12 of 21 newly
+      held runs, all at `tree_fat`, half of them glancing pushes.
+    - Instead, `Player.wedged` latches after a grounded tick whose slide
+      gave up. While it's set, shallow undersides that touch count for the
+      clip, and it stays set as long as the clip keeps changing the
+      motion. So each wedge costs one 20-pass tick.
+  - **Measured (debug, the same binary with the new code on and off, two
+    repeats each):**
+    - 20-pass ticks: 257 and 233 → 5 and 7, all shallow wedges, about
+      one per wedge (8 in 7 runs on a traced pass);
+    - mean tick: 46.6–46.9 → 47.2–47.4 µs;
+    - walking in the open (over 3 m from any prop): 3.90–3.93 → 3.86–3.90
+      µs.
+    - Predicted: at least 90% fewer 20-pass ticks (right, 97–98%) and
+      at most +3 µs in the open (right, no measurable change). My first
+      open-walking figure read +6 µs because it counted ticks held by the
+      clip beside canopies as "open": a wrong measure, not a cost.
+    - The 20-pass count moves by about ±20 between identical runs of the
+      old code: a few runs depend on the physics world's history.
+  - **Behaviour:**
+    - Walking: 2,368 of the 2,832 runs got past their prop before, and
+      2,399 now: 36 newly get past, and 5 are newly held (3 head-on at
+      round trees, 2 glancing). Two runs of the old code differ in none.
+    - Hopping at every prop from four sides (708 runs): 704 reach the
+      same height as before and one reaches 2 mm higher. The other 3 also
+      differ between two runs of the old code. 512 runs climb above 1.8 m
+      either way. Predicted: all within 1 mm (off by that one run).
+  - Tests (both fail on the old code, checked):
+    - `reaching_a_low_overhang_mid_tick_is_cheap`: starts spread over one
+      tick's travel, head-on and glancing, hull and trimesh. At most 3
+      passes on every tick; the old code hit 20.
+    - `a_shallow_overhang_wedges_at_most_once`: a wall leaning 9°, with an
+      inside corner (83 of 120 ticks at 20 passes before) and at its open
+      end, where the old controller stuck (67). Now at most one each, and
+      the player slides off the open end.
+  - **Still open:**
+    - each shallow wedge still costs one 20-pass tick, about 0.3–0.4 ms
+      in debug;
+    - when the 3 bends run out, the rest of the motion is dropped: the
+      player stops short rather than wedging.
   - **Correction:** this section used to blame a second stall on trimesh
     floor tiles plus a camp prop (0.24 ms), and the nature tiles became flat
     boxes for it. That obstacle was a player capsule the measuring harness
@@ -1849,9 +1937,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   Level entities carry a `ColliderRef` handle. Scene colliders also carry their
   §20 footstep surface in rapier's `user_data`, and a grounded player sweeps its
   bottom sphere down each tick to read it into `Player.surface` (§15). Before
-  each move, the motion loses any part going into a downward-facing surface
-  touching the top of the capsule, which otherwise stalled the controller
-  (§15). The controller maths stay plain functions (`player_target`/`player_readback`) that
+  each grounded move, the motion is bent round any downward-facing surface
+  the top of the capsule touches or would reach this tick (shallow ones only
+  once a slide has given up), which otherwise stalled the controller (§15). The controller maths stay plain functions (`player_target`/`player_readback`) that
   the systems wrap, so the physics tests drive the real logic. Still open: no `InteractionGroups` layers
   (nothing to separate yet); the drifting orbs and their spin are still
   non-physical (cosmetic, not rigid bodies). Known limits: the ground is a finite 80×80 box, so walking
