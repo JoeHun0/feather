@@ -27,10 +27,10 @@ intel_tex_2       = "0.5"
 # (bake crate only)
 meshopt           = "0.6"
 xxhash-rust       = { version = "0.8", features = ["xxh3"] }
-# audio (§20, app only): kira's mixer on cpal; no decoding features yet (sounds
-# are synthesised as raw frames), no realtime-dbus (a second system library).
-# Needs the ALSA headers on Linux: `libasound2-dev`.
-kira              = { version = "=0.12.5", default-features = false, features = ["cpal"] }
+# audio (§20, app only): kira's mixer on cpal, decoding Ogg Vorbis only (the
+# recorded SFX; the rest is synthesised), no realtime-dbus (a second system
+# library). Needs the ALSA headers on Linux: `libasound2-dev`.
+kira              = { version = "=0.12.5", default-features = false, features = ["cpal", "ogg", "vorbis"] }
 mint              = "0.5"
 # internal (path deps, referenced as `<crate>.workspace = true`)
 feather-platform = { path = "platform" }

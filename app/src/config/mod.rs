@@ -197,7 +197,7 @@ impl ConfigFile {
 
 /// A fresh, empty directory per test under the system temp dir.
 #[cfg(test)]
-fn test_dir(name: &str) -> std::path::PathBuf {
+pub(crate) fn test_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("feather-config-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     dir

@@ -203,13 +203,18 @@ screen, and resumes play only from the pause menu's top level.
   `config/controls.toml`, FIELD OF VIEW (a view setting) to
   `config/graphics.toml`, volumes to `config/audio.toml`.
 
-**What you hear** (all synthesised at startup, no sound files yet):
-footsteps every ~1.6 m walked, a jump sound, a thump on landings from more
+**What you hear:** footsteps every ~1.6 m walked, a jump sound, a thump on landings from more
 than a small step down (louder the harder), nothing in noclip, and a 60 Hz
 hum from every *visible* lamp (a point light on geometry, e.g. the
 testscene's two glowing orbs) that pans as you turn and fades out at the
-light's radius. With no audio device the game logs `[audio] unavailable` and
-runs silent.
+light's radius. Footsteps, jump and landing are **recorded** (Kenney Impact
+Sounds, CC0: concrete footsteps, soft impacts) once
+`python3 tools/fetch_assets.py kenney_impact_sounds` has run (0.76 MB); without
+the pack, or for any file that won't decode, each falls back to a synthesised
+sound, so audio never needs the download. The lamp hum is always synthesised.
+Every clip is normalised to its event's level, so recorded and synthesised
+sounds play equally loud. With no audio device the game logs
+`[audio] unavailable` and runs silent.
 
 Defaults: shadows HIGH, FXAA off, MSAA 1×.
 
@@ -298,6 +303,11 @@ it again and it's a no-op. `--zip PATH` uses an archive you already have
 The kit is **CC0** (Creative Commons Zero, see its `License.txt`): free for any
 use, with credit to Kenney (kenney.nl) appreciated but not required.
 
+The same command also fetches **Kenney Impact Sounds** (0.76 MB, CC0) into
+`scratch/assets/kenney_impact_sounds/`: only the 15 sounds the game plays
+(concrete footsteps, soft impacts) plus the licence. Fetch just that pack with
+`python3 tools/fetch_assets.py kenney_impact_sounds`.
+
 `gen_naturescene.py` builds a grass meadow, forest, rocks, a cliff ridge on the
 east edge, a camp with a fire light (you spawn at its edge, facing the fire), and a
 stone path lit by lamps. Options: `--density low|med|high`, `--seed N`,
@@ -364,12 +374,12 @@ and distant shadows should look unchanged.
 
 ## 5. Tests — what exists and what it guards
 
-`cargo test --workspace`: 118 tests, all CPU-side (none needs a GPU).
+`cargo test --workspace`: 121 tests, all CPU-side (none needs a GPU).
 
 | Area | Crate | What the tests pin down |
 |---|---|---|
 | Character controller | app | settling, walking speed, jumps and head bumps, no air-jump, autostep lip vs wall, sliding along box faces, noclip |
-| Audio | app | synthesised sounds are finite, within ±1, end at zero (no click) and are deterministic, and the hum loops without a seam; footsteps per stride, silent in noclip, jump vs walking off a ledge, the landing threshold, teleports ignored; percent → dB; **through the real kira mixer** (a capture backend, no sound card): a landing is audible, master and SFX at 50% halve its peak and 0% silences it, a lamp to the listener's right is louder in the right ear (and vice versa), and one past its radius is silent; `audio.toml` parse/warn/save; the SOUND rows step and save |
+| Audio | app | a missing sound pack falls back to 15 synthesised clips with one note (naming the fetch command); a file that doesn't decode falls back for that sound only, with a note; every clip is normalised to its event's peak; synthesised sounds are finite, within ±1, end at zero (no click) and are deterministic, and the hum loops without a seam; footsteps per stride, silent in noclip, jump vs walking off a ledge, the landing threshold, teleports ignored; percent → dB; **through the real kira mixer** (a capture backend, no sound card): a landing is audible, master and SFX at 50% halve its peak and 0% silences it, a lamp to the listener's right is louder in the right ear (and vice versa), and one past its radius is silent; `audio.toml` parse/warn/save; the SOUND rows step and save |
 | Collision proxies | app | the `collider` param picks mesh/hull/box/none, `auto` switches to a hull past 2048 triangles without a bake, `collide: false` still wins; a dense 30 cm prop is walkable as a hull; a flat hull still holds the player; with a bake, `auto` picks the finest LOD within the triangle budget and 5 cm (scaled by the node), and a concave dish keeps the player *in* it as a LOD trimesh but on its rim as a hull; `mesh` stays exact |
 | Menus | app | row layout and hit-testing at several window sizes, including scrolling a screen taller than the window (the selection stays visible, hovering a visible row never scrolls, hits map back to the right row); wraparound, Esc/back behaviour, OPTIONS reachable from both menus, MSAA only outside a session, DISPLAY toggles windowed/fullscreen, FIELD OF VIEW steps its presets (and the projection really uses it); SENSITIVITY / INVERT Y change and save; rebinding waits for a key, ignores menu keys, takes the key from its old action (which shows NONE), and is cancelled by Esc, moving away or BACK; RESET KEYS; **every label drawable by the 5×7 A–Z/0–9 font** |
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice at every FOV from 30° to 120°; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
@@ -408,7 +418,7 @@ Everything goes to stderr.
 | `[quality] shadows / fxaa: …` | a setting changed |
 | `[config] …` | a config file created / loaded / renamed, a line ignored or a key bound twice, plus the effective graphics settings at startup |
 | `[light] N visible lights exceeds MAX_LIGHTS` | lights past 128 were dropped this frame |
-| `[audio] started … / unavailable: … / N lamps humming` | the mixer came up (or why not; the game then runs silent), and how many lamps a session gave a hum |
+| `[audio] started …; sounds: R recorded, S synthesised` / `… not found (…fetch_assets.py…)` / `unavailable: …` / `N lamps humming` | the mixer came up (or why not; the game then runs silent), and how many lamps a session gave a hum |
 | `[mesh] N meshes (B baked, L LODs): …` | geometry uploaded at load, and how much of it came from the bake |
 | `[mesh] N textures uploaded … (B baked BC7, R raw; D images decoded)` | textures at load; with a complete bake D is 0 |
 | `[scene] colliders: N mesh (M from LODs), H hull, B box` | the colliders a session built; with a bake, detailed props should be LODs, not hulls |

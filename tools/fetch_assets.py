@@ -45,6 +45,23 @@ PACKS = {
         # copies of every model and ~1600 preview PNGs, none of which we use.
         "keep": ["Models/GLTF format/", "License.txt"],
     },
+    # Recorded SFX for the audio system (§20). Pinned by the SHA-256 of the
+    # archive as downloaded on 2026-09-27 (Kenney publishes no hash).
+    "kenney_impact_sounds": {
+        "title": "Kenney Impact Sounds 1.0",
+        "url": "https://kenney.nl/media/pages/assets/impact-sounds/87b4ddecda-1677589768/"
+               "kenney_impact-sounds.zip",
+        "sha256": "029d734af1582474edf3a694d1b0cebc97c1c152f2f39fa34d4c2bafc5de77f8",
+        "license": "CC0 1.0 (Creative Commons Zero), per the pack's License.txt",
+        # Footsteps (concrete: the levels are concrete and boxes) and the soft
+        # impacts used for jump and landing. The pack's other 110 sounds
+        # (metal, glass, wood, other surfaces) aren't used yet.
+        "keep": [
+            "Audio/footstep_concrete_",
+            "Audio/impactSoft_",
+            "License.txt",
+        ],
+    },
     # Detail stress set (2K textures): see ARCHITECTURE.md §21. Pins are Poly
     # Haven's published per-file MD5s, from api.polyhaven.com/files/<id>.
     "polyhaven_marble_bust_01": {

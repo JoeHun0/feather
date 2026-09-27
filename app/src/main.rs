@@ -3470,9 +3470,21 @@ fn main() {
     let audio = if bench_run {
         None
     } else {
-        match Audio::new(kira::AudioManagerSettings::default(), &configs.audio) {
+        // Recorded SFX where fetched, synthesised otherwise (§20).
+        let sounds = audio::SoundSet::load(std::path::Path::new(audio::SOUNDS_DIR));
+        for note in &sounds.notes {
+            eprintln!("[audio] {note}");
+        }
+        let (recorded, synthesised) = (sounds.recorded, sounds.synthesised);
+        match Audio::new(
+            kira::AudioManagerSettings::default(),
+            &configs.audio,
+            sounds,
+        ) {
             Ok(a) => {
-                eprintln!("[audio] started on the default output device");
+                eprintln!(
+                    "[audio] started on the default output device; sounds: {recorded} recorded, {synthesised} synthesised"
+                );
                 Some(a)
             }
             Err(e) => {

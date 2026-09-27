@@ -3,12 +3,15 @@
 //! startup (no sound files yet).
 //!
 //! - **SFX** is the player's own: footsteps, jump, landing. Not spatial.
+//!   Recorded (Kenney Impact Sounds, CC0, via `tools/fetch_assets.py`) when
+//!   the pack is fetched, synthesised otherwise: see `SoundSet`.
 //! - **AMBIENCE** holds one spatial sub-track per visible lamp, looping a hum
 //!   that pans with the listener and fades out to the light's radius.
 //!
 //! `Audio` is generic over kira's `Backend`, so the tests run the real mixer
 //! through a capture backend and check what it actually produced.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use glam::{Quat, Vec3};
@@ -182,6 +185,140 @@ fn sound(samples: Vec<f32>) -> StaticSoundData {
     }
 }
 
+// ---- the sound set: recorded where fetched, synthesised otherwise ----
+
+/// Where `tools/fetch_assets.py kenney_impact_sounds` puts the recorded SFX
+/// (cwd-relative, like the bake dir).
+pub const SOUNDS_DIR: &str = "scratch/assets/kenney_impact_sounds";
+
+/// Peak level every clip is normalised to, per event, so a recorded sound and
+/// the synthesised one it replaces play at the same level whichever loaded.
+const STEP_PEAK: f32 = 0.5;
+const JUMP_PEAK: f32 = 0.35;
+const LAND_PEAK: f32 = 0.8;
+
+/// A sound plus the gain (dB) that brings its peak to its event's target.
+#[derive(Clone)]
+struct Clip {
+    data: StaticSoundData,
+    gain: f32,
+}
+
+impl Clip {
+    fn new(data: StaticSoundData, target_peak: f32) -> Self {
+        let peak = data
+            .frames
+            .iter()
+            .fold(0.0f32, |m, f| m.max(f.left.abs()).max(f.right.abs()));
+        let gain = if peak > 1e-6 {
+            20.0 * (target_peak / peak).log10()
+        } else {
+            0.0
+        };
+        Self { data, gain }
+    }
+
+    /// The sound to play, `extra_db` louder than its normalised level.
+    fn play(&self, extra_db: f32) -> StaticSoundData {
+        self.data.volume(Decibels(self.gain + extra_db))
+    }
+}
+
+/// The SFX clips, five variants per event (cycled, so repeats don't sound
+/// identical).
+pub struct SoundSet {
+    steps: Vec<Clip>,
+    jumps: Vec<Clip>,
+    lands: Vec<Clip>,
+    pub recorded: usize,
+    pub synthesised: usize,
+    /// Why anything fell back, for the log.
+    pub notes: Vec<String>,
+}
+
+impl SoundSet {
+    /// Everything synthesised: no files needed (the mixer tests).
+    #[cfg(test)]
+    pub fn synthesised() -> Self {
+        Self::load_with(None)
+    }
+
+    /// Recorded clips from `dir`; each file that's missing or doesn't decode
+    /// falls back to its synthesised sound, so audio never needs the fetch.
+    pub fn load(dir: &Path) -> Self {
+        Self::load_with(Some(dir))
+    }
+
+    fn load_with(dir: Option<&Path>) -> Self {
+        let mut set = Self {
+            steps: Vec::new(),
+            jumps: Vec::new(),
+            lands: Vec::new(),
+            recorded: 0,
+            synthesised: 0,
+            notes: Vec::new(),
+        };
+        let dir = match dir {
+            Some(d) if d.is_dir() => Some(d),
+            Some(d) => {
+                set.notes.push(format!(
+                    "{} not found (`python3 tools/fetch_assets.py kenney_impact_sounds`); using synthesised sounds",
+                    d.display()
+                ));
+                None
+            }
+            None => None,
+        };
+        for i in 0..5u32 {
+            let step = set.clip(
+                dir,
+                &format!("footstep_concrete_{i:03}.ogg"),
+                STEP_PEAK,
+                || footstep(i),
+            );
+            set.steps.push(step);
+            let jump = set.clip(
+                dir,
+                &format!("impactSoft_medium_{i:03}.ogg"),
+                JUMP_PEAK,
+                jump,
+            );
+            set.jumps.push(jump);
+            let land = set.clip(
+                dir,
+                &format!("impactSoft_heavy_{i:03}.ogg"),
+                LAND_PEAK,
+                land,
+            );
+            set.lands.push(land);
+        }
+        set
+    }
+
+    fn clip(
+        &mut self,
+        dir: Option<&Path>,
+        file: &str,
+        peak: f32,
+        synth: impl Fn() -> Vec<f32>,
+    ) -> Clip {
+        if let Some(dir) = dir {
+            let path = dir.join(file);
+            match StaticSoundData::from_file(&path) {
+                Ok(data) => {
+                    self.recorded += 1;
+                    return Clip::new(data, peak);
+                }
+                Err(e) => self
+                    .notes
+                    .push(format!("{file}: {e}; using a synthesised sound")),
+            }
+        }
+        self.synthesised += 1;
+        Clip::new(one_shot(synth()), peak)
+    }
+}
+
 // ---- events from player motion ----
 
 /// Walking distance between footsteps (m).
@@ -261,11 +398,10 @@ pub struct Audio<B: Backend> {
     listener: ListenerHandle,
     sfx: TrackHandle,
     ambience: TrackHandle,
-    steps: Vec<StaticSoundData>,
-    jump: StaticSoundData,
-    land: StaticSoundData,
+    sounds: SoundSet,
     hum: StaticSoundData,
-    next_step: usize,
+    /// Next variant per event (steps, jumps, landings).
+    next: [usize; 3],
     /// One spatial track per lamp; dropping a handle removes its track.
     lamps: Vec<SpatialTrackHandle>,
 }
@@ -291,6 +427,7 @@ impl<B: Backend> Audio<B> {
     pub fn new(
         mut settings: AudioManagerSettings<B>,
         volumes: &AudioSettings,
+        sounds: SoundSet,
     ) -> Result<Self, String>
     where
         B::Error: std::fmt::Debug,
@@ -313,11 +450,9 @@ impl<B: Backend> Audio<B> {
             listener,
             sfx,
             ambience,
-            steps: (0..4).map(|seed| one_shot(footstep(seed))).collect(),
-            jump: one_shot(jump()),
-            land: one_shot(land()),
+            sounds,
             hum: sound(hum()).loop_region(..),
-            next_step: 0,
+            next: [0; 3],
             lamps: Vec::new(),
         })
     }
@@ -345,18 +480,17 @@ impl<B: Backend> Audio<B> {
     }
 
     pub fn play(&mut self, event: SoundEvent) {
-        let data = match event {
-            SoundEvent::Step => {
-                self.next_step = (self.next_step + 1) % self.steps.len();
-                self.steps[self.next_step].clone()
-            }
-            SoundEvent::Jump => self.jump.clone(),
+        let (slot, clips, extra_db) = match event {
+            SoundEvent::Step => (0, &self.sounds.steps, 0.0),
+            SoundEvent::Jump => (1, &self.sounds.jumps, 0.0),
             SoundEvent::Land(speed) => {
                 // Louder the harder the landing, from a third up to full.
                 let loud = ((speed - LAND_SPEED) / 7.0).clamp(0.3, 1.0);
-                self.land.volume(Decibels(20.0 * loud.log10()))
+                (2, &self.sounds.lands, 20.0 * loud.log10())
             }
         };
+        self.next[slot] = (self.next[slot] + 1) % clips.len();
+        let data = clips[self.next[slot]].play(extra_db);
         // A full sound queue drops one sound, never the game.
         let _ = self.sfx.play(data);
     }
@@ -438,7 +572,54 @@ mod tests {
     }
 
     fn audio(v: AudioSettings) -> Audio<Capture> {
-        Audio::new(AudioManagerSettings::default(), &v).expect("capture backend starts")
+        Audio::new(AudioManagerSettings::default(), &v, SoundSet::synthesised())
+            .expect("capture backend starts")
+    }
+
+    #[test]
+    fn a_missing_pack_falls_back_to_synthesised_sounds() {
+        let set = SoundSet::load(Path::new("/nonexistent/feather-sounds"));
+        assert_eq!((set.recorded, set.synthesised), (0, 15));
+        assert_eq!(set.notes.len(), 1, "one note, not fifteen: {:?}", set.notes);
+        assert!(set.notes[0].contains("fetch_assets.py kenney_impact_sounds"));
+    }
+
+    /// A file that's there but doesn't decode falls back for that sound only,
+    /// and says so; the rest (missing here) fall back too, each with a note.
+    #[test]
+    fn a_broken_file_falls_back_for_that_sound_only() {
+        let dir = crate::config::test_dir("sounds-broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("footstep_concrete_000.ogg"), b"not an ogg").unwrap();
+        let set = SoundSet::load(&dir);
+        assert_eq!((set.recorded, set.synthesised), (0, 15));
+        assert_eq!(set.notes.len(), 15, "{:?}", set.notes);
+        assert!(
+            set.notes[0].starts_with("footstep_concrete_000.ogg:"),
+            "{}",
+            set.notes[0]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clips_are_normalised_to_their_events_peak() {
+        let set = SoundSet::synthesised();
+        for (clips, target) in [
+            (&set.steps, STEP_PEAK),
+            (&set.jumps, JUMP_PEAK),
+            (&set.lands, LAND_PEAK),
+        ] {
+            for c in clips {
+                let peak = c
+                    .data
+                    .frames
+                    .iter()
+                    .fold(0.0f32, |m, f| m.max(f.left.abs()));
+                let got = peak * 10f32.powf(c.gain / 20.0);
+                assert!((got - target).abs() < 1e-4, "peak {got}, want {target}");
+            }
+        }
     }
 
     fn peak(frames: &[Frame]) -> (f32, f32) {

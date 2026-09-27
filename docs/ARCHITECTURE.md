@@ -1292,9 +1292,9 @@ and punctuation.
   reverb zones, dynamic music are later refinements.
 
 **Landed (§26): the mixer, first sounds, and the SOUND menu.**
-- **Setup:** kira 0.12 on cpal, with default features off: no decoding (the
-  sounds are synthesised as raw frames) and no realtime-dbus, which would be a
-  second system library. On Linux it needs `libasound2-dev`.
+- **Setup:** kira 0.12 on cpal, with default features off: Ogg Vorbis
+  decoding only (below) and no realtime-dbus, which would be a second system
+  library. On Linux it needs `libasound2-dev`.
 - **Buses:** SFX and AMBIENCE sub-tracks under the main (master) track.
   Volumes are built into the tracks at creation, because a `set_volume` tweens
   from 0 dB, so the first sounds would play too loud; live menu changes use
@@ -1320,7 +1320,17 @@ and punctuation.
   landing sound (it now fades its last 5 ms).
 - **Checked on the real device:** PipeWire lists a `feather` stream on the
   analog output while the game runs.
-- **Not yet:** sound files (Ogg decode), music, occlusion and reverb.
+- **Recorded SFX (landed):** footsteps, jump and landing come from Kenney
+  Impact Sounds (CC0, 0.76 MB, pinned in `tools/fetch_assets.py`: concrete
+  footsteps, soft medium/heavy impacts, five variants each, cycled) when the
+  pack is fetched. `SoundSet` falls back per file to the synthesised sound, so
+  audio never needs the download; a missing pack is one log line naming the
+  fetch command. Every clip, recorded or not, is normalised to its event's
+  target peak (0.5 / 0.35 / 0.8) at load. A temporary harness put the real
+  clips through the mixer at 0.503 / 0.350 / 0.800, so they sit exactly where
+  the synthesised ones did. The hum stays synthesised (the pack has no loops).
+- **Not yet:** music, more surfaces (the pack has grass, wood, carpet and snow
+  footsteps; picking one needs a surface tag per material), occlusion, reverb.
 
 ## 21. Debug / profiling
 
