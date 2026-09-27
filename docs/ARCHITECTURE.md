@@ -34,6 +34,16 @@ lives elsewhere; this is the *why* and the *shape*.
   before streaming.)
 - **Open formats at every authoring boundary; one custom format at exactly one
   point** — the offline bake output.
+- **Testable without a GPU.** The part of each system that decides what
+  happens sits behind a seam that needs no device or window:
+  - the controller as plain functions under its ECS systems (§26);
+  - menus that only return outcomes (§19);
+  - a mixer generic over its audio backend (§20);
+  - `build_world`, the CPU half of starting a session (§26).
+
+  `cargo test` covers those, down to loading a glTF file into the game's own
+  world and running its schedule. Only what reaches the GPU is left to
+  validation and to eyes (USAGE.md §5).
 
 ## 2. Technology stack (committed)
 

@@ -53,6 +53,9 @@ cargo test --workspace menu          # every test with "menu" in its name
 cargo test --workspace shader_cluster
 ```
 
+Running single tests, the harnesses the tests use, and writing a new one:
+§5.
+
 **Debug builds optimise dependencies** (`[profile.dev.package."*"]` in
 `Cargo.toml`); the engine's own crates stay at full debug. Without it, rapier
 and the image decoder ran ~10x slower in debug. It costs a slower *clean*
@@ -397,9 +400,138 @@ and distant shadows should look unchanged.
 
 ---
 
-## 5. Tests — what exists and what it guards
+## 5. Tests
 
-`cargo test --workspace`: 131 tests, all CPU-side (none needs a GPU).
+`cargo test --workspace` runs 131 tests, in well under a second once built.
+All of them are CPU-side: none needs a GPU, a window, a sound card or
+anything in `scratch/`, so they pass on a fresh clone.
+
+### Running them
+
+```bash
+cargo test --workspace                     # everything
+cargo test --workspace surface             # every test with "surface" in its name
+cargo test --workspace tests::a_scene_steps_like_its_materials -- --exact   # just that one
+cargo test --workspace a_scene_steps -- --nocapture                         # and show what it printed
+```
+
+- A filter matches the full test name, module included, as the output
+  prints it (`test audio::tests::surface_names_round_trip ... ok`).
+  `--exact` needs that full name. And always `--workspace` (§2).
+- Each crate is its own test binary with its own `test result:` line. To
+  total them:
+  ```bash
+  cargo test --workspace 2>&1 | grep '^test result' | awk '{p+=$4; f+=$6} END {print p, "passed,", f, "failed"}'
+  ```
+- `--nocapture` shows the engine's own log lines too. In the end-to-end
+  tests those are the real load's, such as
+  `[scene] unknown surface "lava"; using concrete`.
+
+### How tests reach the engine without a GPU
+
+The part of each system that decides what happens sits behind a seam that
+needs no device (ARCHITECTURE.md §1), and the tests use those seams
+directly. Reuse them when you add one:
+
+| Seam | What a test can do with it | Helpers |
+|---|---|---|
+| The controller is plain functions (`player_target`, `player_readback`) that the ECS systems wrap | step the real controller against real rapier colliders | `setup(boxes, start)` builds `Physics` with the ground and boxes; `step(…)` runs one tick, `run(…)` several (`app/src/main.rs`) |
+| Prefabs spawn from a `World` and `SpawnArgs` | spawn one node the way a scene does, then inspect its entity and collider | `prefab_world()`, `spawn_one(…)` (`app/src/main.rs`) |
+| `Audio<B: Backend>` is generic over kira's backend | play through the real mixer into a buffer and measure what came out | the `Capture` backend, `audio(…)`, `peak(…)` (`app/src/audio.rs`) |
+| `Menu` needs neither the renderer nor the event loop | drive every screen, row and rebind; hit-test the layout at any window size | the menu tests in `app/src/main.rs` |
+| `build_world` is `Session::new` without the GPU upload | load a scene file into the game's own world and run the real schedule | `write_pad_level(…)`, `walk_pad_level(…)` (`app/src/main.rs`); next section |
+| glTF can be written at test time | use real files without committing binaries | `write_fixture(…)` (`assets/src/lib.rs`), `write_pad_level(…)` |
+
+Temp directories come from `config::test_dir(name)` in `app` and
+`fixture_dir(name)` in `assets`. Tests run in parallel, so give each its own
+name, and remove the directory at the end.
+
+### The end-to-end tests
+
+`build_world(scenes, bake_dir)` is the CPU half of `Session::new`:
+- it loads the scenes, and the bake if given a directory;
+- it resolves each mesh's footstep surface;
+- it builds the world, the player, the built-in level, the scene's nodes and
+  colliders, and the schedule.
+
+`Session::new` is that plus the GPU upload, so a test that calls it runs
+exactly what NEW GAME runs.
+
+The two tests in `app/src/main.rs` work like this:
+
+1. `write_pad_level(dir, pads)` writes a real `.gltf` + `.bin`: a row of flat
+   pads (4 × 0.05 × 3.5 m) along +X at z = 9.75, one material per pad with an
+   optional `extras.surface`, and a `player_start` marker west of the row,
+   facing +X.
+2. `walk_pad_level(path)` builds it with `build_world` and checks that the
+   player starts at the marker. It then sets `InputState.wish` to +X and runs
+   the real schedule one fixed tick at a time. After each tick it feeds the
+   `Player` component to a `StepTracker`, as the app does each frame. It
+   returns each step's x and surface, and the load's colliders per surface.
+3. `check_steps` judges the steps:
+   - well inside a pad, a step must have the pad's surface;
+   - well clear of the pads, concrete;
+   - every pad must get at least one step, so an empty walk can't pass;
+   - within 0.4 m of a pad edge (the capsule's radius plus a margin) either
+     answer is right, so those steps aren't judged.
+
+The tests themselves:
+
+- **`a_scene_steps_like_its_materials`** tags the pads grass, wood, `Carpet`
+  (names are case-insensitive), snow, `lava` (not a surface) and nothing.
+  That covers the whole footstep chain: material extras → the loader →
+  per-mesh surfaces → spawned colliders → the controller's probe →
+  `StepTracker`. From the step event on, `each_surface_plays_its_own_steps`
+  (`app/src/audio.rs`) takes over.
+- **`an_untagged_scene_steps_on_concrete`** walks the same level with no tags,
+  and must hear only concrete. It's the counter-case: what the first test
+  hears has to come from the tags.
+
+To test something else end to end, build a scene and drive the schedule the
+same way:
+
+```rust
+let mut b = build_world(&[path], None);                 // what NEW GAME builds
+b.world.resource_mut::<InputState>().wish = Vec3::X;    // also jump, vertical, noclip
+for _ in 0..120 {
+    b.schedule.run(&mut b.world);                       // one fixed tick
+}
+let p = b.world.get::<Player>(b.player).unwrap();       // read back what you need
+```
+
+- **What runs:** the game's real schedule, multi-threaded as in the game:
+  `integrate`, `tick`, and the §15 bracket (ECS → rapier, the physics step,
+  rapier → ECS).
+- **What `build_world` leaves out:** the GPU upload and everything `App`
+  does per frame (input, menus, audio playback). The test stands in for
+  those, as `walk_pad_level` does for `StepTracker`.
+
+### Writing a test
+
+- **CPU only, and nothing from `scratch/`.** A test must pass on a fresh
+  clone, so write fixtures to a temp directory (above).
+- **Test the real path, not a copy.** If a test would have to duplicate
+  engine code, split a seam out of the engine instead; that's why
+  `build_world` exists.
+- **Make sure it can fail.** Before trusting a new test, break the code it
+  guards for a moment and watch it fail: a negative control.
+  - The end-to-end test was checked that way: a no-op `tag_surface`, and a
+    probe that never updates `Player.surface`, each fail it.
+  - When the expected result could also come from a bug (every step
+    concrete, say), write the counter-case as a test of its own.
+- **Rule out empty passes.** Assert that the thing happened at all (every
+  pad got a step), not only that nothing went wrong.
+- **Take tolerances from the physics** (the 0.4 m edge margin is the
+  capsule's 0.35 m radius plus a little), not from whatever the first run
+  printed.
+- **One-off checks are temporary.** A check against real assets or timings
+  (walking the `scratch/` scenes, the real sound pack through the mixer, a
+  probe's cost) can be a temporary `#[test]` run with `--nocapture`. Delete
+  it before committing, and write what it found into ARCHITECTURE.md.
+- **Keep this section current:** add the test to the table below, and update
+  the count at the top, in the same commit.
+
+### What they guard
 
 | Area | Crate | What the tests pin down |
 |---|---|---|
@@ -421,7 +553,9 @@ and distant shadows should look unchanged.
 | Texture slots | render | one slot per unique image × colour space; sRGB and UNORM uses of the same pixels stay separate; overflow past the capacity is counted and falls back to the defaults |
 | Light clusters | render | GLSL grid constants + `MAX_LIGHTS` match the Rust ones |
 
-What tests **cannot** cover, and how it is checked instead:
+### What tests cannot cover
+
+And how each is checked instead:
 
 - **GPU correctness:** Vulkan validation errors on a debug run (§8 below).
 - **Anything visual:** a person looking at the screen. Say what to look for
@@ -429,6 +563,8 @@ What tests **cannot** cover, and how it is checked instead:
 - **Performance:** `--bench` A/B runs (§7 below).
 - **Shader syntax:** shaders compile at *build* time, so an error there is a
   build error.
+- **Real assets** (the generated `scratch/` scenes, the recorded sound pack):
+  running the game, and one-off harnesses while developing (above).
 
 ---
 
