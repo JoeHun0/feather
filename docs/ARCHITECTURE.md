@@ -727,7 +727,7 @@ merely cleared and every fragment compares against 1.0 as lit. Switching happens
 with the device idle — the shadow image is freed and the mesh renderer's
 descriptor re-pointed, which is unsound mid-flight.
 
-**Landed (§26): persistence.** Display mode, shadows, MSAA and FXAA live in
+**Landed (§26): persistence.** Display mode, field of view, shadows, MSAA and FXAA live in
 `config/graphics.toml` (gitignored, cwd-relative like the bake dir; module
 `app/src/config/`; controls have their own file, §14. It was `settings.toml`
 until then, and an old one is renamed on first run). A missing file is written with commented defaults.
@@ -1169,7 +1169,12 @@ that silently does nothing. SOUND is placeholder rows (§20 audio is unstarted).
 
 **Landed (§26): CONTROLS and GAMEPLAY are live.** GAMEPLAY's SENSITIVITY cycles
 presets and shows a percentage (the font has no decimal point); INVERT Y
-toggles; FIELD OF VIEW is still a placeholder. CONTROLS lists every action
+toggles; FIELD OF VIEW cycles vertical degrees (50–90; the file takes 30–120)
+and is saved to `graphics.toml`, since it's a view setting. The FOV used to be
+a constant; now the projection, the light clusters (§12), the LOD pixel budget
+(§17) and the cascade fit (§11) all read `GraphicsSettings::fov_y()` once per
+frame, so they can't drift apart. `--bench` ignores the config and stays at
+60°, and its numbers were unchanged by this. CONTROLS lists every action
 (§14) with its keys. Rebinding is a small state machine inside `Menu`:
 activating a row sets `capturing`, the app hands the next key press to
 `Menu::capture_key` **and consumes it**, so pressing V to bind JUMP doesn't
@@ -1748,9 +1753,10 @@ skinning; UI/HUD (§19's lightweight quad/text renderer + the Esc pause menu
 landed, with keyboard *and* mouse navigation, an OPTIONS screen tree, and live
 display-mode/shadow-quality/FXAA controls under GRAPHICS — MSAA is changeable
 there only from the main menu, since the session's mesh and sky pipelines bake
-the sample count; all of them persist in `config/graphics.toml` (§13), and key bindings +
-mouse look live in `config/controls.toml` (§14), edited from OPTIONS >
-CONTROLS / GAMEPLAY, whose lists scroll when the window is short; egui dev UI, SDF text and
+the sample count; all of them, plus the GAMEPLAY field of view, persist in
+`config/graphics.toml` (§13), and key bindings + mouse look live in
+`config/controls.toml` (§14), edited from OPTIONS > CONTROLS / GAMEPLAY, whose
+lists scroll when the window is short; egui dev UI, SDF text and
 lower-case/punctuation pending); audio; debug/profiling tooling (per-pass GPU timestamp timing
 landed — stderr log + `Renderer::gpu_times`, plus the `--bench` sweep harness;
 Tracy / RenderDoc / egui overlay and

@@ -243,6 +243,8 @@ struct GraphicsSettings {
     shadows: ShadowQuality,
     /// Windowed or borderless fullscreen; live (menu, F11), saved.
     display: DisplayMode,
+    /// Vertical field of view, whole degrees (30-120); live, saved.
+    fov_deg: u32,
     /// MSAA sample count for the geometry pass (§13), `--msaa N` at startup.
     /// Startup-only rather than live: the sample count is baked into every
     /// geometry pipeline, so changing it means rebuilding them all — the usual
@@ -263,11 +265,29 @@ struct GraphicsSettings {
 /// (`tex/` and `mesh/` below it).
 const BAKE_DIR: &str = "scratch/bake";
 
+impl GraphicsSettings {
+    /// The vertical FOV in radians, as the camera and everything that must
+    /// match it use it.
+    fn fov_y(&self) -> f32 {
+        (self.fov_deg as f32).to_radians()
+    }
+
+    /// The next FIELD OF VIEW preset up, wrapping. A value that isn't a
+    /// preset (typed into the file) goes to the next preset above it.
+    fn step_fov(&mut self) {
+        self.fov_deg = FOV_PRESETS
+            .into_iter()
+            .find(|&p| p > self.fov_deg)
+            .unwrap_or(FOV_PRESETS[0]);
+    }
+}
+
 impl Default for GraphicsSettings {
     fn default() -> Self {
         Self {
             shadows: ShadowQuality::High,
             display: DisplayMode::Windowed,
+            fov_deg: DEFAULT_FOV_DEG,
             msaa: 1,
             fxaa: false,
             bake: true,
@@ -322,6 +342,8 @@ enum MenuAction {
     /// Next SENSITIVITY preset (§14).
     CycleSensitivity,
     ToggleInvertY,
+    /// Next FIELD OF VIEW preset.
+    CycleFov,
     /// Wait for a key to bind to this action.
     Rebind(Action),
     /// Default key bindings again.
@@ -368,6 +390,8 @@ enum MenuOutcome {
     ApplyFxaa,
     ApplyMsaa,
     ApplyDisplay,
+    /// The FOV changed: nothing to rebuild (the next frame uses it), just save.
+    ApplyFov,
     StartSession,
     EndSession,
     /// Controls changed; save the named part of `controls.toml`.
@@ -446,14 +470,18 @@ fn screen_rows(
             MenuRow::new("SFX", MenuAction::Inert),
             MenuRow::new("BACK", MenuAction::Back),
         ],
-        // Saved to controls.toml (§14). Sensitivity is a percentage: the font
-        // has no decimal point. FIELD OF VIEW is still a placeholder.
+        // Sensitivity and invert are saved to controls.toml (§14), the FOV
+        // (vertical degrees) to graphics.toml. Sensitivity is a percentage:
+        // the font has no decimal point.
         MenuScreen::Gameplay => vec![
             MenuRow::new(
                 format!("SENSITIVITY  {}", c.sensitivity_percent()),
                 MenuAction::CycleSensitivity,
             ),
-            MenuRow::new("FIELD OF VIEW", MenuAction::Inert),
+            MenuRow::new(
+                format!("FIELD OF VIEW  {}", s.fov_deg),
+                MenuAction::CycleFov,
+            ),
             MenuRow::new(
                 format!("INVERT Y  {}", if c.invert_y { "ON" } else { "OFF" }),
                 MenuAction::ToggleInvertY,
@@ -623,6 +651,10 @@ impl Menu {
             MenuAction::ToggleDisplay => {
                 s.display = s.display.toggled();
                 MenuOutcome::ApplyDisplay
+            }
+            MenuAction::CycleFov => {
+                s.step_fov();
+                MenuOutcome::ApplyFov
             }
             MenuAction::CycleMsaa => {
                 // 1 -> 2 -> 4 -> 8 -> 1. `Renderer::set_msaa` clamps to what the
@@ -981,9 +1013,14 @@ struct Player {
     controller: KinematicCharacterController,
 }
 
-/// Camera projection. Shared by the view matrix and the light clusters (§12),
-/// which must describe the same frustum or fragments read the wrong cluster.
-const CAMERA_FOV_Y: f32 = 60.0 * std::f32::consts::PI / 180.0;
+/// Camera projection. The vertical FOV is a setting (`GraphicsSettings::fov_y`,
+/// default `DEFAULT_FOV_DEG`); the projection, the light clusters (§12), the LOD
+/// budget (§17) and the cascade fit (§11) all read it from there each frame,
+/// since they must describe the same frustum or fragments read the wrong
+/// cluster.
+const DEFAULT_FOV_DEG: u32 = 60;
+/// What GAMEPLAY > FIELD OF VIEW steps through, in vertical degrees.
+const FOV_PRESETS: [u32; 5] = [50, 60, 70, 80, 90];
 const CAMERA_NEAR: f32 = 0.1;
 const CAMERA_FAR: f32 = 200.0;
 
@@ -1032,8 +1069,8 @@ impl Look {
         Mat4::look_to_rh(eye, self.forward(), Vec3::Y)
     }
 
-    fn view_proj(&self, eye: Vec3, aspect: f32) -> Mat4 {
-        let mut proj = Mat4::perspective_rh(CAMERA_FOV_Y, aspect, CAMERA_NEAR, CAMERA_FAR);
+    fn view_proj(&self, eye: Vec3, aspect: f32, fov_y: f32) -> Mat4 {
+        let mut proj = Mat4::perspective_rh(fov_y, aspect, CAMERA_NEAR, CAMERA_FAR);
         proj.y_axis.y *= -1.0;
         proj * self.view(eye)
     }
@@ -2163,6 +2200,7 @@ impl App {
                 self.apply_display();
                 self.persist(config::graphics::Key::Display);
             }
+            MenuOutcome::ApplyFov => self.persist(config::graphics::Key::Fov),
             MenuOutcome::StartSession => self.start_session(),
             MenuOutcome::EndSession => self.end_session(),
             MenuOutcome::SaveControls(part) => {
@@ -2601,10 +2639,13 @@ impl ApplicationHandler for App {
                     let eye = p_prev.lerp(p_pos, alpha) + Vec3::new(0.0, EYE_HEIGHT, 0.0);
                     let size = self.window.as_ref().unwrap().inner_size();
                     let aspect = size.width as f32 / size.height.max(1) as f32;
-                    let view_proj = look.view_proj(eye, aspect);
+                    // One FOV for the frame: projection, clusters, LOD budget
+                    // and cascades all read this.
+                    let fov_y = self.settings.fov_y();
+                    let view_proj = look.view_proj(eye, aspect, fov_y);
                     let cluster_view = ClusterView {
                         view: look.view(eye),
-                        fov_y: CAMERA_FOV_Y,
+                        fov_y,
                         aspect,
                         near: CAMERA_NEAR,
                         far: CAMERA_FAR,
@@ -2632,7 +2673,7 @@ impl ApplicationHandler for App {
                     let mut near = 0.1f32;
                     for (i, far) in splits.iter().copied().enumerate() {
                         let (centre, radius) =
-                            slice_sphere(eye, fwd, right_v, up_v, CAMERA_FOV_Y, aspect, near, far);
+                            slice_sphere(eye, fwd, right_v, up_v, fov_y, aspect, near, far);
                         let (view_proj, texel_world) = fit_cascade(centre, radius, sun_dir, dim);
                         cascades[i] = CascadeSetup {
                             view_proj,
@@ -3180,8 +3221,9 @@ fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     eprintln!(
-        "[config] effective: display {}, shadows {}, msaa {}, fxaa {}",
+        "[config] effective: display {}, fov {}, shadows {}, msaa {}, fxaa {}",
         settings.display.config_name(),
+        settings.fov_deg,
         settings.shadows.config_name(),
         settings.msaa,
         settings.fxaa
@@ -3781,11 +3823,9 @@ mod tests {
     #[test]
     fn inert_rows_change_nothing() {
         let mut m = in_game_menu();
-        for screen in [
-            MenuScreen::Graphics,
-            MenuScreen::Sound,
-            MenuScreen::Gameplay,
-        ] {
+        // GAMEPLAY had placeholders until FIELD OF VIEW went live; it has
+        // none left to check.
+        for screen in [MenuScreen::Graphics, MenuScreen::Sound] {
             let mut s = GraphicsSettings::default();
             m.screen = screen;
             m.stack.clear();
@@ -4044,22 +4084,85 @@ mod tests {
             pitch: -0.2,
         };
         let (fwd, right, up) = look.camera_basis();
-        let (fov, aspect, near, far) = (60f32.to_radians(), 1.6, 2.0, 30.0);
-        let (centre, radius) = slice_sphere(eye, fwd, right, up, fov, aspect, near, far);
-        let tan_v = (fov * 0.5).tan();
-        let tan_h = tan_v * aspect;
-        for d in [near, far] {
-            let c = eye + fwd * d;
-            for sx in [-1.0f32, 1.0] {
-                for sy in [-1.0f32, 1.0] {
-                    let corner = c + right * (tan_h * d) * sx + up * (tan_v * d) * sy;
-                    assert!(
-                        corner.distance(centre) <= radius + 1e-3,
-                        "corner outside the fitted sphere"
-                    );
+        // Every FOV the menu offers, and both ends of the file's range.
+        for deg in [30.0f32, 50.0, 60.0, 90.0, 120.0] {
+            let (fov, aspect, near, far) = (deg.to_radians(), 1.6, 2.0, 30.0);
+            let (centre, radius) = slice_sphere(eye, fwd, right, up, fov, aspect, near, far);
+            let tan_v = (fov * 0.5).tan();
+            let tan_h = tan_v * aspect;
+            for d in [near, far] {
+                let c = eye + fwd * d;
+                for sx in [-1.0f32, 1.0] {
+                    for sy in [-1.0f32, 1.0] {
+                        let corner = c + right * (tan_h * d) * sx + up * (tan_v * d) * sy;
+                        assert!(
+                            corner.distance(centre) <= radius + 1e-3,
+                            "corner outside the fitted sphere at {deg} degrees"
+                        );
+                    }
                 }
             }
         }
+    }
+
+    /// The projection really uses the FOV it's given: a point 40 degrees above
+    /// the view axis is inside a 90-degree frustum and outside a 60-degree one,
+    /// and the matrix matches glam's own perspective (Y flipped for Vulkan).
+    #[test]
+    fn view_proj_uses_the_fov_setting() {
+        let look = Look::new();
+        let eye = Vec3::ZERO;
+        let point = look.forward() * 10.0 + Vec3::Y * 10.0 * 40f32.to_radians().tan();
+        let visible = |deg: f32| {
+            Frustum::from_view_proj(&look.view_proj(eye, 1.0, deg.to_radians()))
+                .contains_sphere(point, 0.0)
+        };
+        assert!(visible(90.0));
+        assert!(!visible(60.0));
+        let fov = 75f32.to_radians();
+        let mut want = Mat4::perspective_rh(fov, 1.5, CAMERA_NEAR, CAMERA_FAR);
+        want.y_axis.y *= -1.0;
+        let got = look.view_proj(eye, 1.5, fov);
+        assert!(got.abs_diff_eq(want * look.view(eye), 1e-6));
+    }
+
+    #[test]
+    fn fov_row_steps_through_presets_and_saves() {
+        let (mut s, mut c) = (GraphicsSettings::default(), Controls::default());
+        let mut m = in_game_menu();
+        activate_c(
+            &mut m,
+            &mut s,
+            &mut c,
+            MenuAction::Enter(MenuScreen::Options),
+        );
+        activate_c(
+            &mut m,
+            &mut s,
+            &mut c,
+            MenuAction::Enter(MenuScreen::Gameplay),
+        );
+        let label = |m: &Menu, s: &GraphicsSettings| {
+            label_of(m, s, &Controls::default(), MenuAction::CycleFov)
+        };
+        assert_eq!(label(&m, &s), "FIELD OF VIEW  60");
+        let mut seen = vec![s.fov_deg];
+        for _ in 0..FOV_PRESETS.len() {
+            assert_eq!(
+                activate_c(&mut m, &mut s, &mut c, MenuAction::CycleFov),
+                MenuOutcome::ApplyFov
+            );
+            seen.push(s.fov_deg);
+        }
+        assert_eq!(seen, [60, 70, 80, 90, 50, 60]);
+        assert_eq!(label(&m, &s), "FIELD OF VIEW  60");
+        // A hand-typed value steps to the next preset above it.
+        s.fov_deg = 73;
+        s.step_fov();
+        assert_eq!(s.fov_deg, 80);
+        s.fov_deg = 120;
+        s.step_fov();
+        assert_eq!(s.fov_deg, 50);
     }
 
     #[test]
@@ -4458,7 +4561,7 @@ mod tests {
         // Looking down -Z from the origin, matching Look::new().
         let look = Look::new();
         let eye = Vec3::ZERO;
-        let vp = look.view_proj(eye, 16.0 / 9.0);
+        let vp = look.view_proj(eye, 16.0 / 9.0, GraphicsSettings::default().fov_y());
         let frustum = Frustum::from_view_proj(&vp);
 
         let mut w = World::new();
@@ -4524,7 +4627,8 @@ mod tests {
         let mut covering = 0;
         let mut clipped = Vec::new();
         for (i, far) in splits.into_iter().enumerate() {
-            let (c, r) = slice_sphere(eye, fwd, right, up, CAMERA_FOV_Y, 16.0 / 9.0, near, far);
+            let fov = GraphicsSettings::default().fov_y();
+            let (c, r) = slice_sphere(eye, fwd, right, up, fov, 16.0 / 9.0, near, far);
             near = far;
             let (vp, _) = fit_cascade(c, r, sun, 2048);
             let full = Frustum::from_view_proj(&vp);

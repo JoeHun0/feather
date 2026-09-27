@@ -22,6 +22,7 @@ const OLD_PATH: &str = "config/settings.toml";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Key {
     Display,
+    Fov,
     Shadows,
     Msaa,
     Fxaa,
@@ -31,6 +32,7 @@ impl Key {
     fn name(self) -> &'static str {
         match self {
             Self::Display => "display",
+            Self::Fov => "fov",
             Self::Shadows => "shadows",
             Self::Msaa => "msaa",
             Self::Fxaa => "fxaa",
@@ -41,6 +43,7 @@ impl Key {
     fn value(self, s: &GraphicsSettings) -> String {
         match self {
             Self::Display => format!("\"{}\"", s.display.config_name()),
+            Self::Fov => s.fov_deg.to_string(),
             Self::Shadows => format!("\"{}\"", s.shadows.config_name()),
             Self::Msaa => s.msaa.to_string(),
             Self::Fxaa => s.fxaa.to_string(),
@@ -62,6 +65,10 @@ pub fn default_text() -> String {
 # F11 toggles it.
 display = {}
 
+# Vertical field of view in whole degrees, 30 to 120 (60 is about 91
+# horizontal on a 16:9 screen). GAMEPLAY > FIELD OF VIEW steps 50 to 90.
+fov = {}
+
 # Shadow quality: \"high\", \"medium\", \"low\" or \"off\". F1 cycles it in game.
 shadows = {}
 
@@ -73,6 +80,7 @@ msaa = {}
 fxaa = {}
 ",
         Key::Display.value(&d),
+        Key::Fov.value(&d),
         Key::Shadows.value(&d),
         Key::Msaa.value(&d),
         Key::Fxaa.value(&d),
@@ -92,6 +100,10 @@ pub fn parse(text: &str, s: &mut GraphicsSettings) -> Vec<String> {
                 None => warn(format!(
                     "display must be \"windowed\" or \"fullscreen\", got {v}"
                 )),
+            },
+            "fov" => match v.parse::<u32>() {
+                Ok(n @ 30..=120) => s.fov_deg = n,
+                _ => warn(format!("fov must be whole degrees from 30 to 120, got {v}")),
             },
             "shadows" => {
                 let q = string(v).and_then(ShadowQuality::from_config_name);
@@ -202,8 +214,10 @@ mod tests {
     }
 
     /// Settings fields compared as a tuple (the struct has no PartialEq).
-    fn key(s: &GraphicsSettings) -> (DisplayMode, ShadowQuality, u32, bool, bool, bool) {
-        (s.display, s.shadows, s.msaa, s.fxaa, s.bake, s.lod)
+    fn key(s: &GraphicsSettings) -> (DisplayMode, u32, ShadowQuality, u32, bool, bool, bool) {
+        (
+            s.display, s.fov_deg, s.shadows, s.msaa, s.fxaa, s.bake, s.lod,
+        )
     }
 
     #[test]
@@ -220,6 +234,10 @@ mod tests {
         assert!(w.is_empty(), "{w:?}");
         assert_eq!((s.shadows, s.msaa, s.fxaa), (ShadowQuality::Low, 4, true));
         assert_eq!(s.display, DisplayMode::Fullscreen);
+        let (s, w) = parsed("fov = 30\n");
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.fov_deg, 30);
+        assert_eq!(parsed("fov = 120").0.fov_deg, 120);
     }
 
     /// Each bad line must warn *and* leave its key at the default.
@@ -234,6 +252,9 @@ mod tests {
             "shadows = low",
             "display = \"borderless\"",
             "display = fullscreen",
+            "fov = 29",
+            "fov = 121",
+            "fov = 75.5",
             "[graphics]",
             "vsync = true",
             "just words",
