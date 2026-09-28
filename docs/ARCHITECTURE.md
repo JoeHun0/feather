@@ -1666,6 +1666,9 @@ and punctuation.
   It reuses `gen_testscene.check()`. That check now exempts flat ground cover
   (under 5 cm, lying on the ground) from the keep-out test: a floor decal
   cannot block the app's boxes or the spawn. The procedural level has none.
+  (Loaded scenes no longer get the demo's boxes. The keep-out still includes
+  them so every generator gives the same level for a given seed; dropping
+  them is a separate, output-changing step.)
   Measured (RX 7800 XT, `profile_standard`, `--bench`, `med`, ~1480 nodes):
   `shadow` 0.08 ms, `geo` 0.23 ms, `frame` 0.36 ms.
   **Detail stress scene:** `tools/gen_detailscene.py` places Poly Haven CC0
@@ -1711,9 +1714,9 @@ and punctuation.
   - **Textures are pinned as diffuse + GL normal + ARM**, since ARM's G/B are
     the roughness/metal layout `metallicRoughnessTexture` reads. The
     greyscale roughness map the older packs use would read as metallic too.
-  - **The hangar stands round the five boxes the app puts in every level**,
-    plus the old spawn point, which `check()` keeps clear. The boxes read as
-    crates. A level that doesn't want them has no way to say so yet.
+  - **The hangar stands round the orb demo's five boxes and the old spawn
+    point**, which `check()` keeps clear. The boxes themselves no longer
+    appear in a loaded scene (below).
   - **Measured** (debug, clocks not pinned, `--bench`, 295 nodes, 818k
     placed triangles):
     - without the bake: load 1.36–1.41 s, frame median 0.59–0.74 ms, 1.8 M
@@ -1948,7 +1951,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   double-buffered sim state (prev/curr position + spin angle) by
   `alpha = accumulator / FIXED_DT` and reads a per-entity `Scale`; a small
   **static level** (ground box + obstacle boxes, each with a fixed cuboid
-  collider in rapier; no `Velocity`/`Spin` so `integrate` skips them) drawn
+  collider in rapier; the boxes only in the orb demo, since a loaded scene is
+  the level, which `a_loaded_level_has_no_demo_boxes` checks; no `Velocity`/`Spin` so `integrate` skips them) drawn
   through the same instanced path; a **depth prepass** (§10) ahead of the opaque
   draws, which then run depth-write-off + `LESS_OR_EQUAL` (−42% on the geometry
   pass);
@@ -2010,7 +2014,7 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   to 0.4), sets the kinematic target, calls `physics.step()`, and reads the body
   position back. Horizontal velocity is re-derived from the motion that actually
   happened, so blocked axes lose their speed. The ground and every obstacle box
-  are real fixed cuboid colliders (`spawn_static`); one warm-up step publishes
+  (the demo's only) are real fixed cuboid colliders (`spawn_static`); one warm-up step publishes
   them to the broad-phase BVH the controller queries. Look is render-rate; the
   body interpolates like any other entity. The player is a **normal ECS entity**
   (§1): sim state in a `Player` component, render-rate angles in `Look`, driven by

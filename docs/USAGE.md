@@ -385,8 +385,8 @@ electricity poles. You spawn on the road outside the gate, facing it.
 - **Atmosphere:** the level's `environment` marker (see the prefab table)
   makes it grey and hazy. Its values are starting points; tune them in
   `ENVIRONMENT` at the top of the script and regenerate.
-- **The app's boxes:** the five boxes and the grey slab the app puts in every
-  level are inside the hangar and under the mud.
+- **The app's slab:** the grey ground slab the app puts under every level is
+  under the mud. (The orb demo's brown boxes don't appear in loaded scenes.)
 - **Options:** `--seed N` (props, missing fence panels, roof holes), `-o PATH`,
   `--check`.
 - **Known limits:** interiors look too bright (no ambient occlusion yet), and
@@ -434,7 +434,7 @@ and distant shadows should look unchanged.
 
 ## 5. Tests
 
-`cargo test --workspace` runs 143 tests, in well under a second once built.
+`cargo test --workspace` runs 144 tests, in well under a second once built.
 All of them are CPU-side: none needs a GPU, a window, a sound card or
 anything in `scratch/`, so they pass on a fresh clone.
 
@@ -575,7 +575,7 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | Menus | app | row layout and hit-testing at several window sizes, including scrolling a screen taller than the window (the selection stays visible, hovering a visible row never scrolls, hits map back to the right row); wraparound, Esc/back behaviour, OPTIONS reachable from both menus, MSAA only outside a session, DISPLAY toggles windowed/fullscreen, FIELD OF VIEW steps its presets (and the projection really uses it); SENSITIVITY / INVERT Y change and save; rebinding waits for a key, ignores menu keys, takes the key from its old action (which shows NONE), and is cancelled by Esc, moving away or BACK; RESET KEYS; **every label drawable by the 5×7 A–Z/0–9 font** |
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice at every FOV from 30° to 120°; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
-| Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs; `environment`: no marker and an empty one keep the default look, every param lands, left-out params keep defaults and bad ones are reported, the sun's elevation/azimuth convention, and (end-to-end) a level's marker reaches `build_world` |
+| Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs; `environment`: no marker and an empty one keep the default look, every param lands, left-out params keep defaults and bad ones are reported, the sun's elevation/azimuth convention, and (end-to-end) a level's marker reaches `build_world`; the orb demo's obstacle boxes stand in the demo but not in a loaded level (end-to-end) |
 | Environment | render | the specialization constants `mesh.frag` and `sky.frag` declare (read from their compiled SPIR-V) match the Rust map by id and name, with GLSL defaults equal to `Environment::default()`; the map lays the values out in id order |
 | Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one texture, which isn't decoded until asked and then matches the old RGB→RGBA expansion; a material's `extras.surface` is read (a non-string one warns and is dropped) |
 | Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |

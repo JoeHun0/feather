@@ -2415,6 +2415,21 @@ struct WorldBuild {
     t_scenes: std::time::Duration,
 }
 
+/// The orb demo's obstacle boxes, as (centre, size), resting on the ground.
+/// `tools/gen_testscene.py`'s `LEVEL_BOXES` repeats them: the generators
+/// still keep their scenes clear of where they were, so regenerating an old
+/// scene gives the same level.
+fn demo_boxes() -> [(Vec3, Vec3); 5] {
+    [
+        (Vec3::new(-3.0, 0.75, 2.0), Vec3::new(1.5, 1.5, 1.5)),
+        (Vec3::new(3.5, 1.0, -1.0), Vec3::new(2.0, 2.0, 2.0)),
+        (Vec3::new(0.0, 0.5, -4.5), Vec3::new(3.0, 1.0, 1.0)),
+        (Vec3::new(-5.0, 1.5, -3.0), Vec3::new(1.0, 3.0, 1.0)),
+        (Vec3::new(5.0, 0.5, 4.0), Vec3::new(1.0, 1.0, 4.0)),
+    ]
+    .map(|(offset, size)| (Vec3::new(offset.x, GROUND_Y + offset.y, offset.z), size))
+}
+
 /// The CPU half of `Session::new`: load the CLI `scenes` (empty means the orb
 /// demo) and the bake from `bake_dir` (`None` ignores it), then build the
 /// world, the player, the level and the schedule.
@@ -2545,18 +2560,13 @@ fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> WorldBu
     // the whole shadow map. It still *receives* shadows (receiving is sampling
     // the map, not being in it). Relief terrain would drop this marker.
     world.entity_mut(ground).insert(NoShadowCast);
-    // (x, half-height as y, z), size — y offset keeps each box resting on the
-    // ground (center = GROUND_Y + size.y/2).
-    let boxes = [
-        (Vec3::new(-3.0, 0.75, 2.0), Vec3::new(1.5, 1.5, 1.5)),
-        (Vec3::new(3.5, 1.0, -1.0), Vec3::new(2.0, 2.0, 2.0)),
-        (Vec3::new(0.0, 0.5, -4.5), Vec3::new(3.0, 1.0, 1.0)),
-        (Vec3::new(-5.0, 1.5, -3.0), Vec3::new(1.0, 3.0, 1.0)),
-        (Vec3::new(5.0, 0.5, 4.0), Vec3::new(1.0, 1.0, 4.0)),
-    ];
-    for (offset, size) in boxes {
-        let center = Vec3::new(offset.x, GROUND_Y + offset.y, offset.z);
-        spawn_static(&mut world, center, size, MESH_LEVEL_CUBE, box_mat);
+    // The demo's obstacle boxes, like its orbs, only when no scene was given:
+    // a loaded level is the level, and five brown boxes in its middle aren't
+    // part of it.
+    if scenes.is_empty() {
+        for (center, size) in demo_boxes() {
+            spawn_static(&mut world, center, size, MESH_LEVEL_CUBE, box_mat);
+        }
     }
     // Scene geometry from the CLI glTF files (§18): one entity per node,
     // carrying that node's world transform, so nodes sharing a mesh draw as
@@ -5775,6 +5785,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(b.environment, want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The orb demo's obstacle boxes stand in the demo, and nowhere in a
+    /// loaded level: probing each box's centre finds a collider in the first
+    /// and nothing in the second.
+    #[test]
+    fn a_loaded_level_has_no_demo_boxes() {
+        let has_box = |b: &WorldBuild| {
+            let ph = b.world.resource::<Physics>();
+            let queries = ph.broad_phase.as_query_pipeline(
+                ph.narrow_phase.query_dispatcher(),
+                &ph.bodies,
+                &ph.colliders,
+                QueryFilter::default(),
+            );
+            demo_boxes()
+                .map(|(centre, _)| queries.intersect_point(to_rapier(centre)).next().is_some())
+        };
+        assert_eq!(has_box(&build_world(&[], None)), [true; 5]);
+        let dir = crate::config::test_dir("e2e-no-demo-boxes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let level = write_pad_level(&dir, &[("plain", None)]);
+        assert_eq!(has_box(&build_world(&[level], None)), [false; 5]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

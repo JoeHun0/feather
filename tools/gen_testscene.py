@@ -20,10 +20,11 @@ Engine constraints this respects (all verified against the source)
 ------------------------------------------------------------------
 * Ground is a finite 80x80 slab whose top surface is GROUND_Y = -9.0
   (app/src/main.rs:67, :885), so everything must sit within x,z in [-40, 40].
-* The player spawns at (0, -9, 8) (app/src/main.rs:665) and the static level --
-  ground plus five obstacle boxes -- spawns *unconditionally*; only the orb demo
-  is suppressed by passing a scene (app/src/main.rs:673). So we must not
-  intersect those.
+* The player spawns at (0, -9, 8) (app/src/main.rs:665) unless a
+  `player_start` marker says otherwise, and the ground slab spawns
+  *unconditionally*. The orb demo's five obstacle boxes used to as well; a
+  loaded scene no longer gets them, but the generators still keep clear of
+  where they were, so regenerating an existing scene gives the same level.
 * The loader takes triangles only, requires POSITION, computes normals when
   absent and reads TEXCOORD_0 when present (assets/src/lib.rs:322, :352-361).
 * The engine's bindless texture array is sized per level to the textures it
@@ -51,8 +52,10 @@ SPAWN = (0.0, -9.0, 8.0)
 SHADOW_RADIUS = 16.0
 AUTOSTEP = 0.4
 
-# The five obstacle boxes the app always spawns (app/src/main.rs:898-904), as
+# The orb demo's five obstacle boxes (app/src/main.rs, `demo_boxes`), as
 # (center_x, center_y_offset_above_ground, center_z, size_x, size_y, size_z).
+# Loaded scenes no longer get them; they stay in the keep-out so that every
+# generator's output is unchanged for a given seed.
 LEVEL_BOXES = [
     (-3.0, 0.75, 2.0, 1.5, 1.5, 1.5),
     (3.5, 1.0, -1.0, 2.0, 2.0, 2.0),
@@ -442,8 +445,9 @@ def overlaps(a, b, margin=0.0):
 
 
 def keep_out_boxes():
-    """What the app already puts in the world, which we must not intersect:
-    the five obstacle boxes plus a clear cylinder around the spawn point."""
+    """Where scenes keep clear of: the orb demo's five obstacle boxes (which
+    loaded scenes no longer get, kept so outputs don't change) plus a clear
+    cylinder around the default spawn point."""
     out = []
     for cx, cy, cz, sx, sy, sz in LEVEL_BOXES:
         c = (cx, GROUND_Y + cy, cz)

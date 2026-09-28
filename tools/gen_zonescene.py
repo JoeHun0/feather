@@ -24,8 +24,8 @@ What is in it
   and one leaning.
 * A hangar (24 x 22 x 8 m): brick to 3 m, rusty corrugated iron above and on
   the roof, a big door facing the gate, a side door, holes in the roof. It
-  stands round the five boxes the app puts in every level (they read as
-  crates) and the old spawn point, which `gen_testscene.check` keeps clear.
+  stands round where the orb demo's boxes and spawn point are, which
+  `gen_testscene.check` keeps clear.
 * A two-storey office block (12 x 8 m): precast outside, worn plaster inside,
   window and door openings, a stair (0.2 m rises, within autostep) up to the
   first floor, a parapet roof.
