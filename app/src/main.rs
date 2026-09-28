@@ -42,8 +42,9 @@ use feather_assets::MeshData;
 use feather_gfx::{GpuTimes, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use feather_platform::winit;
 use feather_render::{
-    BloomPass, CascadeSetup, ClusterView, Environment, FrameStats, FxaaPass, GpuLight,
-    InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass, UiPass, BLOOM_STRENGTH,
+    BloomPass, CascadeSetup, ClusterView, Environment, ExposureParams, ExposurePass, FrameStats,
+    FxaaPass, GpuLight, InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass, UiPass,
+    BLOOM_STRENGTH,
 };
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
@@ -272,6 +273,9 @@ struct GraphicsSettings {
     /// Bloom (§13). Live-toggleable like FXAA: its chain is always allocated
     /// and it bakes nothing in; off, the passes simply don't run.
     bloom: bool,
+    /// Auto-exposure (§13). Live-toggleable; off, the exposure is fixed (the
+    /// level's `exposure`, adjusted by `[`/`]`).
+    auto_exposure: bool,
     /// Use baked assets from `BAKE_DIR` when present (§17): BC7 textures and
     /// meshes with LODs. `--no-bake` forces the raw assets, for A/B comparisons.
     bake: bool,
@@ -310,6 +314,7 @@ impl Default for GraphicsSettings {
             msaa: 1,
             fxaa: false,
             bloom: true,
+            auto_exposure: true,
             bake: true,
             lod: true,
         }
@@ -364,6 +369,7 @@ enum MenuAction {
     Quit,
     ToggleFxaa,
     ToggleBloom,
+    ToggleAutoExposure,
     CycleShadows,
     CycleMsaa,
     ToggleDisplay,
@@ -421,6 +427,7 @@ enum MenuOutcome {
     ApplyShadows,
     ApplyFxaa,
     ApplyBloom,
+    ApplyAutoExposure,
     ApplyMsaa,
     ApplyDisplay,
     /// The FOV changed: nothing to rebuild (the next frame uses it), just save.
@@ -491,6 +498,13 @@ fn screen_rows(
             MenuRow::new(
                 format!("BLOOM  {}", if s.bloom { "ON" } else { "OFF" }),
                 MenuAction::ToggleBloom,
+            ),
+            MenuRow::new(
+                format!(
+                    "AUTO EXPOSURE  {}",
+                    if s.auto_exposure { "ON" } else { "OFF" }
+                ),
+                MenuAction::ToggleAutoExposure,
             ),
             // Changeable only from the main menu: the mesh and sky pipelines
             // bake the sample count, so it can move only while no session owns
@@ -714,6 +728,10 @@ impl Menu {
             MenuAction::ToggleBloom => {
                 s.bloom = !s.bloom;
                 MenuOutcome::ApplyBloom
+            }
+            MenuAction::ToggleAutoExposure => {
+                s.auto_exposure = !s.auto_exposure;
+                MenuOutcome::ApplyAutoExposure
             }
             MenuAction::CycleShadows => {
                 s.shadows = s.shadows.next();
@@ -1532,6 +1550,11 @@ struct Bench {
     lights: usize,
     /// This frame's triangles and LOD mix (§17).
     stats: FrameStats,
+    /// The auto-exposure the GPU metered (§13), per sampled frame; empty
+    /// with it off.
+    exposures: Vec<f32>,
+    /// The latest metered exposure, sampled with the next `record`.
+    exposure: Option<f32>,
 }
 
 impl Bench {
@@ -1542,6 +1565,8 @@ impl Bench {
             samples: Vec::with_capacity(BENCH_SWEEP as usize),
             lights: 0,
             stats: FrameStats::default(),
+            exposures: Vec::new(),
+            exposure: None,
         }
     }
 
@@ -1560,6 +1585,7 @@ impl Bench {
         let lag = FRAMES_IN_FLIGHT as u32;
         if self.frame >= BENCH_SETTLE + lag {
             self.samples.push((raw, self.lights, self.stats));
+            self.exposures.extend(self.exposure.take());
         }
         self.frame += 1;
         self.frame >= BENCH_SETTLE + BENCH_SWEEP + lag
@@ -1614,6 +1640,7 @@ impl Bench {
         eprintln!("[bench] cluster {}", col(|t| t.cluster_ms));
         eprintln!("[bench] geo     {}", col(|t| t.geometry_ms));
         eprintln!("[bench] bloom   {}", col(|t| t.bloom_ms));
+        eprintln!("[bench] expo    {}", col(|t| t.exposure_ms));
         eprintln!("[bench] post    {}", col(|t| t.post_ms));
         eprintln!("[bench] frame   {}", col(|t| t.frame_ms));
         eprintln!("[bench] lights  {lights}  (visible, after cull)");
@@ -1626,6 +1653,12 @@ impl Bench {
         };
         eprintln!("[bench] masked main   {}", count(|s| s.main_masked));
         eprintln!("[bench] masked shadow {}", count(|s| s.shadow_masked));
+        if !self.exposures.is_empty() {
+            eprintln!(
+                "[bench] exposure {}  (auto, metered)",
+                stats(self.exposures.clone())
+            );
+        }
     }
 }
 
@@ -1643,6 +1676,7 @@ struct App {
     // ---- Engine lifetime: created once, survive every session ----
     tonemap: Option<TonemapPass>,
     bloom: Option<BloomPass>,
+    exposure_pass: Option<ExposurePass>,
     fxaa: Option<FxaaPass>,
     ui: Option<UiPass>,
     renderer: Option<Renderer>,
@@ -1678,6 +1712,11 @@ struct App {
     cursor: Option<(f32, f32)>,
     light_dir: Vec4,
     exposure: f32,
+    /// Auto-exposure snaps to the scene next frame (a new level, or turned
+    /// back on) instead of adapting from where it was.
+    exposure_reset: bool,
+    /// The level's auto-exposure range (§13).
+    exposure_range: (f32, f32),
     /// glTF scenes NEW GAME loads (CLI paths). Empty = the procedural demo.
     /// Kept on `App` rather than `Session` so it survives a teardown.
     scenes: Vec<String>,
@@ -2219,7 +2258,7 @@ fn player_start(nodes: &[feather_assets::SceneNode]) -> (Vec3, Option<f32>) {
 }
 
 /// The parameters an `environment` marker (§13, §18) may carry.
-const ENVIRONMENT_PARAMS: [&str; 17] = [
+const ENVIRONMENT_PARAMS: [&str; 19] = [
     "sun_elevation",
     "sun_azimuth",
     "sun_color",
@@ -2237,6 +2276,8 @@ const ENVIRONMENT_PARAMS: [&str; 17] = [
     "fog_color",
     "fog_sun",
     "exposure",
+    "exposure_min",
+    "exposure_max",
 ];
 
 /// The level's atmosphere (§13): the first `environment` marker's params over
@@ -2285,6 +2326,8 @@ fn environment(nodes: &[feather_assets::SceneNode]) -> (Environment, Vec<String>
     num("fog_falloff", &mut env.fog_falloff);
     num("fog_sun", &mut env.fog_sun);
     num("exposure", &mut env.exposure);
+    num("exposure_min", &mut env.exposure_min);
+    num("exposure_max", &mut env.exposure_max);
     if has("sun_elevation") || has("sun_azimuth") {
         env.sun_dir = sun_travel(elevation, azimuth);
     }
@@ -2702,6 +2745,9 @@ impl App {
             tonemap: None,
             fxaa: None,
             bloom: None,
+            exposure_pass: None,
+            exposure_reset: true,
+            exposure_range: (0.125, 8.0),
             ui: None,
             renderer: None,
             window: None,
@@ -2841,6 +2887,19 @@ impl App {
                 );
                 self.persist(config::graphics::Key::Bloom);
             }
+            MenuOutcome::ApplyAutoExposure => {
+                eprintln!(
+                    "[quality] auto exposure: {}",
+                    if self.settings.auto_exposure {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+                // Back on, snap to the scene rather than fade from stale state.
+                self.exposure_reset = true;
+                self.persist(config::graphics::Key::AutoExposure);
+            }
             MenuOutcome::ApplyMsaa => {
                 self.apply_msaa();
                 self.persist(config::graphics::Key::Msaa);
@@ -2915,6 +2974,8 @@ impl App {
         let env = session.environment;
         self.light_dir = env.sun_dir.extend(0.0);
         self.exposure = env.exposure;
+        self.exposure_range = (env.exposure_min, env.exposure_max);
+        self.exposure_reset = true;
         self.session = Some(session);
         self.paused = false;
         self.menu.reset(MenuScreen::Root);
@@ -3068,11 +3129,13 @@ impl ApplicationHandler for App {
         // belong to a `Session` and are built when one starts.
         let tonemap = TonemapPass::new(&renderer);
         let bloom = BloomPass::new(&renderer);
+        let exposure_pass = ExposurePass::new(&renderer);
         let fxaa = FxaaPass::new(&renderer);
         let ui = UiPass::new(&renderer);
 
         self.tonemap = Some(tonemap);
         self.bloom = Some(bloom);
+        self.exposure_pass = Some(exposure_pass);
         self.fxaa = Some(fxaa);
         self.ui = Some(ui);
         self.renderer = Some(renderer);
@@ -3589,15 +3652,29 @@ impl ApplicationHandler for App {
                 }
 
                 let exposure = self.exposure;
-                // Bloom (§13) only over a world, and only when it's on.
+                // Bloom and auto-exposure (§13) only over a world, and only
+                // when they're on.
                 let bloom_on = self.settings.bloom && self.session.is_some();
-                if let (Some(r), Some(tm), Some(bp), Some(fx), Some(ui)) = (
+                let auto_on = self.settings.auto_exposure && self.session.is_some();
+                let exposure_params = ExposureParams {
+                    dt: dt.min(0.1),
+                    min: self.exposure_range.0,
+                    max: self.exposure_range.1,
+                    reset: self.exposure_reset,
+                };
+                if auto_on {
+                    self.exposure_reset = false;
+                }
+                let mut metered = None;
+                if let (Some(r), Some(tm), Some(bp), Some(ep), Some(fx), Some(ui)) = (
                     self.renderer.as_mut(),
                     self.tonemap.as_mut(),
                     self.bloom.as_mut(),
+                    self.exposure_pass.as_mut(),
                     self.fxaa.as_mut(),
                     self.ui.as_ref(),
                 ) {
+                    let exposure_state = ep.state_buffer();
                     // HDR view/sampler are stable except across resize; capture
                     // before the mutable draw_frame borrow, refresh in `update`.
                     // No session, or shadows off: the cascade passes collapse to
@@ -3664,10 +3741,28 @@ impl ApplicationHandler for App {
                                 bp.dispatch(cmd, frame, extent, &bloom_extents);
                             }
                         },
+                        // Auto-exposure (§13). First the result this frame
+                        // slot's last run left (its fence has been waited
+                        // on), for the bench; then this frame's metering.
                         |cmd, extent, frame| {
-                            tm.update(frame, hdr_view, bloom_views[0], hdr_sampler);
+                            if auto_on {
+                                metered = Some(ep.last(frame));
+                                ep.update(frame, hdr_view, hdr_sampler);
+                                ep.dispatch(cmd, frame, extent, exposure_params);
+                            }
+                        },
+                        |cmd, extent, frame| {
+                            tm.update(frame, hdr_view, bloom_views[0], exposure_state, hdr_sampler);
                             let strength = if bloom_on { BLOOM_STRENGTH } else { 0.0 };
-                            tm.draw(cmd, extent, frame, exposure, strength, bloom_views.len());
+                            tm.draw(
+                                cmd,
+                                extent,
+                                frame,
+                                exposure,
+                                strength,
+                                bloom_views.len(),
+                                auto_on,
+                            );
                         },
                         // Only invoked when FXAA is enabled.
                         |cmd, extent, frame| {
@@ -3680,6 +3775,9 @@ impl ApplicationHandler for App {
                     );
                 }
 
+                if let (Some(b), Some(m)) = (self.bench.as_mut(), metered) {
+                    b.exposure = Some(m.exposure);
+                }
                 if let (Some(b), Some(r)) = (self.bench.as_mut(), self.renderer.as_ref()) {
                     if self.session.is_some() && b.record(r.gpu_times_raw()) {
                         let size = self
@@ -3949,8 +4047,9 @@ fn parse_args(
             "--no-bake" => settings.bake = false,
             "--no-lod" => settings.lod = false,
             // For A/B timing: --bench ignores config/, so this is how a
-            // bench run turns bloom off.
+            // bench run turns these off.
             "--no-bloom" => settings.bloom = false,
+            "--no-auto-exposure" => settings.auto_exposure = false,
             _ => scenes.push(a),
         }
     }
@@ -4024,13 +4123,14 @@ fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     eprintln!(
-        "[config] effective: display {}, fov {}, shadows {}, msaa {}, fxaa {}, bloom {}",
+        "[config] effective: display {}, fov {}, shadows {}, msaa {}, fxaa {}, bloom {}, auto exposure {}",
         settings.display.config_name(),
         settings.fov_deg,
         settings.shadows.config_name(),
         settings.msaa,
         settings.fxaa,
-        settings.bloom
+        settings.bloom,
+        settings.auto_exposure
     );
     let mut app = App::new(scenes, settings, configs, audio, bench);
     event_loop.run_app(&mut app).expect("run app");
@@ -4858,12 +4958,14 @@ mod tests {
                 "4",
                 "--no-lod",
                 "b.gltf",
+                "--no-auto-exposure",
             ]),
             &mut s,
         );
         assert_eq!(scenes, ["a.glb", "b.gltf"]);
         assert!(bench);
         assert_eq!((s.bloom, s.msaa, s.lod, s.bake), (false, 4, false, true));
+        assert!(!s.auto_exposure);
         // A bad sample count is ignored, not taken as a scene.
         let mut s = GraphicsSettings::default();
         let (scenes, bench) = parse_args(args(&["--msaa", "x", "--no-bake"]), &mut s);
@@ -4892,6 +4994,16 @@ mod tests {
         assert_eq!(s.bloom, !before, "BLOOM row did not toggle the setting");
         assert!(
             label_of(&m, &s, &Controls::default(), MenuAction::ToggleBloom).starts_with("BLOOM")
+        );
+
+        let before = s.auto_exposure;
+        assert_eq!(
+            activate(&mut m, &mut s, MenuAction::ToggleAutoExposure),
+            MenuOutcome::ApplyAutoExposure
+        );
+        assert_eq!(
+            s.auto_exposure, !before,
+            "AUTO EXPOSURE row did not toggle it"
         );
 
         // Cycling steps down and wraps: High -> Medium -> Low -> Off -> High.
@@ -5501,6 +5613,7 @@ mod tests {
                 "sky_intensity": 1.5, "sun_glow": 0.2, "sun_disk": 0.0,
                 "fog_density": 0.02, "fog_height": -9.0, "fog_falloff": 0.08,
                 "fog_color": [0.5, 0.52, 0.48], "fog_sun": 0.3, "exposure": 1.2,
+                "exposure_min": 0.25, "exposure_max": 4.0,
             }),
         );
         let (env, bad) = environment(&[marker]);
@@ -5527,6 +5640,8 @@ mod tests {
             fog_color: Some(Vec3::new(0.5, 0.52, 0.48)),
             fog_sun: 0.3,
             exposure: 1.2,
+            exposure_min: 0.25,
+            exposure_max: 4.0,
         };
         assert_eq!(env, want);
     }
@@ -5539,11 +5654,12 @@ mod tests {
             Some("environment"),
             serde_json::json!({
                 "fog_density": 0.05, "fog": 1.0, "sky_zenith": "grey", "fog_color": 0.5,
+                "exposure_max": "bright",
             }),
         );
         let (env, mut bad) = environment(&[marker]);
         bad.sort();
-        assert_eq!(bad, ["fog", "fog_color", "sky_zenith"]);
+        assert_eq!(bad, ["exposure_max", "fog", "fog_color", "sky_zenith"]);
         let want = Environment {
             fog_density: 0.05,
             ..Default::default()

@@ -27,6 +27,7 @@ pub enum Key {
     Msaa,
     Fxaa,
     Bloom,
+    AutoExposure,
 }
 
 impl Key {
@@ -38,6 +39,7 @@ impl Key {
             Self::Msaa => "msaa",
             Self::Fxaa => "fxaa",
             Self::Bloom => "bloom",
+            Self::AutoExposure => "auto_exposure",
         }
     }
 
@@ -50,6 +52,7 @@ impl Key {
             Self::Msaa => s.msaa.to_string(),
             Self::Fxaa => s.fxaa.to_string(),
             Self::Bloom => s.bloom.to_string(),
+            Self::AutoExposure => s.auto_exposure.to_string(),
         }
     }
 }
@@ -84,6 +87,10 @@ fxaa = {}
 
 # Bloom: bright light glows softly into its surroundings. true or false.
 bloom = {}
+
+# Auto-exposure: the image brightens in the dark and darkens in bright light,
+# as eyes adapt. true or false; off, [ and ] set a fixed exposure.
+auto_exposure = {}
 ",
         Key::Display.value(&d),
         Key::Fov.value(&d),
@@ -91,6 +98,7 @@ bloom = {}
         Key::Msaa.value(&d),
         Key::Fxaa.value(&d),
         Key::Bloom.value(&d),
+        Key::AutoExposure.value(&d),
     )
 }
 
@@ -134,6 +142,11 @@ pub fn parse(text: &str, s: &mut GraphicsSettings) -> Vec<String> {
                 "true" => s.bloom = true,
                 "false" => s.bloom = false,
                 _ => warn(format!("bloom must be true or false, got {v}")),
+            },
+            "auto_exposure" => match v {
+                "true" => s.auto_exposure = true,
+                "false" => s.auto_exposure = false,
+                _ => warn(format!("auto_exposure must be true or false, got {v}")),
             },
             _ => warn(format!("unknown key `{k}`")),
         }
@@ -226,9 +239,21 @@ mod tests {
     }
 
     /// Settings fields compared as a tuple (the struct has no PartialEq).
-    fn key(s: &GraphicsSettings) -> (DisplayMode, u32, ShadowQuality, u32, bool, bool, bool, bool) {
-        (
-            s.display, s.fov_deg, s.shadows, s.msaa, s.fxaa, s.bloom, s.bake, s.lod,
+    fn key(s: &GraphicsSettings) -> String {
+        // Debug text of every field compared (the struct has no PartialEq).
+        format!(
+            "{:?}",
+            (
+                s.display,
+                s.fov_deg,
+                s.shadows,
+                s.msaa,
+                s.fxaa,
+                s.bloom,
+                s.auto_exposure,
+                s.bake,
+                s.lod,
+            )
         )
     }
 
@@ -242,10 +267,10 @@ mod tests {
     #[test]
     fn values_apply() {
         let (s, w) =
-            parsed("shadows = \"low\"  # cheap\nmsaa = 4\n  fxaa=true\ndisplay = \"fullscreen\"\nbloom = false\n");
+            parsed("shadows = \"low\"  # cheap\nmsaa = 4\n  fxaa=true\ndisplay = \"fullscreen\"\nbloom = false\nauto_exposure = false\n");
         assert!(w.is_empty(), "{w:?}");
         assert_eq!((s.shadows, s.msaa, s.fxaa), (ShadowQuality::Low, 4, true));
-        assert!(!s.bloom);
+        assert!(!s.bloom && !s.auto_exposure);
         assert_eq!(s.display, DisplayMode::Fullscreen);
         let (s, w) = parsed("fov = 30\n");
         assert!(w.is_empty(), "{w:?}");
@@ -262,6 +287,7 @@ mod tests {
             "msaa = four",
             "fxaa = maybe",
             "bloom = 1",
+            "auto_exposure = yes",
             "shadows = \"ultra\"",
             "shadows = low",
             "display = \"borderless\"",

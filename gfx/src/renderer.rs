@@ -76,7 +76,7 @@ fn clamp_samples(limits: &vk::PhysicalDeviceLimits, want: u32) -> vk::SampleCoun
 }
 // GPU timing (§21): timestamps per frame-in-flight — shadow (start, end),
 // geometry (start, end), post (start, end). Frame is shadow-start → post-end.
-const TIMESTAMPS_PER_FRAME: u32 = 10;
+const TIMESTAMPS_PER_FRAME: u32 = 12;
 
 /// A GPU buffer that frees itself (and its allocation) on drop.
 pub struct Buffer {
@@ -110,6 +110,14 @@ impl MappedBuffer {
         let n = data.len().min(self.size as usize);
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr, n) };
     }
+
+    /// Copy the buffer's start into `out` (clamped to its size), for small
+    /// GPU → CPU readbacks. The caller must have waited for the GPU's write
+    /// (the frame fence) and made it visible to the host (a barrier to HOST).
+    pub fn read(&self, out: &mut [u8]) {
+        let n = out.len().min(self.size as usize);
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr, out.as_mut_ptr(), n) };
+    }
 }
 
 impl Drop for MappedBuffer {
@@ -130,6 +138,8 @@ pub struct GpuTimes {
     pub geometry_ms: f32,
     /// The bloom compute chain (§13), between geometry and the tonemap.
     pub bloom_ms: f32,
+    /// Auto-exposure's metering (§13), after bloom.
+    pub exposure_ms: f32,
     pub post_ms: f32,
     pub frame_ms: f32,
 }
@@ -693,13 +703,14 @@ impl Renderer {
         // valid range still yields the right delta. Then ns → ms.
         let to_ms = |start: u64, end: u64| (end & m).wrapping_sub(start & m) as f32 * period * 1e-6;
         // Slots: shadow (0,1), geometry (2,3), post (4,5), cluster (6,7),
-        // bloom (8,9). Cluster and bloom were added later, so they sit at the
-        // end rather than in pass order; frame = shadow start → post end,
-        // which spans both.
+        // bloom (8,9), exposure (10,11). The last three were added later, so
+        // they sit at the end rather than in pass order; frame = shadow start
+        // → post end, which spans them all.
         let shadow = to_ms(data[0], data[1]);
         let cluster = to_ms(data[6], data[7]);
         let geo = to_ms(data[2], data[3]);
         let bloom = to_ms(data[8], data[9]);
+        let exposure = to_ms(data[10], data[11]);
         let post = to_ms(data[4], data[5]);
         let frame_ms = to_ms(data[0], data[5]);
         self.gpu_times_raw = GpuTimes {
@@ -707,6 +718,7 @@ impl Renderer {
             cluster_ms: cluster,
             geometry_ms: geo,
             bloom_ms: bloom,
+            exposure_ms: exposure,
             post_ms: post,
             frame_ms,
         };
@@ -717,6 +729,7 @@ impl Renderer {
         self.gpu_times.cluster_ms += (cluster - self.gpu_times.cluster_ms) * a;
         self.gpu_times.geometry_ms += (geo - self.gpu_times.geometry_ms) * a;
         self.gpu_times.bloom_ms += (bloom - self.gpu_times.bloom_ms) * a;
+        self.gpu_times.exposure_ms += (exposure - self.gpu_times.exposure_ms) * a;
         self.gpu_times.post_ms += (post - self.gpu_times.post_ms) * a;
         self.gpu_times.frame_ms += (frame_ms - self.gpu_times.frame_ms) * a;
 
@@ -725,8 +738,14 @@ impl Renderer {
             self.ts_log_counter = 0;
             let t = self.gpu_times;
             eprintln!(
-                "[gpu] shadow {:.2}ms  cluster {:.2}ms  geo {:.2}ms  bloom {:.2}ms  post {:.2}ms  frame {:.2}ms",
-                t.shadow_ms, t.cluster_ms, t.geometry_ms, t.bloom_ms, t.post_ms, t.frame_ms
+                "[gpu] shadow {:.2}ms  cluster {:.2}ms  geo {:.2}ms  bloom {:.2}ms  expo {:.2}ms  post {:.2}ms  frame {:.2}ms",
+                t.shadow_ms,
+                t.cluster_ms,
+                t.geometry_ms,
+                t.bloom_ms,
+                t.exposure_ms,
+                t.post_ms,
+                t.frame_ms
             );
         }
     }
@@ -1395,6 +1414,9 @@ impl Renderer {
         // sample the HDR result and read/write the bloom chain, which it finds
         // in GENERAL layout; the tonemap then samples level 0.
         bloom: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
+        // Compute after bloom (§13's auto-exposure): it may sample the HDR
+        // result; it owns and synchronises its own buffers.
+        exposure: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         post: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         aa: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         ui: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
@@ -1858,6 +1880,25 @@ impl Renderer {
                 &[],
                 &[bloom_to_read],
             );
+
+            // ---- Auto-exposure (§13): metering compute. ----
+            if self.timestamps_supported {
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 10,
+                );
+            }
+            exposure(cmd, extent, frame);
+            if self.timestamps_supported {
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 11,
+                );
+            }
 
             // Swapchain: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
             // Without FXAA this is the swapchain image: COLOR_ATTACHMENT_OUTPUT is the

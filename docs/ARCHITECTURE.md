@@ -844,7 +844,8 @@ the ground's edge showed. Now it can pool on the ground.
 2. **Bloom** — threshold → progressive dual-filter down/up mip chain; in HDR,
    before tonemap; persistent mip pyramid.
 3. **Exposure** — fixed constant to start; auto-exposure (luminance compute) is a
-   hook in the camera UBO, not built now.
+   hook in the camera UBO, not built now. **Landed** (below), with its state
+   in a storage buffer the tonemap reads rather than the camera UBO.
 4. **Composite + tonemap** — scene + bloom, exposure, then **AgX**/ACES (in
    linear).
 5. **OETF/gamma** — let the `_SRGB` swapchain encode; do **not** also gamma in
@@ -900,6 +901,62 @@ Call of Duty: AW).
 - **Switch:** OPTIONS > GRAPHICS > BLOOM, saved as `bloom` in
   `graphics.toml`, and `--no-bloom` for bench A/B runs (the bench ignores
   config). Bloom runs only over a world.
+
+**Landed (§26): auto-exposure, centre-weighted.** The eye adapting: the dark
+hangar brightens, bright sky darkens.
+- **Metering:** two compute passes after bloom, owned by
+  `render::ExposurePass`.
+  - **Histogram:** log2 luminance of a quarter-resolution grid of HDR
+    samples in 256 bins over 2⁻¹⁰…2⁶. Each sample is weighted by
+    `exp(−r²/0.6²)`, with r in half-heights from the screen's centre (1…64,
+    never 0), so what you look at drives exposure. A workgroup accumulates
+    in shared memory, then adds into a global histogram.
+  - **Average:** one group. It takes the weighted mean between the 10th and
+    90th percentiles, adapts towards it in log space
+    (`adapted += (target − adapted)·(1 − e^{−dt·speed})`, 3 EV/s to bright,
+    1 EV/s to dark), and computes `exposure = clamp(KEY / 2^adapted, min,
+    max)`. It zeroes the histogram for the next frame.
+  - A level's first frame, and turning auto-exposure back on, snap to the
+    metered value instead of fading.
+- **State:** it stays on the GPU. A persistent buffer (the histogram,
+  `adapted`, `exposure`) is read straight by the tonemap, so there are no
+  frames of CPU readback lag.
+  - The buffer is shared across frames in flight, so the pass's first
+    barrier waits for the previous frame's compute writes and tonemap reads
+    (§21's rule), and its last makes its writes visible to the tonemap.
+  - Each frame also copies the result into a small host buffer, which the
+    app reads after that frame's fence. That's what `[bench] exposure`
+    prints: the evidence that it responds.
+- **Compensation:** with auto-exposure on, the level's `exposure` and the
+  `[`/`]` keys are compensation (a multiplier on the metered value).
+  `exposure_min`/`exposure_max` (defaults ⅛ and 8) bound it per level.
+  With auto-exposure off, `exposure` is the fixed exposure, as before.
+- **`KEY` = 0.55, calibrated, not guessed:** with 0.18 (the textbook middle
+  grey), `lights120`'s sweep metered a median exposure of 0.33, so its look
+  would have darkened by 3×. 0.18 / 0.33 ≈ 0.55 puts that median at **1.00**
+  (0.84–1.14 over the sweep), today's fixed look, as the neutral point.
+  - The zone then meters 0.98–1.88 (median 1.36), since it's a darker,
+    overcast scene. Its `exposure` compensation went from 1.25, a
+    fixed-exposure guess, back to 1.0.
+  - Predicted: exposure varies as the camera turns, and the zone settles
+    higher than `lights120`. Both are right.
+- **Measured** (debug, clocks unpinned, 3 interleaved runs,
+  `--no-auto-exposure` vs on):
+  - the passes cost 0.05 ms and frames grow 0.04–0.05 ms, on the zone and
+    `lights120`. I predicted ≤ 0.04 ms, slightly low.
+  - Validation with sync: 0 messages, on, off, and at MSAA 4× (which
+    meters the resolve target, and gives the same exposures).
+- **Tests:** a Rust reference of the maths, whose constants and state layout
+  the shaders must declare (a text check, which caught a stray comment in
+  the layout on its first run):
+  - bins round-trip;
+  - the trimmed mean ignores tails under 10%;
+  - adaptation converges, brightens faster than it darkens, and is frame-rate
+    independent;
+  - the exposure maps `KEY` and clamps;
+  - the centre weight falls off but never to 0.
+- **Switch:** OPTIONS > GRAPHICS > AUTO EXPOSURE, saved as `auto_exposure`,
+  and `--no-auto-exposure` for bench A/B runs. It runs only over a world.
 **Landed (§26):** a **graphics settings layer** with a live **shadow-quality**
 preset (`F1` cycles; `GraphicsSettings` on `App`, deliberately not an ECS resource
 since §1 scopes the `World` to simulation). Measured on the orb demo at one window
@@ -1970,7 +2027,7 @@ ripped SoC assets, so a public showcase is clean.
 
 ## 25. Deferred by design (hooks left in place)
 
-GPU-driven indirect culling; async compute; auto-exposure; dual-quaternion
+GPU-driven indirect culling; async compute; dual-quaternion
 skinning; animation state machines; local reflection probes / irradiance
 volumes; audio occlusion + reverb zones; user-selectable anti-aliasing mode
 (SMAA / MSAA 2×/4×; the geometry sample-count seam is in place, §26); TAA;
@@ -2220,7 +2277,7 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   *is* now drawn as a visible background (SkyPass) matching the reflected
   environment. Real cubemap IBL (equirect→cube, irradiance/prefilter passes,
   BRDF LUT) is the follow-up. Sun shadows (§11 CSM) and punctual point lights
-  (§12) now exist. Bloom landed (§13). Still missing: auto-exposure. The tonemap curve is a
+  (§12) now exist. Bloom and auto-exposure landed (§13). The tonemap curve is a
   drop-in point for AgX.
   **Known artifact — specular singularity on smooth metal.** A punctual light has
   zero area, so on low-roughness metal (the PBR grid bottoms out at 0.06) its
@@ -2286,7 +2343,7 @@ caster pancaking (depth clamp + near-plane-free caster culling); **PCSS still
 pending**, and since array layers share an extent all
 cascades are the same resolution. Shadows now reach `SHADOW_DISTANCE` (60) rather
 than a ±16 box;
-auto-exposure (bloom landed, §13); transparents (alpha
+transparents (alpha
 *cutout* landed, §5; BLEND still draws opaque); asset
 bake pipeline (runtime glTF scene loading + multi-mesh registry landed, and
 the **texture bake** — BC7 mip chains in a content-addressed cache, §17; mesh /

@@ -9,12 +9,20 @@ layout(set = 0, binding = 0) uniform sampler2D u_hdr;
 // Level 0 of the bloom chain (§13): the sum of every level's filtered copy
 // of the HDR image, at half resolution.
 layout(set = 0, binding = 1) uniform sampler2D u_bloom;
+// Auto-exposure's state (§13, render::exposure's `State`): only `exposure`
+// is read here.
+layout(std430, set = 0, binding = 2) readonly buffer State {
+    uint histogram[256];
+    float adapted;
+    float exposure;
+} state;
 
 // Must match render::tonemap's push layout (a test checks its size).
 layout(push_constant) uniform Push {
     float exposure;
     float bloom;        // mix strength; 0 skips bloom (its image isn't read)
     float bloom_levels; // how many levels were summed into u_bloom
+    float auto_exposure; // 1: `exposure` is compensation on the metered value
 } pc;
 
 layout(location = 0) in vec2 v_uv;
@@ -39,6 +47,7 @@ void main() {
         vec3 bloom = texture(u_bloom, v_uv).rgb / pc.bloom_levels;
         hdr = mix(hdr, bloom, pc.bloom);
     }
-    vec3 mapped = aces(hdr * pc.exposure);
+    float exposure = pc.auto_exposure > 0.0 ? state.exposure * pc.exposure : pc.exposure;
+    vec3 mapped = aces(hdr * exposure);
     o_color = vec4(mapped, 1.0);
 }

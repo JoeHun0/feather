@@ -141,7 +141,7 @@ ENVIRONMENT = {
     # Ground haze: thickest on the ground, thinning by e every 12.5 m up.
     "fog_density": 0.035, "fog_height": G, "fog_falloff": 0.08,
     "fog_color": [0.50, 0.52, 0.48], "fog_sun": 0.3,
-    "exposure": 1.25,
+    "exposure": 1.0,
 }
 LAMP = {"color": [1.0, 0.78, 0.5], "intensity": 10.0, "radius": 12.0,
         "source_radius": 0.1}

@@ -1,0 +1,67 @@
+#version 450
+
+// Auto-exposure, pass 1 (§13): a histogram of the HDR image's log2
+// luminance, over a quarter-resolution grid of bilinear samples, each weighted
+// by how near the screen's centre it is (centre-weighted metering: what you
+// look at drives exposure). Per workgroup in shared memory, then added into
+// the global histogram, which exposure_average.comp reads and zeroes.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_hdr;
+// The persistent exposure state (render::exposure's `State`); `adapted` is
+// the log2 luminance the eye has adapted to.
+layout(std430, set = 0, binding = 1) buffer State {
+    uint histogram[256];
+    float adapted;
+    float exposure;
+    float target;
+    uint frames;
+} state;
+
+layout(push_constant) uniform Push {
+    uvec2 grid;   // the sample grid's size
+    float aspect; // width / height
+} pc;
+
+// Must match render::exposure's reference (a test checks).
+const float LOG_MIN = -10.0;
+const float LOG_MAX = 6.0;
+const float CENTRE_SIGMA = 0.6;
+const uint WEIGHT_MAX = 64u;
+
+shared uint local_bins[256];
+
+uint bin_of(float lum) {
+    if (lum < exp2(LOG_MIN)) {
+        return 0u;
+    }
+    float t = clamp((log2(lum) - LOG_MIN) / (LOG_MAX - LOG_MIN), 0.0, 1.0);
+    return 1u + uint(t * 254.0);
+}
+
+// 1 at the centre down to 1 / WEIGHT_MAX: never 0, so edges still count.
+uint centre_weight(vec2 uv) {
+    vec2 d = (uv - 0.5) * 2.0 * vec2(pc.aspect, 1.0);
+    float w = exp(-dot(d, d) / (CENTRE_SIGMA * CENTRE_SIGMA));
+    return 1u + uint(w * float(WEIGHT_MAX - 1u));
+}
+
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    local_bins[i] = 0u;
+    barrier();
+
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x < pc.grid.x && p.y < pc.grid.y) {
+        vec2 uv = (vec2(p) + 0.5) / vec2(pc.grid);
+        vec3 c = texture(u_hdr, uv).rgb;
+        float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        atomicAdd(local_bins[bin_of(lum)], centre_weight(uv));
+    }
+    barrier();
+
+    if (local_bins[i] != 0u) {
+        atomicAdd(state.histogram[i], local_bins[i]);
+    }
+}

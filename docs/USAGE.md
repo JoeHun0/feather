@@ -89,6 +89,7 @@ on a HiDPI desktop) and is resizable; `--bench` uses a fixed 1920×1080.
 | `--no-bake` | Ignore the bake: raw RGBA8 textures and raw meshes (no LODs), for A/B against it (§4). |
 | `--no-lod` | Draw every mesh at LOD0 but keep the baked vertex order, to A/B the LOD win alone (§4). |
 | `--no-bloom` | Turn bloom off for this run (never saved). Mainly for `--bench` A/B runs, which ignore the config files. |
+| `--no-auto-exposure` | Fixed exposure for this run (never saved), likewise. |
 | `--bench` | Scripted timing run: skips the menu, sweeps the camera 360°, prints a summary and exits. Ignores the config files. See §7. |
 
 Typical runs:
@@ -120,6 +121,7 @@ controls got their own file; an old one is renamed on first run.)
 | `msaa` | `1`, `2`, `4`, `8` (clamped to the device) | `1` |
 | `fxaa` | `true`, `false` | `false` |
 | `bloom` | `true`, `false` | `true` |
+| `auto_exposure` | `true`, `false` | `true` |
 
 **`controls.toml`** — key bindings and mouse look. Saved when you change
 something in OPTIONS > CONTROLS or OPTIONS > GAMEPLAY (same in-place editing as
@@ -176,7 +178,7 @@ Defaults, rebindable in OPTIONS > CONTROLS or `config/controls.toml` (Esc isn't)
 | Space | jump |
 | V | noclip (free flight) on/off |
 | Left Ctrl | fly down (noclip) |
-| `[` / `]` | exposure down / up |
+| `[` / `]` | exposure down / up (compensation, with auto-exposure on) |
 | F1 | cycle shadow quality: OFF → LOW (4×512) → MEDIUM (4×1024) → HIGH (4×2048) |
 | F2 | FXAA on/off |
 | F11 | windowed / fullscreen |
@@ -188,8 +190,8 @@ screen, and resumes play only from the pause menu's top level.
 - **Main menu:** NEW GAME / OPTIONS / QUIT
 - **Pause menu:** CONTINUE / OPTIONS / MAIN MENU / EXIT
 - **OPTIONS:** GRAPHICS / CONTROLS / SOUND / GAMEPLAY / BACK.
-- **OPTIONS > GRAPHICS:** DISPLAY (windowed / fullscreen), shadows, FXAA and
-  BLOOM are live; MSAA can change only from
+- **OPTIONS > GRAPHICS:** DISPLAY (windowed / fullscreen), shadows, FXAA,
+  BLOOM and AUTO EXPOSURE are live; MSAA can change only from
   the main menu, because the mesh and sky pipelines bake the sample count
   (in-game it reads `MENU ONLY`).
 - **OPTIONS > CONTROLS:** one row per action with its keys (`JUMP  SPACE`).
@@ -225,7 +227,7 @@ Every clip is normalised to its event's level, so recorded and synthesised
 sounds play equally loud. With no audio device the game logs
 `[audio] unavailable` and runs silent.
 
-Defaults: shadows HIGH, FXAA off, bloom on, MSAA 1×.
+Defaults: shadows HIGH, FXAA off, bloom on, auto-exposure on, MSAA 1×.
 
 ---
 
@@ -290,7 +292,7 @@ if absent. A node's `extras` can name a prefab:
 |---|---|---|
 | `player_start` | `yaw` degrees (keep the default look direction) | where NEW GAME spawns the player; first one wins |
 | `prop` | `collide` (true), `shadow` (true), `collider` (`auto`) | a mesh with optional collider / shadow casting. `collider`: `auto` (exact mesh up to 2048 triangles; above that, the finest baked LOD under 2048 triangles within 5 cm, else a convex hull), `mesh` (always the full mesh), `hull`, `box`, `none`. Bake a scene so its detailed props get LOD collision instead of hulls, which fill every hollow |
-| `environment` | `sun_elevation` 63° and `sun_azimuth` 127° (degrees above the horizon, and clockwise from north, -Z, seen from above), `sun_color` [1,1,1], `sun_intensity` 8, `sky_zenith` [0.10,0.22,0.55], `sky_horizon` [0.55,0.65,0.85], `sky_ground` [0.17,0.18,0.19], `sky_sun_color` [1,0.95,0.85] (the tint of the sun's glow and disk), `sky_intensity` 1 (also the ambient light), `sun_glow` 0.6, `sun_disk` 60 (0 hides the sun), `fog_density` 0.010 per metre (at `fog_height` 0), `fog_falloff` 0 (per metre; above 0 the fog thins with height, by e every 1/falloff metres, and the sky background fogs through it too), `fog_color` (unset: the sky's colour), `fog_sun` 0 (a glow towards the sun in the fog), `exposure` 1 | the level's atmosphere, on a bare marker; first one wins. Colours are linear. Left-out params keep the default look; unknown or unreadable ones print `[scene] environment: can't use param …` and are ignored |
+| `environment` | `sun_elevation` 63° and `sun_azimuth` 127° (degrees above the horizon, and clockwise from north, -Z, seen from above), `sun_color` [1,1,1], `sun_intensity` 8, `sky_zenith` [0.10,0.22,0.55], `sky_horizon` [0.55,0.65,0.85], `sky_ground` [0.17,0.18,0.19], `sky_sun_color` [1,0.95,0.85] (the tint of the sun's glow and disk), `sky_intensity` 1 (also the ambient light), `sun_glow` 0.6, `sun_disk` 60 (0 hides the sun), `fog_density` 0.010 per metre (at `fog_height` 0), `fog_falloff` 0 (per metre; above 0 the fog thins with height, by e every 1/falloff metres, and the sky background fogs through it too), `fog_color` (unset: the sky's colour), `fog_sun` 0 (a glow towards the sun in the fog), `exposure` 1 (with auto-exposure on, compensation: a multiplier on the metered exposure; off, the fixed exposure), `exposure_min` 0.125 and `exposure_max` 8 (the range auto-exposure may choose from) | the level's atmosphere, on a bare marker; first one wins. Colours are linear. Left-out params keep the default look; unknown or unreadable ones print `[scene] environment: can't use param …` and are ignored |
 | `point_light` | `color` [1,1,1], `intensity` 12, `radius` 10, `source_radius` 0.1 | on a bare marker or on geometry (a lamp that also renders). `source_radius` is the emitter's physical size, clamped to [0, radius]: it sets the size of the highlight on shiny surfaces. Match it to the lamp's geometry; 0 is a true point, which makes a pinprick-bright highlight on smooth metal |
 
 An unknown prefab name falls back to static geometry. Up to 128 point lights
@@ -449,7 +451,7 @@ and distant shadows should look unchanged.
 
 ## 5. Tests
 
-`cargo test --workspace` runs 159 tests, in well under a second once built.
+`cargo test --workspace` runs 165 tests, in well under a second once built.
 All of them are CPU-side: none needs a GPU, a window, a sound card or
 anything in `scratch/`, so they pass on a fresh clone.
 
@@ -598,6 +600,7 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | Texture bake | assets, bake | keys separate content and kind (sRGB colour vs data), and are computed from the encoded bytes without decoding; BC7 level sizes round partial blocks up; baked files round-trip and reject truncation, wrong sizes or an unknown kind; sRGB mips average *light* (black/white → 188, not 128); chains end at 1×1; every baked level has exactly the blocks Vulkan copies |
 | Mesh bake + LOD | assets, bake, render | baked meshes round-trip and reject damage (truncation, trailing bytes, bad magic, out-of-range index, decreasing or NaN error, partial triangle, no LODs); the mesh key ignores the material; a sphere gets a chain with fewer triangles and growing error per level and LOD0 is the input reordered; small meshes stay LOD0; disconnected parts prune; the pixel and texel rules (distance, scale, non-uniform scale, inside the sphere); runs split per (mesh, LOD) |
 | Bloom | gfx, render, app | the chain's level sizes (half resolution, halving to an 8-texel side, at most 7 levels, never zero, odd and tiny windows); a Rust reference of the chain: a flat image blooms to itself, a bright pixel spreads with falloff, a plain downsample keeps energy within 5%, and the shaders declare the reference's weights; the steps go down then up; the tonemap's push block matches its Rust struct; the GRAPHICS row toggles it; `--no-bloom` (with the other flags) parses |
+| Auto-exposure | render, app | a Rust reference of the metering, whose constants and state layout the shaders must declare: luminance round-trips through its bin (black to bin 0), the 10–90% trimmed mean ignores the tails, adaptation converges, brightens faster than it darkens and is frame-rate independent, the exposure maps `KEY` and clamps, the centre weight falls off but never to 0; `exposure_min`/`exposure_max` land and bad values are reported; the GRAPHICS row and `--no-auto-exposure` |
 | Config files | app | both templates parse back to the defaults; `display` parses and rejects anything but `"windowed"` / `"fullscreen"`; `fov` accepts 30–120 whole degrees only; each bad line warns and keeps the default; saving edits one value in place; create-once, the `settings.toml` → `graphics.toml` migration, an unreadable file is left alone |
 | Controls | app | key names round-trip; reserved menu keys are refused; a key on two actions warns; two keys on one action hold until both are released; toggles ignore auto-repeat but exposure repeats; a rebound jump moves; `toggle_fullscreen` defaults to F11 (also in files that predate it) and ignores auto-repeat; `rebind` steals the key and refuses menu/unnamed keys; sensitivity presets step and wrap; saved literals parse back, and saving every binding into the template keeps its comments; every key's menu label is drawable |
 | Texture slots | render | one slot per unique image × colour space; sRGB and UNORM uses of the same pixels stay separate; overflow past the capacity is counted and falls back to the defaults |
@@ -627,8 +630,8 @@ Everything goes to stderr.
 | `[gfx] device: …` | the GPU picked at startup. Check it: machines with an iGPU + dGPU list both |
 | `[gfx] MSAA: …` | requested vs actual sample count |
 | `[vulkan] …` | validation messages (debug builds), or the "layer not found" warning |
-| `[gpu] shadow … cluster … geo … bloom … post … frame …` | smoothed per-pass GPU ms, about once a second |
-| `[quality] shadows / fxaa / bloom: …` | a setting changed |
+| `[gpu] shadow … cluster … geo … bloom … expo … post … frame …` | smoothed per-pass GPU ms, about once a second |
+| `[quality] shadows / fxaa / bloom / auto exposure: …` | a setting changed |
 | `[config] …` | a config file created / loaded / renamed, a line ignored or a key bound twice, plus the effective graphics settings at startup |
 | `[light] N visible lights exceeds MAX_LIGHTS` | lights past 128 were dropped this frame |
 | `[audio] started …; sounds: R recorded, S synthesised` / `… not found (…fetch_assets.py…)` / `footstep_grass_000.ogg: …; grass steps use the concrete ones (…)` / `unavailable: …` / `N lamps humming` | the mixer came up (or why not; the game then runs silent), which surfaces lack their own steps, and how many lamps a session gave a hum. With the whole pack: 35 recorded, 0 synthesised |
@@ -637,7 +640,7 @@ Everything goes to stderr.
 | `[scene] colliders: N mesh (M from LODs), H hull, B box` | the colliders a session built; with a bake, detailed props should be LODs, not hulls |
 | `[scene] surfaces: N concrete, M grass, …` / `[scene] unknown surface "x"; using concrete` | the same colliders by footstep surface (only surfaces that have any), and any material tag that isn't a surface |
 | `[load] scenes … world … renderer … total …` | where a session's load time went: parsing + reading images + meshes, spawning + colliders, GPU upload |
-| `[bench] …` | the `--bench` summary, including triangles submitted per frame (`Mtris main/shadow`), the share of instances at each LOD (`LOD mix`), and how many instances of cutout materials were drawn (`masked main/shadow`) |
+| `[bench] …` | the `--bench` summary, including triangles submitted per frame (`Mtris main/shadow`), the share of instances at each LOD (`LOD mix`), how many instances of cutout materials were drawn (`masked main/shadow`), and, with auto-exposure on, the exposure it metered over the sweep (`exposure`) |
 
 ---
 

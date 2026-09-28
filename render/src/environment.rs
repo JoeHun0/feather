@@ -51,8 +51,12 @@ pub struct Environment {
     /// Strength of the glow towards the sun in the fog (tinted by
     /// `sky_sun_color`).
     pub fog_sun: f32,
-    /// Starting exposure for the tonemap.
+    /// Exposure: compensation on the metered value with auto-exposure (1 =
+    /// as metered), or the exposure itself without it. `[`/`]` adjust it.
     pub exposure: f32,
+    /// The range auto-exposure may choose from (§13).
+    pub exposure_min: f32,
+    pub exposure_max: f32,
 }
 
 impl Default for Environment {
@@ -74,6 +78,8 @@ impl Default for Environment {
             fog_color: None,
             fog_sun: 0.0,
             exposure: 1.0,
+            exposure_min: 0.125,
+            exposure_max: 8.0,
         }
     }
 }

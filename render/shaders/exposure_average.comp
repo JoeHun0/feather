@@ -1,0 +1,96 @@
+#version 450
+
+// Auto-exposure, pass 2 (§13): one workgroup. Reads the histogram (and
+// zeroes it for the next frame), takes the weighted mean log2 luminance
+// between the LOW_PCT and HIGH_PCT percentiles, adapts towards it over time
+// the way an eye does (faster to bright than to dark), and turns that into
+// the exposure the tonemap reads.
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 1) buffer State {
+    uint histogram[256];
+    float adapted;
+    float exposure;
+    float target;
+    uint frames;
+} state;
+// This frame's copy for the CPU (the bench's evidence), read after its fence.
+layout(std430, set = 0, binding = 2) writeonly buffer Readback {
+    float exposure;
+    float target;
+    float adapted;
+    float pad;
+} readback;
+
+layout(push_constant) uniform Push {
+    float dt;           // seconds since the last frame
+    float min_exposure;
+    float max_exposure;
+    uint reset;         // 1: snap to the target (a new level), don't fade
+} pc;
+
+// Must match render::exposure's reference (a test checks).
+const float LOG_MIN = -10.0;
+const float LOG_MAX = 6.0;
+const float LOW_PCT = 0.1;
+const float HIGH_PCT = 0.9;
+const float SPEED_TO_BRIGHT = 3.0;
+const float SPEED_TO_DARK = 1.0;
+const float KEY = 0.55;
+
+shared uint bins[256];
+
+// The log2 luminance a bin stands for: its centre; bin 0 (black) is LOG_MIN.
+float bin_log(uint b) {
+    if (b == 0u) {
+        return LOG_MIN;
+    }
+    return LOG_MIN + (float(b - 1u) + 0.5) / 254.0 * (LOG_MAX - LOG_MIN);
+}
+
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    bins[i] = state.histogram[i];
+    state.histogram[i] = 0u;
+    barrier();
+    if (i != 0u) {
+        return;
+    }
+
+    float total = 0.0;
+    for (uint b = 0u; b < 256u; b++) {
+        total += float(bins[b]);
+    }
+    float lo = total * LOW_PCT;
+    float hi = total * HIGH_PCT;
+    float cum = 0.0;
+    float sum = 0.0;
+    float kept = 0.0;
+    for (uint b = 0u; b < 256u; b++) {
+        float c = float(bins[b]);
+        float k = max(0.0, min(cum + c, hi) - max(cum, lo));
+        sum += k * bin_log(b);
+        kept += k;
+        cum += c;
+    }
+
+    bool snap = pc.reset != 0u || state.frames == 0u;
+    float target = kept > 0.0 ? sum / kept : state.adapted;
+    float adapted = state.adapted;
+    if (snap) {
+        adapted = target;
+    } else {
+        float speed = target > adapted ? SPEED_TO_BRIGHT : SPEED_TO_DARK;
+        adapted += (target - adapted) * (1.0 - exp(-pc.dt * speed));
+    }
+    float exposure = clamp(KEY / exp2(adapted), pc.min_exposure, pc.max_exposure);
+
+    state.adapted = adapted;
+    state.exposure = exposure;
+    state.target = target;
+    state.frames += 1u;
+    readback.exposure = exposure;
+    readback.target = target;
+    readback.adapted = adapted;
+}

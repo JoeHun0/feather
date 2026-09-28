@@ -22,6 +22,7 @@ struct Push {
     exposure: f32,
     bloom: f32,
     bloom_levels: f32,
+    auto_exposure: f32,
 }
 const PUSH_SIZE: u32 = std::mem::size_of::<Push>() as u32;
 
@@ -32,20 +33,27 @@ pub struct TonemapPass {
     set_layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
     sets: Vec<vk::DescriptorSet>,
-    // Currently-bound HDR and bloom views per set; used to skip redundant
-    // descriptor writes.
+    // Currently-bound HDR and bloom views and exposure buffer per set; used
+    // to skip redundant descriptor writes.
     bound_views: Vec<[vk::ImageView; 2]>,
+    bound_state: Vec<vk::Buffer>,
 }
 
 impl TonemapPass {
     pub fn new(renderer: &Renderer) -> Self {
         let device = renderer.device();
 
-        // The HDR scene, and level 0 of the bloom chain (§13).
-        let bindings = [0, 1].map(|b| {
+        // The HDR scene, level 0 of the bloom chain, and auto-exposure's
+        // state (§13).
+        let bindings = [
+            (0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+            (1, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+            (2, vk::DescriptorType::STORAGE_BUFFER),
+        ]
+        .map(|(b, ty)| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(b)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_type(ty)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT)
         });
@@ -58,9 +66,14 @@ impl TonemapPass {
                 .expect("tonemap set layout")
         };
 
-        let pool_sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(2 * FRAMES_IN_FLIGHT as u32)];
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(2 * FRAMES_IN_FLIGHT as u32),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(FRAMES_IN_FLIGHT as u32),
+        ];
         let pool = unsafe {
             device
                 .create_descriptor_pool(
@@ -128,7 +141,7 @@ impl TonemapPass {
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(PUSH_SIZE)]; // exposure, bloom strength, bloom levels
+            .size(PUSH_SIZE)]; // exposure, bloom strength, bloom levels, auto
         let layout = unsafe {
             device
                 .create_pipeline_layout(
@@ -177,6 +190,7 @@ impl TonemapPass {
             pool,
             sets,
             bound_views: vec![[vk::ImageView::null(); 2]; FRAMES_IN_FLIGHT],
+            bound_state: vec![vk::Buffer::null(); FRAMES_IN_FLIGHT],
         }
     }
 
@@ -185,14 +199,27 @@ impl TonemapPass {
     /// waits on the frame fence before recording, so this set is idle here.
     ///
     /// `bloom_view` is level 0 of the bloom chain, which `draw_frame` keeps in
-    /// GENERAL layout.
+    /// GENERAL layout; `exposure_state` is auto-exposure's state buffer.
     pub fn update(
         &mut self,
         frame: usize,
         hdr_view: vk::ImageView,
         bloom_view: vk::ImageView,
+        exposure_state: vk::Buffer,
         sampler: vk::Sampler,
     ) {
+        if self.bound_state[frame] != exposure_state {
+            let info = [vk::DescriptorBufferInfo::default()
+                .buffer(exposure_state)
+                .range(vk::WHOLE_SIZE)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(self.sets[frame])
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&info);
+            unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+            self.bound_state[frame] = exposure_state;
+        }
         if self.bound_views[frame] == [hdr_view, bloom_view] {
             return;
         }
@@ -217,6 +244,9 @@ impl TonemapPass {
 
     /// `bloom` is the mix strength (0: none, and the bloom image isn't
     /// read); `bloom_levels` how many levels were summed into level 0.
+    /// With `auto_exposure`, `exposure` is compensation on the metered value;
+    /// without, it is the exposure.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
         cmd: vk::CommandBuffer,
@@ -225,6 +255,7 @@ impl TonemapPass {
         exposure: f32,
         bloom: f32,
         bloom_levels: usize,
+        auto_exposure: bool,
     ) {
         unsafe {
             self.device.cmd_bind_pipeline(
@@ -244,6 +275,7 @@ impl TonemapPass {
                 exposure,
                 bloom,
                 bloom_levels: bloom_levels as f32,
+                auto_exposure: if auto_exposure { 1.0 } else { 0.0 },
             };
             let bytes = std::slice::from_raw_parts(
                 (&push as *const Push).cast::<u8>(),
