@@ -2,5 +2,6 @@
 
 mod renderer;
 pub use renderer::{
-    Buffer, GpuTimes, Image, MappedBuffer, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES,
+    bloom_mips, Buffer, GpuTimes, Image, MappedBuffer, Renderer, BLOOM_MAX_MIPS, FRAMES_IN_FLIGHT,
+    SHADOW_CASCADES,
 };

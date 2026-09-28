@@ -42,8 +42,8 @@ use feather_assets::MeshData;
 use feather_gfx::{GpuTimes, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use feather_platform::winit;
 use feather_render::{
-    CascadeSetup, ClusterView, Environment, FrameStats, FxaaPass, GpuLight, InstanceData, MeshId,
-    MeshRenderer, SkyPass, TonemapPass, UiPass,
+    BloomPass, CascadeSetup, ClusterView, Environment, FrameStats, FxaaPass, GpuLight,
+    InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass, UiPass, BLOOM_STRENGTH,
 };
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
@@ -269,6 +269,9 @@ struct GraphicsSettings {
     /// FXAA post-AA (§13). Unlike MSAA this is live-toggleable (`F2`): it bakes
     /// nothing into pipelines, and the LDR intermediate is always allocated.
     fxaa: bool,
+    /// Bloom (§13). Live-toggleable like FXAA: its chain is always allocated
+    /// and it bakes nothing in; off, the passes simply don't run.
+    bloom: bool,
     /// Use baked assets from `BAKE_DIR` when present (§17): BC7 textures and
     /// meshes with LODs. `--no-bake` forces the raw assets, for A/B comparisons.
     bake: bool,
@@ -306,6 +309,7 @@ impl Default for GraphicsSettings {
             fov_deg: DEFAULT_FOV_DEG,
             msaa: 1,
             fxaa: false,
+            bloom: true,
             bake: true,
             lod: true,
         }
@@ -359,6 +363,7 @@ enum MenuAction {
     Back,
     Quit,
     ToggleFxaa,
+    ToggleBloom,
     CycleShadows,
     CycleMsaa,
     ToggleDisplay,
@@ -415,6 +420,7 @@ enum MenuOutcome {
     Quit,
     ApplyShadows,
     ApplyFxaa,
+    ApplyBloom,
     ApplyMsaa,
     ApplyDisplay,
     /// The FOV changed: nothing to rebuild (the next frame uses it), just save.
@@ -481,6 +487,10 @@ fn screen_rows(
             MenuRow::new(
                 format!("FXAA  {}", if s.fxaa { "ON" } else { "OFF" }),
                 MenuAction::ToggleFxaa,
+            ),
+            MenuRow::new(
+                format!("BLOOM  {}", if s.bloom { "ON" } else { "OFF" }),
+                MenuAction::ToggleBloom,
             ),
             // Changeable only from the main menu: the mesh and sky pipelines
             // bake the sample count, so it can move only while no session owns
@@ -700,6 +710,10 @@ impl Menu {
             MenuAction::ToggleFxaa => {
                 s.fxaa = !s.fxaa;
                 MenuOutcome::ApplyFxaa
+            }
+            MenuAction::ToggleBloom => {
+                s.bloom = !s.bloom;
+                MenuOutcome::ApplyBloom
             }
             MenuAction::CycleShadows => {
                 s.shadows = s.shadows.next();
@@ -1599,6 +1613,7 @@ impl Bench {
         eprintln!("[bench] shadow  {}", col(|t| t.shadow_ms));
         eprintln!("[bench] cluster {}", col(|t| t.cluster_ms));
         eprintln!("[bench] geo     {}", col(|t| t.geometry_ms));
+        eprintln!("[bench] bloom   {}", col(|t| t.bloom_ms));
         eprintln!("[bench] post    {}", col(|t| t.post_ms));
         eprintln!("[bench] frame   {}", col(|t| t.frame_ms));
         eprintln!("[bench] lights  {lights}  (visible, after cull)");
@@ -1627,6 +1642,7 @@ struct App {
     session: Option<Session>,
     // ---- Engine lifetime: created once, survive every session ----
     tonemap: Option<TonemapPass>,
+    bloom: Option<BloomPass>,
     fxaa: Option<FxaaPass>,
     ui: Option<UiPass>,
     renderer: Option<Renderer>,
@@ -2685,6 +2701,7 @@ impl App {
             session: None,
             tonemap: None,
             fxaa: None,
+            bloom: None,
             ui: None,
             renderer: None,
             window: None,
@@ -2815,6 +2832,14 @@ impl App {
             MenuOutcome::ApplyFxaa => {
                 self.apply_fxaa();
                 self.persist(config::graphics::Key::Fxaa);
+            }
+            MenuOutcome::ApplyBloom => {
+                // Nothing to push: the frame reads the setting as it draws.
+                eprintln!(
+                    "[quality] bloom: {}",
+                    if self.settings.bloom { "on" } else { "off" }
+                );
+                self.persist(config::graphics::Key::Bloom);
             }
             MenuOutcome::ApplyMsaa => {
                 self.apply_msaa();
@@ -3042,10 +3067,12 @@ impl ApplicationHandler for App {
         // none of them cares about the MSAA setting; the two that do (mesh, sky)
         // belong to a `Session` and are built when one starts.
         let tonemap = TonemapPass::new(&renderer);
+        let bloom = BloomPass::new(&renderer);
         let fxaa = FxaaPass::new(&renderer);
         let ui = UiPass::new(&renderer);
 
         self.tonemap = Some(tonemap);
+        self.bloom = Some(bloom);
         self.fxaa = Some(fxaa);
         self.ui = Some(ui);
         self.renderer = Some(renderer);
@@ -3562,9 +3589,12 @@ impl ApplicationHandler for App {
                 }
 
                 let exposure = self.exposure;
-                if let (Some(r), Some(tm), Some(fx), Some(ui)) = (
+                // Bloom (§13) only over a world, and only when it's on.
+                let bloom_on = self.settings.bloom && self.session.is_some();
+                if let (Some(r), Some(tm), Some(bp), Some(fx), Some(ui)) = (
                     self.renderer.as_mut(),
                     self.tonemap.as_mut(),
+                    self.bloom.as_mut(),
                     self.fxaa.as_mut(),
                     self.ui.as_ref(),
                 ) {
@@ -3576,6 +3606,10 @@ impl ApplicationHandler for App {
                     let hdr_view = r.hdr_view();
                     let ldr_view = r.ldr_view();
                     let hdr_sampler = r.hdr_sampler();
+                    let (bloom_views, bloom_extents) = {
+                        let (v, e) = r.bloom_mips();
+                        (v.to_vec(), e.to_vec())
+                    };
                     // Shared immutably by the shadow and geometry closures — the
                     // draw methods take &self, only `prepare_frame` above needed
                     // &mut, and that already ran.
@@ -3622,9 +3656,18 @@ impl ApplicationHandler for App {
                                     .draw(cmd, extent, v.inv_view_proj, v.camera_pos, v.light_dir);
                             }
                         },
+                        // Bloom (§13): down the chain and back up, before the
+                        // tonemap mixes it in.
                         |cmd, extent, frame| {
-                            tm.update(frame, hdr_view, hdr_sampler);
-                            tm.draw(cmd, extent, frame, exposure);
+                            if bloom_on {
+                                bp.update(frame, hdr_view, &bloom_views, hdr_sampler);
+                                bp.dispatch(cmd, frame, extent, &bloom_extents);
+                            }
+                        },
+                        |cmd, extent, frame| {
+                            tm.update(frame, hdr_view, bloom_views[0], hdr_sampler);
+                            let strength = if bloom_on { BLOOM_STRENGTH } else { 0.0 };
+                            tm.draw(cmd, extent, frame, exposure, strength, bloom_views.len());
                         },
                         // Only invoked when FXAA is enabled.
                         |cmd, extent, frame| {
@@ -3886,6 +3929,34 @@ fn palette_material(k: u32) -> feather_assets::Material {
     }
 }
 
+/// The command line: flags override `settings` for this run (never saved);
+/// anything else is a scene to load. Returns the scenes and whether `--bench`
+/// was given.
+fn parse_args(
+    args: impl IntoIterator<Item = String>,
+    settings: &mut GraphicsSettings,
+) -> (Vec<String>, bool) {
+    let mut scenes: Vec<String> = Vec::new();
+    let mut bench = false;
+    let mut args = args.into_iter();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--msaa" => match args.next().and_then(|v| v.parse::<u32>().ok()) {
+                Some(n) => settings.msaa = n,
+                None => eprintln!("--msaa needs a sample count (1/2/4/8); ignoring"),
+            },
+            "--bench" => bench = true,
+            "--no-bake" => settings.bake = false,
+            "--no-lod" => settings.lod = false,
+            // For A/B timing: --bench ignores config/, so this is how a
+            // bench run turns bloom off.
+            "--no-bloom" => settings.bloom = false,
+            _ => scenes.push(a),
+        }
+    }
+    (scenes, bench)
+}
+
 fn main() {
     // CLI paths are glTF *scenes* to load and walk around
     // (`cargo run -- level.glb`); each node becomes its own entity. With no args,
@@ -3948,31 +4019,18 @@ fn main() {
             }
         }
     };
-    let mut scenes: Vec<String> = Vec::new();
-    let mut bench = false;
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--msaa" => match args.next().and_then(|v| v.parse::<u32>().ok()) {
-                Some(n) => settings.msaa = n,
-                None => eprintln!("--msaa needs a sample count (1/2/4/8); ignoring"),
-            },
-            "--bench" => bench = true,
-            "--no-bake" => settings.bake = false,
-            "--no-lod" => settings.lod = false,
-            _ => scenes.push(a),
-        }
-    }
+    let (scenes, bench) = parse_args(std::env::args().skip(1), &mut settings);
 
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     eprintln!(
-        "[config] effective: display {}, fov {}, shadows {}, msaa {}, fxaa {}",
+        "[config] effective: display {}, fov {}, shadows {}, msaa {}, fxaa {}, bloom {}",
         settings.display.config_name(),
         settings.fov_deg,
         settings.shadows.config_name(),
         settings.msaa,
-        settings.fxaa
+        settings.fxaa,
+        settings.bloom
     );
     let mut app = App::new(scenes, settings, configs, audio, bench);
     event_loop.run_app(&mut app).expect("run app");
@@ -4785,6 +4843,34 @@ mod tests {
         assert_eq!(m.back(), MenuOutcome::Resume);
     }
 
+    /// Flags override the settings for one run; everything else is a scene.
+    #[test]
+    fn command_line_flags_and_scenes() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut s = GraphicsSettings::default();
+        assert!(s.bloom && s.bake && s.lod);
+        let (scenes, bench) = parse_args(
+            args(&[
+                "--bench",
+                "a.glb",
+                "--no-bloom",
+                "--msaa",
+                "4",
+                "--no-lod",
+                "b.gltf",
+            ]),
+            &mut s,
+        );
+        assert_eq!(scenes, ["a.glb", "b.gltf"]);
+        assert!(bench);
+        assert_eq!((s.bloom, s.msaa, s.lod, s.bake), (false, 4, false, true));
+        // A bad sample count is ignored, not taken as a scene.
+        let mut s = GraphicsSettings::default();
+        let (scenes, bench) = parse_args(args(&["--msaa", "x", "--no-bake"]), &mut s);
+        assert!(scenes.is_empty() && !bench);
+        assert_eq!((s.msaa, s.bake, s.bloom), (1, false, true));
+    }
+
     #[test]
     fn graphics_rows_change_the_settings() {
         let mut s = GraphicsSettings::default();
@@ -4797,6 +4883,16 @@ mod tests {
             MenuOutcome::ApplyFxaa
         );
         assert_eq!(s.fxaa, !before, "FXAA row did not toggle the setting");
+
+        let before = s.bloom;
+        assert_eq!(
+            activate(&mut m, &mut s, MenuAction::ToggleBloom),
+            MenuOutcome::ApplyBloom
+        );
+        assert_eq!(s.bloom, !before, "BLOOM row did not toggle the setting");
+        assert!(
+            label_of(&m, &s, &Controls::default(), MenuAction::ToggleBloom).starts_with("BLOOM")
+        );
 
         // Cycling steps down and wraps: High -> Medium -> Low -> Off -> High.
         s.shadows = ShadowQuality::High;

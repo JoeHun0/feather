@@ -16,6 +16,15 @@ macro_rules! spv {
     };
 }
 
+/// The tonemap's push constants; `tonemap.frag`'s `Push` block.
+#[repr(C)]
+struct Push {
+    exposure: f32,
+    bloom: f32,
+    bloom_levels: f32,
+}
+const PUSH_SIZE: u32 = std::mem::size_of::<Push>() as u32;
+
 pub struct TonemapPass {
     device: ash::Device,
     layout: vk::PipelineLayout,
@@ -23,19 +32,23 @@ pub struct TonemapPass {
     set_layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
     sets: Vec<vk::DescriptorSet>,
-    // Currently-bound HDR view per set; used to skip redundant descriptor writes.
-    bound_views: Vec<vk::ImageView>,
+    // Currently-bound HDR and bloom views per set; used to skip redundant
+    // descriptor writes.
+    bound_views: Vec<[vk::ImageView; 2]>,
 }
 
 impl TonemapPass {
     pub fn new(renderer: &Renderer) -> Self {
         let device = renderer.device();
 
-        let bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        // The HDR scene, and level 0 of the bloom chain (§13).
+        let bindings = [0, 1].map(|b| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(b)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        });
         let set_layout = unsafe {
             device
                 .create_descriptor_set_layout(
@@ -47,7 +60,7 @@ impl TonemapPass {
 
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(FRAMES_IN_FLIGHT as u32)];
+            .descriptor_count(2 * FRAMES_IN_FLIGHT as u32)];
         let pool = unsafe {
             device
                 .create_descriptor_pool(
@@ -115,7 +128,7 @@ impl TonemapPass {
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(4)]; // float exposure
+            .size(PUSH_SIZE)]; // exposure, bloom strength, bloom levels
         let layout = unsafe {
             device
                 .create_pipeline_layout(
@@ -163,31 +176,56 @@ impl TonemapPass {
             set_layout,
             pool,
             sets,
-            bound_views: vec![vk::ImageView::null(); FRAMES_IN_FLIGHT],
+            bound_views: vec![[vk::ImageView::null(); 2]; FRAMES_IN_FLIGHT],
         }
     }
 
     /// Point this frame's descriptor at the current HDR view. No-op if unchanged
     /// (the view only changes on resize). Safe to call each frame: `draw_frame`
     /// waits on the frame fence before recording, so this set is idle here.
-    pub fn update(&mut self, frame: usize, hdr_view: vk::ImageView, sampler: vk::Sampler) {
-        if self.bound_views[frame] == hdr_view {
+    ///
+    /// `bloom_view` is level 0 of the bloom chain, which `draw_frame` keeps in
+    /// GENERAL layout.
+    pub fn update(
+        &mut self,
+        frame: usize,
+        hdr_view: vk::ImageView,
+        bloom_view: vk::ImageView,
+        sampler: vk::Sampler,
+    ) {
+        if self.bound_views[frame] == [hdr_view, bloom_view] {
             return;
         }
-        let info = [vk::DescriptorImageInfo::default()
+        let hdr = [vk::DescriptorImageInfo::default()
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image_view(hdr_view)
             .sampler(sampler)];
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(self.sets[frame])
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&info);
-        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
-        self.bound_views[frame] = hdr_view;
+        let bloom = [vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::GENERAL)
+            .image_view(bloom_view)
+            .sampler(sampler)];
+        let writes = [(0, &hdr), (1, &bloom)].map(|(binding, info)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.sets[frame])
+                .dst_binding(binding)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(info)
+        });
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+        self.bound_views[frame] = [hdr_view, bloom_view];
     }
 
-    pub fn draw(&self, cmd: vk::CommandBuffer, extent: vk::Extent2D, frame: usize, exposure: f32) {
+    /// `bloom` is the mix strength (0: none, and the bloom image isn't
+    /// read); `bloom_levels` how many levels were summed into level 0.
+    pub fn draw(
+        &self,
+        cmd: vk::CommandBuffer,
+        extent: vk::Extent2D,
+        frame: usize,
+        exposure: f32,
+        bloom: f32,
+        bloom_levels: usize,
+    ) {
         unsafe {
             self.device.cmd_bind_pipeline(
                 cmd,
@@ -202,12 +240,21 @@ impl TonemapPass {
                 &[self.sets[frame]],
                 &[],
             );
+            let push = Push {
+                exposure,
+                bloom,
+                bloom_levels: bloom_levels as f32,
+            };
+            let bytes = std::slice::from_raw_parts(
+                (&push as *const Push).cast::<u8>(),
+                std::mem::size_of::<Push>(),
+            );
             self.device.cmd_push_constants(
                 cmd,
                 self.layout,
                 vk::ShaderStageFlags::FRAGMENT,
                 0,
-                &exposure.to_ne_bytes(),
+                bytes,
             );
 
             let viewport = vk::Viewport {
@@ -249,5 +296,29 @@ fn load_shader(device: &ash::Device, bytes: &[u8]) -> vk::ShaderModule {
         device
             .create_shader_module(&info, None)
             .expect("create shader module")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `tonemap.frag`'s push block is floats only, so its size is 4 bytes a
+    /// member; it must match the Rust struct the pass pushes, or the bloom
+    /// strength silently reads the wrong bytes.
+    #[test]
+    fn push_block_matches_the_shader() {
+        let src = include_str!("../shaders/tonemap.frag");
+        let start = src.find("uniform Push {").expect("no Push block") + "uniform Push {".len();
+        let block = &src[start..start + src[start..].find('}').unwrap()];
+        let floats = block
+            .lines()
+            .filter(|l| l.trim_start().starts_with("float "))
+            .count();
+        assert!(!block.lines().any(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with("float ") && !t.starts_with("//")
+        }));
+        assert_eq!(floats as u32 * 4, PUSH_SIZE);
     }
 }

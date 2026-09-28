@@ -88,6 +88,7 @@ on a HiDPI desktop) and is resizable; `--bench` uses a fixed 1920×1080.
 | `--msaa N` | Geometry-pass MSAA sample count: 1 / 2 / 4 / 8, clamped to what the device supports. Overrides `config/graphics.toml` for this run only (never saved). Also changeable from the main menu's OPTIONS > GRAPHICS (not mid-game), which *is* saved. |
 | `--no-bake` | Ignore the bake: raw RGBA8 textures and raw meshes (no LODs), for A/B against it (§4). |
 | `--no-lod` | Draw every mesh at LOD0 but keep the baked vertex order, to A/B the LOD win alone (§4). |
+| `--no-bloom` | Turn bloom off for this run (never saved). Mainly for `--bench` A/B runs, which ignore the config files. |
 | `--bench` | Scripted timing run: skips the menu, sweeps the camera 360°, prints a summary and exits. Ignores the config files. See §7. |
 
 Typical runs:
@@ -118,6 +119,7 @@ controls got their own file; an old one is renamed on first run.)
 | `shadows` | `"high"`, `"medium"`, `"low"`, `"off"` | `"high"` |
 | `msaa` | `1`, `2`, `4`, `8` (clamped to the device) | `1` |
 | `fxaa` | `true`, `false` | `false` |
+| `bloom` | `true`, `false` | `true` |
 
 **`controls.toml`** — key bindings and mouse look. Saved when you change
 something in OPTIONS > CONTROLS or OPTIONS > GAMEPLAY (same in-place editing as
@@ -186,8 +188,8 @@ screen, and resumes play only from the pause menu's top level.
 - **Main menu:** NEW GAME / OPTIONS / QUIT
 - **Pause menu:** CONTINUE / OPTIONS / MAIN MENU / EXIT
 - **OPTIONS:** GRAPHICS / CONTROLS / SOUND / GAMEPLAY / BACK.
-- **OPTIONS > GRAPHICS:** DISPLAY (windowed / fullscreen), shadows and FXAA
-  are live; MSAA can change only from
+- **OPTIONS > GRAPHICS:** DISPLAY (windowed / fullscreen), shadows, FXAA and
+  BLOOM are live; MSAA can change only from
   the main menu, because the mesh and sky pipelines bake the sample count
   (in-game it reads `MENU ONLY`).
 - **OPTIONS > CONTROLS:** one row per action with its keys (`JUMP  SPACE`).
@@ -223,7 +225,7 @@ Every clip is normalised to its event's level, so recorded and synthesised
 sounds play equally loud. With no audio device the game logs
 `[audio] unavailable` and runs silent.
 
-Defaults: shadows HIGH, FXAA off, MSAA 1×.
+Defaults: shadows HIGH, FXAA off, bloom on, MSAA 1×.
 
 ---
 
@@ -447,7 +449,7 @@ and distant shadows should look unchanged.
 
 ## 5. Tests
 
-`cargo test --workspace` runs 152 tests, in well under a second once built.
+`cargo test --workspace` runs 159 tests, in well under a second once built.
 All of them are CPU-side: none needs a GPU, a window, a sound card or
 anything in `scratch/`, so they pass on a fresh clone.
 
@@ -595,6 +597,7 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |
 | Texture bake | assets, bake | keys separate content and kind (sRGB colour vs data), and are computed from the encoded bytes without decoding; BC7 level sizes round partial blocks up; baked files round-trip and reject truncation, wrong sizes or an unknown kind; sRGB mips average *light* (black/white → 188, not 128); chains end at 1×1; every baked level has exactly the blocks Vulkan copies |
 | Mesh bake + LOD | assets, bake, render | baked meshes round-trip and reject damage (truncation, trailing bytes, bad magic, out-of-range index, decreasing or NaN error, partial triangle, no LODs); the mesh key ignores the material; a sphere gets a chain with fewer triangles and growing error per level and LOD0 is the input reordered; small meshes stay LOD0; disconnected parts prune; the pixel and texel rules (distance, scale, non-uniform scale, inside the sphere); runs split per (mesh, LOD) |
+| Bloom | gfx, render, app | the chain's level sizes (half resolution, halving to an 8-texel side, at most 7 levels, never zero, odd and tiny windows); a Rust reference of the chain: a flat image blooms to itself, a bright pixel spreads with falloff, a plain downsample keeps energy within 5%, and the shaders declare the reference's weights; the steps go down then up; the tonemap's push block matches its Rust struct; the GRAPHICS row toggles it; `--no-bloom` (with the other flags) parses |
 | Config files | app | both templates parse back to the defaults; `display` parses and rejects anything but `"windowed"` / `"fullscreen"`; `fov` accepts 30–120 whole degrees only; each bad line warns and keeps the default; saving edits one value in place; create-once, the `settings.toml` → `graphics.toml` migration, an unreadable file is left alone |
 | Controls | app | key names round-trip; reserved menu keys are refused; a key on two actions warns; two keys on one action hold until both are released; toggles ignore auto-repeat but exposure repeats; a rebound jump moves; `toggle_fullscreen` defaults to F11 (also in files that predate it) and ignores auto-repeat; `rebind` steals the key and refuses menu/unnamed keys; sensitivity presets step and wrap; saved literals parse back, and saving every binding into the template keeps its comments; every key's menu label is drawable |
 | Texture slots | render | one slot per unique image × colour space; sRGB and UNORM uses of the same pixels stay separate; overflow past the capacity is counted and falls back to the defaults |
@@ -624,8 +627,8 @@ Everything goes to stderr.
 | `[gfx] device: …` | the GPU picked at startup. Check it: machines with an iGPU + dGPU list both |
 | `[gfx] MSAA: …` | requested vs actual sample count |
 | `[vulkan] …` | validation messages (debug builds), or the "layer not found" warning |
-| `[gpu] shadow … cluster … geo … post … frame …` | smoothed per-pass GPU ms, about once a second |
-| `[quality] shadows / fxaa: …` | a setting changed |
+| `[gpu] shadow … cluster … geo … bloom … post … frame …` | smoothed per-pass GPU ms, about once a second |
+| `[quality] shadows / fxaa / bloom: …` | a setting changed |
 | `[config] …` | a config file created / loaded / renamed, a line ignored or a key bound twice, plus the effective graphics settings at startup |
 | `[light] N visible lights exceeds MAX_LIGHTS` | lights past 128 were dropped this frame |
 | `[audio] started …; sounds: R recorded, S synthesised` / `… not found (…fetch_assets.py…)` / `footstep_grass_000.ogg: …; grass steps use the concrete ones (…)` / `unavailable: …` / `N lamps humming` | the mixer came up (or why not; the game then runs silent), which surfaces lack their own steps, and how many lamps a session gave a hum. With the whole pack: 35 recorded, 0 synthesised |

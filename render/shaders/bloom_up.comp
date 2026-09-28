@@ -1,0 +1,39 @@
+#version 450
+
+// Bloom upsample (§13, Jimenez 2014): adds a 3x3 tent-filtered copy of the
+// next smaller level into this one, in place. Run from the smallest level up
+// to level 0, which then holds the sum of every level; the tonemap divides by
+// the level count.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_src;
+layout(set = 0, binding = 1, rgba16f) uniform image2D u_dst;
+
+layout(push_constant) uniform Push {
+    vec2 src_texel; // 1 / the source's size
+} pc;
+
+// Must match render::bloom's reference (a test checks): 1 2 1 / 2 4 2 / 1 2 1.
+const float TENT_CENTRE = 0.25;
+const float TENT_EDGE = 0.125;
+const float TENT_CORNER = 0.0625;
+
+vec3 tap(vec2 uv, float x, float y) {
+    return texture(u_src, uv + vec2(x, y) * pc.src_texel).rgb;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_dst);
+    if (p.x >= size.x || p.y >= size.y) {
+        return;
+    }
+    vec2 uv = (vec2(p) + 0.5) / vec2(size);
+
+    vec3 up = tap(uv, 0.0, 0.0) * TENT_CENTRE
+        + (tap(uv, -1.0, 0.0) + tap(uv, 1.0, 0.0) + tap(uv, 0.0, -1.0) + tap(uv, 0.0, 1.0)) * TENT_EDGE
+        + (tap(uv, -1.0, -1.0) + tap(uv, 1.0, -1.0) + tap(uv, -1.0, 1.0) + tap(uv, 1.0, 1.0)) * TENT_CORNER;
+    vec3 here = imageLoad(u_dst, p).rgb;
+    imageStore(u_dst, p, vec4(here + up, 1.0));
+}

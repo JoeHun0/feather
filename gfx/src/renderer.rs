@@ -26,6 +26,13 @@ const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 // Offscreen scene color. Geometry lights in linear space into this; the tonemap
 // pass reads it and writes the sRGB swapchain. RGBA16F gives HDR headroom.
 const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+/// The bloom chain's format (§13). RGBA16F rather than the half-size
+/// B10G11R11: the bloom passes write it as a storage image, and RGBA16F is
+/// on Vulkan's mandatory storage-format list.
+const BLOOM_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+/// Most levels in the bloom chain, and the smallest side a level may have.
+pub const BLOOM_MAX_MIPS: usize = 7;
+const BLOOM_MIN_SIDE: u32 = 8;
 // Directional sun shadow map (§11): fixed-size D32 depth target, rendered
 // depth-only from the light and sampled (comparison) in the mesh fragment shader.
 // Independent of the window — never recreated on resize.
@@ -69,7 +76,7 @@ fn clamp_samples(limits: &vk::PhysicalDeviceLimits, want: u32) -> vk::SampleCoun
 }
 // GPU timing (§21): timestamps per frame-in-flight — shadow (start, end),
 // geometry (start, end), post (start, end). Frame is shadow-start → post-end.
-const TIMESTAMPS_PER_FRAME: u32 = 8;
+const TIMESTAMPS_PER_FRAME: u32 = 10;
 
 /// A GPU buffer that frees itself (and its allocation) on drop.
 pub struct Buffer {
@@ -121,6 +128,8 @@ pub struct GpuTimes {
     /// The light-cluster compute pass (§12), between shadow and geometry.
     pub cluster_ms: f32,
     pub geometry_ms: f32,
+    /// The bloom compute chain (§13), between geometry and the tonemap.
+    pub bloom_ms: f32,
     pub post_ms: f32,
     pub frame_ms: f32,
 }
@@ -140,6 +149,47 @@ impl Drop for Image {
         unsafe {
             self.device.destroy_image_view(self.view, None);
             self.allocator.destroy_image(self.handle, &mut self.allocation);
+        }
+    }
+}
+
+/// The extents of the bloom chain's levels (§13) for a window of `extent`:
+/// half its size, halving down until a side would drop below
+/// `BLOOM_MIN_SIDE`, at most `BLOOM_MAX_MIPS` levels, never a zero side. They
+/// are the mip extents of one image whose level 0 is the first.
+pub fn bloom_mips(extent: vk::Extent2D) -> Vec<vk::Extent2D> {
+    let half = |e: vk::Extent2D| vk::Extent2D {
+        width: (e.width / 2).max(1),
+        height: (e.height / 2).max(1),
+    };
+    let mut level = half(extent);
+    let mut out = vec![level];
+    while out.len() < BLOOM_MAX_MIPS && level.width.min(level.height) / 2 >= BLOOM_MIN_SIDE {
+        level = half(level);
+        out.push(level);
+    }
+    out
+}
+
+/// The bloom chain (§13): one image with a mip level per step, written by
+/// the bloom compute passes and sampled by the tonemap. Each level needs its
+/// own view, to be read or written alone.
+struct BloomChain {
+    /// Owns the image; its view is level 0, which the tonemap samples.
+    image: Image,
+    /// One single-level view per mip, level 0 first.
+    mip_views: Vec<vk::ImageView>,
+    extents: Vec<vk::Extent2D>,
+    device: Device,
+}
+
+impl Drop for BloomChain {
+    fn drop(&mut self) {
+        // Before `image` drops and takes the allocation with it.
+        unsafe {
+            for &v in &self.mip_views {
+                self.device.destroy_image_view(v, None);
+            }
         }
     }
 }
@@ -204,6 +254,8 @@ pub struct Renderer {
     // the swapchain, so one tonemap pipeline serves both targets. Always
     // allocated (~8 MB at 1080p) so the toggle needs no resource churn.
     ldr: Option<Image>,
+    // The bloom mip chain (§13), sized from the window, recreated with it.
+    bloom: Option<BloomChain>,
     fxaa: bool,
     /// False when nothing will be drawn into the shadow map this frame.
     shadow_casters: bool,
@@ -421,6 +473,7 @@ impl Renderer {
         let hdr_resolve = (samples != vk::SampleCountFlags::TYPE_1)
             .then(|| create_hdr(&allocator, &device, sc.extent, vk::SampleCountFlags::TYPE_1));
         let ldr = create_ldr(&allocator, &device, sc.extent, sc.format.format);
+        let bloom = create_bloom(&allocator, &device, sc.extent);
         let hdr_sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -525,6 +578,7 @@ impl Renderer {
             hdr: Some(hdr),
             hdr_resolve,
             ldr: Some(ldr),
+            bloom: Some(bloom),
             fxaa: false,
             shadow_casters: true,
             samples,
@@ -638,18 +692,21 @@ impl Renderer {
         // Mask to valid bits and wrapping-subtract, so a counter wrap within the
         // valid range still yields the right delta. Then ns → ms.
         let to_ms = |start: u64, end: u64| (end & m).wrapping_sub(start & m) as f32 * period * 1e-6;
-        // Slots: shadow (0,1), geometry (2,3), post (4,5), cluster (6,7) —
-        // cluster was added last, so it sits at the end rather than in pass
-        // order; frame = shadow start → post end, which spans it.
+        // Slots: shadow (0,1), geometry (2,3), post (4,5), cluster (6,7),
+        // bloom (8,9). Cluster and bloom were added later, so they sit at the
+        // end rather than in pass order; frame = shadow start → post end,
+        // which spans both.
         let shadow = to_ms(data[0], data[1]);
         let cluster = to_ms(data[6], data[7]);
         let geo = to_ms(data[2], data[3]);
+        let bloom = to_ms(data[8], data[9]);
         let post = to_ms(data[4], data[5]);
         let frame_ms = to_ms(data[0], data[5]);
         self.gpu_times_raw = GpuTimes {
             shadow_ms: shadow,
             cluster_ms: cluster,
             geometry_ms: geo,
+            bloom_ms: bloom,
             post_ms: post,
             frame_ms,
         };
@@ -659,6 +716,7 @@ impl Renderer {
         self.gpu_times.shadow_ms += (shadow - self.gpu_times.shadow_ms) * a;
         self.gpu_times.cluster_ms += (cluster - self.gpu_times.cluster_ms) * a;
         self.gpu_times.geometry_ms += (geo - self.gpu_times.geometry_ms) * a;
+        self.gpu_times.bloom_ms += (bloom - self.gpu_times.bloom_ms) * a;
         self.gpu_times.post_ms += (post - self.gpu_times.post_ms) * a;
         self.gpu_times.frame_ms += (frame_ms - self.gpu_times.frame_ms) * a;
 
@@ -667,10 +725,18 @@ impl Renderer {
             self.ts_log_counter = 0;
             let t = self.gpu_times;
             eprintln!(
-                "[gpu] shadow {:.2}ms  cluster {:.2}ms  geo {:.2}ms  post {:.2}ms  frame {:.2}ms",
-                t.shadow_ms, t.cluster_ms, t.geometry_ms, t.post_ms, t.frame_ms
+                "[gpu] shadow {:.2}ms  cluster {:.2}ms  geo {:.2}ms  bloom {:.2}ms  post {:.2}ms  frame {:.2}ms",
+                t.shadow_ms, t.cluster_ms, t.geometry_ms, t.bloom_ms, t.post_ms, t.frame_ms
             );
         }
+    }
+
+    /// The bloom chain's per-level views and extents (§13), level 0 first.
+    /// They change on resize, so consumers holding descriptors on them must
+    /// refresh when a handle changes.
+    pub fn bloom_mips(&self) -> (&[vk::ImageView], &[vk::Extent2D]) {
+        let b = self.bloom.as_ref().expect("bloom chain alive");
+        (&b.mip_views, &b.extents)
     }
 
     /// View of the current HDR target. Changes on resize, so consumers that hold
@@ -1314,6 +1380,9 @@ impl Renderer {
     /// then `post` (the tonemap pass) samples the HDR and writes the sRGB
     /// swapchain. `shadow` gets the shadow-map extent; `geometry`/`post` get the
     /// window extent. All three receive `(cmd, extent, frame_in_flight)`.
+    // One callback per pass, in frame order: grouping them in a struct would
+    // only move the list.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_frame(
         &mut self,
         // Called once per cascade with its index — hence `Fn`, not `FnOnce`.
@@ -1322,6 +1391,10 @@ impl Renderer {
         // clusters); its writes are made visible to fragment shaders.
         cluster: impl FnOnce(vk::CommandBuffer, usize),
         geometry: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
+        // Compute work between geometry and the tonemap (§13's bloom): it may
+        // sample the HDR result and read/write the bloom chain, which it finds
+        // in GENERAL layout; the tonemap then samples level 0.
+        bloom: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         post: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         aa: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         ui: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
@@ -1376,6 +1449,7 @@ impl Renderer {
         // actually holds the single-sample result.
         let hdr_resolve = self.hdr_resolve.as_ref();
         let sampled = hdr_resolve.unwrap_or(hdr);
+        let bloom_chain = self.bloom.as_ref().expect("bloom chain alive");
         // With FXAA the tonemap renders into the LDR intermediate and the AA pass
         // writes the swapchain; without it the tonemap writes the swapchain directly.
         let ldr = self.ldr.as_ref().expect("ldr target alive");
@@ -1699,7 +1773,8 @@ impl Renderer {
 
             // ---- Tonemap pass: sample HDR, write the sRGB swapchain. ----
 
-            // HDR: COLOR_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL (frag read).
+            // HDR: COLOR_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL, read by
+            // the bloom compute passes and the tonemap's fragment shader.
             let hdr_to_read = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -1712,11 +1787,76 @@ impl Renderer {
             dev.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
                 &[hdr_to_read],
+            );
+
+            // ---- Bloom (§13): compute over the bloom chain. ----
+
+            // Bloom chain: UNDEFINED -> GENERAL, every level. Shared across
+            // frames in flight, so this waits for the previous frame's bloom
+            // writes and tonemap reads (§21's rule). Done even when bloom is
+            // off: the tonemap's descriptor names this layout.
+            let bloom_range = vk::ImageSubresourceRange {
+                level_count: bloom_chain.extents.len() as u32,
+                ..color_range
+            };
+            let to_bloom = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(bloom_chain.image.handle)
+                .subresource_range(bloom_range)
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_bloom],
+            );
+            if self.timestamps_supported {
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 8,
+                );
+            }
+            bloom(cmd, extent, frame);
+            if self.timestamps_supported {
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 9,
+                );
+            }
+            // Its writes, visible to the tonemap's fragment shader.
+            let bloom_to_read = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(bloom_chain.image.handle)
+                .subresource_range(bloom_range)
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[bloom_to_read],
             );
 
             // Swapchain: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
@@ -1958,6 +2098,7 @@ impl Renderer {
                 vk::SampleCountFlags::TYPE_1,
             )
         });
+        self.bloom = Some(create_bloom(self.allocator(), &self.device, extent));
     }
 
     /// Change the geometry-pass sample count, recreating the targets that carry
@@ -2037,6 +2178,7 @@ impl Drop for Renderer {
             self.hdr.take();
             self.hdr_resolve.take();
             self.ldr.take();
+            self.bloom.take();
             self.shadow.take();
             self.device.destroy_sampler(self.hdr_sampler, None);
             self.device.destroy_sampler(self.shadow_sampler, None);
@@ -2362,6 +2504,68 @@ fn create_ldr(
     }
 }
 
+fn create_bloom(
+    allocator: &Arc<vk_mem::Allocator>,
+    device: &Device,
+    extent: vk::Extent2D,
+) -> BloomChain {
+    let extents = bloom_mips(extent);
+    let image_ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(BLOOM_FORMAT)
+        .extent(vk::Extent3D {
+            width: extents[0].width,
+            height: extents[0].height,
+            depth: 1,
+        })
+        .mip_levels(extents.len() as u32)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        // Written by the bloom compute passes, sampled by them and the tonemap.
+        .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let ai = vk_mem::AllocationCreateInfo {
+        usage: vk_mem::MemoryUsage::AutoPreferDevice,
+        ..Default::default()
+    };
+    let (image, allocation) =
+        unsafe { allocator.create_image(&image_ci, &ai).expect("bloom image") };
+    let level_view = |level: u32| {
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(BLOOM_FORMAT)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: level,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        unsafe {
+            device
+                .create_image_view(&view_info, None)
+                .expect("bloom view")
+        }
+    };
+    let mip_views = (0..extents.len() as u32).map(level_view).collect();
+    BloomChain {
+        image: Image {
+            allocator: allocator.clone(),
+            allocation,
+            device: device.clone(),
+            handle: image,
+            view: level_view(0),
+            format: BLOOM_FORMAT,
+        },
+        mip_views,
+        extents,
+        device: device.clone(),
+    }
+}
+
 fn create_hdr(
     allocator: &Arc<vk_mem::Allocator>,
     device: &Device,
@@ -2473,6 +2677,45 @@ fn mip_levels(width: u32, height: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bloom chain (§13) starts at half the window, halves while the
+    /// smaller side stays at least 8 texels, keeps within the level cap and
+    /// never has a zero side; each level is what Vulkan makes the next mip of
+    /// an image whose level 0 is the first.
+    #[test]
+    fn bloom_mips_halve_from_half_resolution() {
+        let e = |width, height| vk::Extent2D { width, height };
+        let sizes = |w, h| {
+            bloom_mips(e(w, h))
+                .iter()
+                .map(|m| (m.width, m.height))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            sizes(1920, 1045),
+            [
+                (960, 522),
+                (480, 261),
+                (240, 130),
+                (120, 65),
+                (60, 32),
+                (30, 16),
+                (15, 8)
+            ]
+        );
+        // The cap: a 4K window would go further, but stops at 7 levels.
+        assert_eq!(bloom_mips(e(3840, 2160)).len(), BLOOM_MAX_MIPS);
+        // Small or thin windows: one level, never zero-sized.
+        assert_eq!(sizes(20, 20), [(10, 10)]);
+        assert_eq!(sizes(1, 1), [(1, 1)]);
+        assert_eq!(sizes(3000, 1), [(1500, 1)]);
+        for m in bloom_mips(e(1366, 768)).windows(2) {
+            assert_eq!(
+                (m[1].width, m[1].height),
+                ((m[0].width / 2).max(1), (m[0].height / 2).max(1))
+            );
+        }
+    }
 
     #[test]
     fn mip_levels_cover_the_chain() {

@@ -849,6 +849,57 @@ the ground's edge showed. Now it can pool on the ground.
    linear).
 5. **OETF/gamma** — let the `_SRGB` swapchain encode; do **not** also gamma in
    shader (no double-correction).
+
+**Landed (§26): bloom, physically based, without a threshold** (Jimenez 2014,
+Call of Duty: AW).
+- **How it works:** the whole HDR image is filtered down a mip chain and back
+  up. The tonemap mixes the result in at `BLOOM_STRENGTH` = 0.04, so things
+  glow in proportion to how bright they are and dark ones stay crisp.
+- **Target:** gfx owns the chain: one RGBA16F image at half resolution, mips
+  down to an 8-texel side, at most 7 levels (`bloom_mips`), one view per
+  level, rebuilt with the other targets. It's RGBA16F because the passes
+  write it as a storage image and RGBA16F is on the mandatory storage-format
+  list, unlike B10G11R11.
+- **`draw_frame`** gets a compute slot between geometry and tonemap, timed on
+  its own (`[gpu] … bloom`, `[bench] bloom`).
+  - It moves the chain UNDEFINED → GENERAL each frame. Following §21's rule,
+    that waits for the previous frame's bloom writes and tonemap reads, and
+    it happens even with bloom off, since the tonemap's descriptor names that
+    layout.
+  - The HDR→read barrier now also covers compute.
+- **`render::BloomPass`:** 13 dispatches for 7 levels, each its own
+  descriptor set, with a compute→compute barrier between steps.
+  - **Down:** a 13-tap filter (five overlapping 2×2 boxes, weights ½ + 4 × ⅛).
+    The first step is a Karis average: boxes weighted 1/(1 + luma), so a lone
+    very bright pixel can't flicker the bloom.
+  - **Up:** each level adds a 3×3 tent of the one below, in place, so level 0
+    ends as the sum of every level.
+- **The tonemap** divides that sum by the level count before mixing. A flat
+  image then blooms to itself exactly, which makes the mix energy-conserving.
+  It skips bloom entirely at strength 0.
+- **Tests:** a Rust reference of the chain, whose weights the shaders must
+  declare (a text check):
+  - a flat image stays flat;
+  - a bright pixel spreads with falloff;
+  - a plain downsample keeps energy within 5%.
+
+  Also the chain's sizes and the tonemap's push layout.
+- **Measured** (debug, clocks unpinned, 3 interleaved runs, `--no-bloom` vs
+  on):
+  - `bloom` 0.15–0.16 ms on both `zone.glb` and `lights120`, tonemap +0.01–
+    0.02 ms (the extra sample), frame +0.12–0.16 ms. **I predicted
+    0.05–0.10 ms, and was wrong.**
+  - It isn't the barriers between the many small dispatches: capping the
+    chain at 4 levels still cost 0.14 ms. The cost is in the big levels, the
+    first downsample (13 taps of the full-resolution HDR image) and the last
+    upsample.
+  - A single-pass downsample (FidelityFX SPD-style) or a cheaper first tap
+    pattern is where to look if it matters.
+  - Validation with sync: 0 messages, with bloom on, off, and at MSAA 4×
+    (where it reads the resolve target).
+- **Switch:** OPTIONS > GRAPHICS > BLOOM, saved as `bloom` in
+  `graphics.toml`, and `--no-bloom` for bench A/B runs (the bench ignores
+  config). Bloom runs only over a world.
 **Landed (§26):** a **graphics settings layer** with a live **shadow-quality**
 preset (`F1` cycles; `GraphicsSettings` on `App`, deliberately not an ECS resource
 since §1 scopes the `World` to simulation). Measured on the orb demo at one window
@@ -2169,7 +2220,7 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   *is* now drawn as a visible background (SkyPass) matching the reflected
   environment. Real cubemap IBL (equirect→cube, irradiance/prefilter passes,
   BRDF LUT) is the follow-up. Sun shadows (§11 CSM) and punctual point lights
-  (§12) now exist. Still missing: auto-exposure and bloom. The tonemap curve is a
+  (§12) now exist. Bloom landed (§13). Still missing: auto-exposure. The tonemap curve is a
   drop-in point for AgX.
   **Known artifact — specular singularity on smooth metal.** A punctual light has
   zero area, so on low-roughness metal (the PBR grid bottoms out at 0.06) its
@@ -2235,7 +2286,7 @@ caster pancaking (depth clamp + near-plane-free caster culling); **PCSS still
 pending**, and since array layers share an extent all
 cascades are the same resolution. Shadows now reach `SHADOW_DISTANCE` (60) rather
 than a ±16 box;
-bloom + auto-exposure (HDR target + tonemap now in place); transparents (alpha
+auto-exposure (bloom landed, §13); transparents (alpha
 *cutout* landed, §5; BLEND still draws opaque); asset
 bake pipeline (runtime glTF scene loading + multi-mesh registry landed, and
 the **texture bake** — BC7 mip chains in a content-addressed cache, §17; mesh /
