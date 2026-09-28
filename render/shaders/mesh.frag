@@ -63,6 +63,7 @@ layout(set = 0, binding = 4) uniform Globals {
     vec4 cluster_proj;   // x = tan(fov_x/2), y = tan(fov_y/2)
     vec4 sky_origin;     // sky volume: xyz = minimum corner, w = 1 / cell
     vec4 sky_dims;       // xyz = cells per axis, w = 1 if there is a volume
+    vec4 ao_params;      // x = 1 if GTAO ran this frame
 } g;
 
 // Punctual lights (§12), shaded only if this fragment's cluster lists them.
@@ -89,6 +90,8 @@ layout(set = 0, binding = 6) readonly buffer Clusters {
 // SkyVis moments as RGBA8 and y the SkyFree nibbles. Read with texelFetch and
 // blended by hand in sky_visibility().
 layout(set = 0, binding = 7) uniform usampler3D u_sky;
+// GTAO's result (§13): the ambient's small-scale visibility, one per pixel.
+layout(set = 0, binding = 8) uniform sampler2D u_ao;
 
 layout(location = 0) in vec3 v_normal;
 layout(location = 1) in flat uint v_material;
@@ -260,6 +263,22 @@ vec3 sky_irradiance_occluded(vec3 n, vec4 sv) {
 float sky_specular(vec4 sv, vec3 r) {
     float ratio = clamp(sky_weight(sv, r) / max(0.5 + 0.5 * r.y, 0.5), 0.0, 1.0);
     return mix(2.0 * sv.x, ratio, smoothstep(0.0, SKY_SPECULAR_FADE, r.y));
+}
+
+// --- GTAO (§13) ---
+// Jimenez et al. 2016: visibility `v` with the light that bounces between
+// occluders of this albedo put back, so bright corners don't go grey. Its
+// coefficients are render::ao's AO_MULTIBOUNCE (a test checks).
+vec3 ao_multibounce(float v, vec3 albedo) {
+    vec3 a = 2.0404 * albedo - 0.3324;
+    vec3 b = -4.7951 * albedo + 0.6417;
+    vec3 c = 2.7552 * albedo + 0.6903;
+    return max(vec3(v), ((v * a + b) * v + c) * v);
+}
+// Lagarde and de Rousiers 2014: the specular ambient that survives
+// visibility `ao` at this view angle and roughness.
+float ao_specular(float ndv, float ao, float roughness) {
+    return clamp(pow(ndv + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
 }
 
 // Karis' analytic environment BRDF (avoids a precomputed LUT).
@@ -546,6 +565,12 @@ void main() {
     vec3 prefiltered = mix(sky(r), sky_irradiance(r), roughness); // crude roughness blur
     vec2 ab = env_brdf_approx(roughness, ndv);
     vec3 specular_ibl = prefiltered * (f0 * ab.x + ab.y) * sky_specular(sv, r);
+    // Contact shadowing within a metre (GTAO, §13), on the ambient only.
+    if (g.ao_params.x > 0.5) {
+        float ao = texelFetch(u_ao, ivec2(gl_FragCoord.xy), 0).r;
+        diffuse_ibl *= ao_multibounce(ao, albedo);
+        specular_ibl *= ao_specular(ndv, ao, roughness);
+    }
     vec3 ambient = kd_amb * diffuse_ibl + specular_ibl;
 
     vec3 color = ambient + lo + m.emissive.rgb;

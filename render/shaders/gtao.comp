@@ -1,0 +1,179 @@
+#version 450
+
+// Ground-truth ambient occlusion (§13; Jimenez et al. 2016, after Intel's
+// XeGTAO): how much of the hemisphere above each pixel's surface is open
+// within AO_RADIUS, cosine-weighted, from the depth buffer alone.
+//
+// Per pixel, AO_SLICES planes through the view vector, each marched AO_STEPS
+// times both ways on screen for the highest horizon, then integrated
+// analytically against the surface normal projected into the slice. Slice
+// angles and step offsets are jittered by two 4x4 patterns, so the 4x4
+// depth-aware blur in gtao_denoise.comp averages 16 variants of each: 32
+// directions for the price of 2.
+//
+// Positions are in a screen-aligned view space: x right, y down, z away from
+// the camera (the distance along the view axis), so screen and slice
+// directions share axes. render::ao's reference is this, step for step.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_depth;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D u_raw;
+
+layout(push_constant) uniform Push {
+    // x = near·r, y = r, with r = far / (near − far): distance = x / (depth + y).
+    // z = tan(fov_x / 2), w = tan(fov_y / 2).
+    vec4 proj;
+    // x = pixels per metre at 1 m (height / 2 tan(fov_y / 2)).
+    vec4 params;
+} pc;
+
+// Must match render::ao's reference (a test checks).
+const int AO_SLICES = 2;
+const int AO_STEPS = 4;
+const float AO_RADIUS = 0.8;
+const float AO_FALLOFF = 0.6;
+const float AO_MIN_RADIUS_PX = 2.0;
+const float AO_MAX_RADIUS_PX = 200.0;
+const float AO_MIN_STEP_PX = 1.3;
+
+const float PI = 3.14159265359;
+const float HALF_PI = 1.57079632679;
+
+ivec2 g_size;
+
+// view_pos() and depth_normal() are gtao_denoise.comp's too, text for text
+// (a test checks).
+vec3 view_pos(ivec2 p) {
+    p = clamp(p, ivec2(0), g_size - 1);
+    float dist = pc.proj.x / (texelFetch(u_depth, p, 0).r + pc.proj.y);
+    vec2 ndc = (vec2(p) + 0.5) / vec2(g_size) * 2.0 - 1.0;
+    return vec3(ndc * pc.proj.zw * dist, dist);
+}
+
+// The surface normal at pixel `p` (position `P`), from the neighbours on
+// whichever side is nearer in depth (so a silhouette edge doesn't bend it),
+// facing the camera. At the image's edge, the side that's in it.
+vec3 depth_normal(ivec2 p, vec3 P) {
+    vec3 l = view_pos(p - ivec2(1, 0));
+    vec3 r = view_pos(p + ivec2(1, 0));
+    vec3 u = view_pos(p - ivec2(0, 1));
+    vec3 d = view_pos(p + ivec2(0, 1));
+    bool right = p.x == 0 || (p.x < g_size.x - 1 && abs(r.z - P.z) < abs(P.z - l.z));
+    bool down = p.y == 0 || (p.y < g_size.y - 1 && abs(d.z - P.z) < abs(P.z - u.z));
+    vec3 dx = right ? r - P : P - l;
+    vec3 dy = down ? d - P : P - u;
+    return normalize(cross(dy, dx));
+}
+
+// The position at screen point `q` (pixels, centres on +0.5), with depth
+// interpolated between the four texels round it (clamped at the edges).
+// Depth is linear in screen space across a plane, so on one this is exact,
+// and a step lands on the surface *and* in its slice. Snapping to texel
+// centres instead turned the first, 1-2 px steps up to 20 degrees off the
+// slice, which raises horizons: a flat floor read 0.5% occluded on average
+// and 6% at worst, at any resolution.
+vec3 view_pos_at(vec2 q) {
+    vec4 g = textureGather(u_depth, q / vec2(g_size), 0);
+    vec2 f = fract(q - 0.5);
+    float depth = mix(mix(g.w, g.z, f.x), mix(g.x, g.y, f.x), f.y);
+    float dist = pc.proj.x / (depth + pc.proj.y);
+    vec2 ndc = q / vec2(g_size) * 2.0 - 1.0;
+    return vec3(ndc * pc.proj.zw * dist, dist);
+}
+
+// A 4x4 ordered-dither index, 0-15: every 4x4 window holds each value once.
+float bayer4(ivec2 p) {
+    const float M[16] = float[16](0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0,
+                                  3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+    return M[(p.y & 3) * 4 + (p.x & 3)];
+}
+
+// The cosine-weighted visibility of one slice between horizon angles h0, h1
+// for a normal at angle n in it (all from the view vector).
+float slice_arc(float h0, float h1, float n) {
+    float cos_n = cos(n);
+    float sin_n = sin(n);
+    return 0.25 * (-cos(2.0 * h0 - n) + cos_n + 2.0 * h0 * sin_n)
+         + 0.25 * (-cos(2.0 * h1 - n) + cos_n + 2.0 * h1 * sin_n);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    g_size = textureSize(u_depth, 0);
+    if (p.x >= g_size.x || p.y >= g_size.y) {
+        return;
+    }
+    // The sky, and surfaces too far for the radius to span two pixels: open.
+    if (texelFetch(u_depth, p, 0).r >= 1.0) {
+        imageStore(u_raw, p, vec4(1.0));
+        return;
+    }
+    vec3 P = view_pos(p);
+    float radius_px = AO_RADIUS * pc.params.x / P.z;
+    if (radius_px < AO_MIN_RADIUS_PX) {
+        imageStore(u_raw, p, vec4(1.0));
+        return;
+    }
+    radius_px = min(radius_px, AO_MAX_RADIUS_PX);
+
+    vec3 N = depth_normal(p, P);
+    vec3 V = normalize(-P);
+
+    // Occluders fade out over the last AO_FALLOFF of the radius.
+    float falloff_mul = -1.0 / (AO_FALLOFF * AO_RADIUS);
+    float falloff_add = 1.0 / AO_FALLOFF;
+    float slice_noise = (bayer4(p) + 0.5) / 16.0;
+    float step_noise = (bayer4(p.yx) + 0.5) / 16.0;
+    float min_step = AO_MIN_STEP_PX / radius_px;
+    vec2 centre = vec2(p) + 0.5;
+
+    // Slices spread evenly round the view vector, which is what the
+    // integral assumes. Evenly round the *screen* instead (XeGTAO's choice)
+    // they bunch up off-centre, and a wall filling the view read 4-6% dark
+    // towards the screen's edges.
+    vec3 b1 = normalize(cross(vec3(0.0, 1.0, 0.0), V));
+    vec3 b2 = cross(V, b1);
+    float visibility = 0.0;
+    for (int s = 0; s < AO_SLICES; ++s) {
+        float psi = (float(s) + slice_noise) / float(AO_SLICES) * PI;
+        vec3 ortho = cos(psi) * b1 + sin(psi) * b2;
+        // The slice's screen direction: where P + e·ortho moves on screen.
+        // Steps along it stay in the slice's plane.
+        vec2 dir = normalize(ortho.xy * P.z - P.xy * ortho.z);
+        vec3 axis = cross(ortho, V);
+        vec3 proj_n = N - axis * dot(N, axis);
+        float proj_len = length(proj_n);
+        float cos_n = clamp(dot(proj_n, V) / proj_len, 0.0, 1.0);
+        float n = sign(dot(ortho, proj_n)) * acos(cos_n);
+        // Horizons start at the surface's own tangent, each side.
+        float low0 = cos(n + HALF_PI);
+        float low1 = cos(n - HALF_PI);
+        float hc0 = low0;
+        float hc1 = low1;
+        for (int j = 0; j < AO_STEPS; ++j) {
+            float t = (float(j) + step_noise) / float(AO_STEPS);
+            t = t * t + min_step;
+            vec2 off = dir * (t * radius_px);
+            vec3 d0 = view_pos_at(centre + off) - P;
+            vec3 d1 = view_pos_at(centre - off) - P;
+            float l0 = length(d0);
+            float l1 = length(d1);
+            float w0 = clamp(l0 * falloff_mul + falloff_add, 0.0, 1.0);
+            float w1 = clamp(l1 * falloff_mul + falloff_add, 0.0, 1.0);
+            hc0 = max(hc0, mix(low0, dot(d0 / max(l0, 1e-6), V), w0));
+            hc1 = max(hc1, mix(low1, dot(d1 / max(l1, 1e-6), V), w1));
+        }
+        // +dir's horizon is h1, −dir's is h0; clamped to the normal's
+        // hemisphere.
+        float h0 = -acos(clamp(hc1, -1.0, 1.0));
+        float h1 = acos(clamp(hc0, -1.0, 1.0));
+        h0 = n + max(h0 - n, -HALF_PI);
+        h1 = n + min(h1 - n, HALF_PI);
+        visibility += proj_len * slice_arc(h0, h1, n);
+    }
+    // Not clamped to 1: one pixel's pair of slices can read above 1 as well
+    // as below (only the average over all directions is exact), and
+    // clamping before the denoise averaged them read a flat floor 2% dark.
+    imageStore(u_raw, p, vec4(max(visibility / float(AO_SLICES), 0.0)));
+}

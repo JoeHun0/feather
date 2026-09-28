@@ -1,5 +1,6 @@
 //! Render: frame graph, passes, pipelines, the RenderFrame consumer.
 
+mod ao;
 mod bloom;
 mod environment;
 mod exposure;
@@ -8,6 +9,7 @@ mod mesh;
 mod sky;
 mod tonemap;
 mod ui;
+pub use ao::{AoPass, AoProjection};
 pub use bloom::{BloomPass, BLOOM_STRENGTH};
 pub use environment::Environment;
 pub use exposure::{ExposureParams, ExposurePass, ExposureReadback};

@@ -28,6 +28,7 @@ pub enum Key {
     Fxaa,
     Bloom,
     AutoExposure,
+    AmbientOcclusion,
 }
 
 impl Key {
@@ -40,6 +41,7 @@ impl Key {
             Self::Fxaa => "fxaa",
             Self::Bloom => "bloom",
             Self::AutoExposure => "auto_exposure",
+            Self::AmbientOcclusion => "ambient_occlusion",
         }
     }
 
@@ -53,6 +55,7 @@ impl Key {
             Self::Fxaa => s.fxaa.to_string(),
             Self::Bloom => s.bloom.to_string(),
             Self::AutoExposure => s.auto_exposure.to_string(),
+            Self::AmbientOcclusion => s.ambient_occlusion.to_string(),
         }
     }
 }
@@ -91,6 +94,10 @@ bloom = {}
 # Auto-exposure: the image brightens in the dark and darkens in bright light,
 # as eyes adapt. true or false; off, [ and ] set a fixed exposure.
 auto_exposure = {}
+
+# Ambient occlusion (GTAO): contact shadows in corners and under objects.
+# true or false.
+ambient_occlusion = {}
 ",
         Key::Display.value(&d),
         Key::Fov.value(&d),
@@ -99,6 +106,7 @@ auto_exposure = {}
         Key::Fxaa.value(&d),
         Key::Bloom.value(&d),
         Key::AutoExposure.value(&d),
+        Key::AmbientOcclusion.value(&d),
     )
 }
 
@@ -147,6 +155,11 @@ pub fn parse(text: &str, s: &mut GraphicsSettings) -> Vec<String> {
                 "true" => s.auto_exposure = true,
                 "false" => s.auto_exposure = false,
                 _ => warn(format!("auto_exposure must be true or false, got {v}")),
+            },
+            "ambient_occlusion" => match v {
+                "true" => s.ambient_occlusion = true,
+                "false" => s.ambient_occlusion = false,
+                _ => warn(format!("ambient_occlusion must be true or false, got {v}")),
             },
             _ => warn(format!("unknown key `{k}`")),
         }
@@ -251,6 +264,7 @@ mod tests {
                 s.fxaa,
                 s.bloom,
                 s.auto_exposure,
+                s.ambient_occlusion,
                 s.bake,
                 s.lod,
             )
@@ -267,10 +281,10 @@ mod tests {
     #[test]
     fn values_apply() {
         let (s, w) =
-            parsed("shadows = \"low\"  # cheap\nmsaa = 4\n  fxaa=true\ndisplay = \"fullscreen\"\nbloom = false\nauto_exposure = false\n");
+            parsed("shadows = \"low\"  # cheap\nmsaa = 4\n  fxaa=true\ndisplay = \"fullscreen\"\nbloom = false\nauto_exposure = false\nambient_occlusion = false\n");
         assert!(w.is_empty(), "{w:?}");
         assert_eq!((s.shadows, s.msaa, s.fxaa), (ShadowQuality::Low, 4, true));
-        assert!(!s.bloom && !s.auto_exposure);
+        assert!(!s.bloom && !s.auto_exposure && !s.ambient_occlusion);
         assert_eq!(s.display, DisplayMode::Fullscreen);
         let (s, w) = parsed("fov = 30\n");
         assert!(w.is_empty(), "{w:?}");
@@ -288,6 +302,7 @@ mod tests {
             "fxaa = maybe",
             "bloom = 1",
             "auto_exposure = yes",
+            "ambient_occlusion = on",
             "shadows = \"ultra\"",
             "shadows = low",
             "display = \"borderless\"",

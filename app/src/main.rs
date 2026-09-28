@@ -42,9 +42,9 @@ use feather_assets::MeshData;
 use feather_gfx::{GpuTimes, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use feather_platform::winit;
 use feather_render::{
-    BloomPass, CascadeSetup, ClusterView, Environment, ExposureParams, ExposurePass, FrameStats,
-    FxaaPass, GpuLight, InstanceData, MeshId, MeshRenderer, SkyPass, TonemapPass, UiPass,
-    BLOOM_STRENGTH,
+    AoPass, AoProjection, BloomPass, CascadeSetup, ClusterView, Environment, ExposureParams,
+    ExposurePass, FrameStats, FxaaPass, GpuLight, InstanceData, MeshId, MeshRenderer, SkyPass,
+    TonemapPass, UiPass, BLOOM_STRENGTH,
 };
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
@@ -276,6 +276,9 @@ struct GraphicsSettings {
     /// Auto-exposure (§13). Live-toggleable; off, the exposure is fixed (the
     /// level's `exposure`, adjusted by `[`/`]`).
     auto_exposure: bool,
+    /// GTAO (§13). Live-toggleable: its targets are always allocated; off,
+    /// its passes don't run and the main pass skips its result.
+    ambient_occlusion: bool,
     /// Use baked assets from `BAKE_DIR` when present (§17): BC7 textures and
     /// meshes with LODs. `--no-bake` forces the raw assets, for A/B comparisons.
     bake: bool,
@@ -319,6 +322,7 @@ impl Default for GraphicsSettings {
             fxaa: false,
             bloom: true,
             auto_exposure: true,
+            ambient_occlusion: true,
             bake: true,
             lod: true,
             sky_occlusion: true,
@@ -375,6 +379,7 @@ enum MenuAction {
     ToggleFxaa,
     ToggleBloom,
     ToggleAutoExposure,
+    ToggleAmbientOcclusion,
     CycleShadows,
     CycleMsaa,
     ToggleDisplay,
@@ -433,6 +438,7 @@ enum MenuOutcome {
     ApplyFxaa,
     ApplyBloom,
     ApplyAutoExposure,
+    ApplyAmbientOcclusion,
     ApplyMsaa,
     ApplyDisplay,
     /// The FOV changed: nothing to rebuild (the next frame uses it), just save.
@@ -510,6 +516,13 @@ fn screen_rows(
                     if s.auto_exposure { "ON" } else { "OFF" }
                 ),
                 MenuAction::ToggleAutoExposure,
+            ),
+            MenuRow::new(
+                format!(
+                    "AMBIENT OCCLUSION  {}",
+                    if s.ambient_occlusion { "ON" } else { "OFF" }
+                ),
+                MenuAction::ToggleAmbientOcclusion,
             ),
             // Changeable only from the main menu: the mesh and sky pipelines
             // bake the sample count, so it can move only while no session owns
@@ -737,6 +750,10 @@ impl Menu {
             MenuAction::ToggleAutoExposure => {
                 s.auto_exposure = !s.auto_exposure;
                 MenuOutcome::ApplyAutoExposure
+            }
+            MenuAction::ToggleAmbientOcclusion => {
+                s.ambient_occlusion = !s.ambient_occlusion;
+                MenuOutcome::ApplyAmbientOcclusion
             }
             MenuAction::CycleShadows => {
                 s.shadows = s.shadows.next();
@@ -1644,6 +1661,7 @@ impl Bench {
         eprintln!("[bench] shadow  {}", col(|t| t.shadow_ms));
         eprintln!("[bench] cluster {}", col(|t| t.cluster_ms));
         eprintln!("[bench] geo     {}", col(|t| t.geometry_ms));
+        eprintln!("[bench] ao      {}", col(|t| t.ao_ms));
         eprintln!("[bench] bloom   {}", col(|t| t.bloom_ms));
         eprintln!("[bench] expo    {}", col(|t| t.exposure_ms));
         eprintln!("[bench] post    {}", col(|t| t.post_ms));
@@ -1682,6 +1700,7 @@ struct App {
     tonemap: Option<TonemapPass>,
     bloom: Option<BloomPass>,
     exposure_pass: Option<ExposurePass>,
+    ao_pass: Option<AoPass>,
     fxaa: Option<FxaaPass>,
     ui: Option<UiPass>,
     renderer: Option<Renderer>,
@@ -2785,6 +2804,7 @@ impl App {
             fxaa: None,
             bloom: None,
             exposure_pass: None,
+            ao_pass: None,
             exposure_reset: true,
             exposure_range: (0.125, 8.0),
             ui: None,
@@ -2938,6 +2958,17 @@ impl App {
                 // Back on, snap to the scene rather than fade from stale state.
                 self.exposure_reset = true;
                 self.persist(config::graphics::Key::AutoExposure);
+            }
+            MenuOutcome::ApplyAmbientOcclusion => {
+                eprintln!(
+                    "[quality] ambient occlusion: {}",
+                    if self.settings.ambient_occlusion {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+                self.persist(config::graphics::Key::AmbientOcclusion);
             }
             MenuOutcome::ApplyMsaa => {
                 self.apply_msaa();
@@ -3170,12 +3201,14 @@ impl ApplicationHandler for App {
         let tonemap = TonemapPass::new(&renderer);
         let bloom = BloomPass::new(&renderer);
         let exposure_pass = ExposurePass::new(&renderer);
+        let ao_pass = AoPass::new(&renderer);
         let fxaa = FxaaPass::new(&renderer);
         let ui = UiPass::new(&renderer);
 
         self.tonemap = Some(tonemap);
         self.bloom = Some(bloom);
         self.exposure_pass = Some(exposure_pass);
+        self.ao_pass = Some(ao_pass);
         self.fxaa = Some(fxaa);
         self.ui = Some(ui);
         self.renderer = Some(renderer);
@@ -3696,6 +3729,9 @@ impl ApplicationHandler for App {
                 // when they're on.
                 let bloom_on = self.settings.bloom && self.session.is_some();
                 let auto_on = self.settings.auto_exposure && self.session.is_some();
+                // GTAO (§13) likewise, with the camera it reconstructs from.
+                let ao_on = self.settings.ambient_occlusion && self.session.is_some();
+                let fov_y = self.settings.fov_y();
                 let exposure_params = ExposureParams {
                     dt: dt.min(0.1),
                     min: self.exposure_range.0,
@@ -3706,11 +3742,12 @@ impl ApplicationHandler for App {
                     self.exposure_reset = false;
                 }
                 let mut metered = None;
-                if let (Some(r), Some(tm), Some(bp), Some(ep), Some(fx), Some(ui)) = (
+                if let (Some(r), Some(tm), Some(bp), Some(ep), Some(ap), Some(fx), Some(ui)) = (
                     self.renderer.as_mut(),
                     self.tonemap.as_mut(),
                     self.bloom.as_mut(),
                     self.exposure_pass.as_mut(),
+                    self.ao_pass.as_mut(),
                     self.fxaa.as_mut(),
                     self.ui.as_ref(),
                 ) {
@@ -3727,6 +3764,15 @@ impl ApplicationHandler for App {
                         let (v, e) = r.bloom_mips();
                         (v.to_vec(), e.to_vec())
                     };
+                    // GTAO's inputs and output move when the targets are
+                    // recreated; the generation says when.
+                    let depth_view = r.depth_sample_view();
+                    let ao_views = r.ao_views();
+                    let nearest = r.nearest_sampler();
+                    let generation = r.targets_generation();
+                    if let Some(s) = self.session.as_mut() {
+                        s.mesh.set_ao(ao_on, ao_views[1], nearest, generation);
+                    }
                     // Shared immutably by the shadow and geometry closures — the
                     // draw methods take &self, only `prepare_frame` above needed
                     // &mut, and that already ran.
@@ -3747,10 +3793,7 @@ impl ApplicationHandler for App {
                                 s.mesh.dispatch_clusters(cmd, frame);
                             }
                         },
-                        // Geometry (§10): depth prepass, then the lit opaque pass
-                        // (each pixel shaded once), then the sky depth-tested into
-                        // whatever background is left. Skipped wholesale in the
-                        // main menu, leaving the attachment's clear colour.
+                        // Depth prepass (§10), on its own so GTAO can read it.
                         |cmd, extent, frame| {
                             if let (Some(s), Some(v)) = (session, frame_view) {
                                 s.mesh.draw_depth_prepass(
@@ -3761,6 +3804,27 @@ impl ApplicationHandler for App {
                                     v.light_dir,
                                     v.camera_pos,
                                 );
+                            }
+                        },
+                        // GTAO (§13), from the prepass's depth.
+                        |cmd, extent, frame| {
+                            if ao_on {
+                                ap.update(frame, generation, depth_view, ao_views, nearest);
+                                let proj = AoProjection {
+                                    near: CAMERA_NEAR,
+                                    far: CAMERA_FAR,
+                                    fov_y,
+                                    aspect: extent.width as f32 / extent.height.max(1) as f32,
+                                };
+                                ap.dispatch(cmd, frame, extent, proj);
+                            }
+                        },
+                        // Geometry: the lit opaque pass over the prepass's depth
+                        // (each pixel shaded once), then the sky depth-tested into
+                        // whatever background is left. Skipped wholesale in the
+                        // main menu, leaving the attachment's clear colour.
+                        |cmd, extent, frame| {
+                            if let (Some(s), Some(v)) = (session, frame_view) {
                                 s.mesh.draw_main(
                                     cmd,
                                     extent,
@@ -4090,6 +4154,7 @@ fn parse_args(
             // bench run turns these off.
             "--no-bloom" => settings.bloom = false,
             "--no-auto-exposure" => settings.auto_exposure = false,
+            "--no-ao" => settings.ambient_occlusion = false,
             "--no-sky-occlusion" => settings.sky_occlusion = false,
             _ => scenes.push(a),
         }
@@ -4164,14 +4229,15 @@ fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     eprintln!(
-        "[config] effective: display {}, fov {}, shadows {}, msaa {}, fxaa {}, bloom {}, auto exposure {}",
+        "[config] effective: display {}, fov {}, shadows {}, msaa {}, fxaa {}, bloom {}, auto exposure {}, ambient occlusion {}",
         settings.display.config_name(),
         settings.fov_deg,
         settings.shadows.config_name(),
         settings.msaa,
         settings.fxaa,
         settings.bloom,
-        settings.auto_exposure
+        settings.auto_exposure,
+        settings.ambient_occlusion
     );
     let mut app = App::new(scenes, settings, configs, audio, bench);
     event_loop.run_app(&mut app).expect("run app");
@@ -4989,7 +5055,7 @@ mod tests {
     fn command_line_flags_and_scenes() {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut s = GraphicsSettings::default();
-        assert!(s.bloom && s.bake && s.lod && s.sky_occlusion);
+        assert!(s.bloom && s.bake && s.lod && s.sky_occlusion && s.ambient_occlusion);
         let (scenes, bench) = parse_args(
             args(&[
                 "--bench",
@@ -5001,13 +5067,14 @@ mod tests {
                 "b.gltf",
                 "--no-auto-exposure",
                 "--no-sky-occlusion",
+                "--no-ao",
             ]),
             &mut s,
         );
         assert_eq!(scenes, ["a.glb", "b.gltf"]);
         assert!(bench);
         assert_eq!((s.bloom, s.msaa, s.lod, s.bake), (false, 4, false, true));
-        assert!(!s.auto_exposure && !s.sky_occlusion);
+        assert!(!s.auto_exposure && !s.sky_occlusion && !s.ambient_occlusion);
         // A bad sample count is ignored, not taken as a scene.
         let mut s = GraphicsSettings::default();
         let (scenes, bench) = parse_args(args(&["--msaa", "x", "--no-bake"]), &mut s);
@@ -5046,6 +5113,16 @@ mod tests {
         assert_eq!(
             s.auto_exposure, !before,
             "AUTO EXPOSURE row did not toggle it"
+        );
+
+        let before = s.ambient_occlusion;
+        assert_eq!(
+            activate(&mut m, &mut s, MenuAction::ToggleAmbientOcclusion),
+            MenuOutcome::ApplyAmbientOcclusion
+        );
+        assert_eq!(
+            s.ambient_occlusion, !before,
+            "AMBIENT OCCLUSION row did not toggle it"
         );
 
         // Cycling steps down and wraps: High -> Medium -> Low -> Off -> High.

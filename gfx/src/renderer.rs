@@ -76,7 +76,11 @@ fn clamp_samples(limits: &vk::PhysicalDeviceLimits, want: u32) -> vk::SampleCoun
 }
 // GPU timing (§21): timestamps per frame-in-flight — shadow (start, end),
 // geometry (start, end), post (start, end). Frame is shadow-start → post-end.
-const TIMESTAMPS_PER_FRAME: u32 = 12;
+const TIMESTAMPS_PER_FRAME: u32 = 14;
+/// GTAO's targets (§13): its raw and denoised visibility, one float each.
+/// R32F because the passes write them as storage images, and it's on the
+/// mandatory storage-format list (R16F and R8 aren't).
+const AO_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
 
 /// A GPU buffer that frees itself (and its allocation) on drop.
 pub struct Buffer {
@@ -140,6 +144,9 @@ pub struct GpuTimes {
     pub bloom_ms: f32,
     /// Auto-exposure's metering (§13), after bloom.
     pub exposure_ms: f32,
+    /// GTAO (§13), between the depth prepass and the main pass. `geometry_ms`
+    /// is the two passes round it, without it.
+    pub ao_ms: f32,
     pub post_ms: f32,
     pub frame_ms: f32,
 }
@@ -260,6 +267,19 @@ pub struct Renderer {
     // Single-sample resolve of `hdr`, allocated only when MSAA is on. This is what
     // the tonemap pass samples — a multisampled image cannot be sampled directly.
     hdr_resolve: Option<Image>,
+    // Single-sample depth, resolved (sample 0) from `depth` at the end of the
+    // prepass, allocated only when MSAA is on: what GTAO reads (§13).
+    depth_resolve: Option<Image>,
+    // GTAO's raw and denoised visibility (§13), full size, recreated with the
+    // other targets.
+    ao_raw: Option<Image>,
+    ao: Option<Image>,
+    // Nearest, clamp-to-edge: for images read with texelFetch/textureGather.
+    nearest_sampler: vk::Sampler,
+    // Bumped each time the window-sized targets are recreated, so passes that
+    // hold descriptors on them know to re-point. (A view handle can't tell:
+    // a new view may reuse a freed one's handle.)
+    targets_generation: u64,
     // Tonemapped LDR intermediate for the FXAA pass (§13). Same _SRGB format as
     // the swapchain, so one tonemap pipeline serves both targets. Always
     // allocated (~8 MB at 1080p) so the toggle needs no resource churn.
@@ -484,6 +504,21 @@ impl Renderer {
             .then(|| create_hdr(&allocator, &device, sc.extent, vk::SampleCountFlags::TYPE_1));
         let ldr = create_ldr(&allocator, &device, sc.extent, sc.format.format);
         let bloom = create_bloom(&allocator, &device, sc.extent);
+        let depth_resolve = (samples != vk::SampleCountFlags::TYPE_1)
+            .then(|| create_depth(&allocator, &device, sc.extent, vk::SampleCountFlags::TYPE_1));
+        let ao_raw = create_ao(&allocator, &device, sc.extent);
+        let ao = create_ao(&allocator, &device, sc.extent);
+        let nearest_sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::NEAREST)
+                    .min_filter(vk::Filter::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )?
+        };
         let hdr_sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -587,6 +622,11 @@ impl Renderer {
             depth: Some(depth),
             hdr: Some(hdr),
             hdr_resolve,
+            depth_resolve,
+            ao_raw: Some(ao_raw),
+            ao: Some(ao),
+            nearest_sampler,
+            targets_generation: 0,
             ldr: Some(ldr),
             bloom: Some(bloom),
             fxaa: false,
@@ -703,12 +743,14 @@ impl Renderer {
         // valid range still yields the right delta. Then ns → ms.
         let to_ms = |start: u64, end: u64| (end & m).wrapping_sub(start & m) as f32 * period * 1e-6;
         // Slots: shadow (0,1), geometry (2,3), post (4,5), cluster (6,7),
-        // bloom (8,9), exposure (10,11). The last three were added later, so
-        // they sit at the end rather than in pass order; frame = shadow start
-        // → post end, which spans them all.
+        // bloom (8,9), exposure (10,11), ao (12,13). The later ones sit at the
+        // end rather than in pass order; frame = shadow start → post end,
+        // which spans them all. AO runs inside geometry's span (after the
+        // prepass, before the main pass), so geometry leaves it out.
         let shadow = to_ms(data[0], data[1]);
         let cluster = to_ms(data[6], data[7]);
-        let geo = to_ms(data[2], data[3]);
+        let ao = to_ms(data[12], data[13]);
+        let geo = to_ms(data[2], data[12]) + to_ms(data[13], data[3]);
         let bloom = to_ms(data[8], data[9]);
         let exposure = to_ms(data[10], data[11]);
         let post = to_ms(data[4], data[5]);
@@ -719,6 +761,7 @@ impl Renderer {
             geometry_ms: geo,
             bloom_ms: bloom,
             exposure_ms: exposure,
+            ao_ms: ao,
             post_ms: post,
             frame_ms,
         };
@@ -730,6 +773,7 @@ impl Renderer {
         self.gpu_times.geometry_ms += (geo - self.gpu_times.geometry_ms) * a;
         self.gpu_times.bloom_ms += (bloom - self.gpu_times.bloom_ms) * a;
         self.gpu_times.exposure_ms += (exposure - self.gpu_times.exposure_ms) * a;
+        self.gpu_times.ao_ms += (ao - self.gpu_times.ao_ms) * a;
         self.gpu_times.post_ms += (post - self.gpu_times.post_ms) * a;
         self.gpu_times.frame_ms += (frame_ms - self.gpu_times.frame_ms) * a;
 
@@ -738,16 +782,49 @@ impl Renderer {
             self.ts_log_counter = 0;
             let t = self.gpu_times;
             eprintln!(
-                "[gpu] shadow {:.2}ms  cluster {:.2}ms  geo {:.2}ms  bloom {:.2}ms  expo {:.2}ms  post {:.2}ms  frame {:.2}ms",
+                "[gpu] shadow {:.2}ms  cluster {:.2}ms  geo {:.2}ms  ao {:.2}ms  bloom {:.2}ms  expo {:.2}ms  post {:.2}ms  frame {:.2}ms",
                 t.shadow_ms,
                 t.cluster_ms,
                 t.geometry_ms,
+                t.ao_ms,
                 t.bloom_ms,
                 t.exposure_ms,
                 t.post_ms,
                 t.frame_ms
             );
         }
+    }
+
+    /// The single-sample depth GTAO reads (§13): the depth buffer itself, or
+    /// its sample-0 resolve under MSAA. In `DEPTH_STENCIL_READ_ONLY_OPTIMAL`
+    /// while the AO slot runs.
+    pub fn depth_sample_view(&self) -> vk::ImageView {
+        self.depth_resolve
+            .as_ref()
+            .or(self.depth.as_ref())
+            .expect("depth alive")
+            .view
+    }
+
+    /// GTAO's raw and denoised targets (§13), in `GENERAL` while the AO slot
+    /// runs and while the main pass reads the denoised one.
+    pub fn ao_views(&self) -> [vk::ImageView; 2] {
+        [
+            self.ao_raw.as_ref().expect("ao alive").view,
+            self.ao.as_ref().expect("ao alive").view,
+        ]
+    }
+
+    /// A nearest, clamp-to-edge sampler, for images read with `texelFetch`
+    /// or `textureGather`.
+    pub fn nearest_sampler(&self) -> vk::Sampler {
+        self.nearest_sampler
+    }
+
+    /// Counts recreations of the window-sized targets (resize, MSAA): when it
+    /// changes, descriptors on `depth_sample_view` or `ao_views` are stale.
+    pub fn targets_generation(&self) -> u64 {
+        self.targets_generation
     }
 
     /// The bloom chain's per-level views and extents (§13), level 0 first.
@@ -1549,6 +1626,16 @@ impl Renderer {
         // Compute work between the shadow and geometry passes (the §12 light
         // clusters); its writes are made visible to fragment shaders.
         cluster: impl FnOnce(vk::CommandBuffer, usize),
+        // The depth prepass (§10), in a depth-only rendering of its own, so
+        // GTAO can read the depth before anything is shaded.
+        prepass: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
+        // Compute between the prepass and the main pass (§13's GTAO): it may
+        // sample `depth_sample_view` (read-only depth layout) and write both
+        // `ao_views` (GENERAL); the result is made visible to fragment
+        // shaders.
+        ao: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
+        // The lit pass and the sky, over the prepass's depth (loaded, tested,
+        // never written).
         geometry: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         // Compute work between geometry and the tonemap (§13's bloom): it may
         // sample the HDR result and read/write the bloom chain, which it finds
@@ -1812,7 +1899,8 @@ impl Renderer {
                 );
             }
 
-            // ---- Geometry pass: render into the linear HDR target. ----
+            // ---- Geometry: the depth prepass, GTAO, then the lit pass into the
+            // linear HDR target. ----
 
             // HDR: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL (prior contents discarded).
             // Shared across frames in flight: wait for the previous frame's colour
@@ -1862,28 +1950,185 @@ impl Renderer {
                 );
             }
 
-            // Depth: UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL
-            // Shared across frames: wait for the previous frame's depth tests.
-            let to_depth = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(depth.handle)
-                .subresource_range(depth_range)
-                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+            // Depth: UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL, and the same for
+            // its sample-0 resolve under MSAA. Shared across frames: wait for
+            // the previous frame's depth tests and GTAO's reads. A depth
+            // resolve writes in COLOR_ATTACHMENT_OUTPUT, as colour resolves do.
+            let depth_resolve = self.depth_resolve.as_ref();
+            let to_attachment = |image: vk::Image| {
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(depth_range)
+                    .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    )
+            };
+            let mut to_depth = vec![to_attachment(depth.handle)];
+            to_depth.extend(depth_resolve.map(|r| to_attachment(r.handle)));
             dev.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[to_depth],
+                &to_depth,
             );
 
+            // ---- Depth prepass (§10): depth only, kept for GTAO and the main
+            // pass. ----
+            let prepass_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(depth.view)
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                });
+            let prepass_attachment = match depth_resolve {
+                Some(r) => prepass_attachment
+                    .resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO)
+                    .resolve_image_view(r.view)
+                    .resolve_image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
+                None => prepass_attachment,
+            };
+            let prepass_rendering = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                })
+                .layer_count(1)
+                .depth_attachment(&prepass_attachment);
+            dev.cmd_begin_rendering(cmd, &prepass_rendering);
+            prepass(cmd, extent, frame);
+            dev.cmd_end_rendering(cmd);
+
+            // The single-sample depth GTAO reads (the buffer itself, or its
+            // resolve): to DEPTH_STENCIL_READ_ONLY, for compute reads and, at
+            // 1x, as the main pass's depth, which it only tests. Under MSAA
+            // the multisampled buffer stays an attachment, and this orders
+            // its prepass writes before the main pass's tests.
+            let sampled_depth = depth_resolve.unwrap_or(depth);
+            let mut depth_to_read = vec![vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(sampled_depth.handle)
+                .subresource_range(depth_range)
+                .src_access_mask(
+                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+                )];
+            if depth_resolve.is_some() {
+                depth_to_read.push(
+                    vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(depth.handle)
+                        .subresource_range(depth_range)
+                        .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                        .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ),
+                );
+            }
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &depth_to_read,
+            );
+
+            // ---- GTAO (§13): compute between the prepass and the main pass. ----
+            if self.timestamps_supported {
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 12,
+                );
+            }
+            // Both targets: UNDEFINED -> GENERAL. Shared across frames in
+            // flight, so wait for the previous frame's GTAO writes and main
+            // pass reads (§21's rule). Done even with GTAO off: the main
+            // pass's descriptor names this layout.
+            let (ao_raw, ao_img) = (
+                self.ao_raw.as_ref().expect("ao alive"),
+                self.ao.as_ref().expect("ao alive"),
+            );
+            let to_general = |image: vk::Image| {
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(color_range)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            };
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_general(ao_raw.handle), to_general(ao_img.handle)],
+            );
+            ao(cmd, extent, frame);
+            // Its result, visible to the main pass's fragment shader.
+            let ao_to_read = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(ao_img.handle)
+                .subresource_range(color_range)
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[ao_to_read],
+            );
+            if self.timestamps_supported {
+                dev.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    ts_base + 13,
+                );
+            }
+
+            // ---- Main pass: the lit opaque pass and the sky, into HDR. ----
             let hdr_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(hdr.view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -1892,17 +2137,18 @@ impl Renderer {
                 .clear_value(vk::ClearValue {
                     color: vk::ClearColorValue { float32: CLEAR_COLOR },
                 });
+            // The prepass's depth, tested and never written: read-only at 1x
+            // (GTAO sampled that same image), an attachment under MSAA.
+            let depth_layout = if depth_resolve.is_some() {
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
+            } else {
+                vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+            };
             let depth_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(depth.view)
-                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::DONT_CARE)
-                .clear_value(vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                });
+                .image_layout(depth_layout)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE);
             // Dynamic rendering resolves at cmd_end_rendering, so no manual blit.
             let hdr_attachment = match hdr_resolve {
                 Some(r) => hdr_attachment
@@ -2280,6 +2526,17 @@ impl Renderer {
             )
         });
         self.bloom = Some(create_bloom(self.allocator(), &self.device, extent));
+        self.depth_resolve = (samples != vk::SampleCountFlags::TYPE_1).then(|| {
+            create_depth(
+                self.allocator(),
+                &self.device,
+                extent,
+                vk::SampleCountFlags::TYPE_1,
+            )
+        });
+        self.ao_raw = Some(create_ao(self.allocator(), &self.device, extent));
+        self.ao = Some(create_ao(self.allocator(), &self.device, extent));
+        self.targets_generation += 1;
     }
 
     /// Change the geometry-pass sample count, recreating the targets that carry
@@ -2358,10 +2615,14 @@ impl Drop for Renderer {
             self.depth.take();
             self.hdr.take();
             self.hdr_resolve.take();
+            self.depth_resolve.take();
+            self.ao_raw.take();
+            self.ao.take();
             self.ldr.take();
             self.bloom.take();
             self.shadow.take();
             self.device.destroy_sampler(self.hdr_sampler, None);
+            self.device.destroy_sampler(self.nearest_sampler, None);
             self.device.destroy_sampler(self.shadow_sampler, None);
 
             for &v in &self.image_views {
@@ -2513,7 +2774,9 @@ fn create_depth(
         .array_layers(1)
         .samples(samples)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+        // Sampled by GTAO (§13): the single-sample one directly, or the
+        // resolve of the multisampled one.
+        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let ai = vk_mem::AllocationCreateInfo {
@@ -2543,6 +2806,51 @@ fn create_depth(
         handle: image,
         view,
         format: DEPTH_FORMAT,
+    }
+}
+
+/// One of GTAO's full-size targets (§13): written as a storage image by its
+/// compute passes, then sampled by the main pass.
+fn create_ao(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::Extent2D) -> Image {
+    let image_ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(AO_FORMAT)
+        .extent(vk::Extent3D {
+            width: extent.width.max(1),
+            height: extent.height.max(1),
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let ai = vk_mem::AllocationCreateInfo {
+        usage: vk_mem::MemoryUsage::AutoPreferDevice,
+        ..Default::default()
+    };
+    let (image, allocation) = unsafe { allocator.create_image(&image_ci, &ai).expect("ao image") };
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(AO_FORMAT)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let view = unsafe { device.create_image_view(&view_info, None).expect("ao view") };
+    Image {
+        allocator: allocator.clone(),
+        allocation,
+        device: device.clone(),
+        handle: image,
+        view,
+        format: AO_FORMAT,
     }
 }
 

@@ -333,6 +333,8 @@ struct Globals {
     sky_origin: [f32; 4],
     /// xyz = its cells per axis, w = 1 when a volume is bound, 0 for none.
     sky_dims: [f32; 4],
+    /// x = 1 when GTAO's result (§13, binding 8) is this frame's to use.
+    ao_params: [f32; 4],
 }
 
 /// One punctual light, std430, 32 bytes (§12).
@@ -428,6 +430,10 @@ pub struct MeshRenderer {
     sky_sampler: vk::Sampler,
     /// `Globals::sky_origin` and `sky_dims`, fixed for the session.
     sky_params: [[f32; 4]; 2],
+    /// Whether GTAO ran this frame (`set_ao`), for `Globals::ao_params`.
+    ao_on: bool,
+    /// The `Renderer::targets_generation` binding 8 points into.
+    ao_generation: u64,
     slices: Vec<MeshSlice>,
     // Reused each frame to gather sorted instances before the SSBO upload.
     scratch: Vec<InstanceData>,
@@ -463,7 +469,9 @@ impl MeshRenderer {
     /// mesh as its only LOD. `bake_dir` is still read for textures.
     ///
     /// `sky` is the level's sky-visibility volume (§13, baked); without one the
-    /// ambient light is unoccluded, as it was before there were volumes.
+    /// ambient light is unoccluded, as it was before there were volumes. GTAO's
+    /// result (binding 8) starts at `renderer.ao_views()[1]`; `set_ao` keeps it
+    /// current.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         renderer: &Renderer,
@@ -572,9 +580,9 @@ impl MeshRenderer {
             renderer.create_texture(&[128, 128, 255, 255], 1, 1, false), // 1: flat normal (UNORM)
         ];
         // Each unique image uploads once, however many materials use it.
-        // The shadow map and the sky volume are the other combined samplers
-        // in the set.
-        let capacity = renderer.max_bindless_textures().saturating_sub(2);
+        // The shadow map, the sky volume and GTAO's result are the other
+        // combined samplers in the set.
+        let capacity = renderer.max_bindless_textures().saturating_sub(3);
         let plan = plan_texture_slots(materials, capacity);
         let (mut baked_count, mut bytes) = (0usize, 0usize);
         for (t, kind) in &plan.uploads {
@@ -793,6 +801,12 @@ impl MeshRenderer {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // binding 8: GTAO's result (§13), one texel per pixel.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(8)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let set_layout = unsafe {
             device
@@ -808,10 +822,10 @@ impl MeshRenderer {
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(4 * FRAMES_IN_FLIGHT as u32),
-            // the texture array + the shadow map + the sky volume, per set.
+            // the texture array + the shadow map, sky volume and AO, per set.
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count((texture_count + 2) * FRAMES_IN_FLIGHT as u32),
+                .descriptor_count((texture_count + 3) * FRAMES_IN_FLIGHT as u32),
             // the globals UBO, per set.
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
@@ -879,11 +893,15 @@ impl MeshRenderer {
                 .buffer(cluster_buffers[i].handle)
                 .offset(0)
                 .range(vk::WHOLE_SIZE)];
-            // binding 7 -> the shared sky volume.
+            // binding 7 -> the shared sky volume; binding 8 -> GTAO's result.
             let sky_info = [vk::DescriptorImageInfo::default()
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .image_view(sky_image.view)
                 .sampler(sky_sampler)];
+            let ao_info = [vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::GENERAL)
+                .image_view(renderer.ao_views()[1])
+                .sampler(renderer.nearest_sampler())];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
@@ -926,6 +944,11 @@ impl MeshRenderer {
                     .dst_binding(7)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&sky_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(8)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&ao_info),
             ];
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
@@ -1085,18 +1108,13 @@ impl MeshRenderer {
             .depth_test_enable(true)
             .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS);
-        // This runs *inside* the geometry pass, which has one colour attachment, so
-        // the pipeline must declare the same attachment count — writing no colour
-        // is expressed with an empty write mask, not by omitting the attachment.
-        // Depth target, sample count and vertex input all match the main pass (they
-        // must agree for the prepass depths to match).
-        let depth_blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::empty())
-            .blend_enable(false)];
-        let depth_color_blend =
-            vk::PipelineColorBlendStateCreateInfo::default().attachments(&depth_blend_attachment);
+        // It runs in a depth-only rendering of its own (so GTAO can read the
+        // depth before the main pass, §13), which has no colour attachment,
+        // so neither does the pipeline. Depth target, sample count and vertex
+        // input all match the main pass (they must agree for the prepass
+        // depths to match).
+        let depth_color_blend = vk::PipelineColorBlendStateCreateInfo::default();
         let mut depth_rendering = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_formats)
             .depth_attachment_format(renderer.depth_format());
         let depth_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&depth_stages)
@@ -1281,6 +1299,8 @@ impl MeshRenderer {
             sky: sky_image,
             sky_sampler,
             sky_params,
+            ao_on: false,
+            ao_generation: renderer.targets_generation(),
             slices,
             scratch: Vec::new(),
             keyed: Vec::new(),
@@ -1294,6 +1314,35 @@ impl MeshRenderer {
             max_instances,
         };
         (renderer, ids)
+    }
+
+    /// This frame's GTAO state (§13): whether it ran (`on`), and the result
+    /// image to read, which moves when the renderer's targets are recreated
+    /// (`generation`, `Renderer::targets_generation`). Call before
+    /// `draw_frame`.
+    ///
+    /// Re-pointing rewrites every frame's set at once. That's sound because
+    /// the generation only changes when the targets were recreated, which
+    /// waits for the device to go idle, and no frame has been submitted
+    /// since: nothing can be using a set.
+    pub fn set_ao(&mut self, on: bool, view: vk::ImageView, sampler: vk::Sampler, generation: u64) {
+        self.ao_on = on;
+        if generation == self.ao_generation {
+            return;
+        }
+        for &set in &self.sets {
+            let info = [vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::GENERAL)
+                .image_view(view)
+                .sampler(sampler)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(8)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info);
+            unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+        }
+        self.ao_generation = generation;
     }
 
     /// Re-point every frame's shadow-map descriptor (binding 3) at a new view —
@@ -1424,6 +1473,7 @@ impl MeshRenderer {
             },
             sky_origin: self.sky_params[0],
             sky_dims: self.sky_params[1],
+            ao_params: [if self.ao_on { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
         };
         for (i, c) in cascades.iter().enumerate().take(SHADOW_CASCADES) {
             globals.light_view_proj[i] = c.view_proj.to_cols_array();

@@ -2,7 +2,8 @@
 
 Status: in active implementation — a textured-PBR forward renderer with IBL,
 4-cascade sun shadows with caster pancaking, clustered punctual point lights
-with sphere-light specular, a depth prepass, per-view frustum culling,
+with sphere-light specular, ambient light occluded by a baked sky-visibility
+volume and GTAO, a depth prepass, per-view frustum culling,
 MSAA/FXAA, mipmapped textures (deduplicated, a per-level bindless array, and
 an offline BC7 bake), GPU per-pass timing, a rapier FPS controller in the ECS
 with collision proxies for detailed props, glTF scene loading with §18
@@ -430,6 +431,22 @@ attachment. Still pending here: no MSAA resolve or transparent pass. (The
 cluster pass landed — §12 — as a compute dispatch between shadow and geometry,
 guarded by a legacy `vkCmdPipelineBarrier` until the sync2 pass.)
 
+**Landed (§26): the prepass on its own.** GTAO (§13) needs the depth before
+anything is shaded, so the geometry pass is now three steps:
+1. **Depth prepass**, a depth-only rendering. Depth is stored, and under MSAA
+   also resolved (`SAMPLE_ZERO`, always supported) into a single-sample D32
+   image. Its pipelines lost their empty colour attachment, since the
+   rendering has none, and still share `mesh.vert`.
+2. **GTAO**, compute, reading that depth in `DEPTH_STENCIL_READ_ONLY_OPTIMAL`.
+3. **Main pass** (opaque + sky), which loads the depth, tests it and never
+   writes it. At 1× it uses that same image in the read-only layout, under
+   MSAA the multisampled buffer.
+
+`geo` still times steps 1 and 3; GTAO has its own `ao` slot. Measured (debug,
+clocks unpinned, 3 interleaved runs against the old binary, GTAO off): `geo`
+0.21–0.23 → 0.22–0.23 ms on the zone and 0.64 → 0.62 ms on `lights120`. I
+predicted at most +0.02 ms, and it held.
+
 Barriers: Vulkan 1.3 **sync2** (`VkImageMemoryBarrier2`, timeline semaphores).
 Key hazards: shadow depth W→R before opaque; HDR color W→R at resolve; cluster
 buffer W(compute)→R(fragment). Queues: graphics for all passes; cluster
@@ -763,7 +780,7 @@ overlap every pixel.
 no term for a sky that isn't there. So a room lit only through its door got
 the whole sky's light on every wall, and the zone's hangar and office looked
 as bright inside as the yard. The level's baked sky-visibility volume (§17)
-now scales the sky term. GTAO (small-scale contact) is still to come.
+now scales the sky term. GTAO (below) adds the small-scale contact.
 - **Shading** (`mesh.frag`, mirroring `SkyVis`, whose tests pin it):
   - Diffuse is `ground·(½ − ½n.y)·2w0 + sky_avg·max(w0 + w·n, 0)`: the sky
     part by its directional weight, and the ground's bounce by the fraction
@@ -816,6 +833,96 @@ now scales the sky term. GTAO (small-scale contact) is still to come.
   - lamps and the sun are direct light and unaffected;
   - thin walls within a cell of each other can still exchange a little
     light where the per-axis distances miss a diagonal gap.
+
+**Landed (§26): GTAO** (Jimenez et al. 2016, after Intel's XeGTAO): contact
+shadowing within 0.8 m, which the sky volume's 0.5 m cells, sampled a cell off
+the surface, can't see. It uses the depth prepass alone (§10).
+- **`gtao.comp`** (`render::AoPass`), full resolution:
+  - Normals are rebuilt from depth.
+  - 2 slices × 4 steps each way, both jittered by 4×4 patterns.
+  - Radius 0.8 m, with occluders fading over its last 60%.
+  - Pixels whose radius spans under 2 px are left open; the radius is
+    clamped to 200 px.
+  - The horizons are integrated against the normal projected into each slice.
+- **`gtao_denoise.comp`:** a 4×4 blur, so every pixel averages all 16 jitter
+  variants (32 directions). Each neighbour is weighted by its distance off the
+  centre's tangent plane, and gets nothing past 10% of the view distance.
+- **`mesh.frag`:** multiplies the diffuse ambient by Jimenez's multi-bounce
+  fit (per albedo) and the specular ambient by Lagarde's specular occlusion.
+  It's texel-for-pixel, sky visibility times GTAO, ambient only.
+- **Targets:** gfx owns two R32F images (raw and denoised; R32F because it's
+  on the mandatory storage list). A `targets_generation` counter tells
+  `AoPass` and `MeshRenderer::set_ao` when a resize or MSAA change has moved
+  them. A view handle can't tell, since a new view may reuse a freed one's
+  handle.
+- **Four ways it went wrong first.** A flat floor must read 1, and didn't:
+  - **Clamping** each pixel to ≤ 1 before the denoise. One pixel's slice pair
+    reads above 1 as often as below; only their average over directions is
+    exact. Clamped, the floor read 0.982. The raw target is now unclamped.
+  - **Snapping steps to texel centres,** as XeGTAO does. The first 1–2 px
+    steps land up to 20° off their slice, and the horizon keeps the error:
+    0.995 mean, 0.936 at worst. Steps now sit at their exact sub-pixel point,
+    with depth interpolated from a `textureGather`, which is exact on a plane
+    (depth is linear in screen space across one).
+  - **Weighting the denoise by depth difference** instead of plane distance.
+    That weighs the jitter variants unevenly on a receding floor: 0.957 at the
+    worst pixel.
+  - **Spreading slices evenly round the screen** (XeGTAO's choice) rather than
+    round the view vector, which is what the integral assumes. Off-centre
+    they bunch up. A face-on wall filling the view read 0.926 in the corners,
+    and a wall at 40° read 0.81.
+  - A fifth suspect, steps off the screen reading clamped depth, measured as
+    **no difference** on either wall. Where steps leave the screen the
+    surface comes towards the camera, so a clamped depth lies behind it. No
+    rule for it was kept.
+
+  Now: floor mean 0.9998, and 0.995 or more away from the screen's edge
+  columns. Face-on and 40° walls read ≥ 0.99 except the two edge columns on
+  the 86° side.
+- **Checked on the GPU:** a temporary harness dumped one frame's depth and
+  GTAO output from three zone viewpoints. The CPU reference, run over that
+  depth, matches the GPU to a median of 1e-5 and a 99th percentile of
+  1e-3 (0.03 at worst, a few pixels).
+- **Measured** (debug, clocks unpinned, 3 interleaved runs, `--no-ao` vs on):
+  - `ao` 0.26–0.27 ms on the zone (frames +0.25–0.28 ms) and 0.37–0.38 ms on
+    `lights120`. I predicted 0.15–0.30: the zone held, `lights120` didn't.
+  - The gtao pass is most of it: 0.23 / 0.31 ms, against 0.05–0.07 for the
+    denoise.
+  - The orb demo, with meshes up close at the 200 px radius clamp, costs
+    0.47 ms.
+  - Release (not interleaved with debug, clocks unpinned): 0.30 / 0.39 ms.
+  - The metered exposure doesn't move (1.36 → 1.37): corners are a small
+    share of any view.
+  - Validation with sync: 0 messages at MSAA 1/2/4×, with GTAO off, on the
+    nature scene and the orb demo, and across two resizes mid-session.
+- **Next lever:** half resolution with a depth-aware upsample. The plan named
+  it for costs over 0.25 ms, and both scenes are over. Not done here.
+- **Limits:**
+  - screen-space: what's off-screen or behind a silhouette doesn't occlude;
+  - no thickness heuristic, so thin poles and grass cards shadow as if
+    solid;
+  - no temporal filtering, so the result is noise-free only where the 4×4
+    blur averages a smooth surface;
+  - the screen's two outermost columns can read a few percent dark where a
+    surface is seen near grazing;
+  - a faint large-scale tint (≤ 2%) was seen on the hangar's far wall in one
+    dump and not chased.
+- **Switch:** OPTIONS > GRAPHICS > AMBIENT OCCLUSION, saved as
+  `ambient_occlusion`, and `--no-ao` for bench A/B runs. Off, the passes
+  don't run and `mesh.frag` skips the fetch (`Globals::ao_params`).
+- **Tests** (`render::ao`'s reference is both shaders step for step):
+  - distances back from depth, against glam's projection;
+  - the slice integral against Simpson's rule;
+  - an open floor, and face-on and 40° walls filling the view, read 1;
+  - a wall darkens the floor at its foot and nowhere else;
+  - the denoise keeps to its side of an edge;
+  - every 4×4 window holds each jitter once;
+  - the ambient fits leave open surfaces alone;
+  - the shaders declare the reference's constants, and share `view_pos` and
+    `depth_normal` text for text;
+  - the menu row, config key and flag.
+
+  Each was shown to fail against a deliberately broken copy.
 
 ### Environment: a level's atmosphere
 
@@ -1947,7 +2054,7 @@ and punctuation.
   SSR/volumetrics cost gets judged. **Landed** (§26): a timestamp query pool in
   `gfx` brackets the shadow, geometry, and post passes, reads back after the frame
   fence (no stall), and logs smoothed per-pass ms to stderr (`[gpu] shadow … cluster … geo …
-  post … frame …`), with a `Renderer::gpu_times` accessor for a future overlay.
+  ao … bloom … expo … post … frame …`), with a `Renderer::gpu_times` accessor for a future overlay.
   **Caveat when reading these numbers:** absolute per-pass ms shift with overall
   GPU load/clock state — the fixed-size shadow pass measured 2.5 ms with a small
   window and 4.7 ms with a large one, unchanged work. Only compare A/B runs taken
@@ -2140,8 +2247,8 @@ app        thin binary wiring it together
 3. Lighting: CSM sun + GTAO + a few clustered lights + IBL ambient (the "better
    than 2010" look lands here). (Landed: PBR + textures, analytic-sky IBL,
    4-cascade CSM with 3×3 PCF, and clustered punctual point lights (§12 stage
-   B, the engine's first compute pass), and caster pancaking. Remaining: GTAO
-   and cubemap IBL.)
+   B, the engine's first compute pass), caster pancaking, a baked sky-visibility
+   volume and GTAO occluding the ambient (§13). Remaining: cubemap IBL.)
 4. Physics + FPS controller (rapier), fixed timestep + interpolation → walkable.
    (Landed: fixed timestep + interpolation, the rapier kinematic FPS controller
    against static colliders, and the ECS↔rapier sync systems with the player as an
@@ -2340,7 +2447,7 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   the per-entity cull (and on LODs, §17, for its triangle count).
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
-  *not* the cluster grid, GTAO or cubemap IBL;
+  sky visibility and GTAO (§13), *not* cubemap IBL;
   step 4 mostly landed — fixed timestep + interpolation and the rapier kinematic
   FPS controller against static colliders (ECS↔rapier sync systems and dynamic
   bodies still pending, see below). Steps 5+ not started.
@@ -2400,7 +2507,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   (binding 0), resident materials (binding 1), and a resident
   `sampler2D textures[]` (binding 2) sized per level, as N discrete per-frame
   sets. It has since grown the shadow map, globals, lights and cluster masks
-  (bindings 3–6) and the sky-visibility volume (binding 7). Not yet the
+  (bindings 3–6), the sky-visibility volume (binding 7) and GTAO's result
+  (binding 8). Not yet the
   Set 0 (resident) / Set 1 (per-frame ring) / Set 2 (per-view) split, and the
   texture array is sized and filled at load — **not** update-after-bind /
   partially-bound (fine until streaming; no runtime texture loading yet).
@@ -2422,8 +2530,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   environment. Real cubemap IBL (equirect→cube, irradiance/prefilter passes,
   BRDF LUT) is the follow-up. Sun shadows (§11 CSM) and punctual point lights
   (§12) now exist. Bloom and auto-exposure landed (§13). The ambient is
-  occluded by a baked per-level sky-visibility volume (§13, §17). The
-  tonemap curve is a drop-in point for AgX.
+  occluded by a baked per-level sky-visibility volume (§13, §17) and by GTAO
+  (§13). The tonemap curve is a drop-in point for AgX.
   **Known artifact — specular singularity on smooth metal.** A punctual light has
   zero area, so on low-roughness metal (the PBR grid bottoms out at 0.06) its
   specular lobe collapses to a near-singular bright dot. With a geometry-free

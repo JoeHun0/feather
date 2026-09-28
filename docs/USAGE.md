@@ -90,6 +90,7 @@ on a HiDPI desktop) and is resizable; `--bench` uses a fixed 1920×1080.
 | `--no-lod` | Draw every mesh at LOD0 but keep the baked vertex order, to A/B the LOD win alone (§4). |
 | `--no-bloom` | Turn bloom off for this run (never saved). Mainly for `--bench` A/B runs, which ignore the config files. |
 | `--no-auto-exposure` | Fixed exposure for this run (never saved), likewise. |
+| `--no-ao` | GTAO off for this run (never saved), for `--bench` A/B runs like `--no-bloom`. |
 | `--no-sky-occlusion` | Ignore the level's baked sky visibility, so the ambient light is unoccluded, as before it existed. For A/B runs; there's no menu option, as it's part of the look. |
 | `--bench` | Scripted timing run: skips the menu, sweeps the camera 360°, prints a summary and exits. Ignores the config files. See §7. |
 
@@ -123,6 +124,7 @@ controls got their own file; an old one is renamed on first run.)
 | `fxaa` | `true`, `false` | `false` |
 | `bloom` | `true`, `false` | `true` |
 | `auto_exposure` | `true`, `false` | `true` |
+| `ambient_occlusion` | `true`, `false` (GTAO: contact shadows in corners and under objects) | `true` |
 
 **`controls.toml`** — key bindings and mouse look. Saved when you change
 something in OPTIONS > CONTROLS or OPTIONS > GAMEPLAY (same in-place editing as
@@ -410,8 +412,7 @@ electricity poles. You spawn on the road outside the gate, facing it.
 - **Interiors** get the sky's light only through their openings once the
   zone is baked: the hangar is dim and lit mostly by its door, roof holes and
   lamp, and the office is darker still. Unbaked, they're as bright as the yard.
-- **Known limits:** no small-scale contact shadowing (GTAO) yet, and no leafy
-  trees yet.
+- **Known limits:** no leafy trees yet.
 
 ### Baking — `feather-bake`
 
@@ -458,6 +459,14 @@ until you re-run the bake; stale files in `scratch/bake/` are simply ignored.
 **What to look for** when judging LODs: distant objects should look the same
 with `--no-lod` as without, with no visible popping as you walk towards them,
 and distant shadows should look unchanged.
+
+**What to look for** when judging GTAO (OPTIONS > GRAPHICS > AMBIENT
+OCCLUSION, live):
+- A soft darkening along wall-floor and wall-ceiling creases, in the corners
+  of door and window openings, and under barrels, tyres and the car.
+- No dark halos round objects against the sky or a far background, and no
+  4×4 grain on flat walls.
+- Flat surfaces shouldn't darken towards the screen's edges as you turn.
 
 **What to look for** when judging sky occlusion (A/B with
 `--no-sky-occlusion`):
@@ -622,6 +631,7 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | Texture bake | assets, bake | keys separate content and kind (sRGB colour vs data), and are computed from the encoded bytes without decoding; BC7 level sizes round partial blocks up; baked files round-trip and reject truncation, wrong sizes or an unknown kind; sRGB mips average *light* (black/white → 188, not 128); chains end at 1×1; every baked level has exactly the blocks Vulkan copies |
 | Mesh bake + LOD | assets, bake, render | baked meshes round-trip and reject damage (truncation, trailing bytes, bad magic, out-of-range index, decreasing or NaN error, partial triangle, no LODs); the mesh key ignores the material; a sphere gets a chain with fewer triangles and growing error per level and LOD0 is the input reordered; small meshes stay LOD0; disconnected parts prune; the pixel and texel rules (distance, scale, non-uniform scale, inside the sphere); runs split per (mesh, LOD) |
 | Sky visibility | assets, bake, render, app | the BVH finds what brute force finds; open ground sees the whole sky; a closed room with 0.2 m walls is dark inside, nothing leaking in even at corners; a door lets sky in from its side; a canopy shades only what's under it; the probe finds the inside of a closed box, not of a double-sided one; inside cells take their darkest neighbour, ring by ring; mirrored placements face outwards; occluders skip cutouts and `shadow: false`, and take the coarsest LOD within 5 cm; big levels get bigger cells; open-sky weights equal `sky_irradiance`'s for every normal and specular occlusion is 1 in the open, 0 shut in, and smooth through the horizon; the encoding is exact for open sky, and free distances round down; a sample leaves out a cell behind a wall and fades to open sky outside the grid; the key covers occluders and nothing else; files round-trip and reject damage; `mesh.frag` declares the same constants; (end to end) `build_world` finds a level's volume by its key, the first scene's of several, and not after the level changes |
+| GTAO | render, app | a Rust reference of both passes, run over depth buffers ray-cast from known scenes: distances come back from depth as glam's projection put them; the slice integral equals Simpson's rule; an open floor reads 1 (0.9998 mean), and so do face-on and 40° walls filling the view, out to the screen's edges; a wall darkens the floor at its foot (0.4–0.8) and nowhere else; the denoise keeps to its side of an edge; every 4×4 window holds each jitter once; the multi-bounce and specular-occlusion fits leave open surfaces alone; the shaders declare the reference's constants and share `view_pos` / `depth_normal` text for text; the GRAPHICS row, `ambient_occlusion` key and `--no-ao` |
 | Bloom | gfx, render, app | the chain's level sizes (half resolution, halving to an 8-texel side, at most 7 levels, never zero, odd and tiny windows); a Rust reference of the chain: a flat image blooms to itself, a bright pixel spreads with falloff, a plain downsample keeps energy within 5%, and the shaders declare the reference's weights; the steps go down then up; the tonemap's push block matches its Rust struct; the GRAPHICS row toggles it; `--no-bloom` (with the other flags) parses |
 | Auto-exposure | render, app | a Rust reference of the metering, whose constants and state layout the shaders must declare: luminance round-trips through its bin (black to bin 0), the 10–90% trimmed mean ignores the tails, adaptation converges, brightens faster than it darkens and is frame-rate independent, the exposure maps `KEY` and clamps, the centre weight falls off but never to 0; `exposure_min`/`exposure_max` land and bad values are reported; the GRAPHICS row and `--no-auto-exposure` |
 | Config files | app | both templates parse back to the defaults; `display` parses and rejects anything but `"windowed"` / `"fullscreen"`; `fov` accepts 30–120 whole degrees only; each bad line warns and keeps the default; saving edits one value in place; create-once, the `settings.toml` → `graphics.toml` migration, an unreadable file is left alone |
@@ -653,7 +663,7 @@ Everything goes to stderr.
 | `[gfx] device: …` | the GPU picked at startup. Check it: machines with an iGPU + dGPU list both |
 | `[gfx] MSAA: …` | requested vs actual sample count |
 | `[vulkan] …` | validation messages (debug builds), or the "layer not found" warning |
-| `[gpu] shadow … cluster … geo … bloom … expo … post … frame …` | smoothed per-pass GPU ms, about once a second |
+| `[gpu] shadow … cluster … geo … ao … bloom … expo … post … frame …` | smoothed per-pass GPU ms, about once a second |
 | `[quality] shadows / fxaa / bloom / auto exposure: …` | a setting changed |
 | `[config] …` | a config file created / loaded / renamed, a line ignored or a key bound twice, plus the effective graphics settings at startup |
 | `[light] N visible lights exceeds MAX_LIGHTS` | lights past 128 were dropped this frame |
@@ -698,8 +708,10 @@ defaults and CLI flags only.
 
 Bloom and auto-exposure are on by default, so a bench's `frame` includes
 them (~0.15 and ~0.05 ms, debug), and so is sky occlusion when the scene's
-volume is baked (`geo` +0.03–0.07 ms). To compare with numbers from before they
-existed, add `--no-bloom --no-auto-exposure --no-sky-occlusion`.
+volume is baked (`geo` +0.03–0.07 ms), and GTAO (its own `ao` line, ~0.27 ms on
+the zone). `geo` also times the depth prepass, which now runs on its own before
+GTAO. To compare with numbers from before they existed, add
+`--no-bloom --no-auto-exposure --no-sky-occlusion --no-ao`.
 
 ### A/B recipe
 
