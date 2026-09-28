@@ -709,6 +709,41 @@ overlap every pixel.
   reads. Later: local probes per-object for interiors; irradiance volumes for
   dynamic bounce.
 
+### Environment: a level's atmosphere
+
+**Landed (§26).** A level chooses its sun, sky, fog and starting exposure with
+an `environment` marker (§18). Without one it gets `Environment::default()`,
+which is exactly the look every level had before.
+- **What it sets:** the sun (direction, colour × intensity); the analytic sky
+  (zenith, horizon, below-horizon colours, overall intensity, which is also
+  the ambient light, since the IBL is that sky); the tint and strength of the
+  sun's glow and of its disk (0 hides the sun, as behind cloud); exponential
+  fog density (fog blends towards the sky, so it takes the sky's colour); and
+  the tonemap's starting exposure.
+- **How it reaches the GPU: specialization constants.** `render::Environment`
+  fills 19 `constant_id`s that `mesh.frag` and `sky.frag` declare, baked when
+  a session builds its pipelines (`MeshRenderer::new`, `SkyPass::new`).
+  - A level's atmosphere is fixed for its session, so this costs nothing
+    per frame and needs no descriptor or push-constant space. The sky pass's
+    push constants were already 96 of the guaranteed 128 bytes.
+  - One struct feeds both shaders, which used to repeat the palette by
+    hand. Their `sky()` functions still have to agree by hand.
+  - A test parses the compiled SPIR-V: every constant a shader declares must
+    be in the map at the same id, under the expected name, with a GLSL
+    default equal to `Environment::default()`. A mismatch compiles fine and
+    shades silently wrong, so without that test nothing would catch it. Both
+    kinds of mismatch were tried; the test failed on each.
+- The sun's **direction** and the **exposure** aren't baked. They already
+  travel per frame, so the app takes them from the environment at session
+  start. The exposure debug keys still adjust it, but no longer carry over
+  from one session to the next.
+- **Measured:** `--bench scratch/lights120.gltf`, old and new binaries
+  interleaved (clocks not pinned): frame median 0.72/0.71 ms either way, as
+  predicted. The constants fold as the literals did.
+- **Limit:** changing the atmosphere *during* a session (weather, time of
+  day) means rebuilding two pipelines. The runtime route is the globals UBO
+  (§25).
+
 ### Post chain (after transparents; HDR until tonemap)
 
 1. **HDR resolve** (done as pass 7).
@@ -1331,6 +1366,12 @@ Implemented prefabs are deliberately only those that do something today:
   there was a light system to feed; it needed one new function and no change to
   the scene format, which is this section's claim holding up in practice.
 
+- **`environment`** — a marker for the level's atmosphere (§13): sun
+  elevation/azimuth, colour and intensity, the sky palette, the sun's glow
+  and disk, fog density, exposure. Consumed before the world is built, like
+  `player_start`; first one wins. Params left out keep the default look, and
+  unknown or unreadable ones are warned about and ignored.
+
 **Unknown ids warn once and fall back to static geometry** rather than failing,
 which is what lets a scene be authored ahead of the engine. Extras parsing is
 lenient for the same reason: malformed data costs one prop, not the level.
@@ -1733,7 +1774,9 @@ skinning; animation state machines; local reflection probes / irradiance
 volumes; audio occlusion + reverb zones; user-selectable anti-aliasing mode
 (SMAA / MSAA 2×/4×; the geometry sample-count seam is in place, §26); TAA;
 streaming + stage pipelining; X-Ray (`.ogf`/level) importer for the SoC-rebuild
-stretch dream (becomes just another importer feeding the same bake).
+stretch dream (becomes just another importer feeding the same bake); changing
+a level's atmosphere during a session (weather, time of day: §13's constants
+would move into the globals UBO).
 
 ## 26. Implementation status
 
@@ -1968,7 +2011,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   roughness) for one directional light plus **analytic-sky IBL** ambient (split-sum:
   hemisphere irradiance for diffuse, reflection-vector sky sample for specular,
   Karis analytic env-BRDF), into an RGBA16F HDR target resolved by an ACES
-  **tonemap** pass. The environment is a **procedural sky evaluated in-shader**,
+  **tonemap** pass. The environment is a **procedural sky evaluated in-shader**
+  (its palette, the sun and the fog are now per level, §13's environment),
   not a precomputed cubemap — so no arbitrary HDR environments and the specular
   "prefilter" is a crude roughness lerp (no real GGX convolution/mips). The sky
   *is* now drawn as a visible background (SkyPass) matching the reflected

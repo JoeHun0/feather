@@ -7,6 +7,7 @@
 //! No descriptors — the inverse view-projection, camera position, and light
 //! direction come in through a push constant.
 
+use crate::environment::{Environment, Specialization};
 use ash::vk;
 use feather_gfx::Renderer;
 use glam::{Mat4, Vec3, Vec4};
@@ -24,11 +25,14 @@ pub struct SkyPass {
 }
 
 impl SkyPass {
-    pub fn new(renderer: &Renderer) -> Self {
+    /// `env` is the level's atmosphere, baked into the pipeline (§13).
+    pub fn new(renderer: &Renderer, env: &Environment) -> Self {
         let device = renderer.device();
 
         let vert = load_shader(&device, spv!("fullscreen.vert"));
         let frag = load_shader(&device, spv!("sky.frag"));
+        let spec = Specialization::new(env);
+        let spec_info = spec.info();
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -37,7 +41,8 @@ impl SkyPass {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(frag)
-                .name(c"main"),
+                .name(c"main")
+                .specialization_info(&spec_info),
         ];
 
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();

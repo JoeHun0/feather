@@ -73,19 +73,39 @@ layout(location = 3) in vec3 v_world_pos;
 layout(location = 0) out vec4 o_color; // linear HDR (RGBA16F target)
 
 const float PI = 3.14159265359;
-const vec3 SUN_RADIANCE = vec3(8.0);
-const float FOG_DENSITY = 0.010; // exp distance fog; tuned for the 200-unit far plane
+// The level's atmosphere (§13): specialization constants that
+// render::Environment fills, by constant_id, for this shader and sky.frag
+// alike. The defaults here are Environment::default() (a test checks).
+layout(constant_id = 0) const float SUN_RADIANCE_R = 8.0;
+layout(constant_id = 1) const float SUN_RADIANCE_G = 8.0;
+layout(constant_id = 2) const float SUN_RADIANCE_B = 8.0;
+layout(constant_id = 3) const float SKY_ZENITH_R = 0.10;
+layout(constant_id = 4) const float SKY_ZENITH_G = 0.22;
+layout(constant_id = 5) const float SKY_ZENITH_B = 0.55;
+layout(constant_id = 6) const float SKY_HORIZON_R = 0.55;
+layout(constant_id = 7) const float SKY_HORIZON_G = 0.65;
+layout(constant_id = 8) const float SKY_HORIZON_B = 0.85;
+layout(constant_id = 9) const float SKY_GROUND_R = 0.17;
+layout(constant_id = 10) const float SKY_GROUND_G = 0.18;
+layout(constant_id = 11) const float SKY_GROUND_B = 0.19;
+layout(constant_id = 12) const float SKY_SUN_R = 1.0;
+layout(constant_id = 13) const float SKY_SUN_G = 0.95;
+layout(constant_id = 14) const float SKY_SUN_B = 0.85;
+layout(constant_id = 15) const float SKY_INTENSITY = 1.0;
+layout(constant_id = 16) const float SUN_GLOW = 0.6;
+layout(constant_id = 18) const float FOG_DENSITY = 0.010; // exp distance fog, per metre
+
+const vec3 SUN_RADIANCE = vec3(SUN_RADIANCE_R, SUN_RADIANCE_G, SUN_RADIANCE_B);
 
 // Analytic procedural sky (stand-in for a precomputed IBL cubemap). Linear HDR.
-// NOTE: these constants + the soft-glow term must stay in sync with sky.frag.
-// The only intended difference is that sky.frag (the visible background) also
-// adds a sharp sun disk, which this reflection path deliberately omits.
-// SKY_GROUND tracks the level ground material tone so downward reflections match.
-const vec3 SKY_ZENITH = vec3(0.10, 0.22, 0.55);
-const vec3 SKY_HORIZON = vec3(0.55, 0.65, 0.85);
-const vec3 SKY_GROUND = vec3(0.17, 0.18, 0.19);
-const vec3 SUN_COLOR = vec3(1.0, 0.95, 0.85);
-const float SKY_INTENSITY = 1.0;
+// NOTE: the palette comes from the same constants as sky.frag, but the sky()
+// below must stay in step with sky.frag's by hand. The only intended difference
+// is that sky.frag (the visible background) also adds a sharp sun disk, which
+// this reflection path deliberately omits.
+const vec3 SKY_ZENITH = vec3(SKY_ZENITH_R, SKY_ZENITH_G, SKY_ZENITH_B);
+const vec3 SKY_HORIZON = vec3(SKY_HORIZON_R, SKY_HORIZON_G, SKY_HORIZON_B);
+const vec3 SKY_GROUND = vec3(SKY_GROUND_R, SKY_GROUND_G, SKY_GROUND_B);
+const vec3 SUN_COLOR = vec3(SKY_SUN_R, SKY_SUN_G, SKY_SUN_B);
 
 vec3 sky(vec3 d) {
     vec3 sundir = normalize(-pc.light_dir.xyz);
@@ -97,7 +117,7 @@ vec3 sky(vec3 d) {
     // Soft glow only (the direct sun is a separate analytic light; a sharp disk
     // here would double-count on smooth metals). Coefficient matches sky.frag's
     // glow so a reflection shows the same haze the background sky does.
-    col += SUN_COLOR * pow(s, 16.0) * 0.6;
+    col += SUN_COLOR * pow(s, 16.0) * SUN_GLOW;
     return col * SKY_INTENSITY;
 }
 // Cheap hemisphere-averaged irradiance (diffuse IBL).

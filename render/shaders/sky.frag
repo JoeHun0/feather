@@ -13,13 +13,30 @@ layout(push_constant) uniform Push {
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_color; // linear HDR
 
-// Palette + soft-glow term must stay in sync with mesh.frag's sky() (the IBL
-// reflection path). The extra sharp sun disk below is unique to the background.
-const vec3 SKY_ZENITH = vec3(0.10, 0.22, 0.55);
-const vec3 SKY_HORIZON = vec3(0.55, 0.65, 0.85);
-const vec3 SKY_GROUND = vec3(0.17, 0.18, 0.19);
-const vec3 SUN_COLOR = vec3(1.0, 0.95, 0.85);
-const float SKY_INTENSITY = 1.0;
+// The level's atmosphere (§13): the same specialization constants as
+// mesh.frag, which render::Environment fills. Defaults = Environment::default()
+// (a test checks). sky() must stay in step with mesh.frag's (the IBL reflection
+// path) by hand; the extra sharp sun disk is unique to the background.
+layout(constant_id = 3) const float SKY_ZENITH_R = 0.10;
+layout(constant_id = 4) const float SKY_ZENITH_G = 0.22;
+layout(constant_id = 5) const float SKY_ZENITH_B = 0.55;
+layout(constant_id = 6) const float SKY_HORIZON_R = 0.55;
+layout(constant_id = 7) const float SKY_HORIZON_G = 0.65;
+layout(constant_id = 8) const float SKY_HORIZON_B = 0.85;
+layout(constant_id = 9) const float SKY_GROUND_R = 0.17;
+layout(constant_id = 10) const float SKY_GROUND_G = 0.18;
+layout(constant_id = 11) const float SKY_GROUND_B = 0.19;
+layout(constant_id = 12) const float SKY_SUN_R = 1.0;
+layout(constant_id = 13) const float SKY_SUN_G = 0.95;
+layout(constant_id = 14) const float SKY_SUN_B = 0.85;
+layout(constant_id = 15) const float SKY_INTENSITY = 1.0;
+layout(constant_id = 16) const float SUN_GLOW = 0.6;
+layout(constant_id = 17) const float SUN_DISK = 60.0;
+
+const vec3 SKY_ZENITH = vec3(SKY_ZENITH_R, SKY_ZENITH_G, SKY_ZENITH_B);
+const vec3 SKY_HORIZON = vec3(SKY_HORIZON_R, SKY_HORIZON_G, SKY_HORIZON_B);
+const vec3 SKY_GROUND = vec3(SKY_GROUND_R, SKY_GROUND_G, SKY_GROUND_B);
+const vec3 SUN_COLOR = vec3(SKY_SUN_R, SKY_SUN_G, SKY_SUN_B);
 
 vec3 sky(vec3 d) {
     vec3 sundir = normalize(-pc.light_dir.xyz);
@@ -28,7 +45,7 @@ vec3 sky(vec3 d) {
     vec3 col = mix(SKY_HORIZON, SKY_ZENITH, pow(up, 0.5));
     col = mix(col, SKY_GROUND, down);
     float s = max(dot(d, sundir), 0.0);
-    col += SUN_COLOR * (pow(s, 4000.0) * 60.0 + pow(s, 16.0) * 0.6); // disk + glow
+    col += SUN_COLOR * (pow(s, 4000.0) * SUN_DISK + pow(s, 16.0) * SUN_GLOW); // disk + glow
     return col * SKY_INTENSITY;
 }
 

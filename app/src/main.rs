@@ -42,8 +42,8 @@ use feather_assets::MeshData;
 use feather_gfx::{GpuTimes, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use feather_platform::winit;
 use feather_render::{
-    CascadeSetup, ClusterView, FrameStats, FxaaPass, GpuLight, InstanceData, MeshId, MeshRenderer,
-    SkyPass, TonemapPass, UiPass,
+    CascadeSetup, ClusterView, Environment, FrameStats, FxaaPass, GpuLight, InstanceData, MeshId,
+    MeshRenderer, SkyPass, TonemapPass, UiPass,
 };
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
@@ -2197,6 +2197,104 @@ fn player_start(nodes: &[feather_assets::SceneNode]) -> (Vec3, Option<f32>) {
     (Vec3::new(0.0, GROUND_Y, 8.0), None)
 }
 
+/// The parameters an `environment` marker (§13, §18) may carry.
+const ENVIRONMENT_PARAMS: [&str; 13] = [
+    "sun_elevation",
+    "sun_azimuth",
+    "sun_color",
+    "sun_intensity",
+    "sky_zenith",
+    "sky_horizon",
+    "sky_ground",
+    "sky_sun_color",
+    "sky_intensity",
+    "sun_glow",
+    "sun_disk",
+    "fog_density",
+    "exposure",
+];
+
+/// The level's atmosphere (§13): the first `environment` marker's params over
+/// `Environment::default()`, which is also what a level without one gets.
+/// Like `player_start`, the marker is read before the world is built. Also
+/// returns the params it couldn't use, unknown or unreadable, to warn about.
+///
+/// The sun is placed by `sun_elevation` (degrees above the horizon) and
+/// `sun_azimuth` (degrees clockwise from north, -Z, seen from above: 90 is
+/// east, +X); give one and the other keeps the default sun's.
+fn environment(nodes: &[feather_assets::SceneNode]) -> (Environment, Vec<String>) {
+    let mut env = Environment::default();
+    let Some(spec) = nodes
+        .iter()
+        .filter_map(|n| n.prefab.as_ref())
+        .find(|s| s.id == "environment")
+    else {
+        return (env, Vec::new());
+    };
+    let mut bad: Vec<String> = spec
+        .params
+        .as_object()
+        .into_iter()
+        .flat_map(|o| o.keys())
+        .filter(|k| !ENVIRONMENT_PARAMS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    let has = |key: &str| spec.params.get(key).is_some();
+    let mut num = |key: &str, field: &mut f32| {
+        if has(key) {
+            match spec.f32(key) {
+                Some(v) => *field = v,
+                None => bad.push(key.to_string()),
+            }
+        }
+    };
+    let (mut elevation, mut azimuth) = sun_angles(env.sun_dir);
+    num("sun_elevation", &mut elevation);
+    num("sun_azimuth", &mut azimuth);
+    num("sun_intensity", &mut env.sun_intensity);
+    num("sky_intensity", &mut env.sky_intensity);
+    num("sun_glow", &mut env.sun_glow);
+    num("sun_disk", &mut env.sun_disk);
+    num("fog_density", &mut env.fog_density);
+    num("exposure", &mut env.exposure);
+    if has("sun_elevation") || has("sun_azimuth") {
+        env.sun_dir = sun_travel(elevation, azimuth);
+    }
+    let colours = [
+        ("sun_color", &mut env.sun_color),
+        ("sky_zenith", &mut env.sky_zenith),
+        ("sky_horizon", &mut env.sky_horizon),
+        ("sky_ground", &mut env.sky_ground),
+        ("sky_sun_color", &mut env.sky_sun_color),
+    ];
+    for (key, field) in colours {
+        if has(key) {
+            match spec.vec3(key) {
+                Some(v) => *field = v,
+                None => bad.push(key.to_string()),
+            }
+        }
+    }
+    (env, bad)
+}
+
+/// The elevation and azimuth (degrees, as `environment` takes them) of the
+/// sun whose light travels along `travel`.
+fn sun_angles(travel: Vec3) -> (f32, f32) {
+    let to_sun = -travel.normalize();
+    let elevation = to_sun.y.clamp(-1.0, 1.0).asin().to_degrees();
+    let azimuth = to_sun.x.atan2(-to_sun.z).to_degrees();
+    (elevation, azimuth)
+}
+
+/// The direction sunlight travels from a sun at `elevation` and `azimuth`
+/// (degrees, as `environment` takes them).
+fn sun_travel(elevation: f32, azimuth: f32) -> Vec3 {
+    let (se, ce) = elevation.to_radians().sin_cos();
+    let (sa, ca) = azimuth.to_radians().sin_cos();
+    -Vec3::new(ce * sa, se, -ce * ca)
+}
+
 /// Per-frame view data the render closures need. Carried as an `Option` so the
 /// main menu can skip the shadow and geometry passes entirely.
 #[derive(Clone, Copy)]
@@ -2226,6 +2324,9 @@ struct Session {
     /// pipelines it is the only thing that bakes `Renderer::samples()`, which is
     /// precisely why MSAA can change while no session exists.
     sky: SkyPass,
+    /// The level's atmosphere (§13). Baked into `mesh` and `sky`; the app
+    /// takes the sun direction and starting exposure from it.
+    environment: Environment,
     /// Per-mesh transform that centers + unit-scales it into the demo grid.
     /// Identity for scene meshes — a level must keep its authored size.
     fits: Vec<Mat4>,
@@ -2264,6 +2365,7 @@ impl Session {
             &b.materials,
             MAX_INSTANCES,
             bake_dir,
+            &b.environment,
         );
         mesh.set_lod_enabled(lod);
         // Where a session's load time goes (§17): parse + images + meshes, then
@@ -2276,7 +2378,7 @@ impl Session {
             t_renderer.as_secs_f32(),
             t_total.as_secs_f32(),
         );
-        let sky = SkyPass::new(renderer);
+        let sky = SkyPass::new(renderer, &b.environment);
 
         Self {
             world: b.world,
@@ -2284,6 +2386,7 @@ impl Session {
             player: b.player,
             mesh,
             sky,
+            environment: b.environment,
             fits: b.fits,
             mesh_spheres: b.mesh_spheres,
             accumulator: 0.0,
@@ -2306,6 +2409,8 @@ struct WorldBuild {
     materials: Vec<feather_assets::Material>,
     fits: Vec<Mat4>,
     mesh_spheres: Vec<(Vec3, f32)>,
+    /// The level's atmosphere (§13), from its `environment` marker.
+    environment: Environment,
     /// Time spent loading the scenes and bake, for the `[load]` line.
     t_scenes: std::time::Duration,
 }
@@ -2325,6 +2430,10 @@ fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> WorldBu
     });
     let t_scenes = t_start.elapsed();
     let (start_pos, start_yaw) = player_start(&scene_nodes);
+    let (environment, bad_params) = environment(&scene_nodes);
+    for key in bad_params {
+        eprintln!("[scene] environment: can't use param {key:?}; ignored");
+    }
     let (surfaces, unknown_surfaces) = mesh_surfaces(&meshes);
     for name in unknown_surfaces {
         eprintln!(
@@ -2461,8 +2570,13 @@ fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> WorldBu
     let colliders_before = world.resource::<Physics>().colliders.len();
     let mut spawned = 0usize;
     for node in &scene_nodes {
-        // `player_start` was consumed before the world was built.
-        if node.prefab.as_ref().is_some_and(|s| s.id == "player_start") {
+        // `player_start` and `environment` were consumed before the world
+        // was built.
+        if node
+            .prefab
+            .as_ref()
+            .is_some_and(|s| s.id == "player_start" || s.id == "environment")
+        {
             continue;
         }
         let mesh_idx = node.mesh;
@@ -2516,6 +2630,7 @@ fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> WorldBu
         materials,
         fits,
         mesh_spheres,
+        environment,
         t_scenes,
     }
 }
@@ -2537,7 +2652,7 @@ impl App {
             audio: audio_settings,
             audio_file,
         } = configs;
-        let light = Vec3::new(-0.4, -1.0, -0.3).normalize();
+        let light = Environment::default().sun_dir;
         Self {
             session: None,
             tonemap: None,
@@ -2742,6 +2857,11 @@ impl App {
             eprintln!("[audio] {} lamps humming", a.lamp_count());
         }
         self.steps = StepTracker::default();
+        // The level's sun and starting exposure (§13); its sky and fog are
+        // already baked into the session's pipelines.
+        let env = session.environment;
+        self.light_dir = env.sun_dir.extend(0.0);
+        self.exposure = env.exposure;
         self.session = Some(session);
         self.paused = false;
         self.menu.reset(MenuScreen::Root);
@@ -5232,6 +5352,98 @@ mod tests {
         assert_eq!(w.query::<&ColliderRef>().iter(&w).count(), 1);
     }
 
+    /// A level without an `environment` marker keeps the look every level had
+    /// before levels could choose one, and so does one whose marker is empty.
+    #[test]
+    fn a_level_without_an_environment_keeps_the_default_look() {
+        let prop = || node(Some("prop"), serde_json::json!({}));
+        assert_eq!(environment(&[prop()]), (Environment::default(), Vec::new()));
+        let empty = node(Some("environment"), serde_json::json!({}));
+        assert_eq!(
+            environment(&[prop(), empty]),
+            (Environment::default(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn an_environment_marker_sets_the_atmosphere() {
+        let marker = node(
+            Some("environment"),
+            serde_json::json!({
+                "sun_elevation": 90.0, "sun_azimuth": 0.0,
+                "sun_color": [1.0, 0.5, 0.25], "sun_intensity": 3.0,
+                "sky_zenith": [0.1, 0.2, 0.3], "sky_horizon": [0.4, 0.5, 0.6],
+                "sky_ground": [0.7, 0.8, 0.9], "sky_sun_color": [0.9, 0.9, 0.8],
+                "sky_intensity": 1.5, "sun_glow": 0.2, "sun_disk": 0.0,
+                "fog_density": 0.02, "exposure": 1.2,
+            }),
+        );
+        let (env, bad) = environment(&[marker]);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert!(
+            (env.sun_dir - Vec3::NEG_Y).length() < 1e-6,
+            "{:?}",
+            env.sun_dir
+        );
+        let want = Environment {
+            sun_dir: env.sun_dir,
+            sun_color: Vec3::new(1.0, 0.5, 0.25),
+            sun_intensity: 3.0,
+            sky_zenith: Vec3::new(0.1, 0.2, 0.3),
+            sky_horizon: Vec3::new(0.4, 0.5, 0.6),
+            sky_ground: Vec3::new(0.7, 0.8, 0.9),
+            sky_sun_color: Vec3::new(0.9, 0.9, 0.8),
+            sky_intensity: 1.5,
+            sun_glow: 0.2,
+            sun_disk: 0.0,
+            fog_density: 0.02,
+            exposure: 1.2,
+        };
+        assert_eq!(env, want);
+    }
+
+    /// Params left out keep their defaults; ones it doesn't know, or can't
+    /// read, are reported (for a warning) and change nothing.
+    #[test]
+    fn a_partial_environment_keeps_the_rest() {
+        let marker = node(
+            Some("environment"),
+            serde_json::json!({ "fog_density": 0.05, "fog": 1.0, "sky_zenith": "grey" }),
+        );
+        let (env, mut bad) = environment(&[marker]);
+        bad.sort();
+        assert_eq!(bad, ["fog", "sky_zenith"]);
+        let want = Environment {
+            fog_density: 0.05,
+            ..Default::default()
+        };
+        assert_eq!(env, want);
+    }
+
+    /// Elevation is above the horizon and azimuth clockwise from north (-Z),
+    /// seen from above; the direction is the way the light *travels*, away
+    /// from the sun. Giving one angle keeps the default sun's other one.
+    #[test]
+    fn the_sun_is_placed_by_elevation_and_azimuth() {
+        let close = |a: Vec3, b: Vec3| (a - b).length() < 1e-5;
+        assert!(close(sun_travel(90.0, 123.0), Vec3::NEG_Y));
+        assert!(close(sun_travel(0.0, 0.0), Vec3::Z)); // sun in the north
+        assert!(close(sun_travel(0.0, 90.0), Vec3::NEG_X)); // sun in the east
+        let d = Environment::default().sun_dir;
+        let (el, az) = sun_angles(d);
+        assert!(close(sun_travel(el, az), d));
+        let marker = node(
+            Some("environment"),
+            serde_json::json!({ "sun_elevation": 10.0 }),
+        );
+        let (env, _) = environment(&[marker]);
+        let (el2, az2) = sun_angles(env.sun_dir);
+        assert!(
+            (el2 - 10.0).abs() < 1e-3 && (az2 - az).abs() < 1e-3,
+            "{el2} {az2}"
+        );
+    }
+
     #[test]
     fn player_start_marker_places_the_player() {
         let marker = feather_assets::SceneNode {
@@ -5530,6 +5742,39 @@ mod tests {
         let (steps, surfaces) = walk_pad_level(write_pad_level(&dir, &tags));
         assert_eq!(surfaces, "2 concrete, 1 grass, 1 wood, 1 carpet, 1 snow");
         check_steps(&steps, &pads.map(|p| p.2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A level's `environment` marker reaches the session through the game's
+    /// own build, which the renderer then bakes in (§13); without it, the
+    /// same level gets the default look.
+    #[test]
+    fn a_levels_environment_reaches_the_world_build() {
+        let dir = crate::config::test_dir("e2e-environment");
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = write_pad_level(&dir, &[("plain", None)]);
+        let b = build_world(std::slice::from_ref(&plain), None);
+        assert_eq!(b.environment, Environment::default());
+
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&plain).unwrap()).unwrap();
+        let nodes = doc["nodes"].as_array_mut().unwrap();
+        nodes.push(serde_json::json!({
+            "extras": { "prefab": "environment", "params": { "fog_density": 0.03, "sun_disk": 0.0 } },
+        }));
+        let marker = nodes.len() - 1;
+        doc["scenes"][0]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(marker.into());
+        std::fs::write(&plain, doc.to_string()).unwrap();
+        let b = build_world(&[plain], None);
+        let want = Environment {
+            fog_density: 0.03,
+            sun_disk: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(b.environment, want);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

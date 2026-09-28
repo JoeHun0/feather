@@ -10,6 +10,7 @@ use ash::vk;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::environment::{Environment, Specialization};
 use feather_assets::bake::{
     baked_path, texture_key, BakedMesh, BakedTexture, TexKind, MIN_LOD_TRIS, TEX_DIR,
 };
@@ -421,6 +422,7 @@ impl MeshRenderer {
         materials: &[Material],
         max_instances: u32,
         bake_dir: Option<&std::path::Path>,
+        env: &Environment,
     ) -> (Self, Vec<MeshId>) {
         let device = renderer.device();
 
@@ -817,6 +819,9 @@ impl MeshRenderer {
 
         let vert = load_shader(&device, spv!("mesh.vert"));
         let frag = load_shader(&device, spv!("mesh.frag"));
+        // The level's sky, sun and fog, baked in (§13).
+        let spec = Specialization::new(env);
+        let spec_info = spec.info();
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -825,7 +830,8 @@ impl MeshRenderer {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(frag)
-                .name(c"main"),
+                .name(c"main")
+                .specialization_info(&spec_info),
         ];
 
         let vbindings = [vk::VertexInputBindingDescription::default()

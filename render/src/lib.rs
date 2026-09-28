@@ -1,10 +1,12 @@
 //! Render: frame graph, passes, pipelines, the RenderFrame consumer.
 
+mod environment;
 mod fxaa;
 mod mesh;
 mod sky;
 mod tonemap;
 mod ui;
+pub use environment::Environment;
 pub use fxaa::FxaaPass;
 pub use mesh::{
     CascadeSetup, ClusterView, FrameStats, GpuLight, InstanceData, MeshId, MeshRenderer, MAX_LIGHTS,
