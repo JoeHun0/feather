@@ -35,6 +35,12 @@ What is in it
   stacks, utility boxes and pipework on the walls, a compressor, a covered car
   in the hangar, and the kit's three assembled electricity poles in lines
   outside the fence.
+* Cutouts (ARCHITECTURE.md §5): ~600 grass tufts on the mud, three crossed
+  cards each, from a texture this script draws, and a rusty chain-link
+  enclosure round the compressor, from ambientCG's Fence006. glTF takes a
+  cutout's alpha from the base colour, so the fence's colour and opacity maps
+  are merged into one RGBA PNG (a stdlib decoder; the result is cached beside
+  the pack).
 * Dim warm lamps in the hangar and the office, `player_start` outside the
   gate, and the overcast `environment`.
 
@@ -59,7 +65,9 @@ import argparse
 import math
 import os
 import random
+import struct
 import sys
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gen_detailscene as gds  # noqa: E402  (Level: glTF writing, model import)
@@ -138,6 +146,17 @@ ENVIRONMENT = {
 LAMP = {"color": [1.0, 0.78, 0.5], "intensity": 10.0, "radius": 12.0,
         "source_radius": 0.1}
 
+# Alpha cutout (ARCHITECTURE.md §5). A chain-link enclosure round the
+# compressor, from ambientCG's Fence006 (rusty diamond mesh), and grass tufts
+# on the mud from a texture this script draws.
+FENCE_PACK = os.path.join(ASSETS, "ambientcg_Fence006")
+FENCE_MAPS = "Fence006_1K-PNG"
+CHAINLINK_TILE = 1.0  # metres per texture repeat
+ENCLOSURE = (16.8, 23.2, -6.2, 0.2)  # x0, x1, z0, z1
+ENCLOSURE_BAY, ENCLOSURE_HEIGHT = 3.2, 2.0
+GRASS_TUFTS = 600
+GRASS_TUFT = (0.9, 0.55)  # width, height of each of a tuft's three cards
+
 FACES = {
     # face: (normal, the two in-plane axes (u, v) for UVs, as axis indices)
     "+x": ((1, 0, 0), (2, 1)), "-x": ((-1, 0, 0), (2, 1)),
@@ -208,6 +227,62 @@ class Zone(gds.Level):
             self.mats[key] = len(self.doc["materials"]) - 1
         return self.mats[key]
 
+    def _png(self, data, key):
+        if key not in self.textures:
+            self.doc["images"].append({"bufferView": self._view(data), "mimeType": "image/png"})
+            self.doc["textures"].append({"source": len(self.doc["images"]) - 1})
+            self.textures[key] = len(self.doc["textures"]) - 1
+        return self.textures[key]
+
+    def cutout_material(self, key, base_png, normal_png=None, metallic=0.0, roughness=0.9,
+                        surface=None):
+        """A double-sided MASK material (§5) from an RGBA base colour."""
+        if key not in self.mats:
+            m = {
+                "name": key,
+                "pbrMetallicRoughness": {
+                    "baseColorTexture": {"index": self._png(base_png, key + "/base")},
+                    "metallicFactor": metallic,
+                    "roughnessFactor": roughness,
+                },
+                "alphaMode": "MASK",
+                "alphaCutoff": 0.5,
+                "doubleSided": True,
+            }
+            if normal_png is not None:
+                m["normalTexture"] = {"index": self._png(normal_png, key + "/normal")}
+            if surface:
+                m["extras"] = {"surface": surface}
+            self.doc["materials"].append(m)
+            self.mats[key] = len(self.doc["materials"]) - 1
+        return self.mats[key]
+
+    def cards(self, quads, material, name):
+        """One mesh of flat double-sided quads, one primitive. Each quad is
+        (origin, u axis, v axis, uv scale): corners origin, +u, +u+v, +v, with
+        UV (0,1)..(s,1-t) so the texture stands upright."""
+        pos, nrm, uv, idx = [], [], [], []
+        for o, u, v, (su, sv) in quads:
+            n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]
+            ln = math.sqrt(sum(c * c for c in n))
+            n = [c / ln for c in n]
+            base = len(pos)
+            for a, b in ((0, 0), (1, 0), (1, 1), (0, 1)):
+                pos.append([o[i] + a * u[i] + b * v[i] for i in range(3)])
+                nrm.append(n)
+                uv.append([a * su, 1.0 - b * sv])
+            idx += [base, base + 1, base + 2, base, base + 2, base + 3]
+        self.doc["meshes"].append({"name": name, "primitives": [{
+            "attributes": {
+                "POSITION": self._accessor(pos, "f", "VEC3", 5126, 34962, minmax=True),
+                "NORMAL": self._accessor(nrm, "f", "VEC3", 5126, 34962),
+                "TEXCOORD_0": self._accessor(uv, "f", "VEC2", 5126, 34962),
+            },
+            "indices": self._accessor(idx, "I", "SCALAR", 5125, 34963),
+            "material": material,
+        }]})
+        return len(self.doc["meshes"]) - 1
+
     # --- boxes -------------------------------------------------------------
 
     def _box_mesh(self, lo, hi, mats, uv_origin, name):
@@ -250,12 +325,14 @@ class Zone(gds.Level):
         self.doc["meshes"].append({"name": name, "primitives": prims})
         return len(self.doc["meshes"]) - 1
 
-    def place(self, mesh, t, rot=None, extras=None, name="node"):
+    def place(self, mesh, t, rot=None, extras=None, name="node", scale=None):
         n = {"name": name, "translation": [float(c) for c in t]}
         if mesh is not None:
             n["mesh"] = mesh
         if rot is not None:
             n["rotation"] = [float(c) for c in rot]
+        if scale is not None:
+            n["scale"] = [float(scale)] * 3
         if extras:
             n["extras"] = extras
         self.doc["nodes"].append(n)
@@ -291,11 +368,15 @@ class Zone(gds.Level):
         return self.model(key, path=PROPS.get(key, kw.pop("path", None)), **kw)
 
     def put(self, key, x, z, floor=MUD_TOP, rot=None, extras=None, lift=0.0, check=True):
-        """Place prop `key` at (x, z), seated on `floor` (its rotated bounds'
-        bottom on it). Returns False, placing nothing, if it would overlap
-        something solid (when `check`)."""
+        """Place prop `key` with its rotated bounds centred on (x, z), seated
+        on `floor` (the bounds' bottom on it). Centred on the bounds, not the
+        origin: some models sit metres from theirs (the compressor, ~4 m).
+        Returns False, placing nothing, if it would overlap something solid
+        (when `check`)."""
         m = self.prop(key)
-        aabb = gts.node_aabb((m["lo"], m["hi"]), (x, 0.0, z), rot)
+        aabb = gts.node_aabb((m["lo"], m["hi"]), (0.0, 0.0, 0.0), rot)
+        x -= (aabb[0][0] + aabb[1][0]) / 2
+        z -= (aabb[0][2] + aabb[1][2]) / 2
         y = floor + lift - aabb[0][1]
         aabb = gts.node_aabb((m["lo"], m["hi"]), (x, y, z), rot)
         if check and any(gts.overlaps(aabb, s, 0.02) for s in self.solid):
@@ -489,7 +570,7 @@ def props(z):
         count("barrier", z.put("barrier", x, zz, rot=yaw_q(yaw), floor=MUD_TOP))
     # Barrel clusters: yard, behind the hangar, inside it.
     for cx, cz, floor in ((-20.0, 18.0, MUD_TOP), (10.0, 19.0, PAVE_TOP),
-                          (-4.0, -14.0, MUD_TOP), (22.0, -6.0, MUD_TOP),
+                          (-4.0, -14.0, MUD_TOP), (24.8, -8.6, MUD_TOP),
                           (-9.5, -6.5, PAVE_TOP), (9.0, 10.0, PAVE_TOP)):
         for _ in range(rng.randint(3, 6)):
             key = rng.choice(("barrel_a", "barrel_b"))
@@ -532,6 +613,189 @@ def props(z):
     return counts
 
 
+# --- alpha cutout ------------------------------------------------------------
+
+def png_decode(path):
+    """An 8-bit, non-interlaced PNG as (width, height, channels, rows), rows
+    being bytearrays. Stdlib only, like gen_testscene's encoder."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError(f"{path}: not a PNG")
+    pos, idat, head = 8, [], None
+    while pos < len(data):
+        n, tag = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + n]
+        pos += 12 + n
+        if tag == b"IHDR":
+            head = struct.unpack(">IIBBBBB", body)
+        elif tag == b"IDAT":
+            idat.append(body)
+        elif tag == b"IEND":
+            break
+    w, h, depth, ctype, _, _, interlace = head
+    if depth != 8 or interlace:
+        raise ValueError(f"{path}: only 8-bit non-interlaced PNGs are supported")
+    ch = {0: 1, 2: 3, 4: 2, 6: 4}[ctype]
+    raw = zlib.decompress(b"".join(idat))
+    stride = w * ch
+    rows, prev, i = [], bytearray(stride), 0
+    for _ in range(h):
+        f, line = raw[i], bytearray(raw[i + 1:i + 1 + stride])
+        i += 1 + stride
+        if f == 1:
+            for x in range(ch, stride):
+                line[x] = (line[x] + line[x - ch]) & 255
+        elif f == 2:
+            for x in range(stride):
+                line[x] = (line[x] + prev[x]) & 255
+        elif f == 3:
+            for x in range(stride):
+                left = line[x - ch] if x >= ch else 0
+                line[x] = (line[x] + ((left + prev[x]) >> 1)) & 255
+        elif f == 4:
+            for x in range(stride):
+                a = line[x - ch] if x >= ch else 0
+                b = prev[x]
+                c = prev[x - ch] if x >= ch else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pred = a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+                line[x] = (line[x] + pred) & 255
+        rows.append(line)
+        prev = line
+    return w, h, ch, rows
+
+
+def chainlink_rgba():
+    """Fence006's colour with its opacity as alpha, one RGBA PNG: glTF takes
+    a cutout's alpha from the base colour. Cached beside the pack."""
+    cached = os.path.join(FENCE_PACK, "merged_rgba.png")
+    if os.path.exists(cached):
+        with open(cached, "rb") as f:
+            return f.read()
+    w, h, ch, color = png_decode(os.path.join(FENCE_PACK, f"{FENCE_MAPS}_Color.png"))
+    w2, h2, ch2, alpha = png_decode(os.path.join(FENCE_PACK, f"{FENCE_MAPS}_Opacity.png"))
+    if (w, h, ch, ch2) != (w2, h2, 3, 1):
+        raise ValueError("Fence006: expected RGB colour and grey opacity of one size")
+    rows = []
+    for c, a in zip(color, alpha):
+        row = bytearray(w * 4)
+        row[0::4], row[1::4], row[2::4] = c[0::3], c[1::3], c[2::3]
+        row[3::4] = a
+        rows.append(row)
+    data = gts.png_rgba(w, h, rows)
+    with open(cached, "wb") as f:
+        f.write(data)
+    return data
+
+
+def grass_rgba(rng, size=256, blades=46):
+    """A grass card: tapered, gently bent blades from the bottom edge, from a
+    dark base to dry yellow-green tips, alpha 0 between them. Transparent
+    texels carry a mid grass colour, not black: mips average colour across the
+    cut edge too, and black would fringe the blades at a distance."""
+    fill = (92, 88, 48, 0)
+    px = [[list(fill) for _ in range(size)] for _ in range(size)]
+    for _ in range(blades):
+        x0 = rng.uniform(0.08, 0.92) * size
+        height = rng.uniform(0.45, 0.98) * size
+        width = rng.uniform(2.5, 6.0)
+        bend = rng.uniform(-0.25, 0.25) * height
+        tip = rng.choice([(150, 146, 78), (118, 128, 58), (160, 150, 92), (96, 112, 50)])
+        base = (52, 50, 26)
+        steps = int(height)
+        for k in range(steps):
+            t = k / max(1, steps - 1)
+            y = size - 1 - k
+            cx = x0 + bend * t * t
+            half = width * (1.0 - t) / 2 + 0.5
+            col = [int(b + (c - b) * t) for b, c in zip(base, tip)]
+            for x in range(int(cx - half), int(cx + half) + 1):
+                if 0 <= x < size:
+                    px[y][x] = col + [255]
+    rows = [bytearray(v for p in row for v in p) for row in px]
+    return gts.png_rgba(size, size, rows)
+
+
+def enclosure(z):
+    """Chain-link round the compressor: rusty posts, double-sided cutout
+    panels (they collide, as flat boxes), a gap on the west as its gate."""
+    mat = z.cutout_material("chainlink", chainlink_rgba(),
+                            open(os.path.join(FENCE_PACK, f"{FENCE_MAPS}_NormalGL.png"), "rb").read(),
+                            metallic=0.6, roughness=0.6)
+    w, h = ENCLOSURE_BAY, ENCLOSURE_HEIGHT
+    tile = (w / CHAINLINK_TILE, h / CHAINLINK_TILE)
+    panel = z.cards([((-w / 2, 0.0, 0.0), (w, 0.0, 0.0), (0.0, h, 0.0), tile)], mat, "chainlink")
+    post = z.local_box((0.08, h + 0.2, 0.08), "rust", "chainlink_post")
+    x0, x1, z0, z1 = ENCLOSURE
+    extras = {"prefab": "prop", "params": {"collider": "box"}}
+    bays = []  # (centre x, centre z, yaw)
+    for i in range(round((x1 - x0) / w)):
+        cx = x0 + (i + 0.5) * w
+        bays += [(cx, z0, 0.0), (cx, z1, 0.0)]
+    for i in range(round((z1 - z0) / w)):
+        cz = z0 + (i + 0.5) * w
+        bays += [(x1, cz, 90.0)]
+        # West: only the northern bay; the southern one is the gate.
+        if i == 0:
+            bays += [(x0, cz, 90.0)]
+    posts = set()
+    for cx, cz, yaw in bays:
+        z.place(panel, (cx, MUD_TOP + 0.05, cz), yaw_q(yaw), extras, name="chainlink")
+        for s in (-1, 1):
+            p = (cx + s * w / 2, cz) if yaw == 0.0 else (cx, cz + s * w / 2)
+            posts.add((round(p[0], 3), round(p[1], 3)))
+    for px, pz in sorted(posts):
+        z.place(post, (px, MUD_TOP + (h + 0.2) / 2, pz), None, extras, name="chainlink_post")
+    # Solid for the props: the panel lines.
+    t = 0.3
+    for lo, hi in (((x0 - t, G, z0 - t), (x1 + t, G + 3, z0 + t)),
+                   ((x0 - t, G, z1 - t), (x1 + t, G + 3, z1 + t)),
+                   ((x0 - t, G, z0 - t), (x0 + t, G + 3, z1 + t)),
+                   ((x1 - t, G, z0 - t), (x1 + t, G + 3, z1 + t))):
+        z.solid.append((list(lo), list(hi)))
+
+
+def grass(z):
+    """Tufts of three crossed cards on the mud, clear of paving, buildings,
+    the fence lines and every prop. They cast shadows but don't collide."""
+    rng = z.rng
+    mat = z.cutout_material("grass_card", grass_rgba(rng), surface="grass")
+    w, h = GRASS_TUFT
+    quads = []
+    for a in (0.0, 60.0, 120.0):
+        c, s_ = math.cos(math.radians(a)), math.sin(math.radians(a))
+        quads.append(((-c * w / 2, 0.0, -s_ * w / 2), (c * w, 0.0, s_ * w), (0.0, h, 0.0), (1.0, 1.0)))
+    tuft = z.cards(quads, mat, "grass_tuft")
+    hx0, hx1, hz0, hz1 = HANGAR
+    ox0, ox1, oz0, oz1 = OFFICE
+    fx0, fx1, fz0, fz1 = FENCE
+    keep_off = [  # (x0, x1, z0, z1), with a margin
+        (hx0 - 0.6, hx1 + 0.6, hz0 - 0.6, hz1 + 0.6),
+        (ox0 - 0.6, ox1 + 0.6, oz0 - 0.6, oz1 + 0.6),
+        (GATE[0] - 0.4, GATE[1] + 0.4, hz1, HALF),  # the road
+        (-16.4, 16.4, hz1, 22.4),  # the aprons
+    ] + [(fx - 0.5, fx + 0.5, fz0 - 0.5, fz1 + 0.5) for fx in (fx0, fx1)] \
+      + [(fx0 - 0.5, fx1 + 0.5, fz - 0.5, fz + 0.5) for fz in (fz0, fz1)]
+    placed = 0
+    for _ in range(GRASS_TUFTS * 4):
+        if placed == GRASS_TUFTS:
+            break
+        x, zz = rng.uniform(-HALF + 1, HALF - 1), rng.uniform(-HALF + 1, HALF - 1)
+        if any(a <= x <= b and c <= zz <= d for a, b, c, d in keep_off):
+            continue
+        scale = rng.uniform(0.7, 1.35)
+        r = w * scale / 2
+        aabb = ([x - r, MUD_TOP, zz - r], [x + r, MUD_TOP + h * scale, zz + r])
+        if any(gts.overlaps(aabb, s_, 0.05) for s_ in z.solid):
+            continue
+        z.place(tuft, (x, MUD_TOP, zz), yaw_q(rng.uniform(0, 360)),
+                {"prefab": "prop", "params": {"collide": False}}, name="grass", scale=scale)
+        placed += 1
+    return placed
+
+
 def markers(z):
     lamp = {"prefab": "point_light", "params": LAMP}
     for x, y, zz in ((-6.0, 6.8, 0.0), (6.0, 6.8, 6.0),
@@ -549,7 +813,9 @@ def build(seed):
     hangar(z)
     office(z)
     fence(z)
+    enclosure(z)
     counts = props(z)
+    counts["grass"] = grass(z)
     markers(z)
     return z, counts
 
@@ -563,6 +829,8 @@ def main():
     needed = [os.path.join(ASSETS, p) for p in PROPS.values()]
     needed += [os.path.join(ASSETS, f"polyhaven_{pid}", f"{pid}_arm_2k.jpg")
                for pid, _, _ in TEXTURES.values()]
+    needed += [os.path.join(FENCE_PACK, f"{FENCE_MAPS}_{m}.png")
+               for m in ("Color", "Opacity", "NormalGL")]
     missing = [p for p in needed if not os.path.exists(p)]
     if missing:
         print(f"missing {len(missing)} asset files (e.g. {missing[0]}): "

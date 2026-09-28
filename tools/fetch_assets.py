@@ -135,6 +135,22 @@ PACKS = {
              "7c75ce52a121de1fc00422672584f757"),
         ],
     },
+    # Rusty diamond chain-link for the compound's enclosure (alpha cutout,
+    # ARCHITECTURE.md §5). Pinned by the SHA-256 of the archive as downloaded
+    # on 2026-09-28 (ambientCG publishes no hash). Only the colour, opacity
+    # and OpenGL-convention normal maps are kept; gen_zonescene.py merges the
+    # first two into one RGBA image.
+    "ambientcg_Fence006": {
+        "title": "ambientCG Fence006 (1K PNG)",
+        "url": "https://ambientcg.com/get?file=Fence006_1K-PNG.zip",
+        "sha256": "ee3177f83ca25a99aa765a324ca2773f37a4dbc0f3cd6bb6def3a08fecc7d492",
+        "license": "CC0 1.0, per ambientcg.com/license",
+        "keep": [
+            "Fence006_1K-PNG_Color.png",
+            "Fence006_1K-PNG_Opacity.png",
+            "Fence006_1K-PNG_NormalGL.png",
+        ],
+    },
     # The industrial compound (tools/gen_zonescene.py, ARCHITECTURE.md §21):
     # tiling textures at 2K as diffuse + GL normal + ARM (AO/roughness/metal,
     # the channel layout glTF's metallicRoughnessTexture reads; a greyscale

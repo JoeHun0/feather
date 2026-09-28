@@ -1827,9 +1827,20 @@ and punctuation.
     passes, nothing stuck, and the footsteps were concrete, then grass on the
     mud. Walking it into one of the app's boxes, as a negative control,
     registered as stuck.
+  - **Cutout content** (§5): 600 grass tufts (three crossed cards each, a
+    procedural texture) on the mud, and a rusty chain-link enclosure round
+    the compressor from ambientCG's Fence006 (CC0). glTF wants the cut in
+    the base colour's alpha, so the generator merges the fence's colour and
+    opacity maps into one RGBA PNG with a stdlib PNG decoder, cached beside
+    the pack. A cold run, merge included, takes the same 1.7 s as a warm one;
+    I'd expected the pure-Python decode to be slow. The enclosure's panels block the player (a harness walked into
+    one and stopped 0.37 m short, and walked through the gate bay).
+    - `put()` now centres each prop's *bounds* on its spot, not its origin:
+      the compressor's origin is ~4 m from its geometry, which the enclosure
+      exposed.
   - **Known look limits:** the ambient light isn't occluded, so interiors are
-    too bright; there's no alpha cutout, so no grass, chain-link or leafy
-    trees; and shadows are sharp even under an overcast sky (no PCSS).
+    too bright; there are no leafy trees yet; and shadows are sharp even
+    under an overcast sky (no PCSS).
 - **RenderDoc:** in-application API, capture on a keybind.
 - **Object naming:** `vkSetDebugUtilsObjectName` on buffers/images/pipelines
   from the start (readable validation + captures).

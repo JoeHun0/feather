@@ -373,7 +373,7 @@ and uploaded once however many materials share it.
 ### An industrial compound — the STALKER look
 
 ```bash
-python3 tools/fetch_assets.py                          # also fetches ~101 MB of Poly Haven textures and props
+python3 tools/fetch_assets.py                          # also fetches ~101 MB of Poly Haven textures and props, and a 9 MB ambientCG fence
 python3 tools/gen_zonescene.py --check                 # writes scratch/zone.glb
 cargo run --release -p feather-bake -- scratch/zone.glb   # optional: LODs + BC7, loads in ~0.4 s
 cargo run -- scratch/zone.glb
@@ -398,8 +398,12 @@ electricity poles. You spawn on the road outside the gate, facing it.
   under the mud. (The orb demo's brown boxes don't appear in loaded scenes.)
 - **Options:** `--seed N` (props, missing fence panels, roof holes), `-o PATH`,
   `--check`.
+- **Cutouts:** grass tufts on the mud, and a rusty chain-link enclosure round
+  the compressor (ambientCG's Fence006, CC0, SHA-256 pinned). The first run
+  merges the fence's colour and opacity maps into
+  `scratch/assets/ambientcg_Fence006/merged_rgba.png`; later runs reuse it.
 - **Known limits:** interiors look too bright (no ambient occlusion yet), and
-  there is no grass or foliage (no alpha cutout yet).
+  there are no leafy trees yet.
 
 ### Baking — `feather-bake`
 
