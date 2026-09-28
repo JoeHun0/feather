@@ -82,6 +82,8 @@ const TIMESTAMPS_PER_FRAME: u32 = 14;
 /// R32F because the passes write them as storage images, and it's on the
 /// mandatory storage-format list (R16F and R8 aren't).
 const AO_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
+/// GTAO's point-sampled depth levels (§13): ½ to 1/16 of the window.
+pub const AO_DEPTH_LEVELS: usize = 4;
 
 /// A GPU buffer that frees itself (and its allocation) on drop.
 pub struct Buffer {
@@ -212,6 +214,27 @@ impl Drop for BloomChain {
     }
 }
 
+/// GTAO's depth levels (§13): one R32F image whose mip `k - 1` holds level
+/// `k`, full-resolution pixel `2^k·g` at texel `g`. Each level needs its own
+/// view to be written.
+struct AoDepth {
+    /// Owns the image; its view spans every level, for the gtao pass.
+    image: Image,
+    level_views: [vk::ImageView; AO_DEPTH_LEVELS],
+    device: Device,
+}
+
+impl Drop for AoDepth {
+    fn drop(&mut self) {
+        // Before `image` drops and takes the allocation with it.
+        unsafe {
+            for &v in &self.level_views {
+                self.device.destroy_image_view(v, None);
+            }
+        }
+    }
+}
+
 /// The cascaded sun shadow map (§11): one depth image with `SHADOW_CASCADES`
 /// array layers.
 ///
@@ -276,6 +299,8 @@ pub struct Renderer {
     ao_raw: Option<Image>,
     ao_half: Option<Image>,
     ao: Option<Image>,
+    // GTAO's depth levels (§13), point samples for its longer steps.
+    ao_depth: Option<AoDepth>,
     // Nearest, clamp-to-edge: for images read with texelFetch/textureGather.
     nearest_sampler: vk::Sampler,
     // Bumped each time the window-sized targets are recreated, so passes that
@@ -508,9 +533,10 @@ impl Renderer {
         let bloom = create_bloom(&allocator, &device, sc.extent);
         let depth_resolve = (samples != vk::SampleCountFlags::TYPE_1)
             .then(|| create_depth(&allocator, &device, sc.extent, vk::SampleCountFlags::TYPE_1));
-        let ao_raw = create_ao(&allocator, &device, ao_half_extent(sc.extent));
-        let ao_half = create_ao(&allocator, &device, ao_half_extent(sc.extent));
-        let ao = create_ao(&allocator, &device, sc.extent);
+        let ao_raw = create_ao(&allocator, &device, ao_half_extent(sc.extent), 1);
+        let ao_half = create_ao(&allocator, &device, ao_half_extent(sc.extent), 1);
+        let ao = create_ao(&allocator, &device, sc.extent, 1);
+        let ao_depth = create_ao_depth(&allocator, &device, sc.extent);
         let nearest_sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -629,6 +655,7 @@ impl Renderer {
             ao_raw: Some(ao_raw),
             ao_half: Some(ao_half),
             ao: Some(ao),
+            ao_depth: Some(ao_depth),
             nearest_sampler,
             targets_generation: 0,
             ldr: Some(ldr),
@@ -821,6 +848,14 @@ impl Renderer {
         ]
     }
 
+    /// GTAO's depth levels (§13): a view of all `AO_DEPTH_LEVELS` (sampled
+    /// by the gtao pass), and one per level (written by the copy pass). In
+    /// `GENERAL` while the AO slot runs.
+    pub fn ao_depth_views(&self) -> (vk::ImageView, [vk::ImageView; AO_DEPTH_LEVELS]) {
+        let d = self.ao_depth.as_ref().expect("ao alive");
+        (d.image.view, d.level_views)
+    }
+
     /// A nearest, clamp-to-edge sampler, for images read with `texelFetch`
     /// or `textureGather`.
     pub fn nearest_sampler(&self) -> vk::Sampler {
@@ -828,7 +863,8 @@ impl Renderer {
     }
 
     /// Counts recreations of the window-sized targets (resize, MSAA): when it
-    /// changes, descriptors on `depth_sample_view` or `ao_views` are stale.
+    /// changes, descriptors on `depth_sample_view`, `ao_views` or
+    /// `ao_depth_views` are stale.
     pub fn targets_generation(&self) -> u64 {
         self.targets_generation
     }
@@ -1637,7 +1673,8 @@ impl Renderer {
         prepass: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         // Compute between the prepass and the main pass (§13's GTAO): it may
         // sample `depth_sample_view` (read-only depth layout) and write all
-        // the `ao_views` (GENERAL); the last is made visible to fragment
+        // the `ao_views` and `ao_depth_views` (GENERAL); the last `ao_views`
+        // is made visible to fragment
         // shaders.
         ao: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         // The lit pass and the sky, over the prepass's depth (loaded, tested,
@@ -2077,23 +2114,28 @@ impl Renderer {
                     ts_base + 12,
                 );
             }
-            // All three targets: UNDEFINED -> GENERAL. Shared across frames in
+            // All its targets: UNDEFINED -> GENERAL. Shared across frames in
             // flight, so wait for the previous frame's GTAO writes and main
             // pass reads (§21's rule). Done even with GTAO off: the main
             // pass's descriptor names this layout.
-            let (ao_raw, ao_half, ao_img) = (
+            let (ao_raw, ao_half, ao_img, ao_depth) = (
                 self.ao_raw.as_ref().expect("ao alive"),
                 self.ao_half.as_ref().expect("ao alive"),
                 self.ao.as_ref().expect("ao alive"),
+                self.ao_depth.as_ref().expect("ao alive"),
             );
-            let to_general = |image: vk::Image| {
+            let depth_levels = vk::ImageSubresourceRange {
+                level_count: AO_DEPTH_LEVELS as u32,
+                ..color_range
+            };
+            let to_general = |image: vk::Image, range| {
                 vk::ImageMemoryBarrier::default()
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::GENERAL)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(image)
-                    .subresource_range(color_range)
+                    .subresource_range(range)
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
             };
@@ -2105,9 +2147,10 @@ impl Renderer {
                 &[],
                 &[],
                 &[
-                    to_general(ao_raw.handle),
-                    to_general(ao_half.handle),
-                    to_general(ao_img.handle),
+                    to_general(ao_raw.handle, color_range),
+                    to_general(ao_half.handle, color_range),
+                    to_general(ao_img.handle, color_range),
+                    to_general(ao_depth.image.handle, depth_levels),
                 ],
             );
             ao(cmd, extent, frame);
@@ -2546,9 +2589,10 @@ impl Renderer {
             )
         });
         let half = ao_half_extent(extent);
-        self.ao_raw = Some(create_ao(self.allocator(), &self.device, half));
-        self.ao_half = Some(create_ao(self.allocator(), &self.device, half));
-        self.ao = Some(create_ao(self.allocator(), &self.device, extent));
+        self.ao_raw = Some(create_ao(self.allocator(), &self.device, half, 1));
+        self.ao_half = Some(create_ao(self.allocator(), &self.device, half, 1));
+        self.ao = Some(create_ao(self.allocator(), &self.device, extent, 1));
+        self.ao_depth = Some(create_ao_depth(self.allocator(), &self.device, extent));
         self.targets_generation += 1;
     }
 
@@ -2632,6 +2676,7 @@ impl Drop for Renderer {
             self.ao_raw.take();
             self.ao_half.take();
             self.ao.take();
+            self.ao_depth.take();
             self.ldr.take();
             self.bloom.take();
             self.shadow.take();
@@ -2825,7 +2870,12 @@ fn create_depth(
 
 /// One of GTAO's targets (§13): written as a storage image by its compute
 /// passes; the full-size one is then sampled by the main pass.
-fn create_ao(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::Extent2D) -> Image {
+fn create_ao(
+    allocator: &Arc<vk_mem::Allocator>,
+    device: &Device,
+    extent: vk::Extent2D,
+    levels: u32,
+) -> Image {
     let image_ci = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(AO_FORMAT)
@@ -2834,7 +2884,7 @@ fn create_ao(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::Ex
             height: extent.height.max(1),
             depth: 1,
         })
-        .mip_levels(1)
+        .mip_levels(levels)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
@@ -2853,7 +2903,7 @@ fn create_ao(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::Ex
         .subresource_range(vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
-            level_count: 1,
+            level_count: levels,
             base_array_layer: 0,
             layer_count: 1,
         });
@@ -2865,6 +2915,46 @@ fn create_ao(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::Ex
         handle: image,
         view,
         format: AO_FORMAT,
+    }
+}
+
+/// GTAO's depth levels (§13), for a window of `extent`. Level `k` needs
+/// `ceil(extent / 2^k)` texels, but a mip chain's sizes round down, so the
+/// base (level 1) is padded until the last level's does too. The gtao pass
+/// never reads the padding.
+fn create_ao_depth(
+    allocator: &Arc<vk_mem::Allocator>,
+    device: &Device,
+    extent: vk::Extent2D,
+) -> AoDepth {
+    let last = 1u32 << AO_DEPTH_LEVELS; // the last level's stride
+    let base = vk::Extent2D {
+        width: extent.width.max(1).div_ceil(last) * (last / 2),
+        height: extent.height.max(1).div_ceil(last) * (last / 2),
+    };
+    let image = create_ao(allocator, device, base, AO_DEPTH_LEVELS as u32);
+    let level_views = std::array::from_fn(|level| {
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image.handle)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(AO_FORMAT)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: level as u32,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        unsafe {
+            device
+                .create_image_view(&view_info, None)
+                .expect("ao depth view")
+        }
+    });
+    AoDepth {
+        image,
+        level_views,
+        device: device.clone(),
     }
 }
 

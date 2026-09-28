@@ -5,9 +5,11 @@
 // within AO_RADIUS, cosine-weighted, from the depth buffer alone.
 //
 // At half resolution: one thread per half-resolution texel h, which is the
-// full-resolution pixel 2h, read from the full-resolution depth (no
-// downsampled copy), so positions and steps stay exact. gtao_denoise.comp
-// blurs the half-resolution result and gtao_upsample.comp brings it back.
+// full-resolution pixel 2h, read from the full-resolution depth, so its
+// position and normal are exact. Steps longer than a few pixels read
+// gtao_depth.comp's point-sampled levels instead, which keeps them exact on
+// a plane too. gtao_denoise.comp blurs the half-resolution result and
+// gtao_upsample.comp brings it back.
 //
 // Per pixel, AO_SLICES planes through the view vector, each marched AO_STEPS
 // times both ways on screen for the highest horizon, then integrated
@@ -25,6 +27,8 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D u_depth;
 // Half resolution.
 layout(set = 0, binding = 1, r32f) uniform writeonly image2D u_raw;
+// gtao_depth.comp's levels 1 to AO_MIP_LEVELS, as mips 0 to AO_MIP_LEVELS - 1.
+layout(set = 0, binding = 4) uniform sampler2D u_mips;
 
 layout(push_constant) uniform Push {
     // x = near·r, y = r, with r = far / (near − far): distance = x / (depth + y).
@@ -42,6 +46,11 @@ const float AO_FALLOFF = 0.6;
 const float AO_MIN_RADIUS_PX = 2.0;
 const float AO_MAX_RADIUS_PX = 200.0;
 const float AO_MIN_STEP_PX = 1.3;
+// A step reads depth level floor(log2(length in pixels) - AO_MIP_OFFSET),
+// clamped to 0 (the depth itself) .. AO_MIP_LEVELS: its samples are spaced
+// about a tenth of its length apart (XeGTAO's rule).
+const int AO_MIP_LEVELS = 4;
+const float AO_MIP_OFFSET = 3.3;
 
 const float PI = 3.14159265359;
 const float HALF_PI = 1.57079632679;
@@ -75,16 +84,35 @@ vec3 depth_normal(ivec2 p, vec3 P) {
 }
 
 // The position at screen point `q` (pixels, centres on +0.5), with depth
-// interpolated between the four texels round it (clamped at the edges).
-// Depth is linear in screen space across a plane, so on one this is exact,
-// and a step lands on the surface *and* in its slice. Snapping to texel
-// centres instead turned the first, 1-2 px steps up to 20 degrees off the
-// slice, which raises horizons: a flat floor read 0.5% occluded on average
-// and 6% at worst, at any resolution.
-vec3 view_pos_at(vec2 q) {
-    vec4 g = textureGather(u_depth, q / vec2(g_size), 0);
-    vec2 f = fract(q - 0.5);
-    float depth = mix(mix(g.w, g.z, f.x), mix(g.x, g.y, f.x), f.y);
+// interpolated between the four texels of depth level `level` round it
+// (clamped at the edges). Level k's texel g is pixel 2^k g, so q lies at
+// texel coordinate (q - 0.5) / 2^k. Depth is linear in screen space across a
+// plane, and every level holds exact samples of it, so on one this is exact
+// at any level, and a step lands on the surface *and* in its slice. Snapping
+// to texel centres instead turned the first, 1-2 px steps up to 20 degrees
+// off the slice, which raises horizons: a flat floor read 0.5% occluded on
+// average and 6% at worst, at any resolution.
+vec3 view_pos_at(vec2 q, int level) {
+    float depth;
+    if (level == 0) {
+        vec4 g = textureGather(u_depth, q / vec2(g_size), 0);
+        vec2 f = fract(q - 0.5);
+        depth = mix(mix(g.w, g.z, f.x), mix(g.x, g.y, f.x), f.y);
+    } else {
+        // textureGather has no LOD, so four fetches.
+        vec2 c = (q - 0.5) / float(1 << level);
+        vec2 i = floor(c);
+        vec2 f = c - i;
+        ivec2 last = ((g_size + (1 << level) - 1) >> level) - 1;
+        ivec2 a = clamp(ivec2(i), ivec2(0), last);
+        ivec2 b = clamp(ivec2(i) + 1, ivec2(0), last);
+        int lod = level - 1;
+        float d00 = texelFetch(u_mips, a, lod).r;
+        float d10 = texelFetch(u_mips, ivec2(b.x, a.y), lod).r;
+        float d01 = texelFetch(u_mips, ivec2(a.x, b.y), lod).r;
+        float d11 = texelFetch(u_mips, b, lod).r;
+        depth = mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
+    }
     float dist = pc.proj.x / (depth + pc.proj.y);
     vec2 ndc = q / vec2(g_size) * 2.0 - 1.0;
     return vec3(ndc * pc.proj.zw * dist, dist);
@@ -166,9 +194,11 @@ void main() {
         for (int j = 0; j < AO_STEPS; ++j) {
             float t = (float(j) + step_noise) / float(AO_STEPS);
             t = t * t + min_step;
-            vec2 off = dir * (t * radius_px);
-            vec3 d0 = view_pos_at(centre + off) - P;
-            vec3 d1 = view_pos_at(centre - off) - P;
+            float step_px = t * radius_px;
+            int level = clamp(int(floor(log2(step_px) - AO_MIP_OFFSET)), 0, AO_MIP_LEVELS);
+            vec2 off = dir * step_px;
+            vec3 d0 = view_pos_at(centre + off, level) - P;
+            vec3 d1 = view_pos_at(centre - off, level) - P;
             float l0 = length(d0);
             float l1 = length(d1);
             float w0 = clamp(l0 * falloff_mul + falloff_add, 0.0, 1.0);

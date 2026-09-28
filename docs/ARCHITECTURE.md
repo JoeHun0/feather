@@ -843,15 +843,28 @@ now scales the sky term. GTAO (below) adds the small-scale contact.
 **Landed (§26): GTAO** (Jimenez et al. 2016, after Intel's XeGTAO): contact
 shadowing within 0.8 m, which the sky volume's 0.5 m cells, sampled a cell off
 the surface, can't see. It uses the depth prepass alone (§10).
-- **Half resolution, without a downsampled depth.** Half-resolution texel
-  `h` *is* full-resolution pixel `2h`: all three passes read the
-  full-resolution depth, so positions and sub-pixel steps stay exact, and on
-  a plane every blend weight is 1. (A downsampled depth would have to pick
-  one of each 2×2, a bias the four failures below show is easy to reach.)
+- **Half resolution, without an averaged depth.** Half-resolution texel
+  `h` *is* full-resolution pixel `2h`: its position and normal come from the
+  full-resolution depth, so they're exact, and on a plane every blend weight
+  is 1. (A downsampled depth would have to pick one of each 2×2, a bias the
+  four failures below show is easy to reach.)
+- **`gtao_depth.comp`:** point-sampled depth levels for gtao's longer steps.
+  Level `k` (1–4, ½ to 1/16 resolution) holds pixel `2^k·g` at texel `g`,
+  sized `ceil(W/2^k)`: exact depths, never averaged, so interpolating
+  between them is still exact on a plane. One pass over the half grid, each
+  thread writing its pixel to every level whose grid it's on. They're the
+  mips of one R32F image, whose base is padded because mip sizes round
+  down.
 - **`gtao.comp`** (`render::AoPass`), over the half-resolution grid:
   - Normals are rebuilt from depth.
   - 2 slices × 4 steps each way, both jittered by 4×4 patterns over the
     half-resolution grid.
+  - A step `len` px long reads level `floor(log2(len) − 3.3)`, clamped to
+    0–4 (XeGTAO's rule), so its samples are about a tenth of its length
+    apart. Steps under ~20 px read the depth itself. A point at screen
+    position `q` is at texel coordinate `(q − 0.5)/2^k` in level `k`, the
+    same rule as `textureGather` at level 0. Above level 0 it's four
+    `texelFetch`es, since `textureGather` has no LOD.
   - Radius 0.8 m, with occluders fading over its last 60%.
   - Pixels whose radius spans under 2 px are left open; the radius is
     clamped to 200 px (full-resolution pixels, as are the steps).
@@ -868,9 +881,9 @@ the surface, can't see. It uses the depth prepass alone (§10).
 - **`mesh.frag`:** multiplies the diffuse ambient by Jimenez's multi-bounce
   fit (per albedo) and the specular ambient by Lagarde's specular occlusion.
   It's texel-for-pixel, sky visibility times GTAO, ambient only.
-- **Targets:** gfx owns three R32F images (raw and denoised at half size,
-  rounded up, and the full-size result; R32F because it's on the mandatory
-  storage list). A `targets_generation` counter tells
+- **Targets:** gfx owns four R32F images: the depth levels, raw and
+  denoised at half size (rounded up), and the full-size result. R32F because
+  it's on the mandatory storage list. A `targets_generation` counter tells
   `AoPass` and `MeshRenderer::set_ao` when a resize or MSAA change has moved
   them. A view handle can't tell, since a new view may reuse a freed one's
   handle.
@@ -950,10 +963,31 @@ the surface, can't see. It uses the depth prepass alone (§10).
   - Validation with sync: 0 messages at 1×, with GTAO off, on `lights120`,
     the nature scene and the orb demo, and at 1921×1046 (odd halves). At
     MSAA 2/4× only the prepass resolve's messages, as before this change.
-- **Next lever:** gtao's depth reads. A half-resolution (or mip-chained,
-  XeGTAO-style) copy of the depth for the steps, keeping the texel's own
-  position exact, should bring it nearer the quarter its thread count
-  suggests. Not done here.
+- **The steps' depth reads.** An experiment first (pinned, release, both
+  results predicted and both held):
+  - with steps at a quarter of the radius, the gtao pass fell 0.13 → 0.07
+    and 0.19 → 0.09 ms;
+  - with no spread at all, 0.05 / 0.07 ms.
+
+  So about 60% of it was step reads spread across the full-resolution depth.
+  The depth levels above fix that:
+  - `ao` 0.21 → 0.16 ms (zone) and 0.29 → 0.23 ms (`lights120`), frames
+    −0.05 / −0.06 ms. Pinned, release, 3 interleaved rounds, identical
+    medians.
+  - I predicted 0.16–0.18 / 0.20–0.23: both held, at the edge.
+  - The split (skipping passes): copy 0.02, gtao 0.07 / 0.11 (predicted
+    0.07–0.09 / 0.09–0.12), denoise 0.02 / 0.03, upsample 0.05 / 0.07.
+  - The zone's p10 rose 0.10 → 0.12 ms: the copy costs the same in views
+    that are mostly sky.
+  - On the GPU (the dump harness, the same three views): the reference
+    matches to a median of 6e-6 and a p99 of 2e-3.
+  - Against 44dfec4's GPU output: mean difference ≤ 1e-4, p99 ≤ 0.002, at
+    worst 0.12 along the car's lower edge (close detail, read coarser by the
+    long steps).
+  - Validation with sync: as for half resolution above.
+- **Next lever:** the upsample, now 0.05 / 0.07 ms, a full-resolution pass
+  of 13 fetches a pixel, is the biggest piece left; gtao is near its 0.05 /
+  0.07 floor. Not done here.
 - **Limits:**
   - screen-space: what's off-screen or behind a silhouette doesn't occlude;
   - no thickness heuristic, so thin poles and grass cards shadow as if
@@ -965,6 +999,11 @@ the surface, can't see. It uses the depth prepass alone (§10).
     texels, whose clamped 4×4 window repeats some jitter variants (at full
     resolution it was 2 columns; ignoring steps that leave the screen
     halves it at the edge, an unkept experiment);
+  - a step past a level's last grid point, in the last `2^k − 1` px of the
+    right or bottom edge, reads that texel's depth (clamped, like a step off
+    the screen);
+  - an occluder narrower than a level's stride (up to 16 px at 1/16) can
+    fall between a long step's samples;
   - under MSAA, sync validation reports one `SYNC-HAZARD-READ-AFTER-WRITE` a
     frame on the prepass's depth resolve (from e246707, which moved the
     prepass into its own rendering), not yet chased;
@@ -980,12 +1019,16 @@ the surface, can't see. It uses the depth prepass alone (§10).
   - a wall darkens the floor at its foot and nowhere else;
   - the denoise keeps to its side of an edge, and so does the upsample;
   - the upsample copies its texels and is a plain bilinear blend on a plane;
+  - each depth level holds every `2^k`-th pixel, rounded-up sizes included,
+    as the copy pass writes them;
+  - every level is exact on a plane, wherever its grid reaches;
+  - a step's level follows its length;
   - half resolution keeps full resolution's result at a wall's foot (mean
     difference < 0.01, the foot within 0.05);
   - every 4×4 window holds each jitter once;
   - the ambient fits leave open surfaces alone;
-  - the shaders declare the reference's constants, and all three share
-    `view_pos` and `depth_normal` text for text;
+  - the shaders declare the reference's constants (and gfx the level
+    count), and all three share `view_pos` and `depth_normal` text for text;
   - the menu row, config key and flag.
 
   Each was shown to fail against a deliberately broken copy.

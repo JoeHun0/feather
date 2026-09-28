@@ -3768,6 +3768,7 @@ impl ApplicationHandler for App {
                     // recreated; the generation says when.
                     let depth_view = r.depth_sample_view();
                     let ao_views = r.ao_views();
+                    let ao_depth_views = r.ao_depth_views();
                     let nearest = r.nearest_sampler();
                     let generation = r.targets_generation();
                     if let Some(s) = self.session.as_mut() {
@@ -3809,7 +3810,14 @@ impl ApplicationHandler for App {
                         // GTAO (§13), from the prepass's depth.
                         |cmd, extent, frame| {
                             if ao_on {
-                                ap.update(frame, generation, depth_view, ao_views, nearest);
+                                ap.update(
+                                    frame,
+                                    generation,
+                                    depth_view,
+                                    ao_views,
+                                    ao_depth_views,
+                                    nearest,
+                                );
                                 let proj = AoProjection {
                                     near: CAMERA_NEAR,
                                     far: CAMERA_FAR,

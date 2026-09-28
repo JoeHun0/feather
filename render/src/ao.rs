@@ -1,12 +1,15 @@
 //! Ground-truth ambient occlusion (§13, GTAO): contact shadowing of the
 //! ambient light within `AO_RADIUS` of each pixel, from the depth prepass.
 //!
-//! Three compute passes between the prepass and the main pass. The first two
+//! Four compute passes between the prepass and the main pass. The middle two
 //! run at half resolution, where texel `h` is full-resolution pixel `2h`, read
-//! from the full-resolution depth (there's no downsampled copy):
+//! from the full-resolution depth:
+//! - `gtao_depth.comp`: point samples of the depth at ½ to 1/16 resolution
+//!   (level `k`'s texel `g` is pixel `2^k·g`), for gtao's longer steps;
 //! - `gtao.comp`: per texel, `AO_SLICES` slices × `AO_STEPS` steps each way
 //!   for the horizons, integrated against the normal (rebuilt from depth), with
-//!   slice angle and step offset jittered by 4×4 patterns;
+//!   slice angle and step offset jittered by 4×4 patterns; each step reads the
+//!   depth level its length calls for;
 //! - `gtao_denoise.comp`: a depth-aware 4×4 blur, which holds each jitter
 //!   variant exactly once, so the noise averages out;
 //! - `gtao_upsample.comp`: back to full resolution, a bilinear blend of the
@@ -20,7 +23,7 @@
 //! run them over depth buffers of known scenes.
 
 use ash::vk;
-use feather_gfx::{Renderer, FRAMES_IN_FLIGHT};
+use feather_gfx::{Renderer, AO_DEPTH_LEVELS, FRAMES_IN_FLIGHT};
 
 macro_rules! spv {
     ($name:expr) => {
@@ -58,11 +61,12 @@ impl AoProjection {
     }
 }
 
-/// The three GTAO compute passes and their per-frame descriptor sets.
+/// The four GTAO compute passes and their per-frame descriptor sets.
 pub struct AoPass {
     device: ash::Device,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
+    depth: vk::Pipeline,
     gtao: vk::Pipeline,
     denoise: vk::Pipeline,
     upsample: vk::Pipeline,
@@ -80,12 +84,16 @@ impl AoPass {
             (1, vk::DescriptorType::STORAGE_IMAGE),
             (2, vk::DescriptorType::STORAGE_IMAGE),
             (3, vk::DescriptorType::STORAGE_IMAGE),
+            (4, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+            (5, vk::DescriptorType::STORAGE_IMAGE),
         ]
         .map(|(b, ty)| {
+            // Binding 5 is one view per depth level.
+            let count = if b == 5 { AO_DEPTH_LEVELS as u32 } else { 1 };
             vk::DescriptorSetLayoutBinding::default()
                 .binding(b)
                 .descriptor_type(ty)
-                .descriptor_count(1)
+                .descriptor_count(count)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
         });
         let set_layout = unsafe {
@@ -100,10 +108,10 @@ impl AoPass {
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(frames),
+                .descriptor_count(2 * frames),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(3 * frames),
+                .descriptor_count((3 + AO_DEPTH_LEVELS as u32) * frames),
         ];
         let pool = unsafe {
             device
@@ -159,6 +167,7 @@ impl AoPass {
             unsafe { device.destroy_shader_module(module, None) };
             pipeline
         };
+        let depth = compute(spv!("gtao_depth.comp"), "gtao depth pipeline");
         let gtao = compute(spv!("gtao.comp"), "gtao pipeline");
         let denoise = compute(spv!("gtao_denoise.comp"), "gtao denoise pipeline");
         let upsample = compute(spv!("gtao_upsample.comp"), "gtao upsample pipeline");
@@ -166,6 +175,7 @@ impl AoPass {
             device,
             set_layout,
             layout,
+            depth,
             gtao,
             denoise,
             upsample,
@@ -177,7 +187,7 @@ impl AoPass {
 
     /// Point this frame's set at the renderer's current depth and AO images
     /// (the half-resolution raw and denoised ones, then the full-resolution
-    /// result),
+    /// result) and depth levels (a view of all, and one per level),
     /// if they've been recreated since (`generation`). Safe each frame:
     /// `draw_frame` waits on the frame fence before the closures run, and
     /// this is called before the set is bound.
@@ -187,6 +197,7 @@ impl AoPass {
         generation: u64,
         depth_view: vk::ImageView,
         [raw_view, half_view, ao_view]: [vk::ImageView; 3],
+        (levels_view, level_views): (vk::ImageView, [vk::ImageView; AO_DEPTH_LEVELS]),
         sampler: vk::Sampler,
     ) {
         if self.bound[frame] == Some(generation) {
@@ -203,6 +214,11 @@ impl AoPass {
         };
         let (raw_info, half_info, ao_info) =
             (storage(raw_view), storage(half_view), storage(ao_view));
+        let levels_info = [vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::GENERAL)
+            .image_view(levels_view)
+            .sampler(sampler)];
+        let level_infos = level_views.map(|v| storage(v)[0]);
         let set = self.sets[frame];
         let writes = [
             vk::WriteDescriptorSet::default()
@@ -225,13 +241,23 @@ impl AoPass {
                 .dst_binding(3)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&ao_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&levels_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&level_infos),
         ];
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
         self.bound[frame] = Some(generation);
     }
 
-    /// Record the three passes for an image of `extent` (the first two over
-    /// its half, rounded up), with a barrier after each. `draw_frame` puts
+    /// Record the four passes for an image of `extent` (all but the last
+    /// over its half, rounded up), with a barrier after each. `draw_frame` puts
     /// the images in GENERAL first and makes the result visible to fragment
     /// shaders after.
     pub fn dispatch(
@@ -280,6 +306,10 @@ impl AoPass {
                 &bytes,
             );
             self.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.depth);
+            self.device.cmd_dispatch(cmd, half.0, half.1, 1);
+            barrier(cmd);
+            self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.gtao);
             self.device.cmd_dispatch(cmd, half.0, half.1, 1);
             barrier(cmd);
@@ -297,6 +327,7 @@ impl AoPass {
 impl Drop for AoPass {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_pipeline(self.depth, None);
             self.device.destroy_pipeline(self.gtao, None);
             self.device.destroy_pipeline(self.denoise, None);
             self.device.destroy_pipeline(self.upsample, None);
@@ -337,6 +368,11 @@ mod reference {
     /// The first step is at least this many pixels out, so it never samples the
     /// pixel itself.
     pub const AO_MIN_STEP_PX: f32 = 1.3;
+    /// The point-sampled depth levels past the depth itself: ½ to 1/16.
+    pub const AO_MIP_LEVELS: usize = 4;
+    /// A step `len` pixels long reads level `floor(log2(len) − this)`, so its
+    /// samples are about a tenth of its length apart (XeGTAO's rule).
+    pub const AO_MIP_OFFSET: f32 = 3.3;
     /// The denoise ignores neighbours this far off the centre's distance,
     /// relatively.
     pub const AO_DENOISE_DEPTH: f32 = 0.1;
@@ -378,6 +414,40 @@ mod reference {
         ((ndv + ao).powf((-16.0 * roughness - 1.0).exp2()) - 1.0 + ao).clamp(0.0, 1.0)
     }
 
+    /// gtao.comp's depth level for a step `step_px` pixels long: 0 (the depth
+    /// itself) to `AO_MIP_LEVELS`.
+    pub fn step_level(step_px: f32) -> usize {
+        ((step_px.log2() - AO_MIP_OFFSET).floor() as i32).clamp(0, AO_MIP_LEVELS as i32) as usize
+    }
+
+    /// One depth level: `(width, height, texels)`, row-major.
+    pub type Level = (i32, i32, Vec<f32>);
+
+    /// gtao_depth.comp, thread for thread: each level-1 texel `g` holds pixel
+    /// `2g`, and writes it on to level `k` too where `g` is a multiple of
+    /// `2^(k−1)`. Level `k`'s size is the image's over `2^k`, rounded up.
+    pub fn depth_levels(width: i32, height: i32, depth: &[f32]) -> Vec<Level> {
+        let mut levels: Vec<Level> = (1..=AO_MIP_LEVELS as i32)
+            .map(|k| {
+                let (w, h) = ((width + (1 << k) - 1) >> k, (height + (1 << k) - 1) >> k);
+                (w, h, vec![f32::NAN; (w * h) as usize])
+            })
+            .collect();
+        let (hw, hh) = ((width + 1) >> 1, (height + 1) >> 1);
+        for gy in 0..hh {
+            for gx in 0..hw {
+                let d = depth[(2 * gy * width + 2 * gx) as usize];
+                for (i, (w, _, texels)) in levels.iter_mut().enumerate() {
+                    let m = (1 << i) - 1;
+                    if gx & m == 0 && gy & m == 0 {
+                        texels[((gy >> i) * *w + (gx >> i)) as usize] = d;
+                    }
+                }
+            }
+        }
+        levels
+    }
+
     /// A depth buffer (0 near, 1 far/sky) and the projection it was made with:
     /// what the passes read. Row-major, `width × height`.
     pub struct DepthImage<'a> {
@@ -385,6 +455,21 @@ mod reference {
         pub height: i32,
         pub depth: &'a [f32],
         pub push: [f32; 8],
+        /// gtao_depth.comp's levels 1 to `AO_MIP_LEVELS`.
+        pub levels: Vec<Level>,
+    }
+
+    impl<'a> DepthImage<'a> {
+        pub fn new(width: i32, height: i32, depth: &'a [f32], push: [f32; 8]) -> Self {
+            let levels = depth_levels(width, height, depth);
+            Self {
+                width,
+                height,
+                depth,
+                push,
+                levels,
+            }
+        }
     }
 
     impl DepthImage<'_> {
@@ -408,15 +493,25 @@ mod reference {
         }
 
         /// gtao.comp's `view_pos_at`: at screen point `q` (pixels, centres on
-        /// +0.5), depth interpolated between the four texels round it, as
-        /// `textureGather` with a clamp-to-edge sampler finds them.
-        pub fn view_pos_at(&self, q: [f32; 2]) -> [f32; 3] {
-            let (x0, y0) = ((q[0] - 0.5).floor(), (q[1] - 0.5).floor());
-            let (fx, fy) = (q[0] - 0.5 - x0, q[1] - 0.5 - y0);
+        /// +0.5), depth interpolated between the four texels of `level` round
+        /// it, clamped to its edges: at level 0 as `textureGather` with a
+        /// clamp-to-edge sampler finds them, above it by `texelFetch`.
+        pub fn view_pos_at(&self, q: [f32; 2], level: usize) -> [f32; 3] {
+            let scale = (1 << level) as f32;
+            let (cx, cy) = ((q[0] - 0.5) / scale, (q[1] - 0.5) / scale);
+            let (x0, y0) = (cx.floor(), cy.floor());
+            let (fx, fy) = (cx - x0, cy - y0);
             let (x0, y0) = (x0 as i32, y0 as i32);
+            let texel = |x: i32, y: i32| match level {
+                0 => self.raw(x, y),
+                k => {
+                    let (w, h, texels) = &self.levels[k - 1];
+                    texels[(y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize]
+                }
+            };
             let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
-            let top = lerp(self.raw(x0, y0), self.raw(x0 + 1, y0), fx);
-            let bottom = lerp(self.raw(x0, y0 + 1), self.raw(x0 + 1, y0 + 1), fx);
+            let top = lerp(texel(x0, y0), texel(x0 + 1, y0), fx);
+            let bottom = lerp(texel(x0, y0 + 1), texel(x0 + 1, y0 + 1), fx);
             let d = self.dist(lerp(top, bottom, fy));
             let nx = q[0] / self.width as f32 * 2.0 - 1.0;
             let ny = q[1] / self.height as f32 * 2.0 - 1.0;
@@ -443,13 +538,14 @@ mod reference {
         /// gtao.comp for half-resolution texel (hx, hy), which is pixel
         /// (2hx, 2hy).
         pub fn gtao(&self, hx: i32, hy: i32) -> f32 {
-            self.gtao_at(2 * hx, 2 * hy, (hx, hy))
+            self.gtao_at(2 * hx, 2 * hy, (hx, hy), true)
         }
 
         /// gtao.comp's maths at pixel (x, y), with the jitter of grid cell
-        /// `jitter`: the shader's at `(2h, h)`, and the full-resolution pass
-        /// it replaced at `((x, y), (x, y))`.
-        fn gtao_at(&self, x: i32, y: i32, jitter: (i32, i32)) -> f32 {
+        /// `jitter`, its steps reading the depth levels if `levels`: the
+        /// shader's at `(2h, h, true)`, and the full-resolution pass it
+        /// replaced at `((x, y), (x, y), false)`.
+        fn gtao_at(&self, x: i32, y: i32, jitter: (i32, i32), levels: bool) -> f32 {
             use glam::Vec3;
             use std::f32::consts::{FRAC_PI_2, PI};
             if self.raw(x, y) >= 1.0 {
@@ -470,7 +566,7 @@ mod reference {
             let step_noise = (bayer4(jitter.1, jitter.0) + 0.5) / 16.0;
             let min_step = AO_MIN_STEP_PX / radius_px;
             let centre = [x as f32 + 0.5, y as f32 + 0.5];
-            let at = |q: [f32; 2]| Vec3::from(self.view_pos_at(q));
+            let at = |q: [f32; 2], level| Vec3::from(self.view_pos_at(q, level));
             let b1 = Vec3::Y.cross(v).normalize();
             let b2 = v.cross(b1);
             let mut visibility = 0.0;
@@ -488,9 +584,11 @@ mod reference {
                 for j in 0..AO_STEPS {
                     let t = (j as f32 + step_noise) / AO_STEPS as f32;
                     let t = t * t + min_step;
-                    let (ox, oy) = (dir.x * (t * radius_px), dir.y * (t * radius_px));
-                    let d0 = at([centre[0] + ox, centre[1] + oy]) - p;
-                    let d1 = at([centre[0] - ox, centre[1] - oy]) - p;
+                    let step_px = t * radius_px;
+                    let level = if levels { step_level(step_px) } else { 0 };
+                    let (ox, oy) = (dir.x * step_px, dir.y * step_px);
+                    let d0 = at([centre[0] + ox, centre[1] + oy], level) - p;
+                    let d1 = at([centre[0] - ox, centre[1] - oy], level) - p;
                     let (l0, l1) = (d0.length(), d1.length());
                     let w0 = (l0 * falloff_mul + falloff_add).clamp(0.0, 1.0);
                     let w1 = (l1 * falloff_mul + falloff_add).clamp(0.0, 1.0);
@@ -596,12 +694,14 @@ mod reference {
         }
 
         /// The full-resolution GTAO this replaced (both passes on every
-        /// pixel, jittered per pixel): what the half-resolution result is
-        /// held to.
+        /// pixel, jittered per pixel, every step on the depth itself): what
+        /// the result is held to.
         pub fn ambient_occlusion_full_res(&self) -> Vec<f32> {
             let (w, h) = (self.width, self.height);
             let grid = || (0..h).flat_map(move |y| (0..w).map(move |x| (x, y)));
-            let raw: Vec<f32> = grid().map(|(x, y)| self.gtao_at(x, y, (x, y))).collect();
+            let raw: Vec<f32> = grid()
+                .map(|(x, y)| self.gtao_at(x, y, (x, y), false))
+                .collect();
             grid()
                 .map(|(x, y)| self.denoise_at(&raw, (w, h), 1, x, y))
                 .collect()
@@ -707,12 +807,7 @@ mod tests {
     fn view_positions_come_back_from_depth() {
         let (vp, proj) = camera(Vec3::ZERO, -Vec3::Z);
         let depth = vec![0.0; (W * H) as usize];
-        let img = DepthImage {
-            width: W,
-            height: H,
-            depth: &depth,
-            push: proj.push(H as u32),
-        };
+        let img = DepthImage::new(W, H, &depth, proj.push(H as u32));
         // Points in view space project to a depth; the reference turns that
         // depth back into the same distance, and a pixel's direction into
         // the same x, y (screen axes: y down).
@@ -763,12 +858,7 @@ mod tests {
     #[test]
     fn an_open_floor_is_unoccluded() {
         let (depth, _, proj) = floor_and_wall(false);
-        let img = DepthImage {
-            width: W,
-            height: H,
-            depth: &depth,
-            push: proj.push(H as u32),
-        };
+        let img = DepthImage::new(W, H, &depth, proj.push(H as u32));
         let ao = img.ambient_occlusion();
         let floor: Vec<f32> = ao
             .iter()
@@ -798,12 +888,7 @@ mod tests {
         // towards the corners.
         let (vp, proj) = camera(Vec3::new(0.0, 1.0, 1.5), Vec3::new(0.0, 1.0, 0.0));
         let depth = render(vp, |o, d| nearest([plane(o, d, Vec3::Z, 0.0, |_| true)]));
-        let img = DepthImage {
-            width: W,
-            height: H,
-            depth: &depth,
-            push: proj.push(H as u32),
-        };
+        let img = DepthImage::new(W, H, &depth, proj.push(H as u32));
         let ao = img.ambient_occlusion();
         let min = ao.iter().copied().fold(1.0, f32::min);
         assert!(depth.iter().all(|&d| d < 1.0));
@@ -816,12 +901,7 @@ mod tests {
         // up to 86° off it at the screen's edge.
         let (vp, proj) = camera(Vec3::new(0.84, 1.0, 1.0), Vec3::new(0.0, 1.0, 0.0));
         let depth = render(vp, |o, d| nearest([plane(o, d, Vec3::Z, 0.0, |_| true)]));
-        let img = DepthImage {
-            width: W,
-            height: H,
-            depth: &depth,
-            push: proj.push(H as u32),
-        };
+        let img = DepthImage::new(W, H, &depth, proj.push(H as u32));
         let ao = img.ambient_occlusion();
         let min = ao.iter().copied().fold(1.0, f32::min);
         let mean = ao.iter().sum::<f32>() / ao.len() as f32;
@@ -845,12 +925,7 @@ mod tests {
     #[test]
     fn a_wall_darkens_the_floor_at_its_foot_and_nowhere_else() {
         let (depth, vp, proj) = floor_and_wall(true);
-        let img = DepthImage {
-            width: W,
-            height: H,
-            depth: &depth,
-            push: proj.push(H as u32),
-        };
+        let img = DepthImage::new(W, H, &depth, proj.push(H as u32));
         let ao = img.ambient_occlusion();
         let (mut foot, mut far) = (Vec::new(), Vec::new());
         for (a, p) in ao.iter().zip(world(&depth, vp)) {
@@ -889,12 +964,7 @@ mod tests {
         let depth: Vec<f32> = (0..w * h)
             .map(|i| if i % w < w / 2 { 0.5 } else { 0.99 })
             .collect();
-        let img = DepthImage {
-            width: w,
-            height: h,
-            depth: &depth,
-            push: proj.push(h as u32),
-        };
+        let img = DepthImage::new(w, h, &depth, proj.push(h as u32));
         let (hw, hh) = img.half_size();
         let raw: Vec<f32> = (0..hw * hh)
             .map(|i| if 2 * (i % hw) < w / 2 { 0.0 } else { 1.0 })
@@ -917,12 +987,7 @@ mod tests {
         // every pixel should read the ramp at its own place, 2h -> h.
         let (vp, proj) = camera(Vec3::new(0.84, 1.0, 1.0), Vec3::new(0.0, 1.0, 0.0));
         let depth = render(vp, |o, d| nearest([plane(o, d, Vec3::Z, 0.0, |_| true)]));
-        let img = DepthImage {
-            width: W,
-            height: H,
-            depth: &depth,
-            push: proj.push(H as u32),
-        };
+        let img = DepthImage::new(W, H, &depth, proj.push(H as u32));
         let (hw, hh) = img.half_size();
         let ramp = |i: f32, j: f32| 0.2 + 0.004 * i + 0.006 * j;
         let half: Vec<f32> = (0..hw * hh)
@@ -952,12 +1017,7 @@ mod tests {
         let depth: Vec<f32> = (0..w * h)
             .map(|i| if near(i % w) { 0.5 } else { 0.99 })
             .collect();
-        let img = DepthImage {
-            width: w,
-            height: h,
-            depth: &depth,
-            push: proj.push(h as u32),
-        };
+        let img = DepthImage::new(w, h, &depth, proj.push(h as u32));
         let (hw, hh) = img.half_size();
         let half: Vec<f32> = (0..hw * hh)
             .map(|i| if near(2 * (i % hw)) { 0.0 } else { 1.0 })
@@ -976,12 +1036,7 @@ mod tests {
         // The wall's foot: the same corner, as dark, and the rest as open,
         // as the full-resolution GTAO this replaced.
         let (depth, vp, proj) = floor_and_wall(true);
-        let img = DepthImage {
-            width: W,
-            height: H,
-            depth: &depth,
-            push: proj.push(H as u32),
-        };
+        let img = DepthImage::new(W, H, &depth, proj.push(H as u32));
         let (half, full) = (img.ambient_occlusion(), img.ambient_occlusion_full_res());
         let (mut foot_half, mut foot_full, mut diff) = (0.0, 0.0, Vec::new());
         let mut n = 0;
@@ -1005,6 +1060,85 @@ mod tests {
             "foot {foot_half} vs {foot_full}"
         );
         assert!(mean < 0.01 && p99 < 0.1, "|diff| mean {mean}, p99 {p99}");
+    }
+
+    #[test]
+    fn each_depth_level_holds_every_2k_th_pixel() {
+        // Odd sizes, so every level's last texel is a rounded-up one.
+        let (w, h) = (161, 91);
+        let depth: Vec<f32> = (0..w * h).map(|i| i as f32).collect();
+        let levels = depth_levels(w, h, &depth);
+        assert_eq!(levels.len(), AO_MIP_LEVELS);
+        for (i, (lw, lh, texels)) in levels.iter().enumerate() {
+            let s = 1 << (i + 1);
+            assert_eq!(
+                (*lw, *lh),
+                ((w + s - 1) / s, (h + s - 1) / s),
+                "level {}",
+                i + 1
+            );
+            for gy in 0..*lh {
+                for gx in 0..*lw {
+                    let want = depth[(s * gy * w + s * gx) as usize];
+                    assert_eq!(
+                        texels[(gy * lw + gx) as usize],
+                        want,
+                        "level {} ({gx}, {gy})",
+                        i + 1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_depth_level_is_exact_on_a_plane() {
+        // A wall at 40° filling the view: a step reading any level lands on
+        // it, wherever that level's grid reaches.
+        let (vp, proj) = camera(Vec3::new(0.84, 1.0, 1.0), Vec3::new(0.0, 1.0, 0.0));
+        let depth = render(vp, |o, d| nearest([plane(o, d, Vec3::Z, 0.0, |_| true)]));
+        let img = DepthImage::new(W, H, &depth, proj.push(H as u32));
+        let pos = |x, y| Vec3::from(img.view_pos(x, y));
+        let origin = pos(W / 2, H / 2);
+        let n = (pos(W - 1, H / 2) - origin)
+            .cross(pos(W / 2, H - 1) - origin)
+            .normalize();
+        for level in 0..=AO_MIP_LEVELS {
+            let s = (1 << level) as f32;
+            let (lw, lh) = match level {
+                0 => (W, H),
+                k => (img.levels[k - 1].0, img.levels[k - 1].1),
+            };
+            // From the first texel's centre to the last one's, in uneven steps.
+            let (x_end, y_end) = (s * (lw - 1) as f32 + 0.5, s * (lh - 1) as f32 + 0.5);
+            let mut qy = 0.5;
+            while qy <= y_end {
+                let mut qx = 0.5;
+                while qx <= x_end {
+                    let p = Vec3::from(img.view_pos_at([qx, qy], level));
+                    let off = (p - origin).dot(n).abs();
+                    assert!(off < 1e-4 * p.z, "level {level} at ({qx}, {qy}): {off}");
+                    qx += 1.37;
+                }
+                qy += 1.19;
+            }
+        }
+    }
+
+    #[test]
+    fn a_steps_level_follows_its_length() {
+        for (len, want) in [
+            (0.5, 0),
+            (10.0, 0),
+            (19.0, 0),
+            (25.0, 1),
+            (50.0, 2),
+            (100.0, 3),
+        ] {
+            assert_eq!(step_level(len), want, "{len} px");
+        }
+        assert_eq!(step_level(190.0), AO_MIP_LEVELS);
+        assert_eq!(step_level(5000.0), AO_MIP_LEVELS);
     }
 
     #[test]
@@ -1080,9 +1214,16 @@ mod tests {
             format!("const float AO_MIN_RADIUS_PX = {AO_MIN_RADIUS_PX:?};"),
             format!("const float AO_MAX_RADIUS_PX = {AO_MAX_RADIUS_PX:?};"),
             format!("const float AO_MIN_STEP_PX = {AO_MIN_STEP_PX:?};"),
+            format!("const int AO_MIP_LEVELS = {AO_MIP_LEVELS};"),
+            format!("const float AO_MIP_OFFSET = {AO_MIP_OFFSET:?};"),
         ] {
             assert!(gtao.contains(&decl), "gtao.comp lacks `{decl}`");
         }
+        // The copy pass writes that many levels, and gfx makes them.
+        let levels = format!("uniform writeonly image2D u_levels[{AO_MIP_LEVELS}];");
+        let copy = include_str!("../shaders/gtao_depth.comp");
+        assert!(copy.contains(&levels), "gtao_depth.comp lacks `{levels}`");
+        assert_eq!(feather_gfx::AO_DEPTH_LEVELS, AO_MIP_LEVELS);
         let decl = format!("const float AO_DENOISE_DEPTH = {AO_DENOISE_DEPTH:?};");
         for (name, src) in [
             (

@@ -1,0 +1,38 @@
+#version 450
+
+// GTAO's depth levels (§13): point samples of the depth for gtao.comp's
+// longer steps, which then read nearby texels instead of pixels spread far
+// across the full-resolution depth. Level k (1 to 4) holds pixel 2^k g at
+// texel g, so each is a sparser grid of exact depths: a sample never
+// averages across an edge, and interpolating between them is exact on a
+// plane, as it is on the depth itself. Level k's size is the depth's over
+// 2^k, rounded up; the image (mip k - 1) may be larger, and gtao.comp
+// never reads past that.
+// render::ao's reference is this.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_depth;
+// Levels 1 to 4, one view each.
+layout(set = 0, binding = 5, r32f) uniform writeonly image2D u_levels[4];
+
+void main() {
+    // One thread per level-1 texel: it holds pixel 2g, which is also level
+    // k's texel g >> (k - 1) wherever g is a multiple of 2^(k - 1).
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = textureSize(u_depth, 0);
+    if (any(greaterThanEqual(g, (size + 1) >> 1))) {
+        return;
+    }
+    vec4 depth = vec4(texelFetch(u_depth, 2 * g, 0).r);
+    imageStore(u_levels[0], g, depth);
+    if (all(equal(g & 1, ivec2(0)))) {
+        imageStore(u_levels[1], g >> 1, depth);
+    }
+    if (all(equal(g & 3, ivec2(0)))) {
+        imageStore(u_levels[2], g >> 2, depth);
+    }
+    if (all(equal(g & 7, ivec2(0)))) {
+        imageStore(u_levels[3], g >> 3, depth);
+    }
+}
