@@ -673,6 +673,10 @@ each pass plus the visible-light count, then exits. Don't touch the window
 while it runs. It ignores `config/`: settings come from the
 defaults and CLI flags only.
 
+Bloom and auto-exposure are on by default, so a bench's `frame` includes
+them (~0.15 and ~0.05 ms, debug). To compare with numbers from before they
+existed, add `--no-bloom --no-auto-exposure`.
+
 ### A/B recipe
 
 1. State the prediction *before* measuring, so it can be wrong.
