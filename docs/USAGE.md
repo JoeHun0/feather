@@ -361,6 +361,37 @@ Unlike the nature scene, materials pass through as authored (textures,
 loads it in ~2 s and release in under half a second; each image is decoded
 and uploaded once however many materials share it.
 
+### An industrial compound — the STALKER look
+
+```bash
+python3 tools/fetch_assets.py                          # also fetches ~101 MB of Poly Haven textures and props
+python3 tools/gen_zonescene.py --check                 # writes scratch/zone.glb
+cargo run --release -p feather-bake -- scratch/zone.glb   # optional: LODs + BC7, loads in ~0.4 s
+cargo run -- scratch/zone.glb
+```
+
+An abandoned industrial compound under an overcast sky: a yard walled by
+Soviet precast-panel fence, a brick and rusty-iron hangar with holes in the
+roof, a two-storey office block you can walk into and climb, broken asphalt
+and mud, road barriers, barrels, tyres, pipework, a covered car and lines of
+electricity poles. You spawn on the road outside the gate, facing it.
+
+- **Assets:** 8 tiling Poly Haven textures at 2K (precast concrete, factory
+  brick, rusty corrugated iron, rusty metal, damaged concrete floor, damaged
+  road, muddy leaves, worn plaster) and 9 props at 1K. All are CC0, and each
+  file is pinned by Poly Haven's MD5.
+- **Surfaces** tile at their real-world size.
+- **Footsteps:** grass on the mud, concrete everywhere else.
+- **Atmosphere:** the level's `environment` marker (see the prefab table)
+  makes it grey and hazy. Its values are starting points; tune them in
+  `ENVIRONMENT` at the top of the script and regenerate.
+- **The app's boxes:** the five boxes and the grey slab the app puts in every
+  level are inside the hangar and under the mud.
+- **Options:** `--seed N` (props, missing fence panels, roof holes), `-o PATH`,
+  `--check`.
+- **Known limits:** interiors look too bright (no ambient occlusion yet), and
+  there is no grass or foliage (no alpha cutout yet).
+
 ### Baking — `feather-bake`
 
 ```bash

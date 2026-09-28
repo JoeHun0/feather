@@ -1691,6 +1691,47 @@ and punctuation.
     **Mipmaps fixed** (full chains + trilinear + anisotropy, §26); memory
     **fixed** by the §17 texture bake (BC7: 64 vs 256 MB); alpha cutout
     pending until content needs it (no current asset has alpha).
+  **Industrial compound (the STALKER look):** `tools/gen_zonescene.py` writes
+  `scratch/zone.glb`, the first scene aimed at the game's intended look
+  rather than at a subsystem.
+  - **Content:**
+    - a yard walled by Soviet precast-panel fence (a gate, missing, fallen and
+      leaning panels);
+    - a 24 × 22 × 8 m hangar of brick and rusty corrugated iron, with a big
+      door, a side door and holes in the roof;
+    - a two-storey office block with windows, a door and a walkable stair
+      (0.2 m rises);
+    - broken asphalt, concrete aprons, mud;
+    - Poly Haven props (barriers, barrels, tyres, pipework, utility boxes, a
+      compressor, a covered car, assembled electricity poles);
+    - dim lamps, and an overcast, hazy `environment` (§13).
+  - **Architecture is generated boxes** with a material per face. UVs are
+    world metres over each texture's real size (from Poly Haven's metadata),
+    so surfaces tile at true scale and adjacent boxes continue one texture.
+  - **Textures are pinned as diffuse + GL normal + ARM**, since ARM's G/B are
+    the roughness/metal layout `metallicRoughnessTexture` reads. The
+    greyscale roughness map the older packs use would read as metallic too.
+  - **The hangar stands round the five boxes the app puts in every level**,
+    plus the old spawn point, which `check()` keeps clear. The boxes read as
+    crates. A level that doesn't want them has no way to say so yet.
+  - **Measured** (debug, clocks not pinned, `--bench`, 295 nodes, 818k
+    placed triangles):
+    - without the bake: load 1.36–1.41 s, frame median 0.59–0.74 ms, 1.8 M
+      shadow triangles;
+    - baked (LODs + BC7): load 0.41–0.42 s, frame 0.37–0.38 ms, 0.22 M shadow
+      triangles, and 58 props collide as LOD trimeshes instead of hulls.
+    - Predicted under 3 s / under 1 s to load and ≤ 1.0 ms a frame; all
+      right. I'd estimated ~0.5 M placed triangles; it is 818k, since the
+      barriers and pole crossarms are dense scans.
+  - A throwaway harness walked the game's own schedule from the spawn
+    through the gate, the hangar, out of its side door, across the mud, into
+    the office and up the stair to the first floor. No slide ran out of
+    passes, nothing stuck, and the footsteps were concrete, then grass on the
+    mud. Walking it into one of the app's boxes, as a negative control,
+    registered as stuck.
+  - **Known look limits:** the ambient light isn't occluded, so interiors are
+    too bright; there's no alpha cutout, so no grass, chain-link or leafy
+    trees; and shadows are sharp even under an overcast sky (no PCSS).
 - **RenderDoc:** in-application API, capture on a keybind.
 - **Object naming:** `vkSetDebugUtilsObjectName` on buffers/images/pipelines
   from the start (readable validation + captures).

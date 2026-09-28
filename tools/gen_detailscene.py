@@ -67,6 +67,16 @@ def load_gltf(path):
     return doc, bin_, base
 
 
+def node_size(doc, node):
+    """The extent of a mesh node's own bounds (from its POSITION min/max)."""
+    lo, hi = [1e30] * 3, [-1e30] * 3
+    for p in doc["meshes"][node["mesh"]]["primitives"]:
+        acc = doc["accessors"][p["attributes"]["POSITION"]]
+        lo = [min(a, b) for a, b in zip(lo, acc["min"])]
+        hi = [max(a, b) for a, b in zip(hi, acc["max"])]
+    return [h - l for l, h in zip(lo, hi)]
+
+
 class Level:
     def __init__(self):
         self.bin = bytearray()
@@ -135,13 +145,18 @@ class Level:
         cache[index] = len(self.doc["materials"]) - 1
         return cache[index]
 
-    def model(self, key):
+    def model(self, key, path=None, keep=None, shift=(0.0, 0.0, 0.0)):
         """One level mesh per source model: every mesh node baked into the
         vertices (Poly Haven sets carry per-piece transforms), one primitive
-        per source primitive, materials and textures carried over."""
+        per source primitive, materials and textures carried over.
+
+        `path` (under the asset cache) defaults to MODELS[key]. `keep(name,
+        size)` picks which mesh nodes go in, by node name and the size of
+        its bounds (for one assembly out of a modular kit), and `shift` is
+        added to every vertex (to put that assembly's base at the origin)."""
         if key in self.models:
             return self.models[key]
-        doc, bin_, base = load_gltf(os.path.join(ASSETS, MODELS[key]))
+        doc, bin_, base = load_gltf(os.path.join(ASSETS, path or MODELS[key]))
         prims, mats = [], {}
         lo, hi = [1e30] * 3, [-1e30] * 3
 
@@ -151,9 +166,13 @@ class Level:
             if "matrix" in node or max(sc) - min(sc) > 1e-6:
                 raise ValueError(f"{key}: node {ni} has a matrix or non-uniform scale")
             world = matmul(parent, trs_matrix(node))
-            for p in doc["meshes"][node["mesh"]]["primitives"] if "mesh" in node else []:
+            prims_here = doc["meshes"][node["mesh"]]["primitives"] if "mesh" in node else []
+            if keep and prims_here and not keep(node.get("name", ""), node_size(doc, node)):
+                prims_here = []
+            for p in prims_here:
                 a = p["attributes"]
-                pos = [xform_point(world, v) for v in read_accessor(doc, bin_, a["POSITION"])]
+                pos = [[c + d for c, d in zip(xform_point(world, v), shift)]
+                       for v in read_accessor(doc, bin_, a["POSITION"])]
                 for v in pos:
                     for i in range(3):
                         lo[i], hi[i] = min(lo[i], v[i]), max(hi[i], v[i])
