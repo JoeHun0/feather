@@ -109,7 +109,8 @@ impl TextureData {
 /// Surface parameters for a mesh (glTF metallic-roughness aligned). Factor
 /// colors are **linear**; `base_color_texture` is sRGB; `normal_texture` and
 /// `metallic_roughness_texture` are linear data (uploaded `_UNORM`). MR packing
-/// follows glTF: green = roughness, blue = metallic.
+/// follows glTF: green = roughness, blue = metallic. `occlusion_texture` is
+/// linear data read from red, often the same image as MR (an "ARM" map).
 #[derive(Clone, Debug)]
 pub struct Material {
     pub base_color: [f32; 4], // linear RGBA factor
@@ -120,6 +121,13 @@ pub struct Material {
     pub base_color_texture: Option<Arc<TextureData>>,
     pub normal_texture: Option<Arc<TextureData>>,
     pub metallic_roughness_texture: Option<Arc<TextureData>>,
+    /// glTF `occlusionTexture`: the ambient's texture-scale visibility, in
+    /// red. The same `Arc` as `metallic_roughness_texture` when both name
+    /// one image.
+    pub occlusion_texture: Option<Arc<TextureData>>,
+    /// glTF `occlusionTexture.strength`: 0 ignores the texture, 1 applies it
+    /// fully.
+    pub occlusion_strength: f32,
     /// Gameplay, not rendering: what the material sounds like underfoot
     /// (§20), from its glTF `extras.surface`. Passed through unchecked; the
     /// app knows which surfaces exist.
@@ -157,6 +165,8 @@ impl Default for Material {
             base_color_texture: None,
             normal_texture: None,
             metallic_roughness_texture: None,
+            occlusion_texture: None,
+            occlusion_strength: 1.0,
             surface: None,
             alpha_mode: AlphaMode::Opaque,
             double_sided: false,
@@ -474,6 +484,10 @@ fn read_material(m: &gltf::Material, images: &ImageCache) -> Material {
         Some(nt) => (tex(nt.texture().source().index()), nt.scale()),
         None => (None, 1.0),
     };
+    let (occlusion_texture, occlusion_strength) = match m.occlusion_texture() {
+        Some(ot) => (tex(ot.texture().source().index()), ot.strength()),
+        None => (None, 1.0),
+    };
     Material {
         base_color: pbr.base_color_factor(), // linear RGBA
         metallic: pbr.metallic_factor(),
@@ -483,6 +497,8 @@ fn read_material(m: &gltf::Material, images: &ImageCache) -> Material {
         base_color_texture,
         normal_texture,
         metallic_roughness_texture,
+        occlusion_texture,
+        occlusion_strength,
         surface: read_surface(m),
         alpha_mode: match m.alpha_mode() {
             gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
@@ -902,6 +918,64 @@ mod tests {
         assert_eq!(tex[2].pixels(), Some(&[0, 0, 255, 255][..]));
         assert!(tex[0].is_decoded() && !tex[2].encoded.is_empty());
         assert_ne!(tex[0].source_key, tex[2].source_key);
+    }
+
+    #[test]
+    fn materials_carry_an_occlusion_texture() {
+        // An ARM-style material (occlusion and metallic-roughness from one
+        // image, through two glTF textures), one with an occlusion image of
+        // its own, and one with none.
+        let dir = fixture_dir("occlusion");
+        let positions: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let bin: Vec<u8> = positions.iter().flat_map(|f| f.to_le_bytes()).collect();
+        std::fs::write(dir.join("tri.bin"), &bin).unwrap();
+        let red = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        let blue = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/5ncLrgAAAABJRU5ErkJggg==";
+        let gltf = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "scene": 0,
+  "scenes": [ {{ "nodes": [0] }} ],
+  "nodes": [ {{ "mesh": 0 }} ],
+  "meshes": [ {{ "primitives": [
+    {{ "attributes": {{ "POSITION": 0 }}, "material": 0 }},
+    {{ "attributes": {{ "POSITION": 0 }}, "material": 1 }},
+    {{ "attributes": {{ "POSITION": 0 }}, "material": 2 }}
+  ] }} ],
+  "materials": [
+    {{ "pbrMetallicRoughness": {{ "metallicRoughnessTexture": {{ "index": 0 }} }},
+      "occlusionTexture": {{ "index": 1, "strength": 0.5 }} }},
+    {{ "pbrMetallicRoughness": {{ "metallicRoughnessTexture": {{ "index": 0 }} }},
+      "occlusionTexture": {{ "index": 2 }} }},
+    {{ "pbrMetallicRoughness": {{ "metallicRoughnessTexture": {{ "index": 0 }} }} }}
+  ],
+  "textures": [ {{ "source": 0 }}, {{ "source": 0 }}, {{ "source": 1 }} ],
+  "images": [
+    {{ "uri": "data:image/png;base64,{red}" }},
+    {{ "uri": "data:image/png;base64,{blue}" }}
+  ],
+  "accessors": [ {{
+    "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+    "min": [0, 0, 0], "max": [1, 1, 0]
+  }} ],
+  "bufferViews": [ {{ "buffer": 0, "byteOffset": 0, "byteLength": 36 }} ],
+  "buffers": [ {{ "byteLength": 36, "uri": "tri.bin" }} ]
+}}"#
+        );
+        let path = dir.join("occlusion.gltf");
+        std::fs::write(&path, gltf).unwrap();
+        let scene = load_gltf_scene(&path).unwrap();
+        let m: Vec<&Material> = scene.meshes.iter().map(|m| &m.material).collect();
+        let mr = m[0].metallic_roughness_texture.as_ref().expect("MR");
+        let arm = m[0].occlusion_texture.as_ref().expect("occlusion");
+        assert!(Arc::ptr_eq(mr, arm), "one image: MR's own conversion");
+        assert_eq!(m[0].occlusion_strength, 0.5);
+        let own = m[1].occlusion_texture.as_ref().expect("occlusion");
+        assert!(!Arc::ptr_eq(mr, own), "an image of its own");
+        assert_eq!(m[1].occlusion_strength, 1.0, "glTF's default strength");
+        assert!(m[2].occlusion_texture.is_none());
+        assert_eq!(m[2].occlusion_strength, 1.0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

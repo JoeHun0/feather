@@ -158,6 +158,10 @@ struct GpuMaterial {
 };
 ```
 
+(As built: `tex.w` is flags in bits 0–7 and the occlusion texture's slot
+above them; there's no emissive texture yet. `params.z` is the occlusion
+strength. See material AO in §13.)
+
 CPU-side only (routing, not shading): alpha mode (opaque/mask/blend),
 double-sided, cull — used to pick pipeline and draw bucket.
 
@@ -769,9 +773,10 @@ overlap every pixel.
 - **Runtime term:**
   ```
   ambient = (irradiance(N)·albedo·(1-metallic)
-           + prefiltered(R, rough·maxMip)·(F0·brdf.x + brdf.y)) · (ORM.ao × GTAO)
+           + prefiltered(R, rough·maxMip)·(F0·brdf.x + brdf.y)) · min(ORM.ao, GTAO)
   ```
-  Added to direct sun+cluster. GTAO modulates **ambient only**. Consumes exactly
+  Added to direct sun+cluster. GTAO modulates **ambient only**. (The design
+  said `ORM.ao × GTAO`; material AO landed as their `min`, below.) Consumes exactly
   the material data already defined. All bake-time; runtime cost ≈ a few texture
   reads. Later: local probes per-object for interiors; irradiance volumes for
   dynamic bounce.
@@ -865,6 +870,59 @@ now scales the sky term. GTAO (below) adds the small-scale contact.
   - lamps and the sun are direct light and unaffected;
   - thin walls within a cell of each other can still exchange a little
     light where the per-axis distances miss a diagonal gap.
+
+**Landed (§26): material AO** (glTF `occlusionTexture`). A material's own
+texture-scale occlusion (mortar lines, corrugation grooves, the seams of a
+barrel), for the ambient only, as glTF specifies.
+- **Content:** Poly Haven's ARM maps carry AO in red, but their glTFs
+  don't reference it.
+  - `gen_zonescene.py` names the ARM map as each tiling material's
+    `occlusionTexture`.
+  - `gen_detailscene.py`'s import does the same for any model whose MR image
+    is a `*_arm_<res>k` file with no occlusion of its own.
+  - The zone's `--check` requires all 25 of its MR materials to carry one.
+  - Their red channel means run 0.77 (rusty metal) to 0.98 (concrete floor)
+    for the tiling textures.
+- **Loader and bake:** `Material` gains `occlusion_texture` and
+  `occlusion_strength`. An ARM map is one image for both, so one `Arc`, one
+  BC7 bake (all four channels) and one bindless slot.
+- **GPU:** `tex.w` holds the flags in bits 0–7 and the occlusion slot above
+  them (`MATERIAL_OCCLUSION_SHIFT` = 8); `params.z` is the strength.
+- **`mesh.frag`:**
+  - it samples MR as `.rgb`;
+  - if the occlusion slot is MR's, it's that sample's red, at no extra
+    fetch;
+  - slot 0 (none) is 1; any other slot gets a sample of its own;
+  - then glTF's `1 + strength·(sample − 1)`.
+- **With GTAO: the `min`, not the product** (as Filament does). The
+  models' baked AO already holds some of what GTAO sees (under the car,
+  inside the tyre), and multiplying would darken those crevices twice.
+  With GTAO off, it's the material AO alone.
+- **Checked on the GPU:** a temporary harness wrote the material AO to the
+  HDR target from the three zone views.
+  - The means were 0.89–0.93, against the textures' 0.77–0.98.
+  - Brick mortar, corrugation grooves, the asphalt's patches and the tyre's
+    tread were all visible.
+  - Materials without occlusion read exactly 1.
+- **Measured** (pinned, release, 3 interleaved rounds against 0954247):
+  - the zone `geo` 0.30 ms either way, frames 0.73–0.74;
+  - `lights120` `geo` 0.90 → 0.93 ms, frames 1.37 → 1.40, though none of its
+    materials has occlusion.
+  - I predicted ±0.02 ms for both. The zone held; `lights120` didn't.
+  - The bench-sweep exposure on the zone moved 1.36 → 1.38 (darker
+    ambient).
+- **Chasing the `lights120` cost** (each variant measured):
+  - It isn't occupancy: 72 VGPRs and 20 waves throughout.
+  - It isn't the extra branch: the rule reduced to `arm.r` or 1 costs the
+    same 0.93.
+  - It isn't the fetch order: the code before the sky fetches is the same
+    ISA as before.
+  - Compiling the occlusion out (`material_ao = 1`) gives back 0.90. So
+    it's one more value live across the light loop, which is `lights120`'s
+    hot spot.
+  - The light loop's bank conflicts *fell* (27 → 21) while it slowed, so
+    that model doesn't explain this one (the fog finding's caveat).
+  - Accepted: the zone doesn't pay it.
 
 **Landed (§26): GTAO** (Jimenez et al. 2016, after Intel's XeGTAO): contact
 shadowing within 0.8 m, which the sky volume's 0.5 m cells, sampled a cell off
@@ -1222,7 +1280,9 @@ the ground's edge showed. Now it can pool on the ground.
     - **The likely mechanism.** RDNA's VGPRs sit in four banks (index mod 4),
       and a VALU instruction that reads two sources from one bank stalls. A
       count of those in the loop ranks the variants as their times do. (It's
-      a simplified model of RDNA3: consistent with the evidence, not proof.)
+      a simplified model of RDNA3: consistent with the evidence, not proof.
+      Material AO later gave a counterexample: fewer conflicts and slower,
+      so treat it as one factor among several.)
     - **A check that it predicts, not just fits:** three edits that change
       no maths (swapping two AO lines, a sentinel constant, one
       `inversesqrt`) left the loop's allocation as it was, and each timed
@@ -2776,8 +2836,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   environment. Real cubemap IBL (equirect→cube, irradiance/prefilter passes,
   BRDF LUT) is the follow-up. Sun shadows (§11 CSM) and punctual point lights
   (§12) now exist. Bloom and auto-exposure landed (§13). The ambient is
-  occluded by a baked per-level sky-visibility volume (§13, §17) and by
-  half-resolution GTAO (§13). The tonemap curve is a drop-in point for AgX.
+  occluded by a baked per-level sky-visibility volume (§13, §17) and by the
+  lower of half-resolution GTAO and the material's own AO (glTF
+  `occlusionTexture`, §13). The tonemap curve is a drop-in point for AgX.
   **Known artifact — specular singularity on smooth metal.** A punctual light has
   zero area, so on low-roughness metal (the PBR grid bottoms out at 0.06) its
   specular lobe collapses to a near-singular bright dot. With a geometry-free

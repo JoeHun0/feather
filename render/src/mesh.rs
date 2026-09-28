@@ -64,8 +64,9 @@ struct TexturePlan {
     /// Unique (image, kind) pairs to upload, in slot order from
     /// `FIRST_TEXTURE_SLOT`.
     uploads: Vec<(Arc<TextureData>, TexKind)>,
-    /// Per material: base colour, normal, metallic-roughness slots.
-    slots: Vec<[u32; 3]>,
+    /// Per material: base colour, normal, metallic-roughness and occlusion
+    /// slots.
+    slots: Vec<[u32; 4]>,
     /// Texture references across all materials, before dedup.
     references: usize,
     /// References that fell back to a default because the array was full.
@@ -124,6 +125,8 @@ fn plan_texture_slots(materials: &[Material], capacity: usize) -> TexturePlan {
                 slot(&m.base_color_texture, TexKind::Color, 0),
                 slot(&m.normal_texture, TexKind::Data, 1),
                 slot(&m.metallic_roughness_texture, TexKind::Data, 0),
+                // Usually MR's own image (an ARM map), so MR's own slot.
+                slot(&m.occlusion_texture, TexKind::Data, 0),
             ]
         })
         .collect();
@@ -256,17 +259,23 @@ pub struct FrameStats {
 struct GpuMaterial {
     base_color_factor: [f32; 4],
     emissive: [f32; 4], // rgb = emissive, a = metallic
-    params: [f32; 4],   // x = roughness, y = normal_scale, z = occlusion, w = alpha_cutoff
-    tex: [u32; 4],      // x = base color, y = normal, z = metallic-roughness, w = flags
+    params: [f32; 4],   // x = roughness, y = normal_scale, z = occlusion strength, w = alpha_cutoff
+    tex: [u32; 4],      // x = base color, y = normal, z = MR, w = flags | occlusion << 8
 }
 
 /// `GpuMaterial.tex.w` flag: both faces are the surface (glTF
 /// `doubleSided`), so `mesh.frag` flips a back face's normal. Must match
 /// `mesh.frag`'s `MATERIAL_DOUBLE_SIDED` (a test checks).
 const MATERIAL_DOUBLE_SIDED: u32 = 1;
+/// `GpuMaterial.tex.w` holds the flags in its low byte and the occlusion
+/// texture's slot above them: 0 (white) for none, MR's slot when it's MR's
+/// own image (an ARM map), which mesh.frag reads from the MR sample it
+/// already takes. Must match mesh.frag's `MATERIAL_OCCLUSION_SHIFT` (a test
+/// checks).
+const MATERIAL_OCCLUSION_SHIFT: u32 = 8;
 
 impl GpuMaterial {
-    fn from_material(m: &Material, slots: [u32; 3]) -> Self {
+    fn from_material(m: &Material, slots: [u32; 4]) -> Self {
         // The cutoff only for masked materials (§5). BLEND has no pass to go
         // to yet, so it draws opaque.
         let cutoff = match m.alpha_mode {
@@ -281,8 +290,13 @@ impl GpuMaterial {
         Self {
             base_color_factor: m.base_color,
             emissive: [m.emissive[0], m.emissive[1], m.emissive[2], m.metallic],
-            params: [m.roughness, m.normal_scale, 1.0, cutoff],
-            tex: [slots[0], slots[1], slots[2], flags],
+            params: [m.roughness, m.normal_scale, m.occlusion_strength, cutoff],
+            tex: [
+                slots[0],
+                slots[1],
+                slots[2],
+                flags | slots[3] << MATERIAL_OCCLUSION_SHIFT,
+            ],
         }
     }
 }
@@ -1927,7 +1941,7 @@ mod tests {
         assert_eq!(s[0][0], s[1][0], "shared image shares a slot");
         assert_ne!(s[0][0], s[2][0], "distinct images get distinct slots");
         assert_ne!(s[3][2], s[0][0], "sRGB and UNORM views are separate");
-        assert_eq!(s[4], [0, 1, 0], "untextured materials use the defaults");
+        assert_eq!(s[4], [0, 1, 0, 0], "untextured materials use the defaults");
         assert_eq!(s[5][1], s[3][2], "normal and MR maps are both UNORM data");
         let kinds: Vec<TexKind> = plan.uploads.iter().map(|(_, k)| *k).collect();
         assert_eq!(kinds, [TexKind::Color, TexKind::Color, TexKind::Data]);
@@ -2154,15 +2168,19 @@ mod tests {
     #[test]
     fn gpu_materials_pack_cutoff_and_flags() {
         let src = include_str!("../shaders/mesh.frag");
-        let decl = format!("const uint MATERIAL_DOUBLE_SIDED = {MATERIAL_DOUBLE_SIDED}u;");
-        assert!(src.contains(&decl), "mesh.frag lacks `{decl}`");
+        for decl in [
+            format!("const uint MATERIAL_DOUBLE_SIDED = {MATERIAL_DOUBLE_SIDED}u;"),
+            format!("const uint MATERIAL_OCCLUSION_SHIFT = {MATERIAL_OCCLUSION_SHIFT}u;"),
+        ] {
+            assert!(src.contains(&decl), "mesh.frag lacks `{decl}`");
+        }
         let pack = |alpha_mode, double_sided| {
             let m = Material {
                 alpha_mode,
                 double_sided,
                 ..Default::default()
             };
-            let g = GpuMaterial::from_material(&m, [0, 1, 0]);
+            let g = GpuMaterial::from_material(&m, [0, 1, 0, 0]);
             (g.params[3], g.tex[3])
         };
         assert_eq!(
@@ -2172,6 +2190,44 @@ mod tests {
         assert_eq!(pack(AlphaMode::Mask(0.5), false), (0.5, 0));
         assert_eq!(pack(AlphaMode::Opaque, false), (0.0, 0));
         assert_eq!(pack(AlphaMode::Blend, true), (0.0, MATERIAL_DOUBLE_SIDED));
+    }
+
+    /// A material's occlusion texture reaches the GPU as a slot above the
+    /// flags: MR's own slot for an ARM map, a slot of its own for an image of
+    /// its own, 0 (white) for none; and its strength as `params.z`.
+    #[test]
+    fn gpu_materials_pack_their_occlusion() {
+        let (arm, own) = (tex(1), tex(2));
+        let mat = |occ: Option<&Arc<TextureData>>, strength, double_sided| Material {
+            metallic_roughness_texture: Some(arm.clone()),
+            occlusion_texture: occ.cloned(),
+            occlusion_strength: strength,
+            double_sided,
+            ..Material::default()
+        };
+        let materials = [
+            mat(Some(&arm), 0.5, true),
+            mat(Some(&own), 1.0, false),
+            mat(None, 1.0, true),
+        ];
+        let plan = plan_texture_slots(&materials, 1024);
+        let g: Vec<GpuMaterial> = materials
+            .iter()
+            .zip(&plan.slots)
+            .map(|(m, &s)| GpuMaterial::from_material(m, s))
+            .collect();
+        let occ = |g: &GpuMaterial| g.tex[3] >> MATERIAL_OCCLUSION_SHIFT;
+        let flags = |g: &GpuMaterial| g.tex[3] & ((1 << MATERIAL_OCCLUSION_SHIFT) - 1);
+        assert_eq!(occ(&g[0]), g[0].tex[2], "an ARM map: MR's own slot");
+        assert_ne!(occ(&g[1]), g[1].tex[2], "an image of its own");
+        assert_ne!(occ(&g[1]), 0);
+        assert_eq!(occ(&g[2]), 0, "none: white");
+        assert_eq!(
+            [flags(&g[0]), flags(&g[1]), flags(&g[2])],
+            [MATERIAL_DOUBLE_SIDED, 0, MATERIAL_DOUBLE_SIDED]
+        );
+        assert_eq!([g[0].params[2], g[1].params[2]], [0.5, 1.0]);
+        assert_eq!(plan.uploads.len(), 2, "the ARM image uploads once");
     }
 
     /// The alpha test is written out in mesh.frag (the main pass) and

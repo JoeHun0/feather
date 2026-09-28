@@ -215,13 +215,16 @@ class Zone(gds.Level):
         if key not in self.mats:
             pid, _, surface = TEXTURES[key]
             base = os.path.join(ASSETS, f"polyhaven_{pid}", pid)
+            arm = self._image(f"{base}_arm_2k.jpg")
             self.doc["materials"].append({
                 "name": key,
                 "pbrMetallicRoughness": {
                     "baseColorTexture": {"index": self._image(f"{base}_diff_2k.jpg")},
-                    "metallicRoughnessTexture": {"index": self._image(f"{base}_arm_2k.jpg")},
+                    "metallicRoughnessTexture": {"index": arm},
                 },
                 "normalTexture": {"index": self._image(f"{base}_nor_gl_2k.jpg")},
+                # The ARM map's red is ambient occlusion (§13).
+                "occlusionTexture": {"index": arm},
                 "extras": {"surface": surface},
             })
             self.mats[key] = len(self.doc["materials"]) - 1
@@ -844,9 +847,24 @@ def main():
     print(f"wrote {args.out} ({os.path.getsize(args.out) / 1e6:.1f} MB): "
           + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
           + f"\n  {tris:,} triangles placed, {len(z.doc['images'])} images")
-    if args.check and not gts.check(z.doc):
+    if args.check and not (gts.check(z.doc) and check_occlusion(z.doc)):
         return 1
     return 0
+
+
+def check_occlusion(doc):
+    """Every material here with an MR texture takes it from a Poly Haven
+    ARM map, so each must name the same image as its occlusion."""
+    source = lambda slot: doc["textures"][slot["index"]]["source"]
+    bad = [m.get("name", i) for i, m in enumerate(doc["materials"])
+           if "metallicRoughnessTexture" in m.get("pbrMetallicRoughness", {})
+           and ("occlusionTexture" not in m
+                or source(m["occlusionTexture"])
+                != source(m["pbrMetallicRoughness"]["metallicRoughnessTexture"]))]
+    if bad:
+        print(f"check: {len(bad)} ARM materials without their occlusion: {bad[:5]}",
+              file=sys.stderr)
+    return not bad
 
 
 if __name__ == "__main__":

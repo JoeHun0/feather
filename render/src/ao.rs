@@ -392,6 +392,19 @@ mod reference {
         })
     }
 
+    /// glTF's occlusionTexture: the material's own ambient visibility from
+    /// its texture's red `sampled`, applied with `strength`. mesh.frag's
+    /// `material_occlusion`.
+    pub fn material_occlusion(sampled: f32, strength: f32) -> f32 {
+        1.0 + strength * (sampled - 1.0)
+    }
+
+    /// The material's occlusion and GTAO's as one visibility: the lower, as
+    /// the two often see the same crevice. mesh.frag's `combine_occlusion`.
+    pub fn combine_occlusion(material: f32, gtao: f32) -> f32 {
+        material.min(gtao)
+    }
+
     /// Lagarde and de Rousiers 2014: how much of the specular ambient survives
     /// visibility `ao` at this view angle and roughness.
     pub fn specular_occlusion(ndv: f32, ao: f32, roughness: f32) -> f32 {
@@ -1171,6 +1184,32 @@ mod tests {
                 assert!((specular_occlusion(ndv, 1.0, rough) - 1.0).abs() < 1e-6);
                 assert_eq!(specular_occlusion(ndv, 0.0, rough), 0.0);
             }
+        }
+    }
+
+    #[test]
+    fn material_occlusion_follows_gltf_and_never_brightens_gtao() {
+        // glTF: strength 0 ignores the texture, 1 applies it, between blends.
+        for sampled in [0.0, 0.3, 1.0] {
+            assert_eq!(material_occlusion(sampled, 0.0), 1.0);
+            assert!((material_occlusion(sampled, 1.0) - sampled).abs() < 1e-6);
+        }
+        assert!((material_occlusion(0.2, 0.5) - 0.6).abs() < 1e-6);
+        // Open by both is open; either one alone darkens, and the other
+        // never brightens it back; two dark ones don't compound.
+        assert_eq!(combine_occlusion(1.0, 1.0), 1.0);
+        for (m, g) in [(0.6, 1.0), (1.0, 0.6), (0.6, 0.8), (0.8, 0.6)] {
+            let c = combine_occlusion(m, g);
+            assert!(c <= m && c <= g, "{m} {g} -> {c}");
+            assert_eq!(c, f32::min(m, g), "no double darkening");
+        }
+        // mesh.frag's text is the reference's.
+        let mesh = include_str!("../shaders/mesh.frag");
+        for line in [
+            "    return 1.0 + strength * (sampled - 1.0);",
+            "float combine_occlusion(float material, float gtao) {\n    return min(material, gtao);",
+        ] {
+            assert!(mesh.contains(line), "mesh.frag lacks `{line}`");
         }
     }
 

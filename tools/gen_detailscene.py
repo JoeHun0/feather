@@ -26,6 +26,7 @@ import json
 import math
 import os
 import random
+import re
 import struct
 import sys
 
@@ -53,6 +54,12 @@ DENSITY = {
 }
 TEXTURE_SLOTS = ("baseColorTexture", "metallicRoughnessTexture")
 MATERIAL_TEXTURES = ("normalTexture", "occlusionTexture", "emissiveTexture")
+
+
+def is_arm_map(uri):
+    """Poly Haven's ARM maps (AO, roughness, metal in R, G, B), by the
+    file name it gives them: `<asset>_arm_<res>.jpg`."""
+    return re.search(r"_arm_\d+k\.(jpg|png)$", os.path.basename(uri)) is not None
 
 
 def load_gltf(path):
@@ -135,6 +142,12 @@ class Level:
         m = json.loads(json.dumps(src_doc["materials"][index]))  # deep copy
         m.pop("extensions", None)  # KHR_materials_transmission: not required
         pbr = m.get("pbrMetallicRoughness", {})
+        # Poly Haven's ARM maps carry ambient occlusion in red, but their
+        # glTFs don't reference it: name it, so the engine applies it (§13).
+        if "metallicRoughnessTexture" in pbr and "occlusionTexture" not in m:
+            src_tex = src_doc["textures"][pbr["metallicRoughnessTexture"]["index"]]
+            if is_arm_map(src_doc["images"][src_tex["source"]].get("uri", "")):
+                m["occlusionTexture"] = {"index": pbr["metallicRoughnessTexture"]["index"]}
         for slot in TEXTURE_SLOTS:
             if slot in pbr:
                 pbr[slot]["index"] = self._texture(src_doc, base, pbr[slot]["index"])

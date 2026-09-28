@@ -25,6 +25,9 @@ layout(set = 0, binding = 2) uniform sampler2D textures[];
 
 // Material flags (tex.w). Must match render::mesh's MATERIAL_DOUBLE_SIDED.
 const uint MATERIAL_DOUBLE_SIDED = 1u;
+// tex.w's bits above the flags: the occlusion texture's slot (render::mesh's
+// MATERIAL_OCCLUSION_SHIFT; a test checks).
+const uint MATERIAL_OCCLUSION_SHIFT = 8u;
 // The masked-material variant of this pipeline (§5): cut out below the
 // material's alpha cutoff. Not part of the environment's constants.
 layout(constant_id = 100) const bool MASKED = false;
@@ -277,6 +280,15 @@ vec3 ao_multibounce(float v, vec3 albedo) {
     vec3 b = -4.7951 * albedo + 0.6417;
     vec3 c = 2.7552 * albedo + 0.6903;
     return max(vec3(v), ((v * a + b) * v + c) * v);
+}
+// glTF's occlusionTexture: `strength` 0 ignores the sample, 1 applies it.
+// render::ao's reference (a test checks the text).
+float material_occlusion(float sampled, float strength) {
+    return 1.0 + strength * (sampled - 1.0);
+}
+// The material's occlusion and GTAO's, as one visibility: the lower.
+float combine_occlusion(float material, float gtao) {
+    return min(material, gtao);
 }
 // Lagarde and de Rousiers 2014: the specular ambient that survives
 // visibility `ao` at this view angle and roughness.
@@ -548,7 +560,9 @@ void main() {
     }
 
     vec3 albedo = texture(textures[nonuniformEXT(m.tex.x)], v_uv).rgb * m.base_color_factor.rgb;
-    vec2 mr = texture(textures[nonuniformEXT(m.tex.z)], v_uv).gb; // green=rough, blue=metal
+    // green = roughness, blue = metallic; red = occlusion if it's an ARM map.
+    vec3 arm = texture(textures[nonuniformEXT(m.tex.z)], v_uv).rgb;
+    vec2 mr = arm.gb;
     float roughness = clamp(m.params.x * mr.x, 0.04, 1.0);
     float metallic = clamp(m.emissive.a * mr.y, 0.0, 1.0);
 
@@ -563,6 +577,14 @@ void main() {
     // texture samples above instead of stalling after the light loop
     // (lights120 geo 0.96 -> 0.90 ms, §13).
     vec4 sv = sky_visibility(v_world_pos + ng / g.sky_origin.w);
+    // The material's own occlusion (glTF occlusionTexture, red), for the
+    // ambient: from the MR sample when they're one image, else its own (none
+    // is slot 0, white). The branch is per material, so uniform in a quad.
+    uint occ_slot = m.tex.w >> MATERIAL_OCCLUSION_SHIFT;
+    float occ_sample = occ_slot == m.tex.z ? arm.r
+                     : occ_slot == 0u ? 1.0
+                     : texture(textures[nonuniformEXT(occ_slot)], v_uv).r;
+    float material_ao = material_occlusion(occ_sample, m.params.z);
     vec3 N;
     if (m.tex.y == 1u) {
         // Slot 1 is the flat-normal default: this material has no normal map, so
@@ -624,12 +646,15 @@ void main() {
     vec3 prefiltered = mix(sky(r), sky_irradiance(r), roughness); // crude roughness blur
     vec2 ab = env_brdf_approx(roughness, ndv);
     vec3 specular_ibl = prefiltered * (f0 * ab.x + ab.y) * sky_specular(sv, r);
-    // Contact shadowing within a metre (GTAO, §13), on the ambient only.
+    // Occlusion on the ambient only: the material's, and GTAO's contact
+    // shadowing within a metre (§13). They see many of the same crevices,
+    // so the darker of the two rather than their product.
+    float ao = material_ao;
     if (g.ao_params.x > 0.5) {
-        float ao = gtao_upsample(v_world_pos, ng);
-        diffuse_ibl *= ao_multibounce(ao, albedo);
-        specular_ibl *= ao_specular(ndv, ao, roughness);
+        ao = combine_occlusion(ao, gtao_upsample(v_world_pos, ng));
     }
+    diffuse_ibl *= ao_multibounce(ao, albedo);
+    specular_ibl *= ao_specular(ndv, ao, roughness);
     vec3 ambient = kd_amb * diffuse_ibl + specular_ibl;
 
     vec3 color = ambient + lo + m.emissive.rgb;

@@ -68,6 +68,8 @@ fn main() {
                 (&mat.base_color_texture, TexKind::Color),
                 (&mat.normal_texture, TexKind::Data),
                 (&mat.metallic_roughness_texture, TexKind::Data),
+                // Usually MR's own image (an ARM map), which this keys once.
+                (&mat.occlusion_texture, TexKind::Data),
             ] {
                 if let Some(t) = tex {
                     textures
