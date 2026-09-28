@@ -557,6 +557,12 @@ void main() {
     if ((m.tex.w & MATERIAL_DOUBLE_SIDED) != 0u && !gl_FrontFacing) {
         ng = -ng;
     }
+    // The level's sky visibility (§13), sampled one cell off the surface so
+    // the cells behind it don't count. Here, before the lights, rather than
+    // where the ambient uses it: its eight fetches' latency then overlaps the
+    // texture samples above instead of stalling after the light loop
+    // (lights120 geo 0.96 -> 0.90 ms, §13).
+    vec4 sv = sky_visibility(v_world_pos + ng / g.sky_origin.w);
     vec3 N;
     if (m.tex.y == 1u) {
         // Slot 1 is the flat-normal default: this material has no normal map, so
@@ -610,9 +616,7 @@ void main() {
     }
 
     // --- Ambient (analytic IBL: split-sum against the procedural sky) ---
-    // Occluded by the level's sky visibility (§13), sampled one cell off the
-    // surface so the cells behind it don't count.
-    vec4 sv = sky_visibility(v_world_pos + ng / g.sky_origin.w);
+    // Occluded by the level's sky visibility (§13), `sv` above.
     vec3 fr = fresnel_schlick_roughness(ndv, f0, roughness);
     vec3 kd_amb = (vec3(1.0) - fr) * (1.0 - metallic);
     vec3 diffuse_ibl = sky_irradiance_occluded(N, sv) * albedo;

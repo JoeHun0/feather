@@ -710,7 +710,7 @@ defaults and CLI flags only.
 
 Bloom and auto-exposure are on by default, so a bench's `frame` includes
 them (~0.10 and ~0.06 ms with pinned clocks). So is sky occlusion when the
-scene's volume is baked (`geo` +0.05 ms on the zone, +0.10 on `lights120`),
+scene's volume is baked (`geo` +0.04 ms on the zone, +0.06 on `lights120`),
 and so is GTAO (its own `ao` line, 0.11 ms on the zone; its upsample runs in
 the main pass, inside `geo`). `geo` also times the
 depth prepass, which now runs on its own before GTAO. Pinned clocks run below

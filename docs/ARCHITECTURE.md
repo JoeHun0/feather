@@ -826,11 +826,37 @@ now scales the sky term. GTAO (below) adds the small-scale contact.
   interleaved rounds, `--no-sky-occlusion` vs on): `geo` 0.24 → 0.29 ms on
   the zone and 0.82 → 0.92 ms on `lights120` (+12%). I predicted
   +0.02–0.05 ms: the zone held at the edge, `lights120` didn't. Its 25 MB
-  volume (below) is the first suspect: 8 fetches a fragment spread across it
+  volume (below) was the first suspect: 8 fetches a fragment spread across it
   can miss the cache much more than in the zone's 3 MB.
+- **Found: it was latency, not the volume's size.** At a2c5e27 (pinned,
+  release, interleaved rounds; `geo` with it off: 0.26–0.27 zone / 0.86
+  `lights120`, on: 0.31 / 0.96):
+  - **All 8 fetches from one cell** (the maths kept): 0.28 / 0.89. So the
+    fetches' addresses cost ~0.07 ms of `lights120`'s 0.10, and the maths
+    little.
+  - **Fetches wrapped into a 16³ block,** 32 KB and cache-resident but still
+    spread: 0.31 / 0.96, unchanged. **I predicted ≈ 0.88 and was wrong:** it
+    isn't cache capacity, so a sparse grid wouldn't help the time.
+  - **4 fetches instead of 8:** 0.31 / 0.95. I predicted 0.92–0.93: wrong
+    again; fewer fetches barely help.
+  - **Latency is left.** `sky_visibility()` ran after the light loop, and
+    its blend waits on the loads at once, with nothing to overlap them.
+  - **Sampling it right after the normal** is known, before the lights
+    (predicted 0.89–0.91, held): 0.30 / 0.90. The loads' latency now
+    overlaps the albedo and metal-roughness samples.
+  - Earlier still, before those samples: 0.30 / 0.93, worse.
+- **Now** (3 interleaved rounds against a2c5e27):
+  - `lights120` `geo` 0.96 → 0.90–0.91 ms, frame 1.43 → 1.37–1.38 ms; the
+    zone 0.31 → 0.30 and 0.75 → 0.73–0.74 ms.
+  - On vs `--no-sky-occlusion`: +0.04 ms (zone) and +0.06 ms (`lights120`),
+    from +0.05 / +0.10.
+  - `mesh.frag` keeps 72 VGPRs and 20 waves.
+  - The off path read 0.84 ms against 0.86 before, which is within
+    §13's register-allocation noise (the fog finding).
 - **Memory:** 8 bytes a cell. That's 3.0 MB for the zone, but 25 MB for
   `lights120`, whose occluders reach 70 m up: its 3.3M cells are nearly all
-  open sky. A sparse or two-level grid would fix that; nothing needs it yet.
+  open sky. A sparse or two-level grid would fix the memory; it wouldn't
+  change the time (above). Nothing needs it yet.
 - **Limits:**
   - one volume per session, the first scene's;
   - static geometry only (a moving object neither occludes nor, beyond
