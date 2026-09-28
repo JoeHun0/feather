@@ -1161,6 +1161,42 @@ the ground's edge showed. Now it can pool on the ground.
     predicted it would persist at +0.01–0.02 ms, and it came out larger. It
     lands on the default fog path, which `lights120` uses, so it's worth
     finding.
+  - **Found: it isn't the fog, it's register allocation.** Variants of
+    `mesh.frag` at a2c5e27 (pinned, release, 3 interleaved rounds;
+    `lights120` `geo`):
+
+    | variant | `geo` ms | light-loop bank conflicts |
+    |---|---|---|
+    | as it is | 0.96 | 30 of 155 VALU |
+    | the three pre-e533010 fog lines | 0.94 | 25 |
+    | `normalize` for the fog direction | 0.96 | 30 |
+    | no fog at all | 0.95 | 30 (and fewer elsewhere) |
+
+    - The zone read 0.31 ms in every variant.
+    - I predicted the old lines would win back 0.03–0.05 ms (it was 0.02),
+      and no fog 0.01 more (it was *slower*): both wrong.
+    - The regression shrank from +0.04–0.05 to +0.02 ms since the re-measure
+      above, with no fog change in between.
+    - **Evidence.** In the ISA (`RADV_DEBUG=shaders`), the current and the
+      old-fog shaders are the same length (1852). Their clustered light loop
+      is the identical instruction sequence with the registers renumbered:
+      0 structural differences, 328 lines differing only in register
+      numbers.
+    - **The likely mechanism.** RDNA's VGPRs sit in four banks (index mod 4),
+      and a VALU instruction that reads two sources from one bank stalls. A
+      count of those in the loop ranks the variants as their times do. (It's
+      a simplified model of RDNA3: consistent with the evidence, not proof.)
+    - **A check that it predicts, not just fits:** three edits that change
+      no maths (swapping two AO lines, a sentinel constant, one
+      `inversesqrt`) left the loop's allocation as it was, and each timed
+      0.96, as predicted.
+    - **What follows.** Any edit to `mesh.frag` can move `lights120`'s `geo`
+      by ~0.02 ms through allocation alone. The fog wording that allocates
+      better today does so by dropping height fog, and matching it with some
+      other wording would be tuning against one driver version, so nothing
+      was changed.
+    - **Next, if it matters:** a lighter light loop (fewer live values), or
+      a driver update, not the fog.
 
 ### Post chain (after transparents; HDR until tonemap)
 

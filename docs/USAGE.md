@@ -736,6 +736,15 @@ pinned; debug and release measure the same. To compare with numbers from before 
 4. Compare medians and the p10–p90 band. **Only compare numbers taken on this
    machine, in one session.** ARCHITECTURE.md's milliseconds come from specific
    hardware, and only the ratios carry over.
+5. **Before blaming a ≤ 0.02 ms `geo` change on your change's maths,** check
+   the compiled shader. Any edit to `mesh.frag` can shift register allocation
+   in its light loop and move `lights120`'s `geo` by ~0.02 ms on its own
+   (ARCHITECTURE.md §13, the fog finding).
+   - `RADV_DEBUG=shaderstats` prints each shader's VGPRs, instructions and
+     waves.
+   - `RADV_DEBUG=shaders,nonir` prints the ISA.
+   - If the instruction counts match and only register numbers differ, it's
+     allocation.
 
 ---
 
