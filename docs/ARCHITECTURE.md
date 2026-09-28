@@ -843,21 +843,34 @@ now scales the sky term. GTAO (below) adds the small-scale contact.
 **Landed (§26): GTAO** (Jimenez et al. 2016, after Intel's XeGTAO): contact
 shadowing within 0.8 m, which the sky volume's 0.5 m cells, sampled a cell off
 the surface, can't see. It uses the depth prepass alone (§10).
-- **`gtao.comp`** (`render::AoPass`), full resolution:
+- **Half resolution, without a downsampled depth.** Half-resolution texel
+  `h` *is* full-resolution pixel `2h`: all three passes read the
+  full-resolution depth, so positions and sub-pixel steps stay exact, and on
+  a plane every blend weight is 1. (A downsampled depth would have to pick
+  one of each 2×2, a bias the four failures below show is easy to reach.)
+- **`gtao.comp`** (`render::AoPass`), over the half-resolution grid:
   - Normals are rebuilt from depth.
-  - 2 slices × 4 steps each way, both jittered by 4×4 patterns.
+  - 2 slices × 4 steps each way, both jittered by 4×4 patterns over the
+    half-resolution grid.
   - Radius 0.8 m, with occluders fading over its last 60%.
   - Pixels whose radius spans under 2 px are left open; the radius is
-    clamped to 200 px.
+    clamped to 200 px (full-resolution pixels, as are the steps).
   - The horizons are integrated against the normal projected into each slice.
-- **`gtao_denoise.comp`:** a 4×4 blur, so every pixel averages all 16 jitter
-  variants (32 directions). Each neighbour is weighted by its distance off the
-  centre's tangent plane, and gets nothing past 10% of the view distance.
+- **`gtao_denoise.comp`:** a 4×4 blur at half resolution (8×8 pixels), so
+  every texel averages all 16 jitter variants (32 directions). Each neighbour
+  is weighted by its distance off the centre's tangent plane, and gets nothing
+  past 10% of the view distance.
+- **`gtao_upsample.comp`:** back to full resolution. A pixel at even
+  coordinates copies its texel. Any other blends the 2 or 4 texels round it
+  bilinearly, each also weighted by its distance off the pixel's tangent
+  plane, as in the denoise. If none lies on the pixel's surface (a feature
+  too thin to have a texel), it takes the one nearest in distance.
 - **`mesh.frag`:** multiplies the diffuse ambient by Jimenez's multi-bounce
   fit (per albedo) and the specular ambient by Lagarde's specular occlusion.
   It's texel-for-pixel, sky visibility times GTAO, ambient only.
-- **Targets:** gfx owns two R32F images (raw and denoised; R32F because it's
-  on the mandatory storage list). A `targets_generation` counter tells
+- **Targets:** gfx owns three R32F images (raw and denoised at half size,
+  rounded up, and the full-size result; R32F because it's on the mandatory
+  storage list). A `targets_generation` counter tells
   `AoPass` and `MeshRenderer::set_ao` when a resize or MSAA change has moved
   them. A view handle can't tell, since a new view may reuse a freed one's
   handle.
@@ -889,7 +902,8 @@ the surface, can't see. It uses the depth prepass alone (§10).
   GTAO output from three zone viewpoints. The CPU reference, run over that
   depth, matches the GPU to a median of 1e-5 and a 99th percentile of
   1e-3 (0.03 at worst, a few pixels).
-- **Measured** (debug, clocks unpinned, 3 interleaved runs, `--no-ao` vs on):
+- **Measured at full resolution** (its first version; debug, clocks unpinned,
+  3 interleaved runs, `--no-ao` vs on):
   - `ao` 0.26–0.27 ms on the zone (frames +0.25–0.28 ms) and 0.37–0.38 ms on
     `lights120`. I predicted 0.15–0.30: the zone held, `lights120` didn't.
   - The gtao pass is most of it: 0.23 / 0.31 ms, against 0.05–0.07 for the
@@ -901,6 +915,9 @@ the surface, can't see. It uses the depth prepass alone (§10).
     share of any view.
   - Validation with sync: 0 messages at MSAA 1/2/4×, with GTAO off, on the
     nature scene and the orb demo, and across two resizes mid-session.
+    (Not reproduced since: under MSAA the prepass's depth resolve reports
+    one `SYNC-HAZARD-READ-AFTER-WRITE` a frame, at that commit too. See
+    Limits.)
 - **Re-measured with pinned clocks** (`profile_standard`, release, 3
   interleaved rounds; every median repeated to 0.01 ms):
   - `ao` 0.38 ms on the zone and 0.54 ms on `lights120` (frames +0.40 /
@@ -910,16 +927,47 @@ the surface, can't see. It uses the depth prepass alone (§10).
     the gtao pass is 85–87% of it. I predicted ~85%, which held.
   - Debug and release measure the same (0.39 / 0.54 ms): GPU work doesn't
     depend on the Rust profile.
-- **Next lever:** half resolution with a depth-aware upsample. The plan named
-  it for costs over 0.25 ms, and both scenes are over. Not done here.
+- **Half resolution, measured** (pinned, release, 3 interleaved rounds
+  against the full-resolution binary; every median repeated to 0.01 ms):
+  - `ao` 0.38 → 0.21 ms on the zone and 0.54 → 0.29 ms on `lights120`
+    (−45%; frames 1.01 → 0.83 and 1.81 → 1.52 ms). **I predicted 0.12–0.18
+    and 0.17–0.25 ms, and was wrong:** too optimistic.
+  - A temporary harness skipping passes split it: gtao 0.13 / 0.19 ms,
+    denoise 0.03 / 0.03, upsample 0.05 / 0.07. With a quarter of the
+    threads, gtao fell only to ~40%. Its steps still read the
+    full-resolution depth, from threads now 2 px apart, so the cache helps
+    less. I'd guessed ~0.03 for the upsample.
+- **Half resolution, checked:**
+  - On the GPU: the same dump harness, from three zone viewpoints (in the
+    hangar, its door, the office). The CPU reference over that depth
+    matches to a median of 1e-5, a p99 of 2e-3 and 0.03 at worst, as at
+    full resolution.
+  - Against the full-resolution reference, on the same depth: mean
+    difference 0.0007–0.002, p99 0.015–0.056. Mean AO is the same to 4
+    decimals. The differences are a pixel-wide line along creases and
+    silhouettes, and the largest (0.5) is in the thin crevice under the car,
+    which reads lighter and softer.
+  - Validation with sync: 0 messages at 1×, with GTAO off, on `lights120`,
+    the nature scene and the orb demo, and at 1921×1046 (odd halves). At
+    MSAA 2/4× only the prepass resolve's messages, as before this change.
+- **Next lever:** gtao's depth reads. A half-resolution (or mip-chained,
+  XeGTAO-style) copy of the depth for the steps, keeping the texel's own
+  position exact, should bring it nearer the quarter its thread count
+  suggests. Not done here.
 - **Limits:**
   - screen-space: what's off-screen or behind a silhouette doesn't occlude;
   - no thickness heuristic, so thin poles and grass cards shadow as if
     solid;
   - no temporal filtering, so the result is noise-free only where the 4×4
     blur averages a smooth surface;
-  - the screen's two outermost columns can read a few percent dark where a
-    surface is seen near grazing;
+  - the screen's outermost ~4 columns and rows can read a few percent dark
+    where a surface is seen near grazing: the last two half-resolution
+    texels, whose clamped 4×4 window repeats some jitter variants (at full
+    resolution it was 2 columns; ignoring steps that leave the screen
+    halves it at the edge, an unkept experiment);
+  - under MSAA, sync validation reports one `SYNC-HAZARD-READ-AFTER-WRITE` a
+    frame on the prepass's depth resolve (from e246707, which moved the
+    prepass into its own rendering), not yet chased;
   - a faint large-scale tint (≤ 2%) was seen on the hangar's far wall in one
     dump and not chased.
 - **Switch:** OPTIONS > GRAPHICS > AMBIENT OCCLUSION, saved as
@@ -930,11 +978,14 @@ the surface, can't see. It uses the depth prepass alone (§10).
   - the slice integral against Simpson's rule;
   - an open floor, and face-on and 40° walls filling the view, read 1;
   - a wall darkens the floor at its foot and nowhere else;
-  - the denoise keeps to its side of an edge;
+  - the denoise keeps to its side of an edge, and so does the upsample;
+  - the upsample copies its texels and is a plain bilinear blend on a plane;
+  - half resolution keeps full resolution's result at a wall's foot (mean
+    difference < 0.01, the foot within 0.05);
   - every 4×4 window holds each jitter once;
   - the ambient fits leave open surfaces alone;
-  - the shaders declare the reference's constants, and share `view_pos` and
-    `depth_normal` text for text;
+  - the shaders declare the reference's constants, and all three share
+    `view_pos` and `depth_normal` text for text;
   - the menu row, config key and flag.
 
   Each was shown to fail against a deliberately broken copy.
@@ -2564,8 +2615,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   environment. Real cubemap IBL (equirect→cube, irradiance/prefilter passes,
   BRDF LUT) is the follow-up. Sun shadows (§11 CSM) and punctual point lights
   (§12) now exist. Bloom and auto-exposure landed (§13). The ambient is
-  occluded by a baked per-level sky-visibility volume (§13, §17) and by GTAO
-  (§13). The tonemap curve is a drop-in point for AgX.
+  occluded by a baked per-level sky-visibility volume (§13, §17) and by
+  half-resolution GTAO (§13). The tonemap curve is a drop-in point for AgX.
   **Known artifact — specular singularity on smooth metal.** A punctual light has
   zero area, so on low-roughness metal (the PBR grid bottoms out at 0.06) its
   specular lobe collapses to a near-singular bright dot. With a geometry-free

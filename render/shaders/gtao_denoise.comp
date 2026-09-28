@@ -1,8 +1,10 @@
 #version 450
 
-// GTAO's denoise (§13): a 4x4 blur of gtao.comp's output, which holds each of
-// its 16 jitter variants exactly once, so on a smooth surface the noise
-// averages away completely. Surface-aware: a neighbour counts less the
+// GTAO's denoise (§13): a 4x4 blur of gtao.comp's half-resolution output,
+// which holds each of its 16 jitter variants exactly once, so on a smooth
+// surface the noise averages away completely. Half-resolution texel h is
+// full-resolution pixel 2h, whose position comes from the full-resolution
+// depth, as in gtao.comp. Surface-aware: a neighbour counts less the
 // further it lies off the centre's tangent plane, and not at all past
 // AO_DENOISE_DEPTH of the centre's distance, so occlusion doesn't bleed
 // across silhouettes. On a plane every weight is 1, which keeps the average
@@ -13,8 +15,9 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform sampler2D u_depth;
+// Both half resolution.
 layout(set = 0, binding = 1, r32f) uniform readonly image2D u_raw;
-layout(set = 0, binding = 2, r32f) uniform writeonly image2D u_ao;
+layout(set = 0, binding = 2, r32f) uniform writeonly image2D u_half;
 
 layout(push_constant) uniform Push {
     vec4 proj; // as gtao.comp's
@@ -24,6 +27,7 @@ layout(push_constant) uniform Push {
 // Must match render::ao's reference (a test checks).
 const float AO_DENOISE_DEPTH = 0.1;
 
+// The full-resolution depth's size.
 ivec2 g_size;
 
 // gtao.comp's, text for text (a test checks).
@@ -50,13 +54,15 @@ vec3 depth_normal(ivec2 p, vec3 P) {
 }
 
 void main() {
-    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    g_size = textureSize(u_depth, 0);
-    if (p.x >= g_size.x || p.y >= g_size.y) {
+    ivec2 h = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 half_size = imageSize(u_raw);
+    if (any(greaterThanEqual(h, half_size))) {
         return;
     }
+    g_size = textureSize(u_depth, 0);
+    ivec2 p = 2 * h;
     if (texelFetch(u_depth, p, 0).r >= 1.0) {
-        imageStore(u_ao, p, vec4(1.0));
+        imageStore(u_half, h, vec4(1.0));
         return;
     }
     vec3 P = view_pos(p);
@@ -66,12 +72,12 @@ void main() {
     float total = 0.0;
     for (int y = -1; y <= 2; ++y) {
         for (int x = -1; x <= 2; ++x) {
-            ivec2 q = clamp(p + ivec2(x, y), ivec2(0), g_size - 1);
-            float off = abs(dot(view_pos(q) - P, N));
+            ivec2 q = clamp(h + ivec2(x, y), ivec2(0), half_size - 1);
+            float off = abs(dot(view_pos(2 * q) - P, N));
             float w = max(1.0 - off / tolerance, 0.0);
             sum += w * imageLoad(u_raw, q).r;
             total += w;
         }
     }
-    imageStore(u_ao, p, vec4(min(sum / total, 1.0)));
+    imageStore(u_half, h, vec4(min(sum / total, 1.0)));
 }

@@ -4,12 +4,17 @@
 // XeGTAO): how much of the hemisphere above each pixel's surface is open
 // within AO_RADIUS, cosine-weighted, from the depth buffer alone.
 //
+// At half resolution: one thread per half-resolution texel h, which is the
+// full-resolution pixel 2h, read from the full-resolution depth (no
+// downsampled copy), so positions and steps stay exact. gtao_denoise.comp
+// blurs the half-resolution result and gtao_upsample.comp brings it back.
+//
 // Per pixel, AO_SLICES planes through the view vector, each marched AO_STEPS
 // times both ways on screen for the highest horizon, then integrated
 // analytically against the surface normal projected into the slice. Slice
-// angles and step offsets are jittered by two 4x4 patterns, so the 4x4
-// depth-aware blur in gtao_denoise.comp averages 16 variants of each: 32
-// directions for the price of 2.
+// angles and step offsets are jittered by two 4x4 patterns over the
+// half-resolution grid, so the 4x4 depth-aware blur in gtao_denoise.comp
+// averages 16 variants of each: 32 directions for the price of 2.
 //
 // Positions are in a screen-aligned view space: x right, y down, z away from
 // the camera (the distance along the view axis), so screen and slice
@@ -18,6 +23,7 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform sampler2D u_depth;
+// Half resolution.
 layout(set = 0, binding = 1, r32f) uniform writeonly image2D u_raw;
 
 layout(push_constant) uniform Push {
@@ -40,10 +46,12 @@ const float AO_MIN_STEP_PX = 1.3;
 const float PI = 3.14159265359;
 const float HALF_PI = 1.57079632679;
 
+// The full-resolution depth's size.
 ivec2 g_size;
 
-// view_pos() and depth_normal() are gtao_denoise.comp's too, text for text
-// (a test checks).
+// view_pos() and depth_normal() are gtao_denoise.comp's and
+// gtao_upsample.comp's too, text for text (a test checks). Both take
+// full-resolution pixels.
 vec3 view_pos(ivec2 p) {
     p = clamp(p, ivec2(0), g_size - 1);
     float dist = pc.proj.x / (texelFetch(u_depth, p, 0).r + pc.proj.y);
@@ -99,20 +107,23 @@ float slice_arc(float h0, float h1, float n) {
 }
 
 void main() {
-    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    g_size = textureSize(u_depth, 0);
-    if (p.x >= g_size.x || p.y >= g_size.y) {
+    // The half-resolution texel, and the full-resolution pixel it stands for
+    // (the half size rounds up, so that's always in the depth).
+    ivec2 h = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(h, imageSize(u_raw)))) {
         return;
     }
+    g_size = textureSize(u_depth, 0);
+    ivec2 p = 2 * h;
     // The sky, and surfaces too far for the radius to span two pixels: open.
     if (texelFetch(u_depth, p, 0).r >= 1.0) {
-        imageStore(u_raw, p, vec4(1.0));
+        imageStore(u_raw, h, vec4(1.0));
         return;
     }
     vec3 P = view_pos(p);
     float radius_px = AO_RADIUS * pc.params.x / P.z;
     if (radius_px < AO_MIN_RADIUS_PX) {
-        imageStore(u_raw, p, vec4(1.0));
+        imageStore(u_raw, h, vec4(1.0));
         return;
     }
     radius_px = min(radius_px, AO_MAX_RADIUS_PX);
@@ -120,11 +131,12 @@ void main() {
     vec3 N = depth_normal(p, P);
     vec3 V = normalize(-P);
 
-    // Occluders fade out over the last AO_FALLOFF of the radius.
+    // Occluders fade out over the last AO_FALLOFF of the radius. The jitter
+    // follows the half-resolution texel, which the denoise's window counts in.
     float falloff_mul = -1.0 / (AO_FALLOFF * AO_RADIUS);
     float falloff_add = 1.0 / AO_FALLOFF;
-    float slice_noise = (bayer4(p) + 0.5) / 16.0;
-    float step_noise = (bayer4(p.yx) + 0.5) / 16.0;
+    float slice_noise = (bayer4(h) + 0.5) / 16.0;
+    float step_noise = (bayer4(h.yx) + 0.5) / 16.0;
     float min_step = AO_MIN_STEP_PX / radius_px;
     vec2 centre = vec2(p) + 0.5;
 
@@ -175,5 +187,5 @@ void main() {
     // Not clamped to 1: one pixel's pair of slices can read above 1 as well
     // as below (only the average over all directions is exact), and
     // clamping before the denoise averaged them read a flat floor 2% dark.
-    imageStore(u_raw, p, vec4(max(visibility / float(AO_SLICES), 0.0)));
+    imageStore(u_raw, h, vec4(max(visibility / float(AO_SLICES), 0.0)));
 }

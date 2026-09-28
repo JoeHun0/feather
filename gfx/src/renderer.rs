@@ -77,7 +77,8 @@ fn clamp_samples(limits: &vk::PhysicalDeviceLimits, want: u32) -> vk::SampleCoun
 // GPU timing (§21): timestamps per frame-in-flight — shadow (start, end),
 // geometry (start, end), post (start, end). Frame is shadow-start → post-end.
 const TIMESTAMPS_PER_FRAME: u32 = 14;
-/// GTAO's targets (§13): its raw and denoised visibility, one float each.
+/// GTAO's targets (§13): its raw and denoised visibility at half resolution
+/// and the upsampled result, one float each.
 /// R32F because the passes write them as storage images, and it's on the
 /// mandatory storage-format list (R16F and R8 aren't).
 const AO_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
@@ -270,9 +271,10 @@ pub struct Renderer {
     // Single-sample depth, resolved (sample 0) from `depth` at the end of the
     // prepass, allocated only when MSAA is on: what GTAO reads (§13).
     depth_resolve: Option<Image>,
-    // GTAO's raw and denoised visibility (§13), full size, recreated with the
-    // other targets.
+    // GTAO's raw and denoised visibility (§13) at half size (rounded up), and
+    // the full-size upsampled result, recreated with the other targets.
     ao_raw: Option<Image>,
+    ao_half: Option<Image>,
     ao: Option<Image>,
     // Nearest, clamp-to-edge: for images read with texelFetch/textureGather.
     nearest_sampler: vk::Sampler,
@@ -506,7 +508,8 @@ impl Renderer {
         let bloom = create_bloom(&allocator, &device, sc.extent);
         let depth_resolve = (samples != vk::SampleCountFlags::TYPE_1)
             .then(|| create_depth(&allocator, &device, sc.extent, vk::SampleCountFlags::TYPE_1));
-        let ao_raw = create_ao(&allocator, &device, sc.extent);
+        let ao_raw = create_ao(&allocator, &device, ao_half_extent(sc.extent));
+        let ao_half = create_ao(&allocator, &device, ao_half_extent(sc.extent));
         let ao = create_ao(&allocator, &device, sc.extent);
         let nearest_sampler = unsafe {
             device.create_sampler(
@@ -624,6 +627,7 @@ impl Renderer {
             hdr_resolve,
             depth_resolve,
             ao_raw: Some(ao_raw),
+            ao_half: Some(ao_half),
             ao: Some(ao),
             nearest_sampler,
             targets_generation: 0,
@@ -806,11 +810,13 @@ impl Renderer {
             .view
     }
 
-    /// GTAO's raw and denoised targets (§13), in `GENERAL` while the AO slot
-    /// runs and while the main pass reads the denoised one.
-    pub fn ao_views(&self) -> [vk::ImageView; 2] {
+    /// GTAO's targets (§13): the half-size raw and denoised ones, then the
+    /// full-size result. In `GENERAL` while the AO slot runs and while the
+    /// main pass reads the result.
+    pub fn ao_views(&self) -> [vk::ImageView; 3] {
         [
             self.ao_raw.as_ref().expect("ao alive").view,
+            self.ao_half.as_ref().expect("ao alive").view,
             self.ao.as_ref().expect("ao alive").view,
         ]
     }
@@ -1630,8 +1636,8 @@ impl Renderer {
         // GTAO can read the depth before anything is shaded.
         prepass: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         // Compute between the prepass and the main pass (§13's GTAO): it may
-        // sample `depth_sample_view` (read-only depth layout) and write both
-        // `ao_views` (GENERAL); the result is made visible to fragment
+        // sample `depth_sample_view` (read-only depth layout) and write all
+        // the `ao_views` (GENERAL); the last is made visible to fragment
         // shaders.
         ao: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         // The lit pass and the sky, over the prepass's depth (loaded, tested,
@@ -2071,12 +2077,13 @@ impl Renderer {
                     ts_base + 12,
                 );
             }
-            // Both targets: UNDEFINED -> GENERAL. Shared across frames in
+            // All three targets: UNDEFINED -> GENERAL. Shared across frames in
             // flight, so wait for the previous frame's GTAO writes and main
             // pass reads (§21's rule). Done even with GTAO off: the main
             // pass's descriptor names this layout.
-            let (ao_raw, ao_img) = (
+            let (ao_raw, ao_half, ao_img) = (
                 self.ao_raw.as_ref().expect("ao alive"),
+                self.ao_half.as_ref().expect("ao alive"),
                 self.ao.as_ref().expect("ao alive"),
             );
             let to_general = |image: vk::Image| {
@@ -2097,7 +2104,11 @@ impl Renderer {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[to_general(ao_raw.handle), to_general(ao_img.handle)],
+                &[
+                    to_general(ao_raw.handle),
+                    to_general(ao_half.handle),
+                    to_general(ao_img.handle),
+                ],
             );
             ao(cmd, extent, frame);
             // Its result, visible to the main pass's fragment shader.
@@ -2534,7 +2545,9 @@ impl Renderer {
                 vk::SampleCountFlags::TYPE_1,
             )
         });
-        self.ao_raw = Some(create_ao(self.allocator(), &self.device, extent));
+        let half = ao_half_extent(extent);
+        self.ao_raw = Some(create_ao(self.allocator(), &self.device, half));
+        self.ao_half = Some(create_ao(self.allocator(), &self.device, half));
         self.ao = Some(create_ao(self.allocator(), &self.device, extent));
         self.targets_generation += 1;
     }
@@ -2617,6 +2630,7 @@ impl Drop for Renderer {
             self.hdr_resolve.take();
             self.depth_resolve.take();
             self.ao_raw.take();
+            self.ao_half.take();
             self.ao.take();
             self.ldr.take();
             self.bloom.take();
@@ -2809,8 +2823,8 @@ fn create_depth(
     }
 }
 
-/// One of GTAO's full-size targets (§13): written as a storage image by its
-/// compute passes, then sampled by the main pass.
+/// One of GTAO's targets (§13): written as a storage image by its compute
+/// passes; the full-size one is then sampled by the main pass.
 fn create_ao(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::Extent2D) -> Image {
     let image_ci = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
@@ -2851,6 +2865,15 @@ fn create_ao(allocator: &Arc<vk_mem::Allocator>, device: &Device, extent: vk::Ex
         handle: image,
         view,
         format: AO_FORMAT,
+    }
+}
+
+/// GTAO's half-resolution size (§13): half the window's, rounded up, so
+/// texel `h` stands for full-resolution pixel `2h` right to the last one.
+fn ao_half_extent(extent: vk::Extent2D) -> vk::Extent2D {
+    vk::Extent2D {
+        width: extent.width.div_ceil(2),
+        height: extent.height.div_ceil(2),
     }
 }
 

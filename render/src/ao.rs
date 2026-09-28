@@ -1,12 +1,16 @@
 //! Ground-truth ambient occlusion (§13, GTAO): contact shadowing of the
 //! ambient light within `AO_RADIUS` of each pixel, from the depth prepass.
 //!
-//! Two compute passes between the prepass and the main pass:
-//! - `gtao.comp`: per pixel, `AO_SLICES` slices × `AO_STEPS` steps each way
+//! Three compute passes between the prepass and the main pass. The first two
+//! run at half resolution, where texel `h` is full-resolution pixel `2h`, read
+//! from the full-resolution depth (there's no downsampled copy):
+//! - `gtao.comp`: per texel, `AO_SLICES` slices × `AO_STEPS` steps each way
 //!   for the horizons, integrated against the normal (rebuilt from depth), with
 //!   slice angle and step offset jittered by 4×4 patterns;
 //! - `gtao_denoise.comp`: a depth-aware 4×4 blur, which holds each jitter
-//!   variant exactly once, so the noise averages out.
+//!   variant exactly once, so the noise averages out;
+//! - `gtao_upsample.comp`: back to full resolution, a bilinear blend of the
+//!   texels round each pixel that lie on its surface.
 //!
 //! `mesh.frag` then multiplies the ambient (diffuse with a multi-bounce fit,
 //! specular with a specular-occlusion fit) by the result. The large scale is
@@ -54,13 +58,14 @@ impl AoProjection {
     }
 }
 
-/// The two GTAO compute passes and their per-frame descriptor sets.
+/// The three GTAO compute passes and their per-frame descriptor sets.
 pub struct AoPass {
     device: ash::Device,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     gtao: vk::Pipeline,
     denoise: vk::Pipeline,
+    upsample: vk::Pipeline,
     pool: vk::DescriptorPool,
     sets: Vec<vk::DescriptorSet>,
     /// The `Renderer::targets_generation` each frame's set points at.
@@ -74,6 +79,7 @@ impl AoPass {
             (0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
             (1, vk::DescriptorType::STORAGE_IMAGE),
             (2, vk::DescriptorType::STORAGE_IMAGE),
+            (3, vk::DescriptorType::STORAGE_IMAGE),
         ]
         .map(|(b, ty)| {
             vk::DescriptorSetLayoutBinding::default()
@@ -97,7 +103,7 @@ impl AoPass {
                 .descriptor_count(frames),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(2 * frames),
+                .descriptor_count(3 * frames),
         ];
         let pool = unsafe {
             device
@@ -155,19 +161,23 @@ impl AoPass {
         };
         let gtao = compute(spv!("gtao.comp"), "gtao pipeline");
         let denoise = compute(spv!("gtao_denoise.comp"), "gtao denoise pipeline");
+        let upsample = compute(spv!("gtao_upsample.comp"), "gtao upsample pipeline");
         Self {
             device,
             set_layout,
             layout,
             gtao,
             denoise,
+            upsample,
             pool,
             sets,
             bound: vec![None; FRAMES_IN_FLIGHT],
         }
     }
 
-    /// Point this frame's set at the renderer's current depth and AO images,
+    /// Point this frame's set at the renderer's current depth and AO images
+    /// (the half-resolution raw and denoised ones, then the full-resolution
+    /// result),
     /// if they've been recreated since (`generation`). Safe each frame:
     /// `draw_frame` waits on the frame fence before the closures run, and
     /// this is called before the set is bound.
@@ -176,7 +186,7 @@ impl AoPass {
         frame: usize,
         generation: u64,
         depth_view: vk::ImageView,
-        [raw_view, ao_view]: [vk::ImageView; 2],
+        [raw_view, half_view, ao_view]: [vk::ImageView; 3],
         sampler: vk::Sampler,
     ) {
         if self.bound[frame] == Some(generation) {
@@ -191,7 +201,8 @@ impl AoPass {
                 .image_layout(vk::ImageLayout::GENERAL)
                 .image_view(view)]
         };
-        let (raw_info, ao_info) = (storage(raw_view), storage(ao_view));
+        let (raw_info, half_info, ao_info) =
+            (storage(raw_view), storage(half_view), storage(ao_view));
         let set = self.sets[frame];
         let writes = [
             vk::WriteDescriptorSet::default()
@@ -208,15 +219,21 @@ impl AoPass {
                 .dst_set(set)
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&half_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&ao_info),
         ];
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
         self.bound[frame] = Some(generation);
     }
 
-    /// Record both passes over an image of `extent`, with the barrier
-    /// between them. `draw_frame` puts the images in GENERAL first and makes
-    /// the result visible to fragment shaders after.
+    /// Record the three passes for an image of `extent` (the first two over
+    /// its half, rounded up), with a barrier after each. `draw_frame` puts
+    /// the images in GENERAL first and makes the result visible to fragment
+    /// shaders after.
     pub fn dispatch(
         &self,
         cmd: vk::CommandBuffer,
@@ -226,7 +243,26 @@ impl AoPass {
     ) {
         let push = proj.push(extent.height);
         let bytes: Vec<u8> = push.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let groups = (extent.width.div_ceil(8), extent.height.div_ceil(8));
+        let groups = |w: u32, h: u32| (w.div_ceil(8), h.div_ceil(8));
+        let half = groups(extent.width.div_ceil(2), extent.height.div_ceil(2));
+        let full = groups(extent.width, extent.height);
+        // Each pass's writes, before the next reads them.
+        let barrier = |cmd| {
+            let b = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[b],
+                    &[],
+                    &[],
+                )
+            };
+        };
         unsafe {
             self.device.cmd_bind_descriptor_sets(
                 cmd,
@@ -245,22 +281,15 @@ impl AoPass {
             );
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.gtao);
-            self.device.cmd_dispatch(cmd, groups.0, groups.1, 1);
-            let b = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[b],
-                &[],
-                &[],
-            );
+            self.device.cmd_dispatch(cmd, half.0, half.1, 1);
+            barrier(cmd);
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.denoise);
-            self.device.cmd_dispatch(cmd, groups.0, groups.1, 1);
+            self.device.cmd_dispatch(cmd, half.0, half.1, 1);
+            barrier(cmd);
+            self.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.upsample);
+            self.device.cmd_dispatch(cmd, full.0, full.1, 1);
         }
     }
 }
@@ -270,6 +299,7 @@ impl Drop for AoPass {
         unsafe {
             self.device.destroy_pipeline(self.gtao, None);
             self.device.destroy_pipeline(self.denoise, None);
+            self.device.destroy_pipeline(self.upsample, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_pool(self.pool, None);
             self.device
@@ -405,8 +435,21 @@ mod reference {
             dy.cross(dx).normalize()
         }
 
-        /// gtao.comp for one pixel.
-        pub fn gtao(&self, x: i32, y: i32) -> f32 {
+        /// The half-resolution grid's size: half the image's, rounded up.
+        pub fn half_size(&self) -> (i32, i32) {
+            ((self.width + 1) / 2, (self.height + 1) / 2)
+        }
+
+        /// gtao.comp for half-resolution texel (hx, hy), which is pixel
+        /// (2hx, 2hy).
+        pub fn gtao(&self, hx: i32, hy: i32) -> f32 {
+            self.gtao_at(2 * hx, 2 * hy, (hx, hy))
+        }
+
+        /// gtao.comp's maths at pixel (x, y), with the jitter of grid cell
+        /// `jitter`: the shader's at `(2h, h)`, and the full-resolution pass
+        /// it replaced at `((x, y), (x, y))`.
+        fn gtao_at(&self, x: i32, y: i32, jitter: (i32, i32)) -> f32 {
             use glam::Vec3;
             use std::f32::consts::{FRAC_PI_2, PI};
             if self.raw(x, y) >= 1.0 {
@@ -423,8 +466,8 @@ mod reference {
             let v = (-p).normalize();
             let falloff_mul = -1.0 / (AO_FALLOFF * AO_RADIUS);
             let falloff_add = 1.0 / AO_FALLOFF;
-            let slice_noise = (bayer4(x, y) + 0.5) / 16.0;
-            let step_noise = (bayer4(y, x) + 0.5) / 16.0;
+            let slice_noise = (bayer4(jitter.0, jitter.1) + 0.5) / 16.0;
+            let step_noise = (bayer4(jitter.1, jitter.0) + 0.5) / 16.0;
             let min_step = AO_MIN_STEP_PX / radius_px;
             let centre = [x as f32 + 0.5, y as f32 + 0.5];
             let at = |q: [f32; 2]| Vec3::from(self.view_pos_at(q));
@@ -464,10 +507,18 @@ mod reference {
             (visibility / AO_SLICES as f32).max(0.0)
         }
 
-        /// gtao_denoise.comp for one pixel, over `raw` (gtao's output, the same
-        /// size).
-        pub fn denoise(&self, raw: &[f32], x: i32, y: i32) -> f32 {
+        /// gtao_denoise.comp for half-resolution texel (hx, hy), over `raw`
+        /// (gtao's output, `half_size()`).
+        pub fn denoise(&self, raw: &[f32], hx: i32, hy: i32) -> f32 {
+            self.denoise_at(raw, self.half_size(), 2, hx, hy)
+        }
+
+        /// gtao_denoise.comp's maths over a `size` grid whose cell (i, j) is
+        /// pixel (scale·i, scale·j): the shader's at scale 2, the
+        /// full-resolution pass it replaced at 1.
+        fn denoise_at(&self, raw: &[f32], size: (i32, i32), scale: i32, i: i32, j: i32) -> f32 {
             use glam::Vec3;
+            let (x, y) = (scale * i, scale * j);
             if self.raw(x, y) >= 1.0 {
                 return 1.0;
             }
@@ -477,26 +528,82 @@ mod reference {
             let (mut sum, mut total) = (0.0, 0.0);
             for dy in -1..=2 {
                 for dx in -1..=2 {
-                    let qx = (x + dx).clamp(0, self.width - 1);
-                    let qy = (y + dy).clamp(0, self.height - 1);
-                    let off = (Vec3::from(self.view_pos(qx, qy)) - p).dot(n).abs();
+                    let qi = (i + dx).clamp(0, size.0 - 1);
+                    let qj = (j + dy).clamp(0, size.1 - 1);
+                    let q = Vec3::from(self.view_pos(scale * qi, scale * qj));
+                    let off = (q - p).dot(n).abs();
                     let w = (1.0 - off / tolerance).max(0.0);
-                    sum += w * raw[(qy * self.width + qx) as usize];
+                    sum += w * raw[(qj * size.0 + qi) as usize];
                     total += w;
                 }
             }
             (sum / total).min(1.0)
         }
 
-        /// Both passes over the whole image.
+        /// gtao_upsample.comp for pixel (x, y), over `half` (the denoise's
+        /// output, `half_size()`).
+        pub fn upsample(&self, half: &[f32], x: i32, y: i32) -> f32 {
+            use glam::Vec3;
+            if self.raw(x, y) >= 1.0 {
+                return 1.0;
+            }
+            let p = Vec3::from(self.view_pos(x, y));
+            let n = self.depth_normal(x, y);
+            let tolerance = AO_DENOISE_DEPTH * p.z;
+            let (hw, hh) = self.half_size();
+            let (fx, fy) = ((x & 1) as f32 * 0.5, (y & 1) as f32 * 0.5);
+            let (mut sum, mut total) = (0.0, 0.0);
+            let (mut nearest, mut nearest_dz) = (1.0, f32::INFINITY);
+            for dy in 0..=1 {
+                for dx in 0..=1 {
+                    let bx = if dx == 0 { 1.0 - fx } else { fx };
+                    let by = if dy == 0 { 1.0 - fy } else { fy };
+                    let bilinear = bx * by;
+                    if bilinear == 0.0 {
+                        continue;
+                    }
+                    let qx = ((x >> 1) + dx).min(hw - 1);
+                    let qy = ((y >> 1) + dy).min(hh - 1);
+                    let q = Vec3::from(self.view_pos(2 * qx, 2 * qy));
+                    let ao = half[(qy * hw + qx) as usize];
+                    let w = bilinear * (1.0 - (q - p).dot(n).abs() / tolerance).max(0.0);
+                    sum += w * ao;
+                    total += w;
+                    let dz = (q.z - p.z).abs();
+                    if dz < nearest_dz {
+                        (nearest, nearest_dz) = (ao, dz);
+                    }
+                }
+            }
+            if total > 1e-4 {
+                sum / total
+            } else {
+                nearest
+            }
+        }
+
+        /// All three passes: the full-resolution result, as mesh.frag reads it.
         pub fn ambient_occlusion(&self) -> Vec<f32> {
-            let raw: Vec<f32> = (0..self.height)
-                .flat_map(|y| (0..self.width).map(move |x| (x, y)))
-                .map(|(x, y)| self.gtao(x, y))
+            let (hw, hh) = self.half_size();
+            let grid = |w: i32, h: i32| (0..h).flat_map(move |j| (0..w).map(move |i| (i, j)));
+            let raw: Vec<f32> = grid(hw, hh).map(|(i, j)| self.gtao(i, j)).collect();
+            let half: Vec<f32> = grid(hw, hh)
+                .map(|(i, j)| self.denoise(&raw, i, j))
                 .collect();
-            (0..self.height)
-                .flat_map(|y| (0..self.width).map(move |x| (x, y)))
-                .map(|(x, y)| self.denoise(&raw, x, y))
+            grid(self.width, self.height)
+                .map(|(x, y)| self.upsample(&half, x, y))
+                .collect()
+        }
+
+        /// The full-resolution GTAO this replaced (both passes on every
+        /// pixel, jittered per pixel): what the half-resolution result is
+        /// held to.
+        pub fn ambient_occlusion_full_res(&self) -> Vec<f32> {
+            let (w, h) = (self.width, self.height);
+            let grid = || (0..h).flat_map(move |y| (0..w).map(move |x| (x, y)));
+            let raw: Vec<f32> = grid().map(|(x, y)| self.gtao_at(x, y, (x, y))).collect();
+            grid()
+                .map(|(x, y)| self.denoise_at(&raw, (w, h), 1, x, y))
                 .collect()
         }
     }
@@ -718,15 +825,19 @@ mod tests {
         let ao = img.ambient_occlusion();
         let min = ao.iter().copied().fold(1.0, f32::min);
         let mean = ao.iter().sum::<f32>() / ao.len() as f32;
-        // The screen's edge on the grazing side (86° there), a little less:
-        // its last column, and the next, whose denoise reaches it.
-        let inner = (0..H)
-            .flat_map(|y| (2..W - 2).map(move |x| (y * W + x) as usize))
+        // The screen's edge on the grazing side (86° there), a little less,
+        // and its corners there. That's the last two half-resolution texels'
+        // pixels, which the denoise's clamped window repeats, so their 4×4
+        // window no longer holds each jitter variant once. (At full
+        // resolution it was 2 columns, min 0.91 and mean > 0.999. It's the
+        // same few pixels at any size, so a 160×90 image exaggerates it.)
+        let inner = (4..H - 4)
+            .flat_map(|y| (4..W - 4).map(move |x| (y * W + x) as usize))
             .map(|i| ao[i])
             .fold(1.0, f32::min);
         assert!(depth.iter().all(|&d| d < 1.0));
         assert!(
-            inner > 0.99 && min > 0.9 && mean > 0.999,
+            inner > 0.99 && min > 0.88 && mean > 0.998,
             "min {min} ({inner} inside), mean {mean}"
         );
     }
@@ -771,15 +882,12 @@ mod tests {
 
     #[test]
     fn the_denoise_keeps_to_its_own_side_of_an_edge() {
-        // Left half near (raw 0), right half far (raw 1).
+        // Left half near, right half far; at half resolution, raw 0 on the
+        // near texels (those of the even columns 0-6) and 1 on the far.
         let (w, h) = (16, 8);
         let (_, proj) = camera(Vec3::ZERO, -Vec3::Z);
         let depth: Vec<f32> = (0..w * h)
             .map(|i| if i % w < w / 2 { 0.5 } else { 0.99 })
-            .collect();
-        let raw: Vec<f32> = depth
-            .iter()
-            .map(|&d| if d < 0.9 { 0.0 } else { 1.0 })
             .collect();
         let img = DepthImage {
             width: w,
@@ -787,15 +895,116 @@ mod tests {
             depth: &depth,
             push: proj.push(h as u32),
         };
-        for y in 0..h {
-            for x in 0..w {
-                let want = raw[(y * w + x) as usize];
-                assert!((img.denoise(&raw, x, y) - want).abs() < 1e-6, "({x}, {y})");
+        let (hw, hh) = img.half_size();
+        let raw: Vec<f32> = (0..hw * hh)
+            .map(|i| if 2 * (i % hw) < w / 2 { 0.0 } else { 1.0 })
+            .collect();
+        for j in 0..hh {
+            for i in 0..hw {
+                let want = raw[(j * hw + i) as usize];
+                assert!((img.denoise(&raw, i, j) - want).abs() < 1e-6, "({i}, {j})");
             }
         }
         // A flat run of one value stays that value.
-        let flat = vec![0.4; (w * h) as usize];
-        assert!((img.denoise(&flat, 3, 3) - 0.4).abs() < 1e-6);
+        let flat = vec![0.4; (hw * hh) as usize];
+        assert!((img.denoise(&flat, 3, 2) - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_upsample_copies_its_texels_and_blends_bilinearly_on_a_plane() {
+        // A wall filling the view (one plane, every pixel on it), and a half
+        // image that's a linear ramp: a bilinear blend reproduces a ramp, so
+        // every pixel should read the ramp at its own place, 2h -> h.
+        let (vp, proj) = camera(Vec3::new(0.84, 1.0, 1.0), Vec3::new(0.0, 1.0, 0.0));
+        let depth = render(vp, |o, d| nearest([plane(o, d, Vec3::Z, 0.0, |_| true)]));
+        let img = DepthImage {
+            width: W,
+            height: H,
+            depth: &depth,
+            push: proj.push(H as u32),
+        };
+        let (hw, hh) = img.half_size();
+        let ramp = |i: f32, j: f32| 0.2 + 0.004 * i + 0.006 * j;
+        let half: Vec<f32> = (0..hw * hh)
+            .map(|k| ramp((k % hw) as f32, (k / hw) as f32))
+            .collect();
+        // Clear of the last column and row, whose missing next texel clamps.
+        for y in 0..H - 1 {
+            for x in 0..W - 1 {
+                let got = img.upsample(&half, x, y);
+                let want = ramp(x as f32 / 2.0, y as f32 / 2.0);
+                assert!((got - want).abs() < 1e-4, "({x}, {y}): {got} vs {want}");
+                if x % 2 == 0 && y % 2 == 0 {
+                    assert_eq!(got, half[(y / 2 * hw + x / 2) as usize], "({x}, {y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_upsample_keeps_to_its_own_side_of_an_edge() {
+        // Near up to column 6, far from 7: odd column 7 lies between texel 3
+        // (column 6, near) and texel 4 (column 8, far), and must take only
+        // the far one's value.
+        let (w, h) = (16, 8);
+        let (_, proj) = camera(Vec3::ZERO, -Vec3::Z);
+        let near = |x: i32| x < 7;
+        let depth: Vec<f32> = (0..w * h)
+            .map(|i| if near(i % w) { 0.5 } else { 0.99 })
+            .collect();
+        let img = DepthImage {
+            width: w,
+            height: h,
+            depth: &depth,
+            push: proj.push(h as u32),
+        };
+        let (hw, hh) = img.half_size();
+        let half: Vec<f32> = (0..hw * hh)
+            .map(|i| if near(2 * (i % hw)) { 0.0 } else { 1.0 })
+            .collect();
+        for y in 0..h {
+            for x in 0..w {
+                let want = if near(x) { 0.0 } else { 1.0 };
+                let got = img.upsample(&half, x, y);
+                assert!((got - want).abs() < 1e-6, "({x}, {y}): {got}");
+            }
+        }
+    }
+
+    #[test]
+    fn half_resolution_keeps_the_full_resolution_result() {
+        // The wall's foot: the same corner, as dark, and the rest as open,
+        // as the full-resolution GTAO this replaced.
+        let (depth, vp, proj) = floor_and_wall(true);
+        let img = DepthImage {
+            width: W,
+            height: H,
+            depth: &depth,
+            push: proj.push(H as u32),
+        };
+        let (half, full) = (img.ambient_occlusion(), img.ambient_occlusion_full_res());
+        let (mut foot_half, mut foot_full, mut diff) = (0.0, 0.0, Vec::new());
+        let mut n = 0;
+        for ((a, b), p) in half.iter().zip(&full).zip(world(&depth, vp)) {
+            let Some(p) = p else { continue };
+            diff.push((a - b).abs());
+            if p.y.abs() < 1e-3 && p.z + 4.0 < 0.15 {
+                foot_half += a;
+                foot_full += b;
+                n += 1;
+            }
+        }
+        // Measured: foot 0.81 vs 0.78 (a little lighter: the blur is twice
+        // as wide), |diff| mean 0.006, p99 0.085.
+        let (foot_half, foot_full) = (foot_half / n as f32, foot_full / n as f32);
+        diff.sort_by(f32::total_cmp);
+        let mean = diff.iter().sum::<f32>() / diff.len() as f32;
+        let p99 = diff[diff.len() * 99 / 100];
+        assert!(
+            (foot_half - foot_full).abs() < 0.05,
+            "foot {foot_half} vs {foot_full}"
+        );
+        assert!(mean < 0.01 && p99 < 0.1, "|diff| mean {mean}, p99 {p99}");
     }
 
     #[test]
@@ -834,8 +1043,9 @@ mod tests {
         }
     }
 
-    /// The denoise rebuilds positions and normals exactly as gtao.comp does,
-    /// or its surface weights would disagree with the AO they blur.
+    /// The denoise and the upsample rebuild positions and normals exactly as
+    /// gtao.comp does, or their surface weights would disagree with the AO
+    /// they blend.
     #[test]
     fn the_passes_share_view_pos_and_depth_normal() {
         let body = |src: &str, sig: &str| -> String {
@@ -847,11 +1057,13 @@ mod tests {
             include_str!("../shaders/gtao.comp"),
             include_str!("../shaders/gtao_denoise.comp"),
         );
+        let c = include_str!("../shaders/gtao_upsample.comp");
         for sig in [
             "vec3 view_pos(ivec2 p)",
             "vec3 depth_normal(ivec2 p, vec3 P)",
         ] {
             assert_eq!(body(a, sig), body(b, sig), "{sig}");
+            assert_eq!(body(a, sig), body(c, sig), "{sig}");
         }
     }
 
@@ -871,9 +1083,19 @@ mod tests {
         ] {
             assert!(gtao.contains(&decl), "gtao.comp lacks `{decl}`");
         }
-        let denoise = include_str!("../shaders/gtao_denoise.comp");
         let decl = format!("const float AO_DENOISE_DEPTH = {AO_DENOISE_DEPTH:?};");
-        assert!(denoise.contains(&decl), "gtao_denoise.comp lacks `{decl}`");
+        for (name, src) in [
+            (
+                "gtao_denoise.comp",
+                include_str!("../shaders/gtao_denoise.comp"),
+            ),
+            (
+                "gtao_upsample.comp",
+                include_str!("../shaders/gtao_upsample.comp"),
+            ),
+        ] {
+            assert!(src.contains(&decl), "{name} lacks `{decl}`");
+        }
         let mesh = include_str!("../shaders/mesh.frag");
         for (name, [k, d]) in ["a", "b", "c"].iter().zip(AO_MULTIBOUNCE) {
             let sign = if d < 0.0 { '-' } else { '+' };

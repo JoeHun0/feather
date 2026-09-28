@@ -470,7 +470,7 @@ impl MeshRenderer {
     ///
     /// `sky` is the level's sky-visibility volume (§13, baked); without one the
     /// ambient light is unoccluded, as it was before there were volumes. GTAO's
-    /// result (binding 8) starts at `renderer.ao_views()[1]`; `set_ao` keeps it
+    /// result (binding 8) starts at `renderer.ao_views()[2]`; `set_ao` keeps it
     /// current.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -900,7 +900,7 @@ impl MeshRenderer {
                 .sampler(sky_sampler)];
             let ao_info = [vk::DescriptorImageInfo::default()
                 .image_layout(vk::ImageLayout::GENERAL)
-                .image_view(renderer.ao_views()[1])
+                .image_view(renderer.ao_views()[2])
                 .sampler(renderer.nearest_sampler())];
             let writes = [
                 vk::WriteDescriptorSet::default()
