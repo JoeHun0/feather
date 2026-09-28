@@ -93,15 +93,21 @@ layout(constant_id = 13) const float SKY_SUN_G = 0.95;
 layout(constant_id = 14) const float SKY_SUN_B = 0.85;
 layout(constant_id = 15) const float SKY_INTENSITY = 1.0;
 layout(constant_id = 16) const float SUN_GLOW = 0.6;
-layout(constant_id = 18) const float FOG_DENSITY = 0.010; // exp distance fog, per metre
+layout(constant_id = 18) const float FOG_DENSITY = 0.010; // per metre, at FOG_HEIGHT
+layout(constant_id = 19) const float FOG_HEIGHT = 0.0;
+layout(constant_id = 20) const float FOG_FALLOFF = 0.0;
+layout(constant_id = 21) const float FOG_R = 0.5;
+layout(constant_id = 22) const float FOG_G = 0.5;
+layout(constant_id = 23) const float FOG_B = 0.5;
+layout(constant_id = 24) const float FOG_SKY = 1.0; // 1: the fog takes the sky's colour
+layout(constant_id = 25) const float FOG_SUN = 0.0;
+const vec3 FOG_COLOR = vec3(FOG_R, FOG_G, FOG_B);
 
 const vec3 SUN_RADIANCE = vec3(SUN_RADIANCE_R, SUN_RADIANCE_G, SUN_RADIANCE_B);
 
 // Analytic procedural sky (stand-in for a precomputed IBL cubemap). Linear HDR.
-// NOTE: the palette comes from the same constants as sky.frag, but the sky()
-// below must stay in step with sky.frag's by hand. The only intended difference
-// is that sky.frag (the visible background) also adds a sharp sun disk, which
-// this reflection path deliberately omits.
+// NOTE: sky() and the fog functions below are copies of sky.frag's, text for
+// text (a test checks). Only sky.frag's background adds the sharp sun disk.
 const vec3 SKY_ZENITH = vec3(SKY_ZENITH_R, SKY_ZENITH_G, SKY_ZENITH_B);
 const vec3 SKY_HORIZON = vec3(SKY_HORIZON_R, SKY_HORIZON_G, SKY_HORIZON_B);
 const vec3 SKY_GROUND = vec3(SKY_GROUND_R, SKY_GROUND_G, SKY_GROUND_B);
@@ -114,11 +120,46 @@ vec3 sky(vec3 d) {
     vec3 col = mix(SKY_HORIZON, SKY_ZENITH, pow(up, 0.5));
     col = mix(col, SKY_GROUND, down);
     float s = max(dot(d, sundir), 0.0);
-    // Soft glow only (the direct sun is a separate analytic light; a sharp disk
-    // here would double-count on smooth metals). Coefficient matches sky.frag's
-    // glow so a reflection shows the same haze the background sky does.
+    // Soft glow only. The sharp disk belongs to sky.frag's visible background
+    // alone: in reflections it would double-count the analytic sun on smooth
+    // metals, and in fog it would show through the haze.
     col += SUN_COLOR * pow(s, 16.0) * SUN_GLOW;
     return col * SKY_INTENSITY;
+}
+// Height fog (§13): density FOG_DENSITY at FOG_HEIGHT, falling by e every
+// 1/FOG_FALLOFF metres up. The optical depth along a ray from `eye` in unit
+// direction `dir` over `dist` metres, integrated exactly; dist < 0 means to
+// infinity, which stays finite only while the ray climbs out of the layer.
+// FOG_FALLOFF = 0 gives uniform fog, FOG_DENSITY * dist.
+// NOTE: must match the other shader's copy, character for character (a test
+// checks), as must sky().
+float fog_optical_depth(vec3 eye, vec3 dir, float dist) {
+    // Specialization constants fold, `x * 0.0` can't (x may be NaN): this is
+    // what makes uniform fog cost what it always did.
+    if (FOG_FALLOFF == 0.0) {
+        return dist < 0.0 ? 1e9 : FOG_DENSITY * dist;
+    }
+    float base = FOG_DENSITY * exp(-FOG_FALLOFF * (eye.y - FOG_HEIGHT));
+    float kv = FOG_FALLOFF * dir.y;
+    if (dist < 0.0) {
+        return kv > 1e-6 ? base / kv : 1e9;
+    }
+    float x = kv * dist;
+    if (abs(x) < 0.01) {
+        // (1 - e^-x) / x by its series: the exact form cancels badly in f32.
+        return base * dist * (1.0 - x * (0.5 - x / 6.0));
+    }
+    return base * (1.0 - exp(-max(x, -80.0))) / kv;
+}
+// The fog's colour seen along `dir`: its own, or the sky's, plus a glow
+// towards the sun.
+vec3 fog_color(vec3 dir) {
+    vec3 col = FOG_SKY > 0.5 ? sky(dir) : FOG_COLOR;
+    if (FOG_SUN > 0.0) {
+        float s = max(dot(dir, normalize(-pc.light_dir.xyz)), 0.0);
+        col += SUN_COLOR * FOG_SUN * pow(s, 8.0);
+    }
+    return col;
 }
 // Cheap hemisphere-averaged irradiance (diffuse IBL).
 vec3 sky_irradiance(vec3 n) {
@@ -401,12 +442,14 @@ void main() {
 
     vec3 color = ambient + lo + m.emissive.rgb;
 
-    // Distance fog: blend toward the sky along the view ray. Hides the finite
-    // ground edge and reads as depth. sky() here has no sun disk, so no searing
-    // dot bleeds into the haze.
-    float dist = length(pc.camera_pos.xyz - v_world_pos);
-    float fog = 1.0 - exp(-dist * FOG_DENSITY);
-    color = mix(color, sky(normalize(v_world_pos - pc.camera_pos.xyz)), fog);
+    // Height fog along the view ray (§13). Reads as depth and hides the
+    // finite ground's edge. sky() has no sun disk, so no searing dot bleeds
+    // into the haze.
+    vec3 to_frag = v_world_pos - pc.camera_pos.xyz;
+    float dist = length(to_frag);
+    vec3 dir = to_frag / max(dist, 1e-6);
+    float fog = 1.0 - exp(-fog_optical_depth(pc.camera_pos.xyz, dir, dist));
+    color = mix(color, fog_color(dir), fog);
 
     o_color = vec4(color, 1.0);
 }

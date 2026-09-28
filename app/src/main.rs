@@ -2198,7 +2198,7 @@ fn player_start(nodes: &[feather_assets::SceneNode]) -> (Vec3, Option<f32>) {
 }
 
 /// The parameters an `environment` marker (§13, §18) may carry.
-const ENVIRONMENT_PARAMS: [&str; 13] = [
+const ENVIRONMENT_PARAMS: [&str; 17] = [
     "sun_elevation",
     "sun_azimuth",
     "sun_color",
@@ -2211,6 +2211,10 @@ const ENVIRONMENT_PARAMS: [&str; 13] = [
     "sun_glow",
     "sun_disk",
     "fog_density",
+    "fog_height",
+    "fog_falloff",
+    "fog_color",
+    "fog_sun",
     "exposure",
 ];
 
@@ -2256,6 +2260,9 @@ fn environment(nodes: &[feather_assets::SceneNode]) -> (Environment, Vec<String>
     num("sun_glow", &mut env.sun_glow);
     num("sun_disk", &mut env.sun_disk);
     num("fog_density", &mut env.fog_density);
+    num("fog_height", &mut env.fog_height);
+    num("fog_falloff", &mut env.fog_falloff);
+    num("fog_sun", &mut env.fog_sun);
     num("exposure", &mut env.exposure);
     if has("sun_elevation") || has("sun_azimuth") {
         env.sun_dir = sun_travel(elevation, azimuth);
@@ -2273,6 +2280,12 @@ fn environment(nodes: &[feather_assets::SceneNode]) -> (Environment, Vec<String>
                 Some(v) => *field = v,
                 None => bad.push(key.to_string()),
             }
+        }
+    }
+    if has("fog_color") {
+        match spec.vec3("fog_color") {
+            Some(v) => env.fog_color = Some(v),
+            None => bad.push("fog_color".to_string()),
         }
     }
     (env, bad)
@@ -5385,7 +5398,8 @@ mod tests {
                 "sky_zenith": [0.1, 0.2, 0.3], "sky_horizon": [0.4, 0.5, 0.6],
                 "sky_ground": [0.7, 0.8, 0.9], "sky_sun_color": [0.9, 0.9, 0.8],
                 "sky_intensity": 1.5, "sun_glow": 0.2, "sun_disk": 0.0,
-                "fog_density": 0.02, "exposure": 1.2,
+                "fog_density": 0.02, "fog_height": -9.0, "fog_falloff": 0.08,
+                "fog_color": [0.5, 0.52, 0.48], "fog_sun": 0.3, "exposure": 1.2,
             }),
         );
         let (env, bad) = environment(&[marker]);
@@ -5407,6 +5421,10 @@ mod tests {
             sun_glow: 0.2,
             sun_disk: 0.0,
             fog_density: 0.02,
+            fog_height: -9.0,
+            fog_falloff: 0.08,
+            fog_color: Some(Vec3::new(0.5, 0.52, 0.48)),
+            fog_sun: 0.3,
             exposure: 1.2,
         };
         assert_eq!(env, want);
@@ -5418,11 +5436,13 @@ mod tests {
     fn a_partial_environment_keeps_the_rest() {
         let marker = node(
             Some("environment"),
-            serde_json::json!({ "fog_density": 0.05, "fog": 1.0, "sky_zenith": "grey" }),
+            serde_json::json!({
+                "fog_density": 0.05, "fog": 1.0, "sky_zenith": "grey", "fog_color": 0.5,
+            }),
         );
         let (env, mut bad) = environment(&[marker]);
         bad.sort();
-        assert_eq!(bad, ["fog", "sky_zenith"]);
+        assert_eq!(bad, ["fog", "fog_color", "sky_zenith"]);
         let want = Environment {
             fog_density: 0.05,
             ..Default::default()

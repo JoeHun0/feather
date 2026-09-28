@@ -123,14 +123,17 @@ PANEL = (3.7, 2.5, 0.16)  # length, height, thickness
 POST = (0.3, 2.8)  # side, height
 GATE = (-4.0, 4.0)  # x span of the gate in the south fence
 
-# Overcast, grey-green, hazy: starting values, to be tuned by eye.
+# Overcast, grey-green, hazy (§13): starting values, to be tuned by eye.
 ENVIRONMENT = {
     "sun_elevation": 35.0, "sun_azimuth": 210.0,
     "sun_color": [1.0, 0.92, 0.80], "sun_intensity": 2.5,
     "sky_zenith": [0.36, 0.39, 0.40], "sky_horizon": [0.58, 0.60, 0.56],
     "sky_ground": [0.16, 0.15, 0.12], "sky_sun_color": [1.0, 0.95, 0.85],
     "sky_intensity": 1.0, "sun_glow": 0.25, "sun_disk": 0.0,
-    "fog_density": 0.022, "exposure": 1.25,
+    # Ground haze: thickest on the ground, thinning by e every 12.5 m up.
+    "fog_density": 0.035, "fog_height": G, "fog_falloff": 0.08,
+    "fog_color": [0.50, 0.52, 0.48], "fog_sun": 0.3,
+    "exposure": 1.25,
 }
 LAMP = {"color": [1.0, 0.78, 0.5], "intensity": 10.0, "radius": 12.0,
         "source_radius": 0.1}

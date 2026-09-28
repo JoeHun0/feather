@@ -38,8 +38,19 @@ pub struct Environment {
     /// Strength of the sharp sun disk in the visible sky; 0 hides the sun,
     /// as behind cloud.
     pub sun_disk: f32,
-    /// Exponential distance fog towards the sky colour, per metre.
+    /// Fog density, per metre, at `fog_height`.
     pub fog_density: f32,
+    /// The world height `fog_density` is given at.
+    pub fog_height: f32,
+    /// How fast the fog thins with height, per metre: the density falls by
+    /// e every `1 / fog_falloff` metres. 0 is uniform fog, the old model,
+    /// which leaves the sky background unfogged.
+    pub fog_falloff: f32,
+    /// The fog's own colour, or `None` to take the sky's in each direction.
+    pub fog_color: Option<Vec3>,
+    /// Strength of the glow towards the sun in the fog (tinted by
+    /// `sky_sun_color`).
+    pub fog_sun: f32,
     /// Starting exposure for the tonemap.
     pub exposure: f32,
 }
@@ -58,6 +69,10 @@ impl Default for Environment {
             sun_glow: 0.6,
             sun_disk: 60.0,
             fog_density: 0.010,
+            fog_height: 0.0,
+            fog_falloff: 0.0,
+            fog_color: None,
+            fog_sun: 0.0,
             exposure: 1.0,
         }
     }
@@ -66,7 +81,7 @@ impl Default for Environment {
 /// The specialization constants, in `constant_id` order: the name each
 /// shader declares at that id. A shader need not declare them all (the sky
 /// has no fog, the mesh no disk); Vulkan ignores map entries a shader lacks.
-const SPEC_NAMES: [&str; 19] = [
+const SPEC_NAMES: [&str; 26] = [
     "SUN_RADIANCE_R",
     "SUN_RADIANCE_G",
     "SUN_RADIANCE_B",
@@ -86,6 +101,13 @@ const SPEC_NAMES: [&str; 19] = [
     "SUN_GLOW",
     "SUN_DISK",
     "FOG_DENSITY",
+    "FOG_HEIGHT",
+    "FOG_FALLOFF",
+    "FOG_R",
+    "FOG_G",
+    "FOG_B",
+    "FOG_SKY",
+    "FOG_SUN",
 ];
 const SPEC_COUNT: usize = SPEC_NAMES.len();
 
@@ -97,6 +119,8 @@ impl Environment {
         let [hr, hg, hb] = self.sky_horizon.to_array();
         let [gr, gg, gb] = self.sky_ground.to_array();
         let [sr, sg, sb] = self.sky_sun_color.to_array();
+        // FOG_SKY = 1 takes the sky's colour; FOG_R/G/B are then unused.
+        let fog = self.fog_color.unwrap_or(Vec3::splat(0.5));
         [
             sun.x,
             sun.y,
@@ -117,6 +141,13 @@ impl Environment {
             self.sun_glow,
             self.sun_disk,
             self.fog_density,
+            self.fog_height,
+            self.fog_falloff,
+            fog.x,
+            fog.y,
+            fog.z,
+            if self.fog_color.is_some() { 0.0 } else { 1.0 },
+            self.fog_sun,
         ]
     }
 }
@@ -239,6 +270,132 @@ mod tests {
         }
     }
 
+    /// The shaders' `fog_optical_depth`, transcribed: the reference the
+    /// derivation is tested on (the GLSL can't run on the CPU).
+    fn fog_optical_depth(env: &Environment, eye: Vec3, dir: Vec3, dist: f32) -> f32 {
+        if env.fog_falloff == 0.0 {
+            return if dist < 0.0 {
+                1e9
+            } else {
+                env.fog_density * dist
+            };
+        }
+        let base = env.fog_density * (-env.fog_falloff * (eye.y - env.fog_height)).exp();
+        let kv = env.fog_falloff * dir.y;
+        if dist < 0.0 {
+            return if kv > 1e-6 { base / kv } else { 1e9 };
+        }
+        let x = kv * dist;
+        if x.abs() < 0.01 {
+            return base * dist * (1.0 - x * (0.5 - x / 6.0));
+        }
+        base * (1.0 - (-x.max(-80.0)).exp()) / kv
+    }
+
+    /// The same optical depth by brute force: Simpson's rule over the
+    /// density along the ray, in f64.
+    fn integrated(env: &Environment, eye: Vec3, dir: Vec3, dist: f64) -> f64 {
+        let rho = |t: f64| {
+            let y = eye.y as f64 + t * dir.y as f64;
+            env.fog_density as f64 * (-(env.fog_falloff as f64) * (y - env.fog_height as f64)).exp()
+        };
+        let n = 20_000;
+        let h = dist / n as f64;
+        let mut sum = rho(0.0) + rho(dist);
+        for i in 1..n {
+            sum += rho(i as f64 * h) * if i % 2 == 1 { 4.0 } else { 2.0 };
+        }
+        sum * h / 3.0
+    }
+
+    /// The closed form of the height fog integral against numeric
+    /// integration: climbing, descending and level rays, a thin and a thick
+    /// layer, eyes above and inside it.
+    #[test]
+    fn height_fog_is_the_integral_of_its_density() {
+        for falloff in [0.0, 0.02, 0.08, 0.5] {
+            let env = Environment {
+                fog_density: 0.035,
+                fog_height: -9.0,
+                fog_falloff: falloff,
+                ..Default::default()
+            };
+            for eye_y in [-7.2, 0.0, 12.0] {
+                for dir_y in [-0.9f32, -0.3, -0.01, 0.0, 0.01, 0.3, 0.9] {
+                    let dir = Vec3::new((1.0 - dir_y * dir_y).sqrt(), dir_y, 0.0);
+                    let eye = Vec3::new(0.0, eye_y, 0.0);
+                    for dist in [0.5f32, 10.0, 80.0, 200.0] {
+                        let got = fog_optical_depth(&env, eye, dir, dist) as f64;
+                        let want = integrated(&env, eye, dir, dist as f64);
+                        if want > 50.0 {
+                            // Total fog either way; the shader clamps the
+                            // exponent there rather than overflow.
+                            assert!(got > 50.0, "k {falloff} dir.y {dir_y} dist {dist}: {got}");
+                            continue;
+                        }
+                        assert!(
+                            (got - want).abs() <= 1e-4 * want.max(1e-3),
+                            "k {falloff} eye {eye_y} dir.y {dir_y} dist {dist}: {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Uniform fog (no falloff) is exactly the old `density · distance`,
+    /// which is why levels without a height layer look as they did. And to
+    /// infinity, a climbing ray sees ρ(eye) / (k · dir.y), a level or
+    /// descending one sees total fog.
+    #[test]
+    fn uniform_fog_and_the_sky_limit() {
+        let old = Environment::default();
+        let (eye, dir) = (Vec3::new(3.0, -7.2, 1.0), Vec3::new(0.6, -0.8, 0.0));
+        for dist in [1.0, 37.5, 200.0] {
+            assert_eq!(
+                fog_optical_depth(&old, eye, dir, dist),
+                old.fog_density * dist
+            );
+        }
+        let env = Environment {
+            fog_density: 0.035,
+            fog_height: -9.0,
+            fog_falloff: 0.08,
+            ..Default::default()
+        };
+        let up = Vec3::new(0.0, 1.0, 0.0);
+        let rho = 0.035 * (-0.08f32 * (-7.2 + 9.0)).exp();
+        let sky = fog_optical_depth(&env, eye, up, -1.0);
+        assert!((sky - rho / 0.08).abs() < 1e-5, "{sky}");
+        // It is the long-distance limit of the finite form.
+        let far = fog_optical_depth(&env, eye, up, 1e4);
+        assert!((far - sky).abs() < 1e-4, "{far} vs {sky}");
+        assert!(fog_optical_depth(&env, eye, Vec3::X, -1.0) >= 1e9);
+        assert!(fog_optical_depth(&env, eye, -up, -1.0) >= 1e9);
+    }
+
+    /// `sky()`, `fog_optical_depth()` and `fog_color()` are written out in
+    /// both shaders (no includes). The sky and the fog on geometry must be
+    /// the same functions, or the horizon shows a seam; so their texts must
+    /// match exactly.
+    #[test]
+    fn the_shaders_share_sky_and_fog_functions() {
+        let body = |src: &str, sig: &str| -> String {
+            let start = src.find(sig).unwrap_or_else(|| panic!("no `{sig}`"));
+            let len = src[start..].find("\n}\n").expect("function end") + 3;
+            src[start..start + len].to_string()
+        };
+        let mesh = include_str!("../shaders/mesh.frag");
+        let sky = include_str!("../shaders/sky.frag");
+        for sig in [
+            "vec3 sky(vec3 d)",
+            "float fog_optical_depth(",
+            "vec3 fog_color(vec3 dir)",
+        ] {
+            assert_eq!(body(mesh, sig), body(sky, sig), "`{sig}` differs");
+        }
+    }
+
     #[test]
     fn the_map_lays_the_values_out_in_order() {
         let env = Environment {
@@ -250,7 +407,7 @@ mod tests {
         assert_eq!(info.map_entry_count as usize, SPEC_COUNT);
         assert_eq!(info.data_size, SPEC_COUNT * 4);
         let last = spec.entries[SPEC_COUNT - 1];
-        assert_eq!(last.constant_id, 18);
-        assert_eq!(spec.data[last.offset as usize / 4], 0.5);
+        assert_eq!(last.constant_id, 25);
+        assert_eq!(spec.data[18], 0.5);
     }
 }

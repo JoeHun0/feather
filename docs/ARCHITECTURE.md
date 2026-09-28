@@ -744,6 +744,50 @@ which is exactly the look every level had before.
   day) means rebuilding two pipelines. The runtime route is the globals UBO
   (§25).
 
+**Landed (§26): height fog.** Fog was uniform (`1 − e^{−density·dist}`,
+towards the sky's colour), only on geometry, so the horizon stayed crisp and
+the ground's edge showed. Now it can pool on the ground.
+- **Model:**
+  - The density is `fog_density · e^{−fog_falloff·(y − fog_height)}`.
+  - Along each view ray it is integrated exactly:
+    `τ = ρ(eye)·(1 − e^{−k·d·v.y}) / (k·v.y)`, with the series
+    `1 − x/2 + x²/6` for `|k·d·v.y| < 0.01`, where the exact form cancels
+    badly in f32 (with the first cut-over, at 1e-4, the integration test
+    caught a 1.2e-4 relative error just above it).
+  - Fog colour is `fog_color` if given, else the sky's in that direction,
+    plus an optional `fog_sun` glow towards the sun.
+  - `fog_falloff = 0`, the default, is exactly the old uniform fog.
+- **The sky background fogs too, but only through a height layer.**
+  - Looking up, the fog to infinity is finite (`ρ(eye)/(k·v.y)`), so the
+    zenith stays clearer than the horizon.
+  - Below the horizon it's total, which hides the void past the ground's
+    edge.
+  - Uniform fog leaves the sky alone, as it always did: fogging an
+    infinitely distant sky uniformly would have dimmed the default sun disk
+    to ~14%.
+- `sky()`, `fog_optical_depth()` and `fog_color()` are written out in both
+  shaders, since the build has no `#include`. A test asserts their texts are
+  identical, so the sky and the fog on geometry can't drift into a seam.
+  `sky.frag`'s disk moved from `sky()` into `main` for that; the same maths.
+- **Tests:** the closed form against Simpson integration (climbing,
+  descending and level rays, four falloffs, three eye heights, four
+  distances); uniform fog equals `density·dist` exactly; the sky limit; the
+  shared text. Each was shown to fail on a deliberately broken copy.
+- **Measured** (debug, clocks not pinned, old and new binaries interleaved):
+  - `zone.glb`, which uses the height fog: `geo` 0.21 ms in both, 3/3 runs.
+  - `lights120` (default fog): `geo` 0.55 → 0.57–0.58 ms, reproducible
+    (3/3). I predicted no change, and was wrong; the cause isn't found.
+    - The compiled `mesh.frag` (RADV shader stats) is 977 vs 975
+      instructions with the same 60 VGPRs, so the same occupancy, and no
+      spills.
+    - Folding the default path on its specialization constants changed
+      nothing.
+    - A bisect found that any rewrite of the fog tail costs the same, and
+      only restoring the old lines removes it. That points at code layout
+      or scheduling in the driver's output, not arithmetic.
+    - Worth re-measuring with pinned clocks and in release before acting on
+      it.
+
 ### Post chain (after transparents; HDR until tonemap)
 
 1. **HDR resolve** (done as pass 7).
