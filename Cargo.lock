@@ -844,8 +844,10 @@ name = "feather-bake"
 version = "0.1.0"
 dependencies = [
  "feather-assets",
+ "glam 0.29.3",
  "intel_tex_2",
  "meshopt",
+ "serde_json",
 ]
 
 [[package]]

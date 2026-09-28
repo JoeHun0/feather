@@ -12,12 +12,16 @@
 //!
 //! Meshes: see `mesh.rs` (meshoptimizer vertex-cache + fetch order, LODs).
 //!
-//! Output goes under `--out` (default `scratch/bake`): `tex/<key>.bc7` and
-//! `mesh/<key>.fbm`, keyed exactly as the runtime keys them. It's
-//! incremental: anything whose file exists is skipped. Open sources stay the
-//! truth; the cache can be deleted at any time.
+//! Sky visibility: see `sky.rs` (a grid of how much sky each point sees,
+//! one per scene, traced against the mesh LODs).
+//!
+//! Output goes under `--out` (default `scratch/bake`): `tex/<key>.bc7`,
+//! `mesh/<key>.fbm` and `sky/<key>.fsv`, keyed exactly as the runtime keys
+//! them. It's incremental: anything whose file exists is skipped. Open
+//! sources stay the truth; the cache can be deleted at any time.
 
 mod mesh;
+mod sky;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,9 +29,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use feather_assets::bake::{
-    baked_mesh_path, baked_path, mesh_key, texture_key, BakedTexture, TexKind, MESH_DIR, TEX_DIR,
+    baked_mesh_path, baked_path, baked_sky_path, load_baked_meshes, mesh_key, sky_key, texture_key,
+    BakedTexture, TexKind, MESH_DIR, SKY_DIR, TEX_DIR,
 };
-use feather_assets::{load_gltf_scene, MeshData, TextureData};
+use feather_assets::{load_gltf_scene, MeshData, SceneData, TextureData};
 
 fn main() {
     let mut out = PathBuf::from("scratch/bake");
@@ -43,16 +48,20 @@ fn main() {
         eprintln!("usage: feather-bake SCENE.gltf|.glb... [--out DIR]");
         std::process::exit(2);
     }
-    let (tex_dir, mesh_dir) = (out.join(TEX_DIR), out.join(MESH_DIR));
+    let (tex_dir, mesh_dir, sky_dir) = (out.join(TEX_DIR), out.join(MESH_DIR), out.join(SKY_DIR));
     std::fs::create_dir_all(&tex_dir).expect("create the texture bake directory");
     std::fs::create_dir_all(&mesh_dir).expect("create the mesh bake directory");
+    std::fs::create_dir_all(&sky_dir).expect("create the sky bake directory");
 
     // Every (texture, kind) pair and every mesh in use, deduped by content key
     // across all scenes.
     let mut textures: HashMap<u64, (Arc<TextureData>, TexKind)> = HashMap::new();
     let mut meshes: HashMap<u64, MeshData> = HashMap::new();
-    for scene in &scenes {
-        let data = load_gltf_scene(scene).unwrap_or_else(|e| panic!("{scene}: {e}"));
+    let loaded: Vec<(&String, SceneData)> = scenes
+        .iter()
+        .map(|s| (s, load_gltf_scene(s).unwrap_or_else(|e| panic!("{s}: {e}"))))
+        .collect();
+    for (_, data) in &loaded {
         for m in &data.meshes {
             let mat = &m.material;
             for (tex, kind) in [
@@ -148,6 +157,38 @@ fn main() {
         t0.elapsed().as_secs_f32(),
         mesh_dir.display()
     );
+
+    // Sky visibility, one volume per scene (each is its own level), traced
+    // against the mesh LODs just baked.
+    for (name, data) in &loaded {
+        let path = baked_sky_path(&sky_dir, sky_key(data));
+        if path.exists() {
+            println!("sky {name}: already cached");
+            continue;
+        }
+        let t0 = Instant::now();
+        let baked = load_baked_meshes(&out, &data.meshes);
+        let tris = sky::triangles(&sky::occluders(data, &baked));
+        let (origin, cell, dims) = sky::grid(&tris);
+        let bvh = sky::Bvh::build(tris);
+        let t_bvh = t0.elapsed();
+        let (volume, stats) = sky::bake(&bvh, origin, cell, dims);
+        volume.write(&path).expect("write sky volume");
+        println!(
+            "sky {name}: {}x{}x{} cells of {cell:.2} m over {} triangles (BVH {:.1} s), \
+             {} inside geometry ({} left closed), mean sky seen {:.2}, {:.1} s into {}",
+            dims[0],
+            dims[1],
+            dims[2],
+            stats.triangles,
+            t_bvh.as_secs_f32(),
+            stats.inside,
+            stats.unfilled,
+            stats.mean_sky,
+            t0.elapsed().as_secs_f32(),
+            path.display()
+        );
+    }
 }
 
 /// `f` over `items` on every core, results in input order.

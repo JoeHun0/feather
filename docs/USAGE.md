@@ -434,6 +434,11 @@ start over. Use `--release`: the BC7 encoder is slow in debug.
   for each shadow cascade. On `detail_high` that cut the triangles drawn by
   ~92% and the frame from 1.83 to 0.50 ms (§17 in ARCHITECTURE.md).
   `--no-lod` turns it off for comparison.
+- **Sky visibility** → `sky/`: one volume per scene, holding how much of the
+  sky each point of the level sees, on a grid of 0.5 m cells. It's traced
+  against the mesh LODs, so it comes after them, and it's fast: the zone
+  takes 0.7 s. The bake prints the grid, the cells found inside geometry and
+  the mean sky seen. The engine doesn't read it yet.
 
 The `[mesh]` lines at load say what you got, e.g.
 `30 meshes (27 baked, 135 LODs): 2.7 MB vertices, 3.0 MB indices` and

@@ -1528,6 +1528,91 @@ a thing to look at. Colliders use these LODs too (§15): over-budget props get
 a LOD trimesh within 5 cm instead of a convex hull.
 Not yet: materials and scenes as baked blobs (the rest of this section).
 
+**Landed (§26): the sky-visibility part of the bake.** Ambient light was
+unoccluded, so a room lit only through its door was as bright as the yard
+outside. The fix starts here: for each scene, the bake measures how much sky
+each point of the level sees. The renderer's side is §13.
+- **What a cell stores:** `bake/src/sky.rs` covers the scene with 0.5 m
+  cells. Each cell centre casts 128 rays over the upper hemisphere (a
+  Fibonacci spiral, turned about the vertical by a per-cell hash so thin
+  poles become noise rather than structure) and keeps two moments of the
+  visibility V:
+  - `w0 = (1/4π)∫V dω` and `w = (1/2π)∫V ω dω` (`SkyVis`);
+  - they are what the clamped-cosine L1 convolution needs, so the sky light
+    reaching a normal n is `max(w0 + w·n, 0)`;
+  - for open sky that is exactly the `½ + ½n.y` that `sky_irradiance`
+    already gives the sky, so an open point shades as before.
+- **Occluders** (`sky_occludes`): every mesh node the sun's shadow sees, i.e.
+  not `shadow: false`, and not cutouts, whose alpha the CPU doesn't test
+  (grass and chain-link are mostly holes). Each is traced at its coarsest
+  baked LOD within 5 cm at its placed scale. That takes the zone from 825k
+  placed triangles to 114k.
+- **Ray casting:** our own BVH (binned SAH, any-hit and nearest-hit walks),
+  about 200 lines. No crate: a test compares it with brute force.
+- **Cells inside geometry:** they would read as closed and darken what
+  samples near them.
+  - A 16-ray full-sphere probe finds them: a quarter or more of the rays
+    hit back faces, judged by the vertex normals, since the renderer draws
+    with culling off and winding means nothing.
+  - They take their **darkest** valid neighbour's value, for up to 3 rings.
+  - Darkest, not the mean: a cell inside a wall between a room and the open
+    would otherwise carry the open sky into the room.
+- **Leaks through thin geometry:** cells are coarser than the thinnest
+  geometry.
+  - First version: a plain trilinear sample, one cell off the surface along
+    its normal. Measured against ray-traced truth in the zone, interiors
+    matched (hangar floor 0.107 vs 0.118 of open sky, office 0.006 vs
+    0.004). But the top 30 cm of the hangar's walls read 0.10–0.50 against
+    a truth of 0: cells above the 0.1 m roof panels were among the samples'
+    neighbours.
+  - Fix: each cell also stores how far it sees along ±x, ±y, ±z (`SkyFree`:
+    4 bits each, up to one cell, rounded down). Sampling
+    (`SkyVolume::sample`, which mesh.frag mirrors) leaves out any of the
+    eight neighbours whose path to the point is blocked, fading over 0.1
+    cell, and renormalises. If it can see none, it uses the plain blend.
+  - After the fix the wall tops read 0.000. The office floor strip next to
+    its west wall reads 0.014 against 0–0.007.
+  - A closed room with 0.2 m walls stays under 0.05 everywhere inside,
+    corners included. The plain blend failed that test at a floor corner.
+- **File:** `scratch/bake/sky/<key>.fsv`: a header (origin, cell, dims)
+  plus 8 bytes per cell (the encoded `SkyVis`, then the `SkyFree`
+  nibbles), one RG32_UINT texel on the GPU.
+  - Validated on read, and written via temp + rename.
+  - Keyed (`sky_key`) on every occluder's `mesh_key`, transform and
+    sidedness, plus `SKY_BAKE_VERSION`, which covers the bake's settings.
+    Moving a wall re-bakes; retexturing doesn't.
+  - One volume per scene file: each is its own level.
+  - Cells grow past 4M, which caps the file at 32 MB.
+- **Measured** (release, 24 threads): the zone (142×21×131 cells, 390k) bakes
+  in **0.7 s** (the BVH build 0.1 s), and the file is 3.1 MB.
+  - I predicted 5–30 s and was wrong by an order of magnitude: the LODs
+    shrank the triangle count 7×, and most rays leave the level after a few
+    boxes.
+  - 5,062 cells are inside geometry, and all are filled.
+  - Mean sky seen is 0.78.
+- **Tests:**
+  - the BVH against brute force (any-hit and nearest);
+  - open ground sees the whole sky;
+  - a closed room is dark inside with no leaks, corners included;
+  - a door lets sky in from its side;
+  - a canopy shades only what is under it;
+  - the probe finds the inside of a closed box, and not of a double-sided
+    one;
+  - the fill rule;
+  - mirrored placements face outwards;
+  - occluder selection and LOD choice;
+  - the grid grows its cells.
+
+  In `assets`:
+  - open-sky weights equal `sky_irradiance`'s;
+  - exact encoding of open sky;
+  - free distances round down;
+  - sampling past a wall;
+  - what the key covers;
+  - file damage.
+
+  Each test was shown to fail against a deliberately broken copy of the code.
+
 ## 18. Scene spawning + save/load
 
 - **Data-driven spawn via prefab registry:** node = static part (transform,
@@ -2346,8 +2431,9 @@ than a ±16 box;
 transparents (alpha
 *cutout* landed, §5; BLEND still draws opaque); asset
 bake pipeline (runtime glTF scene loading + multi-mesh registry landed, and
-the **texture bake** — BC7 mip chains in a content-addressed cache, §17; mesh /
-material / scene bake, runtime blob and handle tables are not); **scene spawning landed**
+the **texture bake** — BC7 mip chains in a content-addressed cache, §17 — then
+the mesh LOD bake and a per-scene **sky-visibility volume**, §17; material /
+scene bake, runtime blob and handle tables are not); **scene spawning landed**
 (§18: `extras` → `PrefabSpec`, a prefab registry, marker nodes, `player_start`
 and a parameterised `prop` with per-node collider/shadow opt-outs; unknown ids
 fall back to static geometry; chunk membership and light/trigger prefabs
