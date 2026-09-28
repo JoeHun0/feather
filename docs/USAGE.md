@@ -295,6 +295,15 @@ An unknown prefab name falls back to static geometry. Up to 128 point lights
 can be *visible* at once; lights past that are dropped for the frame with a
 `[light]` warning.
 
+**Cutouts** (grass, chain-link, leaves) come from the material, as glTF
+defines them: `"alphaMode": "MASK"` cuts out wherever the base colour's
+alpha (texture × factor) is below `alphaCutoff` (default 0.5), in the
+image and in shadows alike. Add `"doubleSided": true` for cards seen from
+both sides; their back faces are then lit like their fronts. The alpha must
+be in the base colour texture (a PNG with alpha): glTF has no separate
+opacity map. `"alphaMode": "BLEND"` still draws opaque (there's no
+transparency yet); the load prints `[mesh] N BLEND materials drawn opaque`.
+
 **Footstep surfaces** belong to *materials*, not nodes: a material's `extras`
 names one, and everything drawn with it (every placement, every face) steps
 like it:
@@ -434,7 +443,7 @@ and distant shadows should look unchanged.
 
 ## 5. Tests
 
-`cargo test --workspace` runs 147 tests, in well under a second once built.
+`cargo test --workspace` runs 152 tests, in well under a second once built.
 All of them are CPU-side: none needs a GPU, a window, a sound card or
 anything in `scratch/`, so they pass on a fresh clone.
 
@@ -576,6 +585,7 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice at every FOV from 30° to 120°; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
 | Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs; `environment`: no marker and an empty one keep the default look, every param lands, left-out params keep defaults and bad ones are reported, the sun's elevation/azimuth convention, and (end-to-end) a level's marker reaches `build_world`; the orb demo's obstacle boxes stand in the demo but not in a loaded level (end-to-end) |
+| Materials | assets, render | glTF `alphaMode`/`alphaCutoff`/`doubleSided` load as `AlphaMode::Mask`(cutoff, default 0.5)/`Blend`/`Opaque` and the flag; the GPU record carries the cutoff only for MASK and the double-sided bit, which matches `mesh.frag`'s; masked instances' runs follow every opaque one (one pipeline switch a pass), with the same instances and triangles, and a scene without masked materials builds the runs it always did; `cutout_alpha()` is textually identical in `mesh.frag` and `mask.frag`; `mesh.frag` declares `MASKED` at the id the masked pipeline sets, defaulting to false |
 | Environment | render | the specialization constants `mesh.frag` and `sky.frag` declare (read from their compiled SPIR-V) match the Rust map by id and name, with GLSL defaults equal to `Environment::default()`; the map lays the values out in id order; height fog's closed form equals numeric integration of its density (rays up, down and level), uniform fog is exactly `density·dist`, the sky's infinite-ray limit; `sky()` and the fog functions are textually identical in both shaders |
 | Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one texture, which isn't decoded until asked and then matches the old RGB→RGBA expansion; a material's `extras.surface` is read (a non-string one warns and is dropped) |
 | Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |
@@ -620,7 +630,7 @@ Everything goes to stderr.
 | `[scene] colliders: N mesh (M from LODs), H hull, B box` | the colliders a session built; with a bake, detailed props should be LODs, not hulls |
 | `[scene] surfaces: N concrete, M grass, …` / `[scene] unknown surface "x"; using concrete` | the same colliders by footstep surface (only surfaces that have any), and any material tag that isn't a surface |
 | `[load] scenes … world … renderer … total …` | where a session's load time went: parsing + reading images + meshes, spawning + colliders, GPU upload |
-| `[bench] …` | the `--bench` summary, including triangles submitted per frame (`Mtris main/shadow`) and the share of instances at each LOD (`LOD mix`) |
+| `[bench] …` | the `--bench` summary, including triangles submitted per frame (`Mtris main/shadow`), the share of instances at each LOD (`LOD mix`), and how many instances of cutout materials were drawn (`masked main/shadow`) |
 
 ---
 

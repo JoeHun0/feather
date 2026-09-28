@@ -1,5 +1,6 @@
 #version 450
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_demote_to_helper_invocation : require
 
 layout(push_constant) uniform Push {
     mat4 view_proj;
@@ -12,7 +13,7 @@ struct Material {
     vec4 base_color_factor; // linear
     vec4 emissive;          // rgb = emissive, a = metallic factor
     vec4 params;            // x = roughness factor, y = normal_scale, z = occlusion, w = alpha_cutoff
-    uvec4 tex;              // x = base color, y = normal, z = metallic-roughness
+    uvec4 tex;              // x = base color, y = normal, z = metallic-roughness, w = flags
 };
 layout(set = 0, binding = 1) readonly buffer Materials {
     Material materials[];
@@ -21,6 +22,23 @@ layout(set = 0, binding = 1) readonly buffer Materials {
 // the level uses. Runtime-sized: the renderer sizes the binding per level,
 // limited only by the device. Base color _SRGB; normal + MR are _UNORM.
 layout(set = 0, binding = 2) uniform sampler2D textures[];
+
+// Material flags (tex.w). Must match render::mesh's MATERIAL_DOUBLE_SIDED.
+const uint MATERIAL_DOUBLE_SIDED = 1u;
+// The masked-material variant of this pipeline (§5): cut out below the
+// material's alpha cutoff. Not part of the environment's constants.
+layout(constant_id = 100) const bool MASKED = false;
+
+// Cutout (§5): the base colour's alpha for material `m` at `uv`, raised
+// with the mip level, since box-filtered mips average alpha down and a cutout
+// would otherwise thin away with distance.
+// NOTE: must match the other shader's copy, character for character (a test
+// checks).
+float cutout_alpha(Material m, vec2 uv) {
+    float a = texture(textures[nonuniformEXT(m.tex.x)], uv).a * m.base_color_factor.a;
+    float lod = textureQueryLod(textures[nonuniformEXT(m.tex.x)], uv).x;
+    return a * (1.0 + max(lod, 0.0) * 0.25);
+}
 // Cascades in the sun shadow map. MUST match feather_gfx::SHADOW_CASCADES.
 const int SHADOW_CASCADES = 4;
 // How far to push the sample along the surface normal, in shadow texels (§11's
@@ -371,6 +389,11 @@ vec3 punctual(Light l, vec3 N, vec3 V, vec3 R, vec3 world_pos, vec3 albedo, vec3
 
 void main() {
     Material m = materials[v_material];
+    // Demote rather than discard: the quad's other fragments still need
+    // their derivatives (normal mapping, mip selection) below.
+    if (MASKED && cutout_alpha(m, v_uv) < m.params.w) {
+        demote;
+    }
 
     vec3 albedo = texture(textures[nonuniformEXT(m.tex.x)], v_uv).rgb * m.base_color_factor.rgb;
     vec2 mr = texture(textures[nonuniformEXT(m.tex.z)], v_uv).gb; // green=rough, blue=metal
@@ -378,6 +401,10 @@ void main() {
     float metallic = clamp(m.emissive.a * mr.y, 0.0, 1.0);
 
     vec3 ng = normalize(v_normal);
+    // A double-sided card seen from behind is the same surface facing us.
+    if ((m.tex.w & MATERIAL_DOUBLE_SIDED) != 0u && !gl_FrontFacing) {
+        ng = -ng;
+    }
     vec3 N;
     if (m.tex.y == 1u) {
         // Slot 1 is the flat-normal default: this material has no normal map, so

@@ -160,6 +160,56 @@ struct GpuMaterial {
 CPU-side only (routing, not shading): alpha mode (opaque/mask/blend),
 double-sided, cull — used to pick pipeline and draw bucket.
 
+**Landed (§26): alpha cutout.**
+- **Loader:** it reads glTF `alphaMode`, `alphaCutoff` (default 0.5) and
+  `doubleSided` into `Material`.
+  - MASK materials cut out.
+  - BLEND materials still draw opaque, since there's no transparent pass;
+    the load prints how many.
+  - On the GPU, `params.w` is the cutoff (0 unless MASK), and `tex.w` holds
+    flags (bit 0: double-sided).
+- **Draw order:** runs sort with the masked bit on top of the
+  `(mesh, LOD)` key, so each view's list is all opaque runs, then all masked
+  ones. Each pass binds its opaque pipeline, draws, and switches once.
+  Scenes without masked materials record exactly the runs they did.
+- **Three masked pipelines,** each with the same layout and descriptors:
+  - **Depth prepass:** `mesh.vert` + `mask.frag`, which only cuts. Same
+    vertex shader, so depths still match the main pass bit for bit.
+  - **Shadow:** `mesh.vert` + `mask.frag`. `mesh.vert` reads its matrix
+    from the first 64 push-constant bytes, which is where the shadow pass
+    pushes the light's, so no new vertex shader was needed. It has **no face
+    culling**, unlike the opaque shadow pass (front-face culling): a card is
+    usually one quad, which would drop out of the map whenever it faced the
+    sun.
+  - **Main:** `mesh.frag` specialized with `MASKED` (constant ID 100).
+    - It has to cut too: where the prepass cut a hole, the depth behind it
+      passes `LESS_OR_EQUAL`.
+    - It **demotes** rather than discards (Vulkan 1.3's mandatory
+      `shaderDemoteToHelperInvocation`, now enabled). Normal mapping and mip
+      selection still need derivatives in the cut fragments' quads, which
+      `discard` would leave undefined.
+    - Opaque materials keep a pipeline with no cut at all, and so their
+      early-Z.
+- **The alpha test** is `cutout_alpha()`, written out in both shaders (a
+  test keeps the texts identical). It's base-colour alpha × factor, scaled up
+  by `1 + 0.25 · mip level`: box-filtered mips average alpha down, so without
+  that a cutout thins away with distance. It works the same for raw and baked
+  (BC7 with alpha) textures.
+- **Double-sided:** a back face of a double-sided material flips its normal,
+  which also fixes its shadow lookup's normal offset. Culling stays NONE for
+  everything, as before.
+- **Measured** (debug, clocks unpinned, 3 interleaved runs):
+  - `lights120`, which has no masked materials: `geo` 0.58 ms with HEAD's
+    binary, 0.56–0.57 with this one. No change, as predicted.
+  - The zone's 600 grass tufts and chain-link enclosure (up to 451 masked
+    instances in view, 519–833 casters a frame) cost `shadow` +0.02 ms
+    (predicted +0.02–0.05) and `geo` ≤ 0.01 ms. I'd predicted +0.05–0.15;
+    they're cheap cards.
+  - Validation with sync: 0 messages with masked draws, and the new
+    `[bench] masked main/shadow` lines show they ran.
+- **Not done:** alpha-to-coverage under MSAA, transparency for BLEND,
+  sorting masked draws front to back.
+
 ### Bindless mechanics
 
 - One descriptor set with a large `textures[]` sampled-image array (4096+) and a
@@ -1736,8 +1786,9 @@ and punctuation.
     proxies).
   - No mipmaps and no alpha cutout, visible as shimmer and opaque grass cards.
     **Mipmaps fixed** (full chains + trilinear + anisotropy, §26); memory
-    **fixed** by the §17 texture bake (BC7: 64 vs 256 MB); alpha cutout
-    pending until content needs it (no current asset has alpha).
+    **fixed** by the §17 texture bake (BC7: 64 vs 256 MB). **Alpha cutout
+    landed** (§5), but this scene's grass is BLEND with JPEG textures, which
+    have no alpha, so it still draws opaque (the load says so).
   **Industrial compound (the STALKER look):** `tools/gen_zonescene.py` writes
   `scratch/zone.glb`, the first scene aimed at the game's intended look
   rather than at a subsystem.
@@ -2173,7 +2224,8 @@ caster pancaking (depth clamp + near-plane-free caster culling); **PCSS still
 pending**, and since array layers share an extent all
 cascades are the same resolution. Shadows now reach `SHADOW_DISTANCE` (60) rather
 than a ±16 box;
-bloom + auto-exposure (HDR target + tonemap now in place); transparents; asset
+bloom + auto-exposure (HDR target + tonemap now in place); transparents (alpha
+*cutout* landed, §5; BLEND still draws opaque); asset
 bake pipeline (runtime glTF scene loading + multi-mesh registry landed, and
 the **texture bake** — BC7 mip chains in a content-addressed cache, §17; mesh /
 material / scene bake, runtime blob and handle tables are not); **scene spawning landed**

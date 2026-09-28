@@ -334,11 +334,15 @@ impl Renderer {
             .queue_priorities(&priorities)];
         let device_exts = [ash::khr::swapchain::NAME.as_ptr()];
         // maintenance4: glslang emits OpExecutionMode LocalSizeId for compute
-        // shaders targeting Vulkan 1.3 (cluster.comp), which requires it. 1.3
-        // makes supporting it mandatory, so this narrows no device.
+        // shaders targeting Vulkan 1.3 (cluster.comp), which requires it.
+        // Demote-to-helper: the main pass cuts out masked fragments (§5) but
+        // still needs derivatives in their quads, which `discard` would leave
+        // undefined. 1.3 makes supporting both mandatory, so they narrow no
+        // device.
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
-            .maintenance4(true);
+            .maintenance4(true)
+            .shader_demote_to_helper_invocation(true);
         // Bindless-lite: non-uniform indexing into a fixed-size sampled-image
         // array (material_id -> textures[]). Widely supported on modern GPUs.
         // Runtime-sized `textures[]` (§9): the bindless array is sized per level

@@ -152,31 +152,50 @@ impl Environment {
     }
 }
 
-/// An environment's specialization data, owned so that a
-/// `vk::SpecializationInfo` borrowing it lives as long as pipeline creation.
+/// `mesh.frag`'s `MASKED` constant (§5): the masked-material variant of the
+/// main pipeline. Outside the environment's id range on purpose.
+pub(crate) const MASKED_ID: u32 = 100;
+
+/// An environment's specialization data (and optionally `MASKED`), owned so
+/// that a `vk::SpecializationInfo` borrowing it lives as long as pipeline
+/// creation. Every value is 4 bytes: an f32, or a VkBool32.
 pub(crate) struct Specialization {
-    entries: [vk::SpecializationMapEntry; SPEC_COUNT],
-    data: [f32; SPEC_COUNT],
+    entries: Vec<vk::SpecializationMapEntry>,
+    data: Vec<u32>,
 }
 
 impl Specialization {
     pub(crate) fn new(env: &Environment) -> Self {
-        let size = std::mem::size_of::<f32>();
-        Self {
-            entries: std::array::from_fn(|i| vk::SpecializationMapEntry {
-                constant_id: i as u32,
-                offset: (i * size) as u32,
-                size,
-            }),
-            data: env.spec_values(),
+        let mut spec = Self {
+            entries: Vec::new(),
+            data: Vec::new(),
+        };
+        for (id, v) in env.spec_values().into_iter().enumerate() {
+            spec.push(id as u32, v.to_bits());
         }
+        spec
+    }
+
+    /// The same, with `MASKED` set: the main pipeline for masked materials.
+    pub(crate) fn masked(mut self) -> Self {
+        self.push(MASKED_ID, vk::TRUE);
+        self
+    }
+
+    fn push(&mut self, constant_id: u32, value: u32) {
+        self.entries.push(vk::SpecializationMapEntry {
+            constant_id,
+            offset: (self.data.len() * 4) as u32,
+            size: 4,
+        });
+        self.data.push(value);
     }
 
     pub(crate) fn info(&self) -> vk::SpecializationInfo<'_> {
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 self.data.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(&self.data),
+                std::mem::size_of_val(self.data.as_slice()),
             )
         };
         vk::SpecializationInfo::default()
@@ -220,6 +239,10 @@ mod tests {
                 50 => {
                     values.insert(args[1], f32::from_bits(args[2]));
                 }
+                // OpSpecConstantTrue / OpSpecConstantFalse: bools, as 1 / 0.
+                48 | 49 => {
+                    values.insert(args[1], if op == 48 { 1.0 } else { 0.0 });
+                }
                 _ => {}
             }
             i += count.max(1);
@@ -251,6 +274,9 @@ mod tests {
         ];
         for (shader, spv) in shaders {
             for (id, (name, value)) in spec_constants(spv) {
+                if id == MASKED_ID {
+                    continue; // not the environment's; checked below
+                }
                 let i = id as usize;
                 assert!(i < SPEC_COUNT, "{shader}: constant_id {id} isn't mapped");
                 if let Some(name) = name {
@@ -268,6 +294,27 @@ mod tests {
         for (i, u) in used.iter().enumerate() {
             assert!(u, "no shader declares {}", SPEC_NAMES[i]);
         }
+    }
+
+    /// `mesh.frag` declares `MASKED` at the id `Specialization::masked`
+    /// sets, defaulting to false: the opaque pipeline, which sets nothing
+    /// there, must not cut anything out.
+    #[test]
+    fn mesh_frag_declares_masked() {
+        let spv = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"));
+        let (name, value) = spec_constants(spv)
+            .remove(&MASKED_ID)
+            .expect("mesh.frag declares no constant at MASKED_ID");
+        if let Some(name) = name {
+            assert_eq!(name, "MASKED");
+        }
+        assert_eq!(value, 0.0, "MASKED must default to false");
+        let spec = Specialization::new(&Environment::default()).masked();
+        let entry = spec.entries.last().unwrap();
+        assert_eq!(
+            (entry.constant_id, spec.data.last()),
+            (MASKED_ID, Some(&vk::TRUE))
+        );
     }
 
     /// The shaders' `fog_optical_depth`, transcribed: the reference the
@@ -408,6 +455,6 @@ mod tests {
         assert_eq!(info.data_size, SPEC_COUNT * 4);
         let last = spec.entries[SPEC_COUNT - 1];
         assert_eq!(last.constant_id, 25);
-        assert_eq!(spec.data[18], 0.5);
+        assert_eq!(f32::from_bits(spec.data[18]), 0.5);
     }
 }

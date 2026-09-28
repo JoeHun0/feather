@@ -1606,6 +1606,11 @@ impl Bench {
         eprintln!("[bench] Mtris shadow {}", mtris(|s| s.shadow_tris));
         eprintln!("[bench] LOD mix main   {}", mix(|s| s.main_lods));
         eprintln!("[bench] LOD mix shadow {}", mix(|s| s.shadow_lods));
+        let count = |f: fn(&FrameStats) -> u32| {
+            stats(self.samples.iter().map(|(_, _, s)| f(s) as f32).collect())
+        };
+        eprintln!("[bench] masked main   {}", count(|s| s.main_masked));
+        eprintln!("[bench] masked shadow {}", count(|s| s.shadow_masked));
     }
 }
 
@@ -3769,7 +3774,7 @@ fn level_material(base_linear: [f32; 3], roughness: f32) -> feather_assets::Mate
         base_color_texture: None,
         normal_texture: None,
         metallic_roughness_texture: None,
-        surface: None,
+        ..Default::default()
     }
 }
 
@@ -3877,7 +3882,7 @@ fn palette_material(k: u32) -> feather_assets::Material {
         base_color_texture: None,
         normal_texture: None,
         metallic_roughness_texture: None,
-        surface: None,
+        ..Default::default()
     }
 }
 

@@ -124,6 +124,25 @@ pub struct Material {
     /// (§20), from its glTF `extras.surface`. Passed through unchecked; the
     /// app knows which surfaces exist.
     pub surface: Option<String>,
+    /// How the base colour's alpha is used (glTF `alphaMode`).
+    pub alpha_mode: AlphaMode,
+    /// glTF `doubleSided`: both faces are the surface, so a back face is
+    /// lit as the front seen from behind.
+    pub double_sided: bool,
+}
+
+/// glTF's `alphaMode`: what the base colour's alpha (texture × factor)
+/// means for a material.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AlphaMode {
+    /// Alpha is ignored.
+    Opaque,
+    /// Cutout: fragments with alpha below the cutoff aren't there (grass,
+    /// chain-link, leaves).
+    Mask(f32),
+    /// Blended transparency. The renderer has no transparent pass yet, so
+    /// these draw opaque.
+    Blend,
 }
 
 impl Default for Material {
@@ -139,6 +158,8 @@ impl Default for Material {
             normal_texture: None,
             metallic_roughness_texture: None,
             surface: None,
+            alpha_mode: AlphaMode::Opaque,
+            double_sided: false,
         }
     }
 }
@@ -463,6 +484,13 @@ fn read_material(m: &gltf::Material, images: &ImageCache) -> Material {
         normal_texture,
         metallic_roughness_texture,
         surface: read_surface(m),
+        alpha_mode: match m.alpha_mode() {
+            gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
+            // glTF's default cutoff is 0.5.
+            gltf::material::AlphaMode::Mask => AlphaMode::Mask(m.alpha_cutoff().unwrap_or(0.5)),
+            gltf::material::AlphaMode::Blend => AlphaMode::Blend,
+        },
+        double_sided: m.double_sided(),
     }
 }
 
@@ -916,6 +944,58 @@ mod tests {
             .map(|m| m.material.surface.as_deref())
             .collect();
         assert_eq!(surfaces, [Some("wood"), None, None, None]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn materials_carry_alpha_mode_and_sidedness() {
+        let dir = fixture_dir("alpha");
+        let positions: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let bin: Vec<u8> = positions.iter().flat_map(|f| f.to_le_bytes()).collect();
+        std::fs::write(dir.join("tri.bin"), &bin).unwrap();
+        let gltf = r#"{
+  "asset": { "version": "2.0" },
+  "scene": 0,
+  "scenes": [ { "nodes": [0] } ],
+  "nodes": [ { "mesh": 0 } ],
+  "meshes": [ { "primitives": [
+    { "attributes": { "POSITION": 0 }, "material": 0 },
+    { "attributes": { "POSITION": 0 }, "material": 1 },
+    { "attributes": { "POSITION": 0 }, "material": 2 },
+    { "attributes": { "POSITION": 0 }, "material": 3 },
+    { "attributes": { "POSITION": 0 } }
+  ] } ],
+  "materials": [
+    { "name": "grass", "alphaMode": "MASK", "alphaCutoff": 0.3, "doubleSided": true },
+    { "name": "fence", "alphaMode": "MASK" },
+    { "name": "glass", "alphaMode": "BLEND" },
+    { "name": "plain", "alphaMode": "OPAQUE", "doubleSided": false }
+  ],
+  "accessors": [ {
+    "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+    "min": [0, 0, 0], "max": [1, 1, 0]
+  } ],
+  "bufferViews": [ { "buffer": 0, "byteOffset": 0, "byteLength": 36 } ],
+  "buffers": [ { "byteLength": 36, "uri": "tri.bin" } ]
+}"#;
+        let path = dir.join("alpha.gltf");
+        std::fs::write(&path, gltf).unwrap();
+        let scene = load_gltf_scene(&path).unwrap();
+        let got: Vec<(AlphaMode, bool)> = scene
+            .meshes
+            .iter()
+            .map(|m| (m.material.alpha_mode, m.material.double_sided))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (AlphaMode::Mask(0.3), true),
+                (AlphaMode::Mask(0.5), false), // glTF's default cutoff
+                (AlphaMode::Blend, false),
+                (AlphaMode::Opaque, false),
+                (AlphaMode::Opaque, false), // no material: glTF's default
+            ]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

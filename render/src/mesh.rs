@@ -14,6 +14,7 @@ use crate::environment::{Environment, Specialization};
 use feather_assets::bake::{
     baked_path, texture_key, BakedMesh, BakedTexture, TexKind, MIN_LOD_TRIS, TEX_DIR,
 };
+use feather_assets::AlphaMode;
 use feather_assets::{Material, MeshData, TextureData, Vertex};
 use feather_gfx::{Buffer, Image, MappedBuffer, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use glam::{Mat4, Vec3, Vec4};
@@ -241,6 +242,10 @@ pub struct FrameStats {
     pub main_lods: [u32; MAX_LODS],
     /// Instances drawn at each LOD, summed over the shadow cascades.
     pub shadow_lods: [u32; MAX_LODS],
+    /// Instances of masked (cutout, §5) materials, camera view.
+    pub main_masked: u32,
+    /// Instances of masked materials, summed over the shadow cascades.
+    pub shadow_masked: u32,
 }
 
 /// GPU material record (§5): std430, 64 bytes, indexed by `material_id`.
@@ -251,16 +256,32 @@ struct GpuMaterial {
     base_color_factor: [f32; 4],
     emissive: [f32; 4], // rgb = emissive, a = metallic
     params: [f32; 4],   // x = roughness, y = normal_scale, z = occlusion, w = alpha_cutoff
-    tex: [u32; 4],      // x = base color, y = normal, z = metallic-roughness, w reserved
+    tex: [u32; 4],      // x = base color, y = normal, z = metallic-roughness, w = flags
 }
+
+/// `GpuMaterial.tex.w` flag: both faces are the surface (glTF
+/// `doubleSided`), so `mesh.frag` flips a back face's normal. Must match
+/// `mesh.frag`'s `MATERIAL_DOUBLE_SIDED` (a test checks).
+const MATERIAL_DOUBLE_SIDED: u32 = 1;
 
 impl GpuMaterial {
     fn from_material(m: &Material, slots: [u32; 3]) -> Self {
+        // The cutoff only for masked materials (§5). BLEND has no pass to go
+        // to yet, so it draws opaque.
+        let cutoff = match m.alpha_mode {
+            AlphaMode::Mask(c) => c,
+            AlphaMode::Opaque | AlphaMode::Blend => 0.0,
+        };
+        let flags = if m.double_sided {
+            MATERIAL_DOUBLE_SIDED
+        } else {
+            0
+        };
         Self {
             base_color_factor: m.base_color,
             emissive: [m.emissive[0], m.emissive[1], m.emissive[2], m.metallic],
-            params: [m.roughness, m.normal_scale, 1.0, 0.5],
-            tex: [slots[0], slots[1], slots[2], 0],
+            params: [m.roughness, m.normal_scale, 1.0, cutoff],
+            tex: [slots[0], slots[1], slots[2], flags],
         }
     }
 }
@@ -336,13 +357,16 @@ pub struct CascadeSetup {
 
 /// A contiguous run of same-(mesh, LOD) instances. `prepare_frame` sorts +
 /// records these once per frame; the shadow and main passes each replay them.
-#[derive(Clone, Copy)]
+/// A view's runs are opaque first, then masked (§5), so a pass switches
+/// pipeline once.
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Run {
     first_index: u32,
     index_count: u32,
     vertex_offset: i32,
     run_start: u32,
     run_len: u32,
+    masked: bool,
 }
 
 fn as_bytes<T>(slice: &[T]) -> &[u8] {
@@ -357,6 +381,14 @@ pub struct MeshRenderer {
     pipeline: vk::Pipeline,
     // Depth-only pipeline for the sun shadow pass (§11); reuses `layout`/`sets`.
     shadow_pipeline: vk::Pipeline,
+    /// The masked-material (§5) variants of the main, depth prepass and
+    /// shadow pipelines: they cut out below the material's alpha cutoff.
+    masked_pipeline: vk::Pipeline,
+    masked_depth_pipeline: vk::Pipeline,
+    masked_shadow_pipeline: vk::Pipeline,
+    /// Per material id: does it cut out (glTF MASK)? Picks each instance's
+    /// pipeline when runs are built.
+    masked: Vec<bool>,
     // Depth-only prepass into the main depth buffer (§10), so the opaque pass
     // shades each pixel once. Shares `mesh.vert` with the main pipeline.
     depth_pipeline: vk::Pipeline,
@@ -601,6 +633,17 @@ impl MeshRenderer {
             as_bytes(&gpu_materials),
             vk::BufferUsageFlags::STORAGE_BUFFER,
         );
+        let masked: Vec<bool> = materials
+            .iter()
+            .map(|m| matches!(m.alpha_mode, AlphaMode::Mask(_)))
+            .collect();
+        let blended = materials
+            .iter()
+            .filter(|m| m.alpha_mode == AlphaMode::Blend)
+            .count();
+        if blended > 0 {
+            eprintln!("[mesh] {blended} BLEND materials drawn opaque (no transparency yet)");
+        }
 
         let instance_buffers: Vec<MappedBuffer> = (0..FRAMES_IN_FLIGHT)
             .map(|_| {
@@ -930,6 +973,33 @@ impl MeshRenderer {
                 .expect("graphics pipeline")[0]
         };
 
+        // ---- Masked materials (§5): the same pass with `MASKED` set, so only
+        // these fragments pay for the cutout, and only this pipeline loses
+        // early-Z's shortcuts. It still needs its own cut: where the prepass
+        // cut a hole, the depth behind passes LESS_OR_EQUAL.
+        let masked_spec = Specialization::new(env).masked();
+        let masked_spec_info = masked_spec.info();
+        let masked_stages = [
+            stages[0],
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(frag)
+                .name(c"main")
+                .specialization_info(&masked_spec_info),
+        ];
+        // A copy of the opaque pipeline's create info (its rendering-info
+        // chain included), with only the stages swapped.
+        let masked_pipeline = unsafe {
+            device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &[pipeline_info.stages(&masked_stages)],
+                    None,
+                )
+                .map_err(|(_, e)| e)
+                .expect("masked graphics pipeline")[0]
+        };
+
         // ---- Depth prepass pipeline (§10): lays down opaque depth so the main
         // pass can early-Z out occluded fragments instead of shading them twice.
         // Deliberately reuses `mesh.vert` — the SAME module as the main pass — so
@@ -975,6 +1045,27 @@ impl MeshRenderer {
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[depth_pipeline_info], None)
                 .map_err(|(_, e)| e)
                 .expect("depth prepass pipeline")[0]
+        };
+        // Masked materials' prepass (§5): `mask.frag` cuts the holes, so the
+        // depth behind them survives. Same vertex shader, so the depths still
+        // match the main pass exactly.
+        let mask_frag = load_shader(&device, spv!("mask.frag"));
+        let masked_depth_stages = [
+            depth_stages[0],
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(mask_frag)
+                .name(c"main"),
+        ];
+        let masked_depth_pipeline = unsafe {
+            device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &[depth_pipeline_info.stages(&masked_depth_stages)],
+                    None,
+                )
+                .map_err(|(_, e)| e)
+                .expect("masked depth prepass pipeline")[0]
         };
 
         // ---- Shadow (depth-only) pipeline: renders instances from the sun into
@@ -1039,11 +1130,39 @@ impl MeshRenderer {
                 .map_err(|(_, e)| e)
                 .expect("shadow pipeline")[0]
         };
+        // Masked casters (§5): `mesh.vert` + `mask.frag`, since the cut needs
+        // UVs and the material, which shadow.vert doesn't pass on. mesh.vert
+        // takes its matrix from the first 64 push-constant bytes, which is
+        // where `draw_shadow` pushes the light's. No face culling: a masked
+        // card (grass, chain-link) is usually one quad, and culling its front
+        // would drop it from the map whenever it faces the sun.
+        let masked_shadow_stages = [
+            stages[0],
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(mask_frag)
+                .name(c"main"),
+        ];
+        let masked_shadow_raster = shadow_raster.cull_mode(vk::CullModeFlags::NONE);
+        let masked_shadow_pipeline = unsafe {
+            device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &[shadow_pipeline_info
+                        .stages(&masked_shadow_stages)
+                        .vertex_input_state(&vertex_input)
+                        .rasterization_state(&masked_shadow_raster)],
+                    None,
+                )
+                .map_err(|(_, e)| e)
+                .expect("masked shadow pipeline")[0]
+        };
 
         unsafe {
             device.destroy_shader_module(vert, None);
             device.destroy_shader_module(frag, None);
             device.destroy_shader_module(shadow_vert, None);
+            device.destroy_shader_module(mask_frag, None);
         }
 
         // Light-cluster assignment (§12), the engine's first compute pipeline.
@@ -1072,6 +1191,10 @@ impl MeshRenderer {
             pipeline,
             shadow_pipeline,
             depth_pipeline,
+            masked_pipeline,
+            masked_depth_pipeline,
+            masked_shadow_pipeline,
+            masked,
             set_layout,
             pool,
             sets,
@@ -1176,12 +1299,14 @@ impl MeshRenderer {
         // firstInstance base into the concatenated SSBO.
         let mut runs = Runs {
             slices: &self.slices,
+            masked: &self.masked,
             keyed: &mut self.keyed,
             scratch: &mut self.scratch,
         };
         let main_stats = runs.build(main, enabled.then_some(screen), &mut self.main_runs, 0);
         stats.main_tris = main_stats.tris;
         stats.main_lods = main_stats.lods;
+        stats.main_masked = main_stats.masked;
         let mut base = main_stats.instances;
         for (cascade, casters) in shadows.iter_mut().enumerate().take(SHADOW_CASCADES) {
             let rule = cascades
@@ -1190,6 +1315,7 @@ impl MeshRenderer {
                 .filter(|_| enabled);
             let st = runs.build(casters, rule, &mut self.shadow_runs[cascade], base);
             stats.shadow_tris += st.tris;
+            stats.shadow_masked += st.masked;
             for (total, n) in stats.shadow_lods.iter_mut().zip(st.lods) {
                 *total += n;
             }
@@ -1267,11 +1393,6 @@ impl MeshRenderer {
                 0,
                 push_bytes,
             );
-            self.device.cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.shadow_pipeline,
-            );
             self.device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -1285,7 +1406,7 @@ impl MeshRenderer {
             self.device.cmd_set_depth_bias(cmd, 2.0, 0.0, 3.0);
             self.set_viewport_scissor(cmd, extent);
             self.bind_geometry(cmd);
-            self.draw_runs(cmd, runs);
+            self.draw_split(cmd, runs, self.shadow_pipeline, self.masked_shadow_pipeline);
         }
     }
 
@@ -1330,11 +1451,6 @@ impl MeshRenderer {
     ) {
         unsafe {
             self.push_view_constants(cmd, view_proj, light_dir, camera_pos);
-            self.device.cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.depth_pipeline,
-            );
             self.device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -1345,7 +1461,12 @@ impl MeshRenderer {
             );
             self.set_viewport_scissor(cmd, extent);
             self.bind_geometry(cmd);
-            self.draw_runs(cmd, &self.main_runs);
+            self.draw_split(
+                cmd,
+                &self.main_runs,
+                self.depth_pipeline,
+                self.masked_depth_pipeline,
+            );
         }
     }
 
@@ -1362,8 +1483,6 @@ impl MeshRenderer {
     ) {
         unsafe {
             self.push_view_constants(cmd, view_proj, light_dir, camera_pos);
-            self.device
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
             self.device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -1374,7 +1493,7 @@ impl MeshRenderer {
             );
             self.set_viewport_scissor(cmd, extent);
             self.bind_geometry(cmd);
-            self.draw_runs(cmd, &self.main_runs);
+            self.draw_split(cmd, &self.main_runs, self.pipeline, self.masked_pipeline);
         }
     }
 
@@ -1436,6 +1555,27 @@ impl MeshRenderer {
             .cmd_bind_index_buffer(cmd, self.index_buffer.handle, 0, vk::IndexType::UINT32);
     }
 
+    /// Draw a view's `runs` with `opaque`, switching to `masked` at the first
+    /// masked run (`Runs::build` puts them last). Both pipelines share one
+    /// layout, so the bound descriptor set and push constants carry over.
+    unsafe fn draw_split(
+        &self,
+        cmd: vk::CommandBuffer,
+        runs: &[Run],
+        opaque: vk::Pipeline,
+        masked: vk::Pipeline,
+    ) {
+        let split = runs.partition_point(|r| !r.masked);
+        self.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, opaque);
+        self.draw_runs(cmd, &runs[..split]);
+        if split < runs.len() {
+            self.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, masked);
+            self.draw_runs(cmd, &runs[split..]);
+        }
+    }
+
     /// One `cmd_draw_indexed` per contiguous same-mesh run. `firstInstance` =
     /// `run_start`, so `gl_InstanceIndex` indexes the concatenated instance SSBO.
     unsafe fn draw_runs(&self, cmd: vk::CommandBuffer, runs: &[Run]) {
@@ -1458,20 +1598,29 @@ struct RunStats {
     instances: u32,
     tris: u64,
     lods: [u32; MAX_LODS],
+    /// Of `instances`, how many are masked.
+    masked: u32,
 }
 
 /// The per-frame state run building shares across views.
 struct Runs<'a> {
     slices: &'a [MeshSlice],
+    /// Per material id: masked (§5)? Ids past the end are opaque.
+    masked: &'a [bool],
     keyed: &'a mut Vec<(u32, InstanceData)>,
     scratch: &'a mut Vec<InstanceData>,
 }
 
+/// Run sort key bit: the instance's material is masked. The top bit, so a
+/// view's runs sort opaque first, then masked.
+const KEY_MASKED: u32 = 1 << 31;
+
 impl Runs<'_> {
-    /// Pick each item's LOD under `rule` (`None` = LOD0), sort by (mesh, LOD),
-    /// append the instances to `scratch`, and record one run per contiguous
-    /// (mesh, LOD) group with `firstInstance = base + local_start`. `base`
-    /// must equal `scratch.len()` at entry.
+    /// Pick each item's LOD under `rule` (`None` = LOD0), sort by (masked,
+    /// mesh, LOD), append the instances to `scratch`, and record one run per
+    /// contiguous group with `firstInstance = base + local_start`: the opaque
+    /// runs first, then the masked. `base` must equal `scratch.len()` at
+    /// entry.
     fn build(
         &mut self,
         items: &[(MeshId, InstanceData)],
@@ -1490,7 +1639,14 @@ impl Runs<'_> {
                     r.budget(&inst.model, slice.center, slice.radius),
                 )
             });
-            Some(((mesh.0 << 4) | lod as u32, *inst))
+            let masked = self.masked.get(inst.material_id as usize) == Some(&true);
+            let key = (mesh.0 << 4) | lod as u32;
+            debug_assert!(
+                key & KEY_MASKED == 0,
+                "mesh id {} overflows the run key",
+                mesh.0
+            );
+            Some((if masked { key | KEY_MASKED } else { key }, *inst))
         }));
         // Unstable sort is fine; draw order within a run doesn't matter
         // (opaque + depth test).
@@ -1506,7 +1662,7 @@ impl Runs<'_> {
             while first + run < count && self.keyed[first + run].0 == key {
                 run += 1;
             }
-            let slice = &self.slices[(key >> 4) as usize];
+            let slice = &self.slices[((key & !KEY_MASKED) >> 4) as usize];
             let lod = (key & 0xf) as usize;
             let l = slice.lods[lod];
             runs.push(Run {
@@ -1515,9 +1671,13 @@ impl Runs<'_> {
                 vertex_offset: slice.vertex_offset,
                 run_start: base + first as u32,
                 run_len: run as u32,
+                masked: key & KEY_MASKED != 0,
             });
             stats.tris += (l.index_count / 3) as u64 * run as u64;
             stats.lods[lod] += run as u32;
+            if key & KEY_MASKED != 0 {
+                stats.masked += run as u32;
+            }
             first += run;
         }
         stats.instances = count as u32;
@@ -1536,6 +1696,11 @@ impl Drop for MeshRenderer {
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline(self.shadow_pipeline, None);
             self.device.destroy_pipeline(self.depth_pipeline, None);
+            self.device.destroy_pipeline(self.masked_pipeline, None);
+            self.device
+                .destroy_pipeline(self.masked_depth_pipeline, None);
+            self.device
+                .destroy_pipeline(self.masked_shadow_pipeline, None);
             self.device.destroy_pipeline(self.cluster_pipeline, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_pool(self.pool, None);
@@ -1715,6 +1880,7 @@ mod tests {
         let (mut keyed, mut scratch, mut runs) = (Vec::new(), Vec::new(), Vec::new());
         let mut b = Runs {
             slices: &slices,
+            masked: &[],
             keyed: &mut keyed,
             scratch: &mut scratch,
         };
@@ -1749,12 +1915,113 @@ mod tests {
         let (mut keyed, mut scratch, mut runs) = (Vec::new(), Vec::new(), Vec::new());
         let mut b = Runs {
             slices: &slices,
+            masked: &[],
             keyed: &mut keyed,
             scratch: &mut scratch,
         };
         let st = b.build(&items, None, &mut runs, 0);
         assert_eq!(st.lods[0], 5);
         assert_eq!(runs.len(), 2);
+    }
+
+    /// Masked instances (§5) run after every opaque one, whatever their
+    /// mesh, so a pass switches pipeline once; within each half the runs
+    /// split by (mesh, LOD) as before, and the instances and triangles are
+    /// the same as without masking.
+    #[test]
+    fn masked_runs_follow_the_opaque_ones() {
+        let slices: Vec<MeshSlice> = (0..3)
+            .map(|i| MeshSlice {
+                vertex_offset: i * 100,
+                lods: lods(&[0.0]),
+                center: Vec3::ZERO,
+                radius: 0.5,
+            })
+            .collect();
+        // Material 1 is masked; 0 is opaque, and 5 is past the table (opaque).
+        let masked = [false, true];
+        let inst = |m: u32| InstanceData::new(Mat4::IDENTITY, m);
+        let items = vec![
+            (MeshId(0), inst(1)),
+            (MeshId(2), inst(0)),
+            (MeshId(0), inst(0)),
+            (MeshId(1), inst(1)),
+            (MeshId(2), inst(5)),
+            (MeshId(0), inst(1)),
+        ];
+        let build = |masked: &[bool]| {
+            let (mut keyed, mut scratch, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+            let st = Runs {
+                slices: &slices,
+                masked,
+                keyed: &mut keyed,
+                scratch: &mut scratch,
+            }
+            .build(&items, None, &mut runs, 0);
+            (runs, st, scratch)
+        };
+        let (runs, st, scratch) = build(&masked);
+        let got: Vec<(i32, u32, u32, bool)> = runs
+            .iter()
+            .map(|r| (r.vertex_offset, r.run_start, r.run_len, r.masked))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 0, 1, false),   // mesh 0, opaque
+                (200, 1, 2, false), // mesh 2, opaque (material 0 and 5)
+                (0, 3, 2, true),    // mesh 0, masked
+                (100, 5, 1, true),  // mesh 1, masked
+            ]
+        );
+        assert!(scratch[3..].iter().all(|i| i.material_id == 1));
+        assert_eq!(st.masked, 3);
+        let (plain, plain_st, _) = build(&[]);
+        assert_eq!((st.instances, st.tris), (plain_st.instances, plain_st.tris));
+        assert!(plain.iter().all(|r| !r.masked));
+        assert_eq!(plain.len(), 3, "without masking, mesh 0 is one run");
+    }
+
+    /// Material flags are shared with mesh.frag; the cutoff reaches the GPU
+    /// only for masked materials, so opaque and BLEND ones never cut.
+    #[test]
+    fn gpu_materials_pack_cutoff_and_flags() {
+        let src = include_str!("../shaders/mesh.frag");
+        let decl = format!("const uint MATERIAL_DOUBLE_SIDED = {MATERIAL_DOUBLE_SIDED}u;");
+        assert!(src.contains(&decl), "mesh.frag lacks `{decl}`");
+        let pack = |alpha_mode, double_sided| {
+            let m = Material {
+                alpha_mode,
+                double_sided,
+                ..Default::default()
+            };
+            let g = GpuMaterial::from_material(&m, [0, 1, 0]);
+            (g.params[3], g.tex[3])
+        };
+        assert_eq!(
+            pack(AlphaMode::Mask(0.3), true),
+            (0.3, MATERIAL_DOUBLE_SIDED)
+        );
+        assert_eq!(pack(AlphaMode::Mask(0.5), false), (0.5, 0));
+        assert_eq!(pack(AlphaMode::Opaque, false), (0.0, 0));
+        assert_eq!(pack(AlphaMode::Blend, true), (0.0, MATERIAL_DOUBLE_SIDED));
+    }
+
+    /// The alpha test is written out in mesh.frag (the main pass) and
+    /// mask.frag (the depth prepass and shadows). Different texts would cut
+    /// different holes in depth and in colour, so they must match exactly.
+    #[test]
+    fn the_shaders_share_the_cutout() {
+        let body = |src: &str| -> String {
+            let sig = "float cutout_alpha(Material m, vec2 uv)";
+            let start = src.find(sig).expect("no cutout_alpha");
+            let len = src[start..].find("\n}\n").expect("function end") + 3;
+            src[start..start + len].to_string()
+        };
+        assert_eq!(
+            body(include_str!("../shaders/mesh.frag")),
+            body(include_str!("../shaders/mask.frag"))
+        );
     }
 
     /// The cluster grid and light cap are repeated as GLSL constants in both
