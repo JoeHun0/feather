@@ -707,10 +707,12 @@ while it runs. It ignores `config/`: settings come from the
 defaults and CLI flags only.
 
 Bloom and auto-exposure are on by default, so a bench's `frame` includes
-them (~0.15 and ~0.05 ms, debug), and so is sky occlusion when the scene's
-volume is baked (`geo` +0.03–0.07 ms), and GTAO (its own `ao` line, ~0.27 ms on
-the zone). `geo` also times the depth prepass, which now runs on its own before
-GTAO. To compare with numbers from before they existed, add
+them (~0.10 and ~0.06 ms with pinned clocks). So is sky occlusion when the
+scene's volume is baked (`geo` +0.05 ms on the zone, +0.10 on `lights120`),
+and so is GTAO (its own `ao` line, 0.38 ms on the zone). `geo` also times the
+depth prepass, which now runs on its own before GTAO. Pinned clocks run below
+boost, so these read higher than unpinned numbers. Compare pinned only with
+pinned; debug and release measure the same. To compare with numbers from before they existed, add
 `--no-bloom --no-auto-exposure --no-sky-occlusion --no-ao`.
 
 ### A/B recipe

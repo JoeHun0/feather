@@ -822,6 +822,12 @@ now scales the sky term. GTAO (below) adds the small-scale contact.
     read ratios of ≈ 0.82 at the gate, ≈ 0.075 in the hangar and < 0.07 in
     the office (clamped). The CPU volume's values are ≈ 0.8, 0.04–0.11 and
     0.006, and with `--no-sky-occlusion` every spot metered alike.
+- **Re-measured with pinned clocks** (`profile_standard`, release, 3
+  interleaved rounds, `--no-sky-occlusion` vs on): `geo` 0.24 → 0.29 ms on
+  the zone and 0.82 → 0.92 ms on `lights120` (+12%). I predicted
+  +0.02–0.05 ms: the zone held at the edge, `lights120` didn't. Its 25 MB
+  volume (below) is the first suspect: 8 fetches a fragment spread across it
+  can miss the cache much more than in the zone's 3 MB.
 - **Memory:** 8 bytes a cell. That's 3.0 MB for the zone, but 25 MB for
   `lights120`, whose occluders reach 70 m up: its 3.3M cells are nearly all
   open sky. A sparse or two-level grid would fix that; nothing needs it yet.
@@ -895,6 +901,15 @@ the surface, can't see. It uses the depth prepass alone (§10).
     share of any view.
   - Validation with sync: 0 messages at MSAA 1/2/4×, with GTAO off, on the
     nature scene and the orb demo, and across two resizes mid-session.
+- **Re-measured with pinned clocks** (`profile_standard`, release, 3
+  interleaved rounds; every median repeated to 0.01 ms):
+  - `ao` 0.38 ms on the zone and 0.54 ms on `lights120` (frames +0.40 /
+    +0.59 ms). I predicted 0.22–0.28 / 0.30–0.38 and was wrong: pinned is a
+    fixed clock *below* boost, so every pass reads slower than unpinned.
+  - Skipping the denoise (a temporary harness) leaves 0.33 / 0.46 ms, so
+    the gtao pass is 85–87% of it. I predicted ~85%, which held.
+  - Debug and release measure the same (0.39 / 0.54 ms): GPU work doesn't
+    depend on the Rust profile.
 - **Next lever:** half resolution with a depth-aware upsample. The plan named
   it for costs over 0.25 ms, and both scenes are over. Not done here.
 - **Limits:**
@@ -1002,6 +1017,13 @@ the ground's edge showed. Now it can pool on the ground.
       or scheduling in the driver's output, not arithmetic.
     - Worth re-measuring with pinned clocks and in release before acting on
       it.
+  - **Re-measured with pinned clocks** (`profile_standard`, 3 interleaved
+    rounds of fb3e789 vs e533010, debug and release): it's real and larger.
+    `lights120` `geo` 0.77 → 0.81 ms in debug and 0.76 → 0.81 ms in release
+    (+5–6%, frames 0.92 → 0.97 ms), 3/3 each; the zone 0.19 ms either way. I
+    predicted it would persist at +0.01–0.02 ms, and it came out larger. It
+    lands on the default fog path, which `lights120` uses, so it's worth
+    finding.
 
 ### Post chain (after transparents; HDR until tonemap)
 
@@ -1061,6 +1083,14 @@ Call of Duty: AW).
     upsample.
   - A single-pass downsample (FidelityFX SPD-style) or a cheaper first tap
     pattern is where to look if it matters.
+  - **Re-measured with pinned clocks** (`profile_standard`, release, 3
+    interleaved rounds): `bloom` 0.10 ms on both scenes, frame +0.10–
+    0.12 ms. A temporary harness that stopped the chain early split it:
+    the first downsample is 0.03 ms, the last upsample 0.02 ms, and the
+    other 11 steps share 0.05 ms. I predicted 0.08–0.12 in all, ~0.04 for
+    the first downsample and 0.02–0.03 for the last upsample, and all held.
+    So the unpinned 0.15 was mostly downclocking, and no single step is
+    worth rewriting on its own.
   - Validation with sync: 0 messages, with bloom on, off, and at MSAA 4×
     (where it reads the resolve target).
 - **Switch:** OPTIONS > GRAPHICS > BLOOM, saved as `bloom` in
@@ -2076,7 +2106,11 @@ and punctuation.
   back-to-back A/B does not cancel. On amdgpu:
   `echo profile_standard | sudo tee /sys/class/drm/cardN/device/power_dpm_force_performance_level`
   (resets on reboot, or write `auto`). With it set, vsync on vs off measured
-  identical, confirming clock state was the only distortion.
+  identical, confirming clock state was the only distortion. It fixes the
+  clock *below* boost, so pinned times read higher than unpinned ones
+  (the zone's frame is 1.01 ms pinned against ~0.87 unpinned): compare
+  pinned only with pinned. Pinned, 3 interleaved rounds repeat every median
+  to 0.01 ms, and debug and release builds measure the same.
 - **Test content:** `tools/gen_testscene.py` generates the measurement
   workload. The orb demo is pathological on purpose (huge overdraw, every object
   a caster, no occlusion) and so is useless for judging cost; this produces a
