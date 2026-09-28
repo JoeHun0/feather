@@ -398,33 +398,64 @@ impl SkyVis {
         (self.w0 + self.w.dot(n)).max(0.0)
     }
 
+    /// The fraction of the upper hemisphere seen, `2·w0`. The ground term of
+    /// the ambient (light bounced up from below) scales with it: a room lit
+    /// through its door has a floor lit through its door.
+    pub fn seen(self) -> f32 {
+        2.0 * self.w0
+    }
+
+    /// How much of the sky's reflection survives along the reflection vector
+    /// `r` (unit): the sky weight around `r` against the open sky's, for `r`
+    /// above the horizon. Below it the reflection is of the ground, which
+    /// scales like the ground term, with [`seen`](Self::seen); the two are
+    /// blended over `SKY_SPECULAR_FADE` in `r.y` so nothing steps. 1 in the
+    /// open, whatever `r`.
+    pub fn specular(self, r: Vec3) -> f32 {
+        let ratio = (self.weight(r) / (0.5 + 0.5 * r.y).max(0.5)).clamp(0.0, 1.0);
+        let t = (r.y / SKY_SPECULAR_FADE).clamp(0.0, 1.0);
+        let t = t * t * (3.0 - 2.0 * t); // smoothstep, as GLSL's
+        self.seen() + (ratio - self.seen()) * t
+    }
+
     /// RGBA8, scaled so every component spans its range and the open sky is
     /// exact: `r = 510·w0`, `g = 127 + 508·w.x`, `b = 510·w.y`,
-    /// `a = 127 + 508·w.z`. mesh.frag decodes the same numbers (a test
-    /// checks), and decoding is linear, so trilinear filtering is exact.
+    /// `a = 127 + 508·w.z` (the `SKY_*` constants). mesh.frag decodes the
+    /// same numbers (a test checks), and decoding is linear, so blending
+    /// decoded texels is blending the values.
     pub fn encode(self) -> [u8; 4] {
         let q = |v: f32| v.round().clamp(0.0, 255.0) as u8;
         [
-            q(510.0 * self.w0),
-            q(127.0 + 508.0 * self.w.x),
-            q(510.0 * self.w.y),
-            q(127.0 + 508.0 * self.w.z),
+            q(SKY_W0_SCALE * self.w0),
+            q(SKY_W_BIAS + SKY_W_SCALE * self.w.x),
+            q(SKY_W0_SCALE * self.w.y),
+            q(SKY_W_BIAS + SKY_W_SCALE * self.w.z),
         ]
     }
 
     /// Inverse of [`encode`](Self::encode), from UNORM values in [0, 1] as a
-    /// shader samples them (so it also decodes filtered texels).
+    /// shader reads them.
     pub fn decode(t: [f32; 4]) -> Self {
+        let b = t.map(|v| v * 255.0);
         SkyVis {
-            w0: t[0] * 255.0 / 510.0,
+            w0: b[0] / SKY_W0_SCALE,
             w: Vec3::new(
-                (t[1] * 255.0 - 127.0) / 508.0,
-                t[2] * 255.0 / 510.0,
-                (t[3] * 255.0 - 127.0) / 508.0,
+                (b[1] - SKY_W_BIAS) / SKY_W_SCALE,
+                b[2] / SKY_W0_SCALE,
+                (b[3] - SKY_W_BIAS) / SKY_W_SCALE,
             ),
         }
     }
 }
+
+/// `SkyVis`'s encoding: `w0` and `w.y` (both in [0, ½]) times this...
+pub const SKY_W0_SCALE: f32 = 510.0;
+/// ...and `w.x`, `w.z` (in [−¼, ¼]) as this plus...
+pub const SKY_W_BIAS: f32 = 127.0;
+/// ...this times the value. 127 rather than 127.5, so 0 is exact.
+pub const SKY_W_SCALE: f32 = 508.0;
+/// See [`SkyVis::specular`], in `r.y`.
+pub const SKY_SPECULAR_FADE: f32 = 0.25;
 
 /// How far one cell centre can see along each axis before geometry, in cells
 /// (0 to 1; 1 means clear all the way to the neighbouring centre).
@@ -571,16 +602,20 @@ impl SkyVolume {
     /// The sky visibility at world point `p`: a trilinear blend of the eight
     /// cells round it (clamped to the grid, like a clamp-to-edge sampler),
     /// leaving out those it can't see ([`SkyFree::visible`]) and renormalising.
-    /// If it can see none, the plain blend. mesh.frag's `sky_visibility` is
-    /// this, step for step.
+    /// If it can see none, the plain blend. Outside the grid it fades to open
+    /// sky over one cell: the bake pads its grid past every occluder, so
+    /// what's out there sees everything. mesh.frag's `sky_visibility` is this,
+    /// step for step.
     pub fn sample(&self, p: Vec3) -> SkyVis {
         let dims = Vec3::new(
             self.dims[0] as f32,
             self.dims[1] as f32,
             self.dims[2] as f32,
         );
+        let u = (p - self.origin) / self.cell;
+        let outside = (-u).max(u - dims).max_element().clamp(0.0, 1.0);
         // Texel space, centres on integers.
-        let t = ((p - self.origin) / self.cell - 0.5).clamp(Vec3::ZERO, dims - 1.0);
+        let t = (u - 0.5).clamp(Vec3::ZERO, dims - 1.0);
         let i = t.floor();
         let f = t - i;
         let (mut seen, mut plain) = ((0.0, 0.0, Vec3::ZERO), (0.0, Vec3::ZERO));
@@ -598,16 +633,15 @@ impl SkyVolume {
             seen = (seen.0 + w, seen.1 + w * v.w0, seen.2 + w * v.w);
             plain = (plain.0 + tri * v.w0, plain.1 + tri * v.w);
         }
-        if seen.0 > 1e-3 {
-            SkyVis {
-                w0: seen.1 / seen.0,
-                w: seen.2 / seen.0,
-            }
+        let (w0, w) = if seen.0 > 1e-3 {
+            (seen.1 / seen.0, seen.2 / seen.0)
         } else {
-            SkyVis {
-                w0: plain.0,
-                w: plain.1,
-            }
+            plain
+        };
+        let open = SkyVis::OPEN;
+        SkyVis {
+            w0: w0 + (open.w0 - w0) * outside,
+            w: w + (open.w - w) * outside,
         }
     }
 }
@@ -875,8 +909,43 @@ mod tests {
         assert!((at(-0.5) - 0.5).abs() < 1e-6);
         assert!(at(0.5).abs() < 1e-6);
         assert!((at(0.0) - 0.25).abs() < 1e-6);
-        assert!((at(-9.0) - 0.5).abs() < 1e-6 && at(9.0).abs() < 1e-6);
-        assert!((v.sample(Vec3::new(-0.5, 7.0, -3.0)).w0 - 0.5).abs() < 1e-6);
+        // Between the last centre and the grid's edge it clamps...
+        assert!(at(0.9).abs() < 1e-6);
+        // ...then fades to open sky over one cell outside...
+        assert!((at(1.5) - 0.25).abs() < 1e-6, "{}", at(1.5));
+        assert!((at(9.0) - 0.5).abs() < 1e-6 && (at(-9.0) - 0.5).abs() < 1e-6);
+        // ...on every axis.
+        assert!((v.sample(Vec3::new(0.5, 7.0, 0.5)).w0 - 0.5).abs() < 1e-6);
+        let edge = v.sample(Vec3::new(0.5, 0.5, -0.25)).w0;
+        assert!((edge - 0.125).abs() < 1e-6, "{edge}");
+    }
+
+    #[test]
+    fn specular_occlusion_is_1_in_the_open_and_0_shut_in() {
+        for i in 0..=40 {
+            let y = -1.0 + i as f32 / 20.0;
+            let r = Vec3::new((1.0 - y * y).max(0.0).sqrt(), y, 0.0);
+            assert!((SkyVis::OPEN.specular(r) - 1.0).abs() < 1e-6, "{r}");
+            assert!(SkyVis::CLOSED.specular(r).abs() < 1e-6, "{r}");
+        }
+        // A doorway to +x: reflections towards it keep more sky than away
+        // from it, and it changes smoothly through the horizon.
+        let door = SkyVis {
+            w0: 0.05,
+            w: Vec3::new(0.08, 0.04, 0.0),
+        };
+        let r = |x: f32, y: f32| door.specular(Vec3::new(x, y, 0.0).normalize());
+        assert!(r(1.0, 0.3) > r(-1.0, 0.3));
+        let mut last = r(1.0, -0.2);
+        for i in 1..=40 {
+            let y = -0.2 + i as f32 * 0.01;
+            let now = r(1.0, y);
+            assert!(
+                (now - last).abs() < 0.02,
+                "step at y = {y}: {last} -> {now}"
+            );
+            last = now;
+        }
     }
 
     #[test]

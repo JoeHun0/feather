@@ -61,6 +61,8 @@ layout(set = 0, binding = 4) uniform Globals {
     mat4 view;           // world -> view, for the cluster lookup
     vec4 cluster_params; // x = near, y = far, z = CLUSTER_Z / ln(far/near)
     vec4 cluster_proj;   // x = tan(fov_x/2), y = tan(fov_y/2)
+    vec4 sky_origin;     // sky volume: xyz = minimum corner, w = 1 / cell
+    vec4 sky_dims;       // xyz = cells per axis, w = 1 if there is a volume
 } g;
 
 // Punctual lights (§12), shaded only if this fragment's cluster lists them.
@@ -82,6 +84,11 @@ const uint CLUSTER_WORDS = MAX_LIGHTS / 32;
 layout(set = 0, binding = 6) readonly buffer Clusters {
     uint cluster_masks[];
 };
+
+// The level's sky visibility (§13), baked: per cell an RG32_UINT texel, x the
+// SkyVis moments as RGBA8 and y the SkyFree nibbles. Read with texelFetch and
+// blended by hand in sky_visibility().
+layout(set = 0, binding = 7) uniform usampler3D u_sky;
 
 layout(location = 0) in vec3 v_normal;
 layout(location = 1) in flat uint v_material;
@@ -184,6 +191,77 @@ vec3 sky_irradiance(vec3 n) {
     vec3 sky_avg = mix(SKY_HORIZON, SKY_ZENITH, 0.5);
     return mix(SKY_GROUND, sky_avg, n.y * 0.5 + 0.5) * SKY_INTENSITY;
 }
+// --- Sky visibility (§13) ---
+// feather_assets::bake's constants (a test checks): the SkyVis encoding, the
+// fade past a SkyFree distance (cells) and SkyVis::specular's fade (in r.y).
+const float SKY_W0_SCALE = 510.0;
+const float SKY_W_BIAS = 127.0;
+const float SKY_W_SCALE = 508.0;
+const float SKY_FREE_SOFT = 0.1;
+const float SKY_SPECULAR_FADE = 0.25;
+// (w0, w.xyz) of open sky.
+const vec4 SKY_OPEN = vec4(0.5, 0.0, 0.5, 0.0);
+
+// How much sky world point `p` sees, as (w0, w): SkyVolume::sample, step for
+// step. A trilinear blend of the eight cells round `p`, leaving out any whose
+// view towards `p` is blocked (so no cell above a thin roof lights the room
+// under it), renormalised; if all are blocked, the plain blend. Outside the
+// grid it fades to open sky over one cell.
+vec4 sky_visibility(vec3 p) {
+    if (g.sky_dims.w == 0.0) {
+        return SKY_OPEN;
+    }
+    vec3 dims = g.sky_dims.xyz;
+    vec3 u = (p - g.sky_origin.xyz) * g.sky_origin.w;
+    vec3 out3 = max(-u, u - dims);
+    float outside = clamp(max(max(out3.x, out3.y), out3.z), 0.0, 1.0);
+    vec3 t = clamp(u - 0.5, vec3(0.0), dims - 1.0);
+    vec3 i = floor(t);
+    vec3 f = t - i;
+    vec4 seen = vec4(0.0);
+    float seen_w = 0.0;
+    vec4 plain = vec4(0.0);
+    for (int c = 0; c < 8; ++c) {
+        vec3 o = vec3(float(c & 1), float((c >> 1) & 1), float((c >> 2) & 1));
+        uvec2 texel = texelFetch(u_sky, ivec3(min(i + o, dims - 1.0)), 0).xy;
+        vec3 tri3 = mix(1.0 - f, f, o);
+        float tri = tri3.x * tri3.y * tri3.z;
+        vec4 b = unpackUnorm4x8(texel.x) * 255.0;
+        vec4 v = vec4(b.x / SKY_W0_SCALE, (b.y - SKY_W_BIAS) / SKY_W_SCALE,
+                      b.z / SKY_W0_SCALE, (b.w - SKY_W_BIAS) / SKY_W_SCALE);
+        // SkyFree::visible: how far this cell sees towards p, per axis.
+        uint fr = texel.y;
+        vec3 plus = vec3(fr & 15u, (fr >> 8) & 15u, (fr >> 16) & 15u) / 15.0;
+        vec3 minus = vec3((fr >> 4) & 15u, (fr >> 12) & 15u, (fr >> 20) & 15u) / 15.0;
+        vec3 delta = f - o;
+        vec3 over3 = abs(delta) - mix(minus, plus, greaterThanEqual(delta, vec3(0.0)));
+        float over = max(max(over3.x, over3.y), over3.z);
+        float w = tri * clamp(1.0 - over / SKY_FREE_SOFT, 0.0, 1.0);
+        seen += w * v;
+        seen_w += w;
+        plain += tri * v;
+    }
+    vec4 vis = seen_w > 1e-3 ? seen / seen_w : plain;
+    return mix(vis, SKY_OPEN, outside);
+}
+// The sky's weight for a surface facing `n`: SkyVis::weight.
+float sky_weight(vec4 sv, vec3 n) {
+    return max(sv.x + dot(sv.yzw, n), 0.0);
+}
+// sky_irradiance(n) with the sky occluded by `sv`: the sky part by its
+// directional weight, the ground's bounce by the fraction of sky seen
+// (SkyVis::seen). Open sky gives sky_irradiance(n) exactly.
+vec3 sky_irradiance_occluded(vec3 n, vec4 sv) {
+    vec3 sky_avg = mix(SKY_HORIZON, SKY_ZENITH, 0.5);
+    return (SKY_GROUND * (0.5 - 0.5 * n.y) * (2.0 * sv.x) + sky_avg * sky_weight(sv, n))
+        * SKY_INTENSITY;
+}
+// How much of the sky's reflection along `r` survives: SkyVis::specular.
+float sky_specular(vec4 sv, vec3 r) {
+    float ratio = clamp(sky_weight(sv, r) / max(0.5 + 0.5 * r.y, 0.5), 0.0, 1.0);
+    return mix(2.0 * sv.x, ratio, smoothstep(0.0, SKY_SPECULAR_FADE, r.y));
+}
+
 // Karis' analytic environment BRDF (avoids a precomputed LUT).
 vec2 env_brdf_approx(float rough, float ndv) {
     const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
@@ -458,13 +536,16 @@ void main() {
     }
 
     // --- Ambient (analytic IBL: split-sum against the procedural sky) ---
+    // Occluded by the level's sky visibility (§13), sampled one cell off the
+    // surface so the cells behind it don't count.
+    vec4 sv = sky_visibility(v_world_pos + ng / g.sky_origin.w);
     vec3 fr = fresnel_schlick_roughness(ndv, f0, roughness);
     vec3 kd_amb = (vec3(1.0) - fr) * (1.0 - metallic);
-    vec3 diffuse_ibl = sky_irradiance(N) * albedo;
+    vec3 diffuse_ibl = sky_irradiance_occluded(N, sv) * albedo;
     vec3 r = reflect(-V, N);
     vec3 prefiltered = mix(sky(r), sky_irradiance(r), roughness); // crude roughness blur
     vec2 ab = env_brdf_approx(roughness, ndv);
-    vec3 specular_ibl = prefiltered * (f0 * ab.x + ab.y);
+    vec3 specular_ibl = prefiltered * (f0 * ab.x + ab.y) * sky_specular(sv, r);
     vec3 ambient = kd_amb * diffuse_ibl + specular_ibl;
 
     vec3 color = ambient + lo + m.emissive.rgb;

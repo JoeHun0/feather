@@ -282,10 +282,14 @@ struct GraphicsSettings {
     /// Pick LODs per view (§17). `--no-lod` pins LOD0 while keeping the baked
     /// vertex order, so an A/B separates the ordering win from the LOD win.
     lod: bool,
+    /// Occlude the ambient light by the level's baked sky visibility (§13),
+    /// when it has one. `--no-sky-occlusion` turns it off for A/B runs; not a
+    /// menu option, since it's part of the look rather than a cost to trade.
+    sky_occlusion: bool,
 }
 
 /// Where `feather-bake` writes, and the runtime looks for, baked assets
-/// (`tex/` and `mesh/` below it).
+/// (`tex/`, `mesh/` and `sky/` below it).
 const BAKE_DIR: &str = "scratch/bake";
 
 impl GraphicsSettings {
@@ -317,6 +321,7 @@ impl Default for GraphicsSettings {
             auto_exposure: true,
             bake: true,
             lod: true,
+            sky_occlusion: true,
         }
     }
 }
@@ -2188,16 +2193,22 @@ fn prefab_registry() -> HashMap<&'static str, SpawnFn> {
 /// Built-ins occupy the fixed MESH_* slots first (the demo sphere/cube, then the
 /// unit cube every static level piece is scaled from); each scene's meshes are
 /// appended and its node indices rebased onto them.
-fn load_scenes(scenes: &[String]) -> (Vec<MeshData>, Vec<feather_assets::SceneNode>) {
+/// Every CLI scene's meshes and nodes, merged after the built-in meshes, plus
+/// the first loaded scene's sky-visibility key (§13): one volume per session.
+fn load_scenes(scenes: &[String]) -> (Vec<MeshData>, Vec<feather_assets::SceneNode>, Option<u64>) {
     let mut meshes: Vec<MeshData> = vec![
         MeshData::uv_sphere(16, 24, 0.5),
         MeshData::cube(1.0),
         MeshData::cube(1.0),
     ];
     let mut nodes: Vec<feather_assets::SceneNode> = Vec::new();
+    let mut sky_key = None;
     for path in scenes {
         match feather_assets::load_gltf_scene(path) {
             Ok(scene) => {
+                if sky_key.is_none() {
+                    sky_key = Some(feather_assets::bake::sky_key(&scene));
+                }
                 eprintln!(
                     "loaded {path}: {} meshes, {} nodes",
                     scene.meshes.len(),
@@ -2214,7 +2225,7 @@ fn load_scenes(scenes: &[String]) -> (Vec<MeshData>, Vec<feather_assets::SceneNo
             Err(e) => eprintln!("failed to load {path}: {e} (skipped)"),
         }
     }
-    (meshes, nodes)
+    (meshes, nodes, sky_key)
 }
 
 /// Each mesh's footstep surface (§20), from its material's `surface` tag,
@@ -2429,7 +2440,7 @@ impl Session {
 
     /// Build a world and the GPU resources that serve it. `scenes` are the CLI
     /// glTF paths; empty means the procedural orb demo, exactly as before.
-    fn new(renderer: &Renderer, scenes: &[String], bake: bool, lod: bool) -> Self {
+    fn new(renderer: &Renderer, scenes: &[String], bake: bool, lod: bool, sky: bool) -> Self {
         let t_start = Instant::now();
         let bake_dir = bake.then(|| std::path::Path::new(BAKE_DIR));
         let b = build_world(scenes, bake_dir);
@@ -2443,6 +2454,7 @@ impl Session {
             MAX_INSTANCES,
             bake_dir,
             &b.environment,
+            b.sky.as_ref().filter(|_| sky),
         );
         mesh.set_lod_enabled(lod);
         // Where a session's load time goes (§17): parse + images + meshes, then
@@ -2488,6 +2500,8 @@ struct WorldBuild {
     mesh_spheres: Vec<(Vec3, f32)>,
     /// The level's atmosphere (§13), from its `environment` marker.
     environment: Environment,
+    /// The first scene's baked sky visibility (§13), if there is one.
+    sky: Option<feather_assets::bake::SkyVolume>,
     /// Time spent loading the scenes and bake, for the `[load]` line.
     t_scenes: std::time::Duration,
 }
@@ -2514,11 +2528,35 @@ fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> WorldBu
     // Scenes load *first*, because a `player_start` marker (§18) decides
     // where the player goes and the player is built below.
     let t_start = Instant::now();
-    let (meshes, scene_nodes) = load_scenes(scenes);
+    let (meshes, scene_nodes, sky_key) = load_scenes(scenes);
     // The bake (§17), read once: the renderer draws its LODs and the
     // colliders built below can use them too.
     let baked = bake_dir.map_or_else(Vec::new, |d| {
         feather_assets::bake::load_baked_meshes(d, &meshes)
+    });
+    // The first scene's sky visibility (§13), if it's been baked.
+    let sky = bake_dir.zip(sky_key).and_then(|(d, key)| {
+        let path =
+            feather_assets::bake::baked_sky_path(&d.join(feather_assets::bake::SKY_DIR), key);
+        match feather_assets::bake::SkyVolume::read(&path) {
+            Ok(v) => {
+                let [x, y, z] = v.dims;
+                eprintln!(
+                    "[sky] visibility: {x}x{y}x{z} cells of {:.2} m, {:.1} MB",
+                    v.cell,
+                    (v.texels.len() * 8) as f64 / 1_048_576.0
+                );
+                Some(v)
+            }
+            Err(_) => {
+                eprintln!(
+                    "[sky] no sky visibility baked for {}: ambient light is unoccluded; \
+                     `feather-bake SCENE` bakes it",
+                    scenes[0]
+                );
+                None
+            }
+        }
     });
     let t_scenes = t_start.elapsed();
     let (start_pos, start_yaw) = player_start(&scene_nodes);
@@ -2718,6 +2756,7 @@ fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> WorldBu
         fits,
         mesh_spheres,
         environment,
+        sky,
         t_scenes,
     }
 }
@@ -2959,6 +2998,7 @@ impl App {
             &self.scenes,
             self.settings.bake,
             self.settings.lod,
+            self.settings.sky_occlusion,
         );
         // Every visible lamp hums (§20): point lights on geometry. Bare light
         // markers stay silent.
@@ -4050,6 +4090,7 @@ fn parse_args(
             // bench run turns these off.
             "--no-bloom" => settings.bloom = false,
             "--no-auto-exposure" => settings.auto_exposure = false,
+            "--no-sky-occlusion" => settings.sky_occlusion = false,
             _ => scenes.push(a),
         }
     }
@@ -4948,7 +4989,7 @@ mod tests {
     fn command_line_flags_and_scenes() {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut s = GraphicsSettings::default();
-        assert!(s.bloom && s.bake && s.lod);
+        assert!(s.bloom && s.bake && s.lod && s.sky_occlusion);
         let (scenes, bench) = parse_args(
             args(&[
                 "--bench",
@@ -4959,13 +5000,14 @@ mod tests {
                 "--no-lod",
                 "b.gltf",
                 "--no-auto-exposure",
+                "--no-sky-occlusion",
             ]),
             &mut s,
         );
         assert_eq!(scenes, ["a.glb", "b.gltf"]);
         assert!(bench);
         assert_eq!((s.bloom, s.msaa, s.lod, s.bake), (false, 4, false, true));
-        assert!(!s.auto_exposure);
+        assert!(!s.auto_exposure && !s.sky_occlusion);
         // A bad sample count is ignored, not taken as a scene.
         let mut s = GraphicsSettings::default();
         let (scenes, bench) = parse_args(args(&["--msaa", "x", "--no-bake"]), &mut s);
@@ -6022,6 +6064,52 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(b.environment, want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A level's baked sky visibility (§13) reaches the session: found by the
+    /// scene's own key under the bake root, and only there. A volume baked
+    /// for another version of the level (a moved pad) isn't used, and nor is
+    /// anything with the bake off.
+    #[test]
+    fn a_levels_sky_visibility_reaches_the_world_build() {
+        use feather_assets::bake::{baked_sky_path, sky_key, SkyVis, SkyVolume, SKY_DIR};
+        let dir = crate::config::test_dir("e2e-sky");
+        let bake = dir.join("bake");
+        std::fs::create_dir_all(bake.join(SKY_DIR)).unwrap();
+        let level = write_pad_level(&dir, &[("plain", None)]);
+        let volume = SkyVolume {
+            origin: Vec3::new(-1.0, -2.0, -3.0),
+            cell: 0.5,
+            dims: [2, 1, 1],
+            texels: vec![[SkyVis::OPEN.encode(), [0; 4]].concat().try_into().unwrap(); 2],
+        };
+        let key = sky_key(&feather_assets::load_gltf_scene(&level).unwrap());
+        assert!(build_world(std::slice::from_ref(&level), Some(&bake))
+            .sky
+            .is_none());
+        volume
+            .write(&baked_sky_path(&bake.join(SKY_DIR), key))
+            .unwrap();
+        let b = build_world(std::slice::from_ref(&level), Some(&bake));
+        assert_eq!(b.sky, Some(volume));
+        assert!(build_world(std::slice::from_ref(&level), None)
+            .sky
+            .is_none());
+        // With several scenes, the first one's volume is the session's.
+        let other_dir = dir.join("other");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other = write_pad_level(&other_dir, &[("plain", None), ("more", None)]);
+        let two = |a: &String, b: &String| build_world(&[a.clone(), b.clone()], Some(&bake)).sky;
+        assert!(two(&level, &other).is_some());
+        assert!(two(&other, &level).is_none());
+
+        // Move the pad: a different level, so the old volume isn't its.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&level).unwrap()).unwrap();
+        doc["nodes"][0]["translation"][0] = 99.0.into();
+        std::fs::write(&level, doc.to_string()).unwrap();
+        assert!(build_world(&[level], Some(&bake)).sky.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

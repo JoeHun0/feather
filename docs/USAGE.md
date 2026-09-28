@@ -90,6 +90,7 @@ on a HiDPI desktop) and is resizable; `--bench` uses a fixed 1920×1080.
 | `--no-lod` | Draw every mesh at LOD0 but keep the baked vertex order, to A/B the LOD win alone (§4). |
 | `--no-bloom` | Turn bloom off for this run (never saved). Mainly for `--bench` A/B runs, which ignore the config files. |
 | `--no-auto-exposure` | Fixed exposure for this run (never saved), likewise. |
+| `--no-sky-occlusion` | Ignore the level's baked sky visibility, so the ambient light is unoccluded, as before it existed. For A/B runs; there's no menu option, as it's part of the look. |
 | `--bench` | Scripted timing run: skips the menu, sweeps the camera 360°, prints a summary and exits. Ignores the config files. See §7. |
 
 Typical runs:
@@ -406,8 +407,11 @@ electricity poles. You spawn on the road outside the gate, facing it.
   the compressor (ambientCG's Fence006, CC0, SHA-256 pinned). The first run
   merges the fence's colour and opacity maps into
   `scratch/assets/ambientcg_Fence006/merged_rgba.png`; later runs reuse it.
-- **Known limits:** interiors look too bright (no ambient occlusion yet), and
-  there are no leafy trees yet.
+- **Interiors** get the sky's light only through their openings once the
+  zone is baked: the hangar is dim and lit mostly by its door, roof holes and
+  lamp, and the office is darker still. Unbaked, they're as bright as the yard.
+- **Known limits:** no small-scale contact shadowing (GTAO) yet, and no leafy
+  trees yet.
 
 ### Baking — `feather-bake`
 
@@ -438,7 +442,10 @@ start over. Use `--release`: the BC7 encoder is slow in debug.
   sky each point of the level sees, on a grid of 0.5 m cells. It's traced
   against the mesh LODs, so it comes after them, and it's fast: the zone
   takes 0.7 s. The bake prints the grid, the cells found inside geometry and
-  the mean sky seen. The engine doesn't read it yet.
+  the mean sky seen. The engine uses it to darken the ambient light where
+  little sky reaches (inside buildings, under roofs). At load,
+  `[sky] visibility: 142x21x131 cells …` says it was found, and `[sky] no
+  sky visibility baked …` says to bake. `--no-sky-occlusion` turns it off.
 
 The `[mesh]` lines at load say what you got, e.g.
 `30 meshes (27 baked, 135 LODs): 2.7 MB vertices, 3.0 MB indices` and
@@ -451,6 +458,16 @@ until you re-run the bake; stale files in `scratch/bake/` are simply ignored.
 **What to look for** when judging LODs: distant objects should look the same
 with `--no-lod` as without, with no visible popping as you walk towards them,
 and distant shadows should look unchanged.
+
+**What to look for** when judging sky occlusion (A/B with
+`--no-sky-occlusion`):
+- Open ground should look the same either way.
+- Inside, walls facing an opening should be brighter than walls facing away
+  from it, and surfaces should brighten towards the door.
+- There should be no bright band along the tops of the hangar's walls under
+  the roof, or at the base of walls. Those would be light leaking through
+  thin geometry.
+- The exposure adapts, so a dark room brightens again after a second.
 
 ---
 
@@ -604,6 +621,7 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |
 | Texture bake | assets, bake | keys separate content and kind (sRGB colour vs data), and are computed from the encoded bytes without decoding; BC7 level sizes round partial blocks up; baked files round-trip and reject truncation, wrong sizes or an unknown kind; sRGB mips average *light* (black/white → 188, not 128); chains end at 1×1; every baked level has exactly the blocks Vulkan copies |
 | Mesh bake + LOD | assets, bake, render | baked meshes round-trip and reject damage (truncation, trailing bytes, bad magic, out-of-range index, decreasing or NaN error, partial triangle, no LODs); the mesh key ignores the material; a sphere gets a chain with fewer triangles and growing error per level and LOD0 is the input reordered; small meshes stay LOD0; disconnected parts prune; the pixel and texel rules (distance, scale, non-uniform scale, inside the sphere); runs split per (mesh, LOD) |
+| Sky visibility | assets, bake, render, app | the BVH finds what brute force finds; open ground sees the whole sky; a closed room with 0.2 m walls is dark inside, nothing leaking in even at corners; a door lets sky in from its side; a canopy shades only what's under it; the probe finds the inside of a closed box, not of a double-sided one; inside cells take their darkest neighbour, ring by ring; mirrored placements face outwards; occluders skip cutouts and `shadow: false`, and take the coarsest LOD within 5 cm; big levels get bigger cells; open-sky weights equal `sky_irradiance`'s for every normal and specular occlusion is 1 in the open, 0 shut in, and smooth through the horizon; the encoding is exact for open sky, and free distances round down; a sample leaves out a cell behind a wall and fades to open sky outside the grid; the key covers occluders and nothing else; files round-trip and reject damage; `mesh.frag` declares the same constants; (end to end) `build_world` finds a level's volume by its key, the first scene's of several, and not after the level changes |
 | Bloom | gfx, render, app | the chain's level sizes (half resolution, halving to an 8-texel side, at most 7 levels, never zero, odd and tiny windows); a Rust reference of the chain: a flat image blooms to itself, a bright pixel spreads with falloff, a plain downsample keeps energy within 5%, and the shaders declare the reference's weights; the steps go down then up; the tonemap's push block matches its Rust struct; the GRAPHICS row toggles it; `--no-bloom` (with the other flags) parses |
 | Auto-exposure | render, app | a Rust reference of the metering, whose constants and state layout the shaders must declare: luminance round-trips through its bin (black to bin 0), the 10–90% trimmed mean ignores the tails, adaptation converges, brightens faster than it darkens and is frame-rate independent, the exposure maps `KEY` and clamps, the centre weight falls off but never to 0; `exposure_min`/`exposure_max` land and bad values are reported; the GRAPHICS row and `--no-auto-exposure` |
 | Config files | app | both templates parse back to the defaults; `display` parses and rejects anything but `"windowed"` / `"fullscreen"`; `fov` accepts 30–120 whole degrees only; each bad line warns and keeps the default; saving edits one value in place; create-once, the `settings.toml` → `graphics.toml` migration, an unreadable file is left alone |
@@ -679,8 +697,9 @@ while it runs. It ignores `config/`: settings come from the
 defaults and CLI flags only.
 
 Bloom and auto-exposure are on by default, so a bench's `frame` includes
-them (~0.15 and ~0.05 ms, debug). To compare with numbers from before they
-existed, add `--no-bloom --no-auto-exposure`.
+them (~0.15 and ~0.05 ms, debug), and so is sky occlusion when the scene's
+volume is baked (`geo` +0.03–0.07 ms). To compare with numbers from before they
+existed, add `--no-bloom --no-auto-exposure --no-sky-occlusion`.
 
 ### A/B recipe
 

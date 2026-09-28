@@ -759,6 +759,64 @@ overlap every pixel.
   reads. Later: local probes per-object for interiors; irradiance volumes for
   dynamic bounce.
 
+**Landed (§26): sky visibility occludes the ambient.** The formula above has
+no term for a sky that isn't there. So a room lit only through its door got
+the whole sky's light on every wall, and the zone's hangar and office looked
+as bright inside as the yard. The level's baked sky-visibility volume (§17)
+now scales the sky term. GTAO (small-scale contact) is still to come.
+- **Shading** (`mesh.frag`, mirroring `SkyVis`, whose tests pin it):
+  - Diffuse is `ground·(½ − ½n.y)·2w0 + sky_avg·max(w0 + w·n, 0)`: the sky
+    part by its directional weight, and the ground's bounce by the fraction
+    of sky seen. A floor lit through a door has a lit ceiling only as far
+    as the door lets light in.
+  - Specular IBL is multiplied by `SkyVis::specular(r)`: the sky weight
+    round the reflection vector against open sky's, blended into the
+    ground-bounce fraction below the horizon over 0.25 in `r.y`.
+  - With open sky both are exactly the old terms, so a level without a
+    volume shades as before (`sky_dims.w = 0` skips the lookup).
+- **Sampling** (`sky_visibility`, mirroring `SkyVolume::sample`):
+  - The point sampled is one cell off the surface along its geometric
+    normal.
+  - Eight `texelFetch`es of an RG32_UINT 3D image at binding 7, each the
+    `SkyVis` moments and the `SkyFree` nibbles.
+  - The cells blend by hand, leaving out those whose path to the point is
+    blocked (the leak fix, §17).
+  - Outside the grid it fades to open sky over one cell. The volume's
+    placement rides in `Globals` (`sky_origin`, `sky_dims`).
+- **Loading:** the first CLI scene's volume, found by its `sky_key` under
+  `scratch/bake/sky/`; `[sky] visibility: …` at load says so. Without one,
+  `[sky] no sky visibility baked …` suggests the bake. `--no-bake` or
+  `--no-sky-occlusion` skip it.
+- **Measured** (debug, clocks unpinned, 3 interleaved runs,
+  `--no-sky-occlusion` vs on, sync validation 0 messages throughout):
+  - `geo`: zone 0.17 → 0.20–0.21 ms, `lights120` 0.56–0.57 → 0.63 ms, and
+    frames +0.04–0.05 ms.
+  - I predicted +0.02–0.06 ms. The zone held; `lights120` landed at the top
+    edge and just over it.
+  - Bench-sweep exposure: the zone median stayed at 1.36 and `lights120`
+    moved 1.00 → 1.02. Both predictions (≤ 10% and ≤ 3%) held, but the zone's
+    says the sweep, from the gate, hardly looks into a building.
+  - From inside (a temporary start-position override): hangar 2.88 → 3.28,
+    office 4.07 → 5.78. **I predicted several-fold, up to the cap of 8, and
+    was wrong.** The lamps, the door and the windows carry most of the light
+    the meter sees there.
+  - To check the GPU really applies the volume, a temporary shader wrote
+    only the occlusion ratio (occluded over open irradiance). The meter then
+    read ratios of ≈ 0.82 at the gate, ≈ 0.075 in the hangar and < 0.07 in
+    the office (clamped). The CPU volume's values are ≈ 0.8, 0.04–0.11 and
+    0.006, and with `--no-sky-occlusion` every spot metered alike.
+- **Memory:** 8 bytes a cell. That's 3.0 MB for the zone, but 25 MB for
+  `lights120`, whose occluders reach 70 m up: its 3.3M cells are nearly all
+  open sky. A sparse or two-level grid would fix that; nothing needs it yet.
+- **Limits:**
+  - one volume per session, the first scene's;
+  - static geometry only (a moving object neither occludes nor, beyond
+    sampling where it is, is occluded correctly);
+  - cutouts don't occlude;
+  - lamps and the sun are direct light and unaffected;
+  - thin walls within a cell of each other can still exchange a little
+    light where the per-axis distances miss a diagonal gap.
+
 ### Environment: a level's atmosphere
 
 **Landed (§26).** A level chooses its sun, sky, fog and starting exposure with
@@ -2341,7 +2399,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
 - **Descriptors (§9)**: one set with three bindings — per-frame instances
   (binding 0), resident materials (binding 1), and a resident
   `sampler2D textures[]` (binding 2) sized per level, as N discrete per-frame
-  sets. Not yet the
+  sets. It has since grown the shadow map, globals, lights and cluster masks
+  (bindings 3–6) and the sky-visibility volume (binding 7). Not yet the
   Set 0 (resident) / Set 1 (per-frame ring) / Set 2 (per-view) split, and the
   texture array is sized and filled at load — **not** update-after-bind /
   partially-bound (fine until streaming; no runtime texture loading yet).
@@ -2362,8 +2421,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   *is* now drawn as a visible background (SkyPass) matching the reflected
   environment. Real cubemap IBL (equirect→cube, irradiance/prefilter passes,
   BRDF LUT) is the follow-up. Sun shadows (§11 CSM) and punctual point lights
-  (§12) now exist. Bloom and auto-exposure landed (§13). The tonemap curve is a
-  drop-in point for AgX.
+  (§12) now exist. Bloom and auto-exposure landed (§13). The ambient is
+  occluded by a baked per-level sky-visibility volume (§13, §17). The
+  tonemap curve is a drop-in point for AgX.
   **Known artifact — specular singularity on smooth metal.** A punctual light has
   zero area, so on low-roughness metal (the PBR grid bottoms out at 0.06) its
   specular lobe collapses to a near-singular bright dot. With a geometry-free

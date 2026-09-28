@@ -1175,6 +1175,146 @@ impl Renderer {
         }
     }
 
+    /// Upload a 3D image of `format`, one mip, tightly packed `texels` (x
+    /// fastest, then y, then z), and leave it in `SHADER_READ_ONLY_OPTIMAL`
+    /// for fragment shaders. For baked volumes (§13's sky visibility), read
+    /// with `texelFetch`, so no mips.
+    pub fn create_texture_3d(&self, texels: &[u8], extent: [u32; 3], format: vk::Format) -> Image {
+        let allocator = self.allocator();
+        let extent = vk::Extent3D {
+            width: extent[0].max(1),
+            height: extent[1].max(1),
+            depth: extent[2].max(1),
+        };
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_3D)
+            .format(format)
+            .extent(extent)
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let ai = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferDevice,
+            ..Default::default()
+        };
+        let (image, allocation) = unsafe {
+            allocator
+                .create_image(&image_ci, &ai)
+                .expect("3D texture image")
+        };
+
+        let staging_ci = vk::BufferCreateInfo::default()
+            .size(texels.len() as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let staging_ai = vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::AutoPreferHost,
+            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
+            ..Default::default()
+        };
+        let (staging_buf, mut staging_alloc) = unsafe {
+            allocator
+                .create_buffer(&staging_ci, &staging_ai)
+                .expect("3D texture staging")
+        };
+        unsafe {
+            let ptr = allocator
+                .map_memory(&mut staging_alloc)
+                .expect("map staging");
+            std::ptr::copy_nonoverlapping(texels.as_ptr(), ptr, texels.len());
+            allocator.unmap_memory(&mut staging_alloc);
+        }
+
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        self.one_time_submit(|cmd| unsafe {
+            let dev = &self.device;
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(extent);
+            dev.cmd_copy_buffer_to_image(
+                cmd,
+                staging_buf,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+            let to_read = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_read],
+            );
+        });
+
+        unsafe { allocator.destroy_buffer(staging_buf, &mut staging_alloc) };
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_3D)
+            .format(format)
+            .subresource_range(range);
+        let view = unsafe {
+            self.device
+                .create_image_view(&view_info, None)
+                .expect("3D texture view")
+        };
+
+        Image {
+            allocator: allocator.clone(),
+            allocation,
+            device: self.device.clone(),
+            handle: image,
+            view,
+            format,
+        }
+    }
+
     /// Upload a baked BC7 mip chain (§17) as a sampled image, every level in one
     /// staging copy with a region per level; no blits, since the bake built the
     /// mips. `levels[i]` must be level i's blocks, as `feather_assets::bake`

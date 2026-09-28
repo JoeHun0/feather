@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use crate::environment::{Environment, Specialization};
 use feather_assets::bake::{
-    baked_path, texture_key, BakedMesh, BakedTexture, TexKind, MIN_LOD_TRIS, TEX_DIR,
+    baked_path, texture_key, BakedMesh, BakedTexture, SkyFree, SkyVis, SkyVolume, TexKind,
+    MIN_LOD_TRIS, TEX_DIR,
 };
 use feather_assets::AlphaMode;
 use feather_assets::{Material, MeshData, TextureData, Vertex};
@@ -328,6 +329,10 @@ struct Globals {
     cluster_params: [f32; 4],
     /// x = tan(fov_x / 2), y = tan(fov_y / 2): view-space slope at the screen edge.
     cluster_proj: [f32; 4],
+    /// The sky-visibility volume (§13): xyz = its minimum corner, w = 1 / cell.
+    sky_origin: [f32; 4],
+    /// xyz = its cells per axis, w = 1 when a volume is bound, 0 for none.
+    sky_dims: [f32; 4],
 }
 
 /// One punctual light, std430, 32 bytes (§12).
@@ -414,6 +419,15 @@ pub struct MeshRenderer {
     #[allow(dead_code)]
     textures: Vec<Image>,
     sampler: vk::Sampler,
+    /// The level's sky-visibility volume (§13), binding 7, or one open texel.
+    /// Held for its lifetime: the descriptor sets reference it.
+    #[allow(dead_code)]
+    sky: Image,
+    /// Nearest, clamped: mesh.frag reads the volume with `texelFetch` and
+    /// blends the cells itself.
+    sky_sampler: vk::Sampler,
+    /// `Globals::sky_origin` and `sky_dims`, fixed for the session.
+    sky_params: [[f32; 4]; 2],
     slices: Vec<MeshSlice>,
     // Reused each frame to gather sorted instances before the SSBO upload.
     scratch: Vec<InstanceData>,
@@ -447,6 +461,10 @@ impl MeshRenderer {
     /// the caller once (`feather_assets::bake::load_baked_meshes`) since the
     /// app builds colliders from the same LODs. Empty or `None` = draw the raw
     /// mesh as its only LOD. `bake_dir` is still read for textures.
+    ///
+    /// `sky` is the level's sky-visibility volume (§13, baked); without one the
+    /// ambient light is unoccluded, as it was before there were volumes.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         renderer: &Renderer,
         meshes: &[MeshData],
@@ -455,6 +473,7 @@ impl MeshRenderer {
         max_instances: u32,
         bake_dir: Option<&std::path::Path>,
         env: &Environment,
+        sky: Option<&SkyVolume>,
     ) -> (Self, Vec<MeshId>) {
         let device = renderer.device();
 
@@ -553,8 +572,9 @@ impl MeshRenderer {
             renderer.create_texture(&[128, 128, 255, 255], 1, 1, false), // 1: flat normal (UNORM)
         ];
         // Each unique image uploads once, however many materials use it.
-        // The shadow map is the one other combined sampler in the set.
-        let capacity = renderer.max_bindless_textures().saturating_sub(1);
+        // The shadow map and the sky volume are the other combined samplers
+        // in the set.
+        let capacity = renderer.max_bindless_textures().saturating_sub(2);
         let plan = plan_texture_slots(materials, capacity);
         let (mut baked_count, mut bytes) = (0usize, 0usize);
         for (t, kind) in &plan.uploads {
@@ -687,6 +707,40 @@ impl MeshRenderer {
         let shadow_sampler = renderer.shadow_sampler();
         let shadow_texel = 1.0 / renderer.shadow_extent().width as f32;
 
+        // The sky-visibility volume (§13): per cell, 4 bytes of `SkyVis` then
+        // 4 of `SkyFree`, i.e. one little-endian RG32_UINT texel. Without a
+        // volume, one open, clear texel, and `sky_dims.w = 0` skips it.
+        let open = {
+            let (v, f) = (SkyVis::OPEN.encode(), SkyFree::CLEAR.encode());
+            [v[0], v[1], v[2], v[3], f[0], f[1], f[2], f[3]]
+        };
+        let (sky_bytes, sky_dims) = match sky {
+            Some(v) => (v.texels.as_flattened(), v.dims),
+            None => (&open[..], [1, 1, 1]),
+        };
+        let sky_image = renderer.create_texture_3d(sky_bytes, sky_dims, vk::Format::R32G32_UINT);
+        let sky_params = match sky {
+            Some(v) => [
+                [v.origin.x, v.origin.y, v.origin.z, 1.0 / v.cell],
+                [v.dims[0] as f32, v.dims[1] as f32, v.dims[2] as f32, 1.0],
+            ],
+            None => [[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 0.0]],
+        };
+        let sky_sampler = unsafe {
+            device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::NEAREST)
+                        .min_filter(vk::Filter::NEAREST)
+                        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                    None,
+                )
+                .expect("sky sampler")
+        };
+
         let bindings = [
             // binding 0: per-frame instances (vertex stage).
             vk::DescriptorSetLayoutBinding::default()
@@ -733,6 +787,12 @@ impl MeshRenderer {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE),
+            // binding 7: the level's sky-visibility volume (§13).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(7)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let set_layout = unsafe {
             device
@@ -748,10 +808,10 @@ impl MeshRenderer {
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(4 * FRAMES_IN_FLIGHT as u32),
-            // the texture array + the shadow map, per set.
+            // the texture array + the shadow map + the sky volume, per set.
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count((texture_count + 1) * FRAMES_IN_FLIGHT as u32),
+                .descriptor_count((texture_count + 2) * FRAMES_IN_FLIGHT as u32),
             // the globals UBO, per set.
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
@@ -819,6 +879,11 @@ impl MeshRenderer {
                 .buffer(cluster_buffers[i].handle)
                 .offset(0)
                 .range(vk::WHOLE_SIZE)];
+            // binding 7 -> the shared sky volume.
+            let sky_info = [vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(sky_image.view)
+                .sampler(sky_sampler)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
@@ -856,6 +921,11 @@ impl MeshRenderer {
                     .dst_binding(6)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(&cluster_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(7)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&sky_info),
             ];
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
@@ -1208,6 +1278,9 @@ impl MeshRenderer {
             materials_buffer,
             textures,
             sampler,
+            sky: sky_image,
+            sky_sampler,
+            sky_params,
             slices,
             scratch: Vec::new(),
             keyed: Vec::new(),
@@ -1349,6 +1422,8 @@ impl MeshRenderer {
                 let tan_y = (camera.fov_y * 0.5).tan();
                 [tan_y * camera.aspect, tan_y, 0.0, 0.0]
             },
+            sky_origin: self.sky_params[0],
+            sky_dims: self.sky_params[1],
         };
         for (i, c) in cascades.iter().enumerate().take(SHADOW_CASCADES) {
             globals.light_view_proj[i] = c.view_proj.to_cols_array();
@@ -1693,6 +1768,7 @@ impl Drop for MeshRenderer {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_sampler(self.sampler, None);
+            self.device.destroy_sampler(self.sky_sampler, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline(self.shadow_pipeline, None);
             self.device.destroy_pipeline(self.depth_pipeline, None);
@@ -2022,6 +2098,31 @@ mod tests {
             body(include_str!("../shaders/mesh.frag")),
             body(include_str!("../shaders/mask.frag"))
         );
+    }
+
+    /// mesh.frag decodes and blends the sky volume by hand, with its own
+    /// copies of `feather_assets::bake`'s constants. A mismatch compiles and
+    /// shades every interior subtly wrong.
+    #[test]
+    fn mesh_frag_decodes_the_sky_like_the_bake() {
+        use feather_assets::bake::{
+            SKY_FREE_SOFT, SKY_SPECULAR_FADE, SKY_W0_SCALE, SKY_W_BIAS, SKY_W_SCALE,
+        };
+        let src = include_str!("../shaders/mesh.frag");
+        for (c, v) in [
+            ("SKY_W0_SCALE", SKY_W0_SCALE),
+            ("SKY_W_BIAS", SKY_W_BIAS),
+            ("SKY_W_SCALE", SKY_W_SCALE),
+            ("SKY_FREE_SOFT", SKY_FREE_SOFT),
+            ("SKY_SPECULAR_FADE", SKY_SPECULAR_FADE),
+        ] {
+            let decl = format!("const float {c} = {v:?};");
+            assert!(src.contains(&decl), "mesh.frag lacks `{decl}`");
+        }
+        // The globals the shader reads the volume's placement from.
+        for field in ["vec4 sky_origin;", "vec4 sky_dims;"] {
+            assert!(src.contains(field), "mesh.frag's Globals lacks `{field}`");
+        }
     }
 
     /// The cluster grid and light cap are repeated as GLSL constants in both
