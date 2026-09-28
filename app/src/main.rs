@@ -3772,7 +3772,13 @@ impl ApplicationHandler for App {
                     let nearest = r.nearest_sampler();
                     let generation = r.targets_generation();
                     if let Some(s) = self.session.as_mut() {
-                        s.mesh.set_ao(ao_on, ao_views[2], nearest, generation);
+                        s.mesh.set_ao(
+                            ao_on,
+                            (ao_views[1], ao_depth_views.0),
+                            nearest,
+                            r.extent(),
+                            generation,
+                        );
                     }
                     // Shared immutably by the shadow and geometry closures — the
                     // draw methods take &self, only `prepare_frame` above needed

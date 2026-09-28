@@ -63,7 +63,7 @@ layout(set = 0, binding = 4) uniform Globals {
     vec4 cluster_proj;   // x = tan(fov_x/2), y = tan(fov_y/2)
     vec4 sky_origin;     // sky volume: xyz = minimum corner, w = 1 / cell
     vec4 sky_dims;       // xyz = cells per axis, w = 1 if there is a volume
-    vec4 ao_params;      // x = 1 if GTAO ran this frame
+    vec4 ao_params;      // x = 1 if GTAO ran this frame, yz = the full-resolution size
 } g;
 
 // Punctual lights (§12), shaded only if this fragment's cluster lists them.
@@ -90,8 +90,11 @@ layout(set = 0, binding = 6) readonly buffer Clusters {
 // SkyVis moments as RGBA8 and y the SkyFree nibbles. Read with texelFetch and
 // blended by hand in sky_visibility().
 layout(set = 0, binding = 7) uniform usampler3D u_sky;
-// GTAO's result (§13): the ambient's small-scale visibility, one per pixel.
+// GTAO's result (§13): the ambient's small-scale visibility at half
+// resolution, and its depth levels, whose level 1 (mip 0 here) holds each
+// half-resolution texel's depth. gtao_upsample() brings it to this pixel.
 layout(set = 0, binding = 8) uniform sampler2D u_ao;
+layout(set = 0, binding = 9) uniform sampler2D u_ao_depth;
 
 layout(location = 0) in vec3 v_normal;
 layout(location = 1) in flat uint v_material;
@@ -279,6 +282,58 @@ vec3 ao_multibounce(float v, vec3 albedo) {
 // visibility `ao` at this view angle and roughness.
 float ao_specular(float ndv, float ao, float roughness) {
     return clamp(pow(ndv + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
+}
+
+// GTAO's result for this fragment (§13): gtao_denoise.comp's half-resolution
+// visibility, upsampled. Texel q stands for pixel 2q. An even pixel copies
+// its texel; any other blends the 2 or 4 round it bilinearly, each weighted
+// by its distance off this fragment's tangent plane (its own position and
+// normal) and not at all past AO_DENOISE_DEPTH of its distance, so occlusion
+// doesn't cross a silhouette. If none lies on the plane (a feature too thin
+// to have a texel), the one nearest in distance. Positions are in the GTAO
+// passes' space: x right, y down, z the distance ahead.
+// render::ao's reference (`upsample`) is this, step for step.
+const float AO_DENOISE_DEPTH = 0.1;
+float gtao_upsample(vec3 world_pos, vec3 n_world) {
+    vec3 v = (g.view * vec4(world_pos, 1.0)).xyz;
+    vec3 P = vec3(v.x, -v.y, -v.z);
+    vec3 nv = mat3(g.view) * n_world;
+    vec3 N = vec3(nv.x, -nv.y, -nv.z);
+    float tolerance = AO_DENOISE_DEPTH * P.z;
+    // A depth's distance, as the passes find it: near·r / (depth + r), with
+    // r = far / (near - far).
+    float r = g.cluster_params.y / (g.cluster_params.x - g.cluster_params.y);
+    ivec2 half_size = textureSize(u_ao, 0);
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec2 q0 = p >> 1;
+    // How far p lies towards the next texel: 0 or 1/2 on each axis.
+    vec2 f = vec2(p & 1) * 0.5;
+    float sum = 0.0;
+    float total = 0.0;
+    float nearest = 1.0;
+    float nearest_dz = 1e30;
+    for (int y = 0; y <= 1; ++y) {
+        for (int x = 0; x <= 1; ++x) {
+            float bilinear = (x == 0 ? 1.0 - f.x : f.x) * (y == 0 ? 1.0 - f.y : f.y);
+            if (bilinear == 0.0) {
+                continue;
+            }
+            ivec2 q = min(q0 + ivec2(x, y), half_size - 1);
+            float dist = g.cluster_params.x * r / (texelFetch(u_ao_depth, q, 0).r + r);
+            vec2 ndc = (vec2(2 * q) + 0.5) / g.ao_params.yz * 2.0 - 1.0;
+            vec3 Q = vec3(ndc * g.cluster_proj.xy * dist, dist);
+            float ao = texelFetch(u_ao, q, 0).r;
+            float w = bilinear * max(1.0 - abs(dot(Q - P, N)) / tolerance, 0.0);
+            sum += w * ao;
+            total += w;
+            float dz = abs(Q.z - P.z);
+            if (dz < nearest_dz) {
+                nearest_dz = dz;
+                nearest = ao;
+            }
+        }
+    }
+    return total > 1e-4 ? sum / total : nearest;
 }
 
 // Karis' analytic environment BRDF (avoids a precomputed LUT).
@@ -567,7 +622,7 @@ void main() {
     vec3 specular_ibl = prefiltered * (f0 * ab.x + ab.y) * sky_specular(sv, r);
     // Contact shadowing within a metre (GTAO, §13), on the ambient only.
     if (g.ao_params.x > 0.5) {
-        float ao = texelFetch(u_ao, ivec2(gl_FragCoord.xy), 0).r;
+        float ao = gtao_upsample(v_world_pos, ng);
         diffuse_ibl *= ao_multibounce(ao, albedo);
         specular_ibl *= ao_specular(ndv, ao, roughness);
     }

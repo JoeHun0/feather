@@ -78,7 +78,7 @@ fn clamp_samples(limits: &vk::PhysicalDeviceLimits, want: u32) -> vk::SampleCoun
 // geometry (start, end), post (start, end). Frame is shadow-start → post-end.
 const TIMESTAMPS_PER_FRAME: u32 = 14;
 /// GTAO's targets (§13): its raw and denoised visibility at half resolution
-/// and the upsampled result, one float each.
+/// and its depth levels, one float each.
 /// R32F because the passes write them as storage images, and it's on the
 /// mandatory storage-format list (R16F and R8 aren't).
 const AO_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
@@ -294,11 +294,10 @@ pub struct Renderer {
     // Single-sample depth, resolved (sample 0) from `depth` at the end of the
     // prepass, allocated only when MSAA is on: what GTAO reads (§13).
     depth_resolve: Option<Image>,
-    // GTAO's raw and denoised visibility (§13) at half size (rounded up), and
-    // the full-size upsampled result, recreated with the other targets.
+    // GTAO's raw and denoised visibility (§13) at half size (rounded up),
+    // recreated with the other targets. mesh.frag upsamples the denoised one.
     ao_raw: Option<Image>,
     ao_half: Option<Image>,
-    ao: Option<Image>,
     // GTAO's depth levels (§13), point samples for its longer steps.
     ao_depth: Option<AoDepth>,
     // Nearest, clamp-to-edge: for images read with texelFetch/textureGather.
@@ -535,7 +534,6 @@ impl Renderer {
             .then(|| create_depth(&allocator, &device, sc.extent, vk::SampleCountFlags::TYPE_1));
         let ao_raw = create_ao(&allocator, &device, ao_half_extent(sc.extent), 1);
         let ao_half = create_ao(&allocator, &device, ao_half_extent(sc.extent), 1);
-        let ao = create_ao(&allocator, &device, sc.extent, 1);
         let ao_depth = create_ao_depth(&allocator, &device, sc.extent);
         let nearest_sampler = unsafe {
             device.create_sampler(
@@ -654,7 +652,6 @@ impl Renderer {
             depth_resolve,
             ao_raw: Some(ao_raw),
             ao_half: Some(ao_half),
-            ao: Some(ao),
             ao_depth: Some(ao_depth),
             nearest_sampler,
             targets_generation: 0,
@@ -837,15 +834,18 @@ impl Renderer {
             .view
     }
 
-    /// GTAO's targets (§13): the half-size raw and denoised ones, then the
-    /// full-size result. In `GENERAL` while the AO slot runs and while the
-    /// main pass reads the result.
-    pub fn ao_views(&self) -> [vk::ImageView; 3] {
+    /// GTAO's targets (§13), half size: raw, then denoised. In `GENERAL`
+    /// while the AO slot runs and while the main pass reads the denoised one.
+    pub fn ao_views(&self) -> [vk::ImageView; 2] {
         [
             self.ao_raw.as_ref().expect("ao alive").view,
             self.ao_half.as_ref().expect("ao alive").view,
-            self.ao.as_ref().expect("ao alive").view,
         ]
+    }
+
+    /// The size the frame is drawn at: the window's (`--bench` fixes it).
+    pub fn extent(&self) -> vk::Extent2D {
+        self.window_extent
     }
 
     /// GTAO's depth levels (§13): a view of all `AO_DEPTH_LEVELS` (sampled
@@ -1673,9 +1673,8 @@ impl Renderer {
         prepass: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         // Compute between the prepass and the main pass (§13's GTAO): it may
         // sample `depth_sample_view` (read-only depth layout) and write all
-        // the `ao_views` and `ao_depth_views` (GENERAL); the last `ao_views`
-        // is made visible to fragment
-        // shaders.
+        // the `ao_views` and `ao_depth_views` (GENERAL); the denoised result
+        // and the depth levels are made visible to fragment shaders.
         ao: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
         // The lit pass and the sky, over the prepass's depth (loaded, tested,
         // never written).
@@ -2118,10 +2117,9 @@ impl Renderer {
             // flight, so wait for the previous frame's GTAO writes and main
             // pass reads (§21's rule). Done even with GTAO off: the main
             // pass's descriptor names this layout.
-            let (ao_raw, ao_half, ao_img, ao_depth) = (
+            let (ao_raw, ao_half, ao_depth) = (
                 self.ao_raw.as_ref().expect("ao alive"),
                 self.ao_half.as_ref().expect("ao alive"),
-                self.ao.as_ref().expect("ao alive"),
                 self.ao_depth.as_ref().expect("ao alive"),
             );
             let depth_levels = vk::ImageSubresourceRange {
@@ -2149,21 +2147,23 @@ impl Renderer {
                 &[
                     to_general(ao_raw.handle, color_range),
                     to_general(ao_half.handle, color_range),
-                    to_general(ao_img.handle, color_range),
                     to_general(ao_depth.image.handle, depth_levels),
                 ],
             );
             ao(cmd, extent, frame);
-            // Its result, visible to the main pass's fragment shader.
-            let ao_to_read = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(ao_img.handle)
-                .subresource_range(color_range)
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            // Its result and depth levels, visible to the main pass's
+            // fragment shader, which upsamples between them.
+            let to_read = |image: vk::Image, range| {
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            };
             dev.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -2171,7 +2171,10 @@ impl Renderer {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[ao_to_read],
+                &[
+                    to_read(ao_half.handle, color_range),
+                    to_read(ao_depth.image.handle, depth_levels),
+                ],
             );
             if self.timestamps_supported {
                 dev.cmd_write_timestamp(
@@ -2591,7 +2594,6 @@ impl Renderer {
         let half = ao_half_extent(extent);
         self.ao_raw = Some(create_ao(self.allocator(), &self.device, half, 1));
         self.ao_half = Some(create_ao(self.allocator(), &self.device, half, 1));
-        self.ao = Some(create_ao(self.allocator(), &self.device, extent, 1));
         self.ao_depth = Some(create_ao_depth(self.allocator(), &self.device, extent));
         self.targets_generation += 1;
     }
@@ -2675,7 +2677,6 @@ impl Drop for Renderer {
             self.depth_resolve.take();
             self.ao_raw.take();
             self.ao_half.take();
-            self.ao.take();
             self.ao_depth.take();
             self.ldr.take();
             self.bloom.take();
@@ -2869,7 +2870,8 @@ fn create_depth(
 }
 
 /// One of GTAO's targets (§13): written as a storage image by its compute
-/// passes; the full-size one is then sampled by the main pass.
+/// passes; the denoised one and the depth levels are then sampled by the
+/// main pass.
 fn create_ao(
     allocator: &Arc<vk_mem::Allocator>,
     device: &Device,

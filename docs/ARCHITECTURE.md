@@ -873,17 +873,23 @@ the surface, can't see. It uses the depth prepass alone (§10).
   every texel averages all 16 jitter variants (32 directions). Each neighbour
   is weighted by its distance off the centre's tangent plane, and gets nothing
   past 10% of the view distance.
-- **`gtao_upsample.comp`:** back to full resolution. A pixel at even
-  coordinates copies its texel. Any other blends the 2 or 4 texels round it
-  bilinearly, each also weighted by its distance off the pixel's tangent
-  plane, as in the denoise. If none lies on the pixel's surface (a feature
-  too thin to have a texel), it takes the one nearest in distance.
-- **`mesh.frag`:** multiplies the diffuse ambient by Jimenez's multi-bounce
-  fit (per albedo) and the specular ambient by Lagarde's specular occlusion.
-  It's texel-for-pixel, sky visibility times GTAO, ambient only.
-- **Targets:** gfx owns four R32F images: the depth levels, raw and
-  denoised at half size (rounded up), and the full-size result. R32F because
-  it's on the mandatory storage list. A `targets_generation` counter tells
+- **`mesh.frag` upsamples** (`gtao_upsample`), with the fragment's own
+  position and geometric normal, and no pass of its own:
+  - A pixel at even coordinates copies its texel.
+  - Any other pixel blends the 2 or 4 texels round it bilinearly. Each is
+    weighted by its distance off the fragment's tangent plane, as in the
+    denoise.
+  - If no texel lies on the fragment's surface (a feature too thin to have a
+    texel), it takes the one nearest in distance.
+  - A texel's position comes from depth level 1, which holds exactly that
+    texel's pixel.
+  - Under MSAA, each surface at an edge pixel gets its own value.
+- **`mesh.frag` then applies it:** the diffuse ambient is multiplied by
+  Jimenez's multi-bounce fit (per albedo), the specular ambient by Lagarde's
+  specular occlusion. Sky visibility times GTAO, ambient only.
+- **Targets:** gfx owns three R32F images: the depth levels, and raw and
+  denoised AO at half size (rounded up). R32F because it's on the mandatory
+  storage list. A `targets_generation` counter tells
   `AoPass` and `MeshRenderer::set_ao` when a resize or MSAA change has moved
   them. A view handle can't tell, since a new view may reuse a freed one's
   handle.
@@ -985,9 +991,43 @@ the surface, can't see. It uses the depth prepass alone (§10).
     worst 0.12 along the car's lower edge (close detail, read coarser by the
     long steps).
   - Validation with sync: as for half resolution above.
-- **Next lever:** the upsample, now 0.05 / 0.07 ms, a full-resolution pass
-  of 13 fetches a pixel, is the biggest piece left; gtao is near its 0.05 /
-  0.07 floor. Not done here.
+- **The upsample, moved into `mesh.frag`.** It started as its own
+  full-resolution pass, at 0.05 / 0.07 ms. An experiment timed variants of
+  that pass:
+
+  | variant | zone | `lights120` |
+  |---|---|---|
+  | as it was | 0.05 | 0.07 |
+  | only its own texel | 0.04 | 0.04 |
+  | plain bilinear | 0.04 | 0.05 |
+  | sky check + store 1.0 | 0.03 | 0.03 |
+
+  The last row is the pass itself: dispatch, barrier, a depth read and an
+  8 MB write. It was most of the cost, so a cheaper blend couldn't win much.
+  (I'd predicted 0.02 for that floor, and 0.03 for plain bilinear: both
+  wrong.)
+  - Measured (pinned, release, 3 interleaved rounds against 635d898;
+    identical medians):
+    - `ao` 0.16 → 0.11 ms (zone) and 0.23 → 0.16 ms (`lights120`);
+    - `geo` +0.02 / +0.04 ms;
+    - frames 0.78 → 0.75 and 1.46 → 1.43 ms.
+    - I predicted `geo` +0.01–0.02 and frames −0.03 to −0.04 / −0.04 to
+      −0.06: the zone held, `lights120` didn't. More of it is geometry, and
+      the fetches land in a heavier shader.
+  - `mesh.frag` keeps 72 VGPRs and 20 waves a SIMD (RADV shader stats);
+    it grew from 1531 to 1826 instructions.
+  - On the GPU: a temporary harness wrote `mesh.frag`'s upsampled value to
+    the HDR target, from the same three zone views.
+    - Against the reference, the median difference is 4.7e-4, which is the
+      RGBA16F target's step near 1, and the p99 ≤ 2.4e-3.
+    - The mean AO is the same as 44dfec4's to 4 decimals.
+    - The largest differences (≤ 0.23, a few pixels) are on the car, whose
+      smooth vertex normals differ from the depth-rebuilt ones the reference
+      uses.
+  - Validation with sync: as for half resolution above.
+- **Next lever:** the AO slot is now depth copy 0.02, gtao 0.07 / 0.11 and
+  denoise 0.02 / 0.03 ms. gtao is near its 0.05 / 0.07 floor, so what's
+  left is small fixed costs. Not pursued.
 - **Limits:**
   - screen-space: what's off-screen or behind a silhouette doesn't occlude;
   - no thickness heuristic, so thin poles and grass cards shadow as if
@@ -1017,7 +1057,8 @@ the surface, can't see. It uses the depth prepass alone (§10).
   - the slice integral against Simpson's rule;
   - an open floor, and face-on and 40° walls filling the view, read 1;
   - a wall darkens the floor at its foot and nowhere else;
-  - the denoise keeps to its side of an edge, and so does the upsample;
+  - the denoise keeps to its side of an edge, and so does `mesh.frag`'s
+    upsample;
   - the upsample copies its texels and is a plain bilinear blend on a plane;
   - each depth level holds every `2^k`-th pixel, rounded-up sizes included,
     as the copy pass writes them;
@@ -1028,7 +1069,9 @@ the surface, can't see. It uses the depth prepass alone (§10).
   - every 4×4 window holds each jitter once;
   - the ambient fits leave open surfaces alone;
   - the shaders declare the reference's constants (and gfx the level
-    count), and all three share `view_pos` and `depth_normal` text for text;
+    count); gtao and the denoise share `view_pos` and `depth_normal` text for
+    text; `mesh.frag` converts to the passes' space as the view test pins
+    it;
   - the menu row, config key and flag.
 
   Each was shown to fail against a deliberately broken copy.
@@ -2635,8 +2678,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   (binding 0), resident materials (binding 1), and a resident
   `sampler2D textures[]` (binding 2) sized per level, as N discrete per-frame
   sets. It has since grown the shadow map, globals, lights and cluster masks
-  (bindings 3–6), the sky-visibility volume (binding 7) and GTAO's result
-  (binding 8). Not yet the
+  (bindings 3–6), the sky-visibility volume (binding 7) and GTAO's
+  half-resolution result and depth levels (bindings 8 and 9). Not yet the
   Set 0 (resident) / Set 1 (per-frame ring) / Set 2 (per-view) split, and the
   texture array is sized and filled at load — **not** update-after-bind /
   partially-bound (fine until streaming; no runtime texture loading yet).

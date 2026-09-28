@@ -1,8 +1,8 @@
 //! Ground-truth ambient occlusion (§13, GTAO): contact shadowing of the
 //! ambient light within `AO_RADIUS` of each pixel, from the depth prepass.
 //!
-//! Four compute passes between the prepass and the main pass. The middle two
-//! run at half resolution, where texel `h` is full-resolution pixel `2h`, read
+//! Three compute passes between the prepass and the main pass, all over the
+//! half-resolution grid, where texel `h` is full-resolution pixel `2h`, read
 //! from the full-resolution depth:
 //! - `gtao_depth.comp`: point samples of the depth at ½ to 1/16 resolution
 //!   (level `k`'s texel `g` is pixel `2^k·g`), for gtao's longer steps;
@@ -11,11 +11,11 @@
 //!   slice angle and step offset jittered by 4×4 patterns; each step reads the
 //!   depth level its length calls for;
 //! - `gtao_denoise.comp`: a depth-aware 4×4 blur, which holds each jitter
-//!   variant exactly once, so the noise averages out;
-//! - `gtao_upsample.comp`: back to full resolution, a bilinear blend of the
-//!   texels round each pixel that lie on its surface.
+//!   variant exactly once, so the noise averages out.
 //!
-//! `mesh.frag` then multiplies the ambient (diffuse with a multi-bounce fit,
+//! `mesh.frag` brings the result to full resolution (`gtao_upsample`: a
+//! bilinear blend of the texels round the pixel that lie on the fragment's
+//! own surface), then multiplies the ambient (diffuse with a multi-bounce fit,
 //! specular with a specular-occlusion fit) by the result. The large scale is
 //! the baked sky visibility's job; this adds what it's too coarse for.
 //!
@@ -61,7 +61,7 @@ impl AoProjection {
     }
 }
 
-/// The four GTAO compute passes and their per-frame descriptor sets.
+/// The three GTAO compute passes and their per-frame descriptor sets.
 pub struct AoPass {
     device: ash::Device,
     set_layout: vk::DescriptorSetLayout,
@@ -69,7 +69,6 @@ pub struct AoPass {
     depth: vk::Pipeline,
     gtao: vk::Pipeline,
     denoise: vk::Pipeline,
-    upsample: vk::Pipeline,
     pool: vk::DescriptorPool,
     sets: Vec<vk::DescriptorSet>,
     /// The `Renderer::targets_generation` each frame's set points at.
@@ -83,7 +82,6 @@ impl AoPass {
             (0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
             (1, vk::DescriptorType::STORAGE_IMAGE),
             (2, vk::DescriptorType::STORAGE_IMAGE),
-            (3, vk::DescriptorType::STORAGE_IMAGE),
             (4, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
             (5, vk::DescriptorType::STORAGE_IMAGE),
         ]
@@ -111,7 +109,7 @@ impl AoPass {
                 .descriptor_count(2 * frames),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count((3 + AO_DEPTH_LEVELS as u32) * frames),
+                .descriptor_count((2 + AO_DEPTH_LEVELS as u32) * frames),
         ];
         let pool = unsafe {
             device
@@ -170,7 +168,6 @@ impl AoPass {
         let depth = compute(spv!("gtao_depth.comp"), "gtao depth pipeline");
         let gtao = compute(spv!("gtao.comp"), "gtao pipeline");
         let denoise = compute(spv!("gtao_denoise.comp"), "gtao denoise pipeline");
-        let upsample = compute(spv!("gtao_upsample.comp"), "gtao upsample pipeline");
         Self {
             device,
             set_layout,
@@ -178,16 +175,15 @@ impl AoPass {
             depth,
             gtao,
             denoise,
-            upsample,
             pool,
             sets,
             bound: vec![None; FRAMES_IN_FLIGHT],
         }
     }
 
-    /// Point this frame's set at the renderer's current depth and AO images
-    /// (the half-resolution raw and denoised ones, then the full-resolution
-    /// result) and depth levels (a view of all, and one per level),
+    /// Point this frame's set at the renderer's current depth, AO images (the
+    /// half-resolution raw and denoised ones) and depth levels (a view of
+    /// all, and one per level),
     /// if they've been recreated since (`generation`). Safe each frame:
     /// `draw_frame` waits on the frame fence before the closures run, and
     /// this is called before the set is bound.
@@ -196,7 +192,7 @@ impl AoPass {
         frame: usize,
         generation: u64,
         depth_view: vk::ImageView,
-        [raw_view, half_view, ao_view]: [vk::ImageView; 3],
+        [raw_view, half_view]: [vk::ImageView; 2],
         (levels_view, level_views): (vk::ImageView, [vk::ImageView; AO_DEPTH_LEVELS]),
         sampler: vk::Sampler,
     ) {
@@ -212,8 +208,7 @@ impl AoPass {
                 .image_layout(vk::ImageLayout::GENERAL)
                 .image_view(view)]
         };
-        let (raw_info, half_info, ao_info) =
-            (storage(raw_view), storage(half_view), storage(ao_view));
+        let (raw_info, half_info) = (storage(raw_view), storage(half_view));
         let levels_info = [vk::DescriptorImageInfo::default()
             .image_layout(vk::ImageLayout::GENERAL)
             .image_view(levels_view)
@@ -238,11 +233,6 @@ impl AoPass {
                 .image_info(&half_info),
             vk::WriteDescriptorSet::default()
                 .dst_set(set)
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&ao_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(set)
                 .dst_binding(4)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&levels_info),
@@ -256,8 +246,8 @@ impl AoPass {
         self.bound[frame] = Some(generation);
     }
 
-    /// Record the four passes for an image of `extent` (all but the last
-    /// over its half, rounded up), with a barrier after each. `draw_frame` puts
+    /// Record the three passes for an image of `extent` (over its half,
+    /// rounded up), with a barrier between each. `draw_frame` puts
     /// the images in GENERAL first and makes the result visible to fragment
     /// shaders after.
     pub fn dispatch(
@@ -271,7 +261,6 @@ impl AoPass {
         let bytes: Vec<u8> = push.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let groups = |w: u32, h: u32| (w.div_ceil(8), h.div_ceil(8));
         let half = groups(extent.width.div_ceil(2), extent.height.div_ceil(2));
-        let full = groups(extent.width, extent.height);
         // Each pass's writes, before the next reads them.
         let barrier = |cmd| {
             let b = vk::MemoryBarrier::default()
@@ -316,10 +305,6 @@ impl AoPass {
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.denoise);
             self.device.cmd_dispatch(cmd, half.0, half.1, 1);
-            barrier(cmd);
-            self.device
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.upsample);
-            self.device.cmd_dispatch(cmd, full.0, full.1, 1);
         }
     }
 }
@@ -330,7 +315,6 @@ impl Drop for AoPass {
             self.device.destroy_pipeline(self.depth, None);
             self.device.destroy_pipeline(self.gtao, None);
             self.device.destroy_pipeline(self.denoise, None);
-            self.device.destroy_pipeline(self.upsample, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_pool(self.pool, None);
             self.device
@@ -519,7 +503,7 @@ mod reference {
         }
 
         /// gtao.comp's `depth_normal`, at pixel (x, y).
-        fn depth_normal(&self, x: i32, y: i32) -> glam::Vec3 {
+        pub fn depth_normal(&self, x: i32, y: i32) -> glam::Vec3 {
             let pos = |x, y| glam::Vec3::from(self.view_pos(x, y));
             let p = pos(x, y);
             let (l, r, u, d) = (pos(x - 1, y), pos(x + 1, y), pos(x, y - 1), pos(x, y + 1));
@@ -638,15 +622,13 @@ mod reference {
             (sum / total).min(1.0)
         }
 
-        /// gtao_upsample.comp for pixel (x, y), over `half` (the denoise's
-        /// output, `half_size()`).
-        pub fn upsample(&self, half: &[f32], x: i32, y: i32) -> f32 {
+        /// mesh.frag's `gtao_upsample` for a fragment at pixel (x, y), with
+        /// position `p` and normal `n` (in the passes' space: x right, y
+        /// down, z ahead), over `half` (the denoise's output, `half_size()`).
+        /// A candidate texel `q`'s position is `view_pos(2q)`: mesh.frag finds
+        /// the same from level 1's depth, which is pixel `2q`'s.
+        pub fn upsample(&self, half: &[f32], x: i32, y: i32, p: glam::Vec3, n: glam::Vec3) -> f32 {
             use glam::Vec3;
-            if self.raw(x, y) >= 1.0 {
-                return 1.0;
-            }
-            let p = Vec3::from(self.view_pos(x, y));
-            let n = self.depth_normal(x, y);
             let tolerance = AO_DENOISE_DEPTH * p.z;
             let (hw, hh) = self.half_size();
             let (fx, fy) = ((x & 1) as f32 * 0.5, (y & 1) as f32 * 0.5);
@@ -680,7 +662,8 @@ mod reference {
             }
         }
 
-        /// All three passes: the full-resolution result, as mesh.frag reads it.
+        /// All three passes and mesh.frag's upsample: the full-resolution
+        /// result, as mesh.frag applies it.
         pub fn ambient_occlusion(&self) -> Vec<f32> {
             let (hw, hh) = self.half_size();
             let grid = |w: i32, h: i32| (0..h).flat_map(move |j| (0..w).map(move |i| (i, j)));
@@ -689,7 +672,16 @@ mod reference {
                 .map(|(i, j)| self.denoise(&raw, i, j))
                 .collect();
             grid(self.width, self.height)
-                .map(|(x, y)| self.upsample(&half, x, y))
+                .map(|(x, y)| {
+                    // mesh.frag doesn't run on the sky. It has the fragment's
+                    // own position and geometric normal: here, from depth,
+                    // which on a plane is the same.
+                    if self.raw(x, y) >= 1.0 {
+                        return 1.0;
+                    }
+                    let p = glam::Vec3::from(self.view_pos(x, y));
+                    self.upsample(&half, x, y, p, self.depth_normal(x, y))
+                })
                 .collect()
         }
 
@@ -810,7 +802,9 @@ mod tests {
         let img = DepthImage::new(W, H, &depth, proj.push(H as u32));
         // Points in view space project to a depth; the reference turns that
         // depth back into the same distance, and a pixel's direction into
-        // the same x, y (screen axes: y down).
+        // the same x, y (screen axes: y down). So a view-space point (x, y, z)
+        // is (x, −y, −z) in the passes' space, which is how mesh.frag's
+        // gtao_upsample converts its fragment (a test checks its text).
         for &(x, y, z) in &[(0.3, -0.2, -2.0), (-1.0, 0.5, -7.5), (4.0, 3.0, -150.0)] {
             let c = vp * glam::Vec4::new(x, y, z, 1.0);
             let d = c.z / c.w;
@@ -996,7 +990,8 @@ mod tests {
         // Clear of the last column and row, whose missing next texel clamps.
         for y in 0..H - 1 {
             for x in 0..W - 1 {
-                let got = img.upsample(&half, x, y);
+                let p = Vec3::from(img.view_pos(x, y));
+                let got = img.upsample(&half, x, y, p, img.depth_normal(x, y));
                 let want = ramp(x as f32 / 2.0, y as f32 / 2.0);
                 assert!((got - want).abs() < 1e-4, "({x}, {y}): {got} vs {want}");
                 if x % 2 == 0 && y % 2 == 0 {
@@ -1025,7 +1020,9 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 let want = if near(x) { 0.0 } else { 1.0 };
-                let got = img.upsample(&half, x, y);
+                // Both surfaces face the camera: the normal is the view axis.
+                let p = Vec3::from(img.view_pos(x, y));
+                let got = img.upsample(&half, x, y, p, Vec3::Z);
                 assert!((got - want).abs() < 1e-6, "({x}, {y}): {got}");
             }
         }
@@ -1177,9 +1174,8 @@ mod tests {
         }
     }
 
-    /// The denoise and the upsample rebuild positions and normals exactly as
-    /// gtao.comp does, or their surface weights would disagree with the AO
-    /// they blend.
+    /// The denoise rebuilds positions and normals exactly as gtao.comp does,
+    /// or its surface weights would disagree with the AO they blend.
     #[test]
     fn the_passes_share_view_pos_and_depth_normal() {
         let body = |src: &str, sig: &str| -> String {
@@ -1191,13 +1187,11 @@ mod tests {
             include_str!("../shaders/gtao.comp"),
             include_str!("../shaders/gtao_denoise.comp"),
         );
-        let c = include_str!("../shaders/gtao_upsample.comp");
         for sig in [
             "vec3 view_pos(ivec2 p)",
             "vec3 depth_normal(ivec2 p, vec3 P)",
         ] {
             assert_eq!(body(a, sig), body(b, sig), "{sig}");
-            assert_eq!(body(a, sig), body(c, sig), "{sig}");
         }
     }
 
@@ -1230,14 +1224,19 @@ mod tests {
                 "gtao_denoise.comp",
                 include_str!("../shaders/gtao_denoise.comp"),
             ),
-            (
-                "gtao_upsample.comp",
-                include_str!("../shaders/gtao_upsample.comp"),
-            ),
+            ("mesh.frag", include_str!("../shaders/mesh.frag")),
         ] {
             assert!(src.contains(&decl), "{name} lacks `{decl}`");
         }
         let mesh = include_str!("../shaders/mesh.frag");
+        // mesh.frag's upsample works in the passes' space: view space with y
+        // and z flipped (view_positions_come_back_from_depth).
+        for line in [
+            "vec3 P = vec3(v.x, -v.y, -v.z);",
+            "vec3 N = vec3(nv.x, -nv.y, -nv.z);",
+        ] {
+            assert!(mesh.contains(line), "mesh.frag lacks `{line}`");
+        }
         for (name, [k, d]) in ["a", "b", "c"].iter().zip(AO_MULTIBOUNCE) {
             let sign = if d < 0.0 { '-' } else { '+' };
             let line = format!("vec3 {name} = {k:?} * albedo {sign} {:?};", d.abs());
