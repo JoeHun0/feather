@@ -766,6 +766,22 @@ VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true target/debug/feather --bench scratch/li
   | grep -o "\[ [A-Za-z0-9_-]* \]" | sort | uniq -c
 ```
 
+**One exception, under MSAA (2× and up):** the installed layer (Ubuntu 24.04's
+1.3.275) reports one `SYNC-HAZARD-READ-AFTER-WRITE` a frame on the depth
+prepass's resolve. It's a false positive, fixed upstream (ARCHITECTURE.md §13,
+GTAO Limits). This drops exactly that message and counts what's left, which
+should be 0:
+
+```bash
+VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true target/debug/feather --bench --msaa 4 scratch/zone.glb 2>&1 \
+  | grep -E 'VUID|SYNC-' \
+  | awk '!(/vkCmdEndRendering\(\): pDepthAttachment->imageView/ && /during resolve/)' | wc -l
+```
+
+It matches the message's text because its ID (`0xe4d96472`) is shared by every
+read-after-write hazard. With a GTAO barrier deliberately removed, the real
+hazards all came through.
+
 Don't truncate these messages with `cut`: the useful detail is at the end.
 
 ---

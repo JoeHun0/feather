@@ -961,8 +961,8 @@ the surface, can't see. It uses the depth prepass alone (§10).
   - Validation with sync: 0 messages at MSAA 1/2/4×, with GTAO off, on the
     nature scene and the orb demo, and across two resizes mid-session.
     (Not reproduced since: under MSAA the prepass's depth resolve reports
-    one `SYNC-HAZARD-READ-AFTER-WRITE` a frame, at that commit too. See
-    Limits.)
+    one `SYNC-HAZARD-READ-AFTER-WRITE` a frame, at that commit too, a known
+    false positive of this validation layer. See Limits.)
 - **Re-measured with pinned clocks** (`profile_standard`, release, 3
   interleaved rounds; every median repeated to 0.01 ms):
   - `ao` 0.38 ms on the zone and 0.54 ms on `lights120` (frames +0.40 /
@@ -994,7 +994,7 @@ the surface, can't see. It uses the depth prepass alone (§10).
     which reads lighter and softer.
   - Validation with sync: 0 messages at 1×, with GTAO off, on `lights120`,
     the nature scene and the orb demo, and at 1921×1046 (odd halves). At
-    MSAA 2/4× only the prepass resolve's messages, as before this change.
+    MSAA 2/4× only the prepass resolve's false positive (Limits).
 - **The steps' depth reads.** An experiment first (pinned, release, both
   results predicted and both held):
   - with steps at a quarter of the radius, the gtao pass fell 0.13 → 0.07
@@ -1071,8 +1071,19 @@ the surface, can't see. It uses the depth prepass alone (§10).
   - an occluder narrower than a level's stride (up to 16 px at 1/16) can
     fall between a long step's samples;
   - under MSAA, sync validation reports one `SYNC-HAZARD-READ-AFTER-WRITE` a
-    frame on the prepass's depth resolve (from e246707, which moved the
-    prepass into its own rendering), not yet chased;
+    frame on the prepass's depth resolve, since e246707 gave the prepass its
+    own rendering. **It's a false positive** of the installed layer
+    (Ubuntu 24.04's `vulkan-validationlayers` 1.3.275):
+    - Vulkan-ValidationLayers issue #7441 reports this exact message on
+      `vkCmdEndRendering` depth resolves. It appeared with 1.3.275 and not
+      with 1.3.268.
+    - Upstream fixed it in PR #7476, "sync: Fix ordered accesses for
+      depth-stencil resolve". Sync-val orders a resolve's reads after the
+      attachment's earlier accesses, but it only knew the colour accesses,
+      so a depth attachment's own writes looked unordered.
+    - The engine was left alone. USAGE §8 filters exactly this message: its
+      ID can't be used, since every read-after-write hazard shares it. A
+      layer with the fix won't report it at all;
   - a faint large-scale tint (≤ 2%) was seen on the hangar's far wall in one
     dump and not chased.
 - **Switch:** OPTIONS > GRAPHICS > AMBIENT OCCLUSION, saved as
@@ -2440,7 +2451,9 @@ and punctuation.
   **Landed (§26):** core validation on debug builds, enabled only if the layer is
   installed (otherwise a startup warning, not a failure). Sync validation has
   no in-app toggle yet, but runs via the layer's env var:
-  `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`. **It is clean — keep it so.** The
+  `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`. **It is clean — keep it so**
+  (under MSAA, but for one known false positive of layer 1.3.275 on the
+  prepass's depth resolve, §13 GTAO Limits, which USAGE §8 filters). The
   first run found ~3.4k cross-frame hazards per `--bench` run. The shadow,
   depth, HDR, resolve and LDR images are *single* images shared by every frame
   in flight, yet their `UNDEFINED` transitions used `TOP_OF_PIPE` as the
