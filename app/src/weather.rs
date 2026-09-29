@@ -1352,6 +1352,52 @@ mod tests {
         assert!((at(1, None).unwrap() - 15.25).abs() < 1.0 / 60.0 + 1e-9);
     }
 
+    /// LEVEL with a clock (SUN ONLY): the level's own palette under its sun
+    /// on the path, faded in over the horizon; by night there's no moon, so
+    /// the light is 0 while the sky still glows towards the sun.
+    #[test]
+    fn level_with_a_clock_moves_the_sun_only() {
+        let level = Environment {
+            sky_zenith: Vec3::new(0.3, 0.2, 0.1),
+            sun_intensity: 5.0,
+            fog_density: 0.035,
+            ..Default::default()
+        };
+        let path = SolarPath::default();
+        let mut w = SessionWeather {
+            clock: Some(12.0),
+            ..Default::default()
+        };
+        let (env, light) = w.frame(&level, &path);
+        assert_eq!(light, -path.sun_at(12.0), "the sun is on its path");
+        assert_eq!(env.sun_dir, light);
+        assert_eq!(
+            Environment {
+                sun_dir: level.sun_dir,
+                ..env
+            },
+            level,
+            "everything but the sun is the level's"
+        );
+        // Sunrise: the sun fades in, up to the level's own strength.
+        let (rise, _) = path.day().unwrap();
+        w.clock = Some(rise);
+        assert!(w.frame(&level, &path).0.sun_intensity < 1e-3);
+        w.clock = Some(rise + 1.0);
+        assert_eq!(w.frame(&level, &path).0.sun_intensity, 5.0);
+        // Night: no moon. The light points the moon's way at 0 strength, and
+        // the sky glows towards the sun, below the horizon.
+        w.clock = Some(1.0);
+        let (env, light) = w.frame(&level, &path);
+        assert_eq!(env.sun_intensity, 0.0, "a moon under LEVEL");
+        assert!(
+            light.y < 0.0 && env.sun_dir.y > 0.0,
+            "{light} {}",
+            env.sun_dir
+        );
+        assert_eq!(env.sky_zenith, level.sky_zenith);
+    }
+
     /// A weather's frame: the key at the warped hour, the fog's height the
     /// level's, the light the sun's, faded, or the moon's.
     #[test]
