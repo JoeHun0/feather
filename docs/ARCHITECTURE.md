@@ -4,7 +4,7 @@ Status: in active implementation — a textured-PBR forward renderer with IBL,
 4-cascade sun shadows with caster pancaking, clustered punctual point lights
 with sphere-light specular, ambient light occluded by a baked sky-visibility
 volume and GTAO, a depth prepass, per-view frustum culling,
-MSAA/FXAA, mipmapped textures (deduplicated, a per-level bindless array, and
+MSAA/FXAA/TAA, bloom and auto-exposure, mipmapped textures (deduplicated, a per-level bindless array, and
 an offline BC7 bake), GPU per-pass timing, a rapier FPS controller in the ECS
 with collision proxies for detailed props, glTF scene loading with §18
 prefabs, and a main menu + pause menu with an options tree are up;
@@ -40,6 +40,7 @@ lives elsewhere; this is the *why* and the *shape*.
   - the controller as plain functions under its ECS systems (§26);
   - menus that only return outcomes (§19);
   - a mixer generic over its audio backend (§20);
+  - the weather engine and the ropes as plain data and maths (§13, §15);
   - `build_world`, the CPU half of starting a session (§26).
 
   `cargo test` covers those, down to loading a glTF file into the game's own
@@ -3292,8 +3293,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
   sky visibility and GTAO (§13), *not* cubemap IBL;
   step 4 mostly landed — fixed timestep + interpolation and the rapier kinematic
-  FPS controller against static colliders (ECS↔rapier sync systems and dynamic
-  bodies still pending, see below). Steps 5+ not started.
+  FPS controller against static colliders, with the ECS↔rapier sync systems
+  (dynamic bodies still pending, see below). Steps 5+ not started.
 
 ### Current simplifications to revisit
 
@@ -3390,11 +3391,12 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   the highlight into a believable disc. Independent of clustering.
 - **HDR/depth targets (§9)**: single engine-owned images shared across both
   frames-in-flight (matches the design: render targets are engine-owned, not
-  per-frame). With `FRAMES_IN_FLIGHT = 2` this carries a latent cross-frame WAW
-  hazard on the shared targets — pending the sync2 barrier + timeline-semaphore
-  pass (§10). The intra-frame HDR write→read hazard *is* handled.
-- **Anti-aliasing (§3, §10, §13)**: none yet — rendering is single-sample
-  throughout. The groundwork is a **single knob**, `MSAA_SAMPLES` /
+  per-frame). With `FRAMES_IN_FLIGHT = 2` the shared targets carried a
+  cross-frame WAW hazard until each `UNDEFINED` transition took the previous
+  frame's uses as its source stages (§21); sync validation has been clean since.
+  The sync2 barrier + timeline-semaphore pass (§10) is still pending.
+- **Anti-aliasing (§3, §10, §13)**: MSAA, FXAA and TAA have landed (§13, and
+  below). The groundwork was a **single knob**, `MSAA_SAMPLES` /
   `Renderer::samples()`, that the HDR + depth targets and the mesh/sky pipelines
   all read (the tonemap pass to the swapchain stays 1× on purpose). Flipping it
   is *not* sufficient on its own: a multisampled HDR target needs a **resolve
@@ -3415,8 +3417,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
 - **Geometry / assets (§6, §7)**: a **mesh registry**, a **material table**, and a
   full **base-color + normal + metallic-roughness texture** path now exist —
   several meshes in shared vertex/index buffers drawn by sorted per-mesh runs; a
-  resident `materials[]` SSBO indexed by per-instance `material_id`; and a fixed
-  bindless `textures[]` array (glTF images or white/flat-normal defaults),
+  resident `materials[]` SSBO indexed by per-instance `material_id`; and a
+  bindless `textures[]` array sized per level (glTF images or white/flat-normal defaults),
   consumed by a Cook-Torrance PBR BRDF. Mips landed (GPU-built, or baked BC7,
   §17). Still missing: MikkTSpace vertex tangents (normal mapping is
   derivative-based), pipeline buckets (one pipeline for everything),
@@ -3424,8 +3426,7 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   landed; runtime blob, handle tables, load-time allocator not). glTF loads directly each
   run; a session's meshes/materials/textures are now **freed on returning to the
   main menu** (§19) — the first teardown path — but nothing is *streamed*, and
-  freeing is still all-or-nothing per session; one material per merged glTF (first primitive
-  wins).
+  freeing is still all-or-nothing per session.
 
 ### Not yet started
 

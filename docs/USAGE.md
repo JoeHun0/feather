@@ -585,7 +585,8 @@ OCCLUSION, live):
 
 ## 5. Tests
 
-`cargo test --workspace` runs 165 tests, in well under a second once built.
+`cargo test --workspace` runs 246 tests, in a few seconds once built (the
+app's, which step rapier and the mixer, take most of it).
 All of them are CPU-side: none needs a GPU, a window, a sound card or
 anything in `scratch/`, so they pass on a fresh clone.
 
