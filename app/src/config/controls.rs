@@ -42,12 +42,13 @@ pub enum Action {
     ExposureUp,
     CycleShadows,
     ToggleFxaa,
+    ToggleTaa,
     ToggleFullscreen,
 }
 
 impl Action {
     /// File order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Forward,
         Self::Back,
         Self::Left,
@@ -59,6 +60,7 @@ impl Action {
         Self::ExposureUp,
         Self::CycleShadows,
         Self::ToggleFxaa,
+        Self::ToggleTaa,
         Self::ToggleFullscreen,
     ];
 
@@ -76,6 +78,7 @@ impl Action {
             Self::ExposureUp => "exposure_up",
             Self::CycleShadows => "cycle_shadows",
             Self::ToggleFxaa => "toggle_fxaa",
+            Self::ToggleTaa => "toggle_taa",
             Self::ToggleFullscreen => "toggle_fullscreen",
         }
     }
@@ -93,6 +96,7 @@ impl Action {
             Self::ExposureUp => KeyCode::BracketRight,
             Self::CycleShadows => KeyCode::F1,
             Self::ToggleFxaa => KeyCode::F2,
+            Self::ToggleTaa => KeyCode::F3,
             Self::ToggleFullscreen => KeyCode::F11,
         }
     }
@@ -111,6 +115,7 @@ impl Action {
             Self::ExposureUp => "exposure up (repeats while held)",
             Self::CycleShadows => "cycle shadow quality",
             Self::ToggleFxaa => "FXAA on/off",
+            Self::ToggleTaa => "TAA on/off",
             Self::ToggleFullscreen => "windowed / fullscreen",
         }
     }
@@ -638,6 +643,21 @@ mod tests {
         let (c, w) = parsed("forward = [\"W\"]");
         assert!(w.is_empty());
         assert_eq!(c.keys(Action::ToggleFullscreen), &[KeyCode::F11]);
+    }
+
+    #[test]
+    fn taa_toggle_is_f3_and_fires_once() {
+        let c = Controls::default();
+        let mut held = HashSet::new();
+        assert_eq!(
+            c.key(&mut held, KeyCode::F3, true, false),
+            vec![Action::ToggleTaa]
+        );
+        assert!(c.key(&mut held, KeyCode::F3, true, true).is_empty());
+        // Files from before TAA still get it.
+        let (c, w) = parsed("toggle_fxaa = [\"F2\"]");
+        assert!(w.is_empty());
+        assert_eq!(c.keys(Action::ToggleTaa), &[KeyCode::F3]);
     }
 
     #[test]

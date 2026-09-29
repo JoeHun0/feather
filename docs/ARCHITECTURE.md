@@ -576,6 +576,10 @@ clocks unpinned, 3 interleaved runs against the old binary, GTAO off): `geo`
 0.21–0.23 → 0.22–0.23 ms on the zone and 0.64 → 0.62 ms on `lights120`. I
 predicted at most +0.02 ms, and it held.
 
+**Landed (§26): TAA's slot.** A compute pass between the main pass and bloom
+(§13) resolves the (jittered) HDR image into a history, which bloom,
+exposure and the tonemap then read in place of the scene's.
+
 Barriers: Vulkan 1.3 **sync2** (`VkImageMemoryBarrier2`, timeline semaphores).
 Key hazards: shadow depth W→R before opaque; HDR color W→R at resolve; cluster
 buffer W(compute)→R(fragment). Queues: graphics for all passes; cluster
@@ -1655,12 +1659,99 @@ allocated (~8 MB at 1080p) so the toggle needs no resource churn.
 SMAA is still the higher-quality target (§13) and still absent: it needs
 precomputed `AreaTex`/`SearchTex` lookup data that would have to be vendored.
 
+**Landed (§26): TAA** (Karis 2014's temporal supersampling, with Playdead's
+clipping). It's **on by default**: `taa` in `graphics.toml`, GRAPHICS > TAA,
+`F3`, and `--no-taa` for A/B runs. It's independent of MSAA and FXAA: it
+reads the resolved HDR, so it runs on top of any sample count.
+- **Jitter:** the camera the prepass, main pass and sky draw with is moved
+  by a sub-pixel offset each frame: Halton (2, 3), 8 phases. It's a
+  clip-space shear (`render::taa::jittered`), so depth is untouched and the
+  masked pass's `EQUAL` still matches. Culling, LOD, clusters and shadows
+  keep the true camera. With TAA off nothing is jittered.
+- **The resolve** (`taa.comp`, one compute pass between the main pass and
+  bloom, timed as `taa`), per pixel:
+  - the 3×3 neighbourhood of this frame's image, in a compressed space
+    (colour over 1 + its luma, after exposure, so a lone bright sample
+    can't dominate) and YCoCg, for its mean and standard deviation;
+  - where the pixel was last frame, from the neighbourhood's nearest depth
+    (so an edge moves with its foreground) and `prev · cur⁻¹` of the
+    **unjittered** cameras. For a still camera that's the identity, so the
+    history is read exactly at texel centres and not blurred again;
+  - the history there by a 5-tap Catmull-Rom, clipped towards the mean to
+    ± 1 deviation (a disocclusion or ghost goes), blended 10% towards the
+    new frame.
+- **Targets:** two RGBA16F images at window size (33 MB at 1080p), always
+  allocated so the toggle is live. They're written in turn, and the newest is
+  what bloom, exposure and the tonemap read (`Renderer::hdr_view`). The
+  history restarts when the targets are recreated and when TAA is turned on,
+  which includes every new session.
+- **Camera motion only.** Nothing but the camera moves in a level, so
+  reprojecting by depth is exact there. The orb demo's orbs fall back to
+  their neighbourhood's box, which leaves a short trail. Per-object motion
+  vectors come with something that moves.
+- **Found on the way:** the main pass stored its depth `DONT_CARE`, which
+  counts as a write that leaves it undefined. At 1× TAA reads that depth
+  after the pass, and sync validation flagged it. It's stored `NONE` now,
+  which costs nothing (`--no-taa` measures as the previous binary).
+- **Not told to GTAO:** GTAO rebuilds view rays from pixel centres, so under
+  TAA they're off by the jitter. That's a uniform ≤ 0.5 px shift (≤ 0.016° at
+  1080p), so its shaders and reference are left as they were.
+- **Tests** (`render::taa`, whose `reference` is the shader step for step):
+  - the jitter covers the pixel evenly;
+  - jittering moves the image by exactly the offset and leaves depth alone;
+  - the reprojection finds last frame's pixel under a moved, turned camera;
+  - the colour transforms round-trip;
+  - Catmull-Rom is exact at texel centres and along rows (close off-axis,
+    since the five taps leave out the corners);
+  - the clip keeps the inside and pulls the outside onto the box;
+  - a still edge converges to its coverage (control: without jitter it
+    stays hard);
+  - a pan keeps its image (control: a history that doesn't follow the camera
+    smears);
+  - the shader declares the reference's constants and formulas.
+  - Mutating the shader's α, the clip, the jitter's y or the motion each
+    fails exactly one of these.
+- **The look,** measured on three zone foliage views (HDR dumps from a
+  temporary harness, compared in a tonemapped space against MSAA 8× without
+  TAA):
+  - **Edges:** on the pixels no AA gets wrong, TAA's error is 0.40–0.47 of
+    no AA's. I predicted at most 0.5.
+  - **Shimmer:** panning 0.02° a frame (~0.4 px), the frame-to-frame change
+    is 0.55–0.64 of no AA's. I predicted at most 0.6: two views of three.
+  - **Softness:** the finest detail (mean |Laplacian|) keeps 0.54–0.57 of
+    MSAA 8×'s. That's the jitter itself: averaging samples spread over the
+    pixel is a pixel-wide box filter, sinc(½) ≈ 0.64 per axis at Nyquist.
+    A sharpen would win it back (not built).
+  - With a fixed exposure, two runs are bit-identical. With auto-exposure
+    they differ slightly: the blend's compression follows the metered
+    exposure, which adapts in wall-clock time.
+- **Cost** (release, clocks **unpinned**, 3 interleaved rounds against the
+  previous binary, medians):
+
+  | | zone frame | lights120 frame | `taa` |
+  |---|---|---|---|
+  | before | 1.02–1.09 | 1.25–1.26 | – |
+  | `--no-taa` | 1.05–1.08 | 1.24–1.25 | 0 |
+  | TAA | 1.23–1.24 | 1.53–1.60 | 0.12–0.14 |
+
+  - I predicted the pass at 0.08–0.15 ms (it held) and frames +0.1–0.2 (zone
+    held, lights120 didn't).
+  - The pass's mean is 0.26–0.30 ms and its p90 0.5–0.7. Sampling the
+    memory clock during a run found it moving between 96 and 1218 MHz, and
+    this pass is bandwidth-bound. Unpinned, its cost is mostly the
+    governor's; pinned numbers are still to take.
+- **Validation:** sync-clean at 1× and MSAA 4× (filtered, USAGE §8), with TAA
+  toggled live four times and the targets recreated twice mid-run.
+- **Not done:** per-object motion vectors, a sharpen, a negative texture-LOD
+  bias, temporal GTAO (rotating its 4×4 jitter each frame and letting TAA
+  average it: the likely next win), transparency.
+
 6. **Anti-alias** — **user-selectable**: SMAA on LDR (post-tonemap) or MSAA
    2×/4× on geometry (the geometry sample count is already a single knob —
    `Renderer::samples`, see §26). SMAA is the cheaper default on bandwidth-bound
    hardware (e.g. Steam Deck); MSAA the higher geometry-edge quality where the
-   budget allows. (TAA is a later, bigger shift that replaces both and moves
-   before tonemap.)
+   budget allows. (TAA landed, above, as its own toggle in HDR before bloom,
+   alongside either.)
 7. **Output** → swapchain; **UI/HUD after tonemap** in LDR/sRGB.
 
 Maybe-hooks placed: **SSR** between resolve and transparents (HDR, pre-tonemap);
@@ -2489,7 +2580,7 @@ and punctuation.
   SSR/volumetrics cost gets judged. **Landed** (§26): a timestamp query pool in
   `gfx` brackets the shadow, geometry, and post passes, reads back after the frame
   fence (no stall), and logs smoothed per-pass ms to stderr (`[gpu] shadow … cluster … geo …
-  ao … bloom … expo … post … frame …`), with a `Renderer::gpu_times` accessor for a future overlay.
+  ao … taa … bloom … expo … post … frame …`), with a `Renderer::gpu_times` accessor for a future overlay.
   **Caveat when reading these numbers:** absolute per-pass ms shift with overall
   GPU load/clock state — the fixed-size shadow pass measured 2.5 ms with a small
   window and 4.7 ms with a large one, unchanged work. Only compare A/B runs taken
@@ -2721,7 +2812,7 @@ ripped SoC assets, so a public showcase is clean.
 GPU-driven indirect culling; async compute; dual-quaternion
 skinning; animation state machines; local reflection probes / irradiance
 volumes; audio occlusion + reverb zones; user-selectable anti-aliasing mode
-(SMAA / MSAA 2×/4×; the geometry sample-count seam is in place, §26); TAA;
+(SMAA / MSAA 2×/4×; the geometry sample-count seam is in place, §26);
 streaming + stage pipelining; X-Ray (`.ogf`/level) importer for the SoC-rebuild
 stretch dream (becomes just another importer feeding the same bake); changing
 a level's atmosphere during a session (weather, time of day: §13's constants
@@ -2970,7 +3061,7 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   *is* now drawn as a visible background (SkyPass) matching the reflected
   environment. Real cubemap IBL (equirect→cube, irradiance/prefilter passes,
   BRDF LUT) is the follow-up. Sun shadows (§11 CSM) and punctual point lights
-  (§12) now exist. Bloom and auto-exposure landed (§13). The ambient is
+  (§12) now exist. Bloom, auto-exposure and TAA landed (§13). The ambient is
   occluded by a baked per-level sky-visibility volume (§13, §17) and by the
   lower of half-resolution GTAO and the material's own AO (glTF
   `occlusionTexture`, §13). The tonemap curve is a drop-in point for AgX.
@@ -3052,7 +3143,7 @@ colliders and the ECS↔rapier sync systems landed — dynamic bodies and collis
 layers pending);
 skinning; UI/HUD (§19's lightweight quad/text renderer + the Esc pause menu
 landed, with keyboard *and* mouse navigation, an OPTIONS screen tree, and live
-display-mode/shadow-quality/FXAA controls under GRAPHICS — MSAA is changeable
+display-mode/shadow-quality/FXAA/TAA controls under GRAPHICS — MSAA is changeable
 there only from the main menu, since the session's mesh and sky pipelines bake
 the sample count; all of them, plus the GAMEPLAY field of view, persist in
 `config/graphics.toml` (§13), and key bindings + mouse look live in
@@ -3065,6 +3156,7 @@ and occlusion pending); debug/profiling tooling (per-pass GPU timestamp timing
 landed — stderr log + `Renderer::gpu_times`, plus the `--bench` sweep harness;
 Tracy / RenderDoc / egui overlay and
 CPU-side zones pending); GPU-driven culling; streaming; stage pipelining;
-anti-aliasing (**MSAA** `--msaa N` at startup and **FXAA** on `F2` both landed,
-§13 — **SMAA** is still absent, as are live MSAA switching and a tonemapped
-resolve to stop bright HDR edges sparkling).
+anti-aliasing (**MSAA** `--msaa N` at startup, **FXAA** on `F2` and **TAA** on
+`F3`, on by default, all landed, §13 — **SMAA** is still absent, as are live
+MSAA switching, a tonemapped resolve to stop bright HDR edges sparkling, and,
+for TAA, per-object motion vectors, a sharpen and pinned cost numbers).

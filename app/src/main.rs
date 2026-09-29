@@ -44,7 +44,7 @@ use feather_platform::winit;
 use feather_render::{
     AoPass, AoProjection, BloomPass, CascadeSetup, ClusterView, Environment, ExposureParams,
     ExposurePass, FrameStats, FxaaPass, GpuLight, InstanceData, MeshId, MeshRenderer, SkyPass,
-    TonemapPass, UiPass, BLOOM_STRENGTH,
+    TaaPass, TaaPush, TonemapPass, UiPass, BLOOM_STRENGTH,
 };
 use glam::{Mat4, Vec3, Vec4};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
@@ -270,6 +270,9 @@ struct GraphicsSettings {
     /// FXAA post-AA (§13). Unlike MSAA this is live-toggleable (`F2`): it bakes
     /// nothing into pipelines, and the LDR intermediate is always allocated.
     fxaa: bool,
+    /// TAA (§13). Live-toggleable (`F3`) like FXAA: its history is always
+    /// allocated; off, the camera isn't jittered and the resolve doesn't run.
+    taa: bool,
     /// Bloom (§13). Live-toggleable like FXAA: its chain is always allocated
     /// and it bakes nothing in; off, the passes simply don't run.
     bloom: bool,
@@ -320,6 +323,7 @@ impl Default for GraphicsSettings {
             fov_deg: DEFAULT_FOV_DEG,
             msaa: 1,
             fxaa: false,
+            taa: true,
             bloom: true,
             auto_exposure: true,
             ambient_occlusion: true,
@@ -377,6 +381,7 @@ enum MenuAction {
     Back,
     Quit,
     ToggleFxaa,
+    ToggleTaa,
     ToggleBloom,
     ToggleAutoExposure,
     ToggleAmbientOcclusion,
@@ -436,6 +441,7 @@ enum MenuOutcome {
     Quit,
     ApplyShadows,
     ApplyFxaa,
+    ApplyTaa,
     ApplyBloom,
     ApplyAutoExposure,
     ApplyAmbientOcclusion,
@@ -505,6 +511,10 @@ fn screen_rows(
             MenuRow::new(
                 format!("FXAA  {}", if s.fxaa { "ON" } else { "OFF" }),
                 MenuAction::ToggleFxaa,
+            ),
+            MenuRow::new(
+                format!("TAA  {}", if s.taa { "ON" } else { "OFF" }),
+                MenuAction::ToggleTaa,
             ),
             MenuRow::new(
                 format!("BLOOM  {}", if s.bloom { "ON" } else { "OFF" }),
@@ -742,6 +752,10 @@ impl Menu {
             MenuAction::ToggleFxaa => {
                 s.fxaa = !s.fxaa;
                 MenuOutcome::ApplyFxaa
+            }
+            MenuAction::ToggleTaa => {
+                s.taa = !s.taa;
+                MenuOutcome::ApplyTaa
             }
             MenuAction::ToggleBloom => {
                 s.bloom = !s.bloom;
@@ -1662,6 +1676,7 @@ impl Bench {
         eprintln!("[bench] cluster {}", col(|t| t.cluster_ms));
         eprintln!("[bench] geo     {}", col(|t| t.geometry_ms));
         eprintln!("[bench] ao      {}", col(|t| t.ao_ms));
+        eprintln!("[bench] taa     {}", col(|t| t.taa_ms));
         eprintln!("[bench] bloom   {}", col(|t| t.bloom_ms));
         eprintln!("[bench] expo    {}", col(|t| t.exposure_ms));
         eprintln!("[bench] post    {}", col(|t| t.post_ms));
@@ -1702,6 +1717,11 @@ struct App {
     exposure_pass: Option<ExposurePass>,
     ao_pass: Option<AoPass>,
     fxaa: Option<FxaaPass>,
+    taa: Option<TaaPass>,
+    /// TAA's frame count (the jitter phase) and last frame's unjittered
+    /// view-projection, for the reprojection (§13).
+    taa_frame: u64,
+    prev_view_proj: Option<Mat4>,
     ui: Option<UiPass>,
     renderer: Option<Renderer>,
     window: Option<Window>,
@@ -2406,8 +2426,11 @@ fn sun_travel(elevation: f32, azimuth: f32) -> Vec3 {
 /// main menu can skip the shadow and geometry passes entirely.
 #[derive(Clone, Copy)]
 struct FrameView {
+    /// What the camera passes draw with: jittered under TAA (§13).
     view_proj: Mat4,
     inv_view_proj: Mat4,
+    /// TAA's reprojection: this frame's unjittered clip space to last frame's.
+    reproject: Mat4,
     light_dir: Vec4,
     camera_pos: Vec3,
 }
@@ -2802,6 +2825,9 @@ impl App {
             session: None,
             tonemap: None,
             fxaa: None,
+            taa: None,
+            taa_frame: 0,
+            prev_view_proj: None,
             bloom: None,
             exposure_pass: None,
             ao_pass: None,
@@ -2923,6 +2949,15 @@ impl App {
         );
     }
 
+    /// Nothing to push: each frame turns TAA on in the renderer while
+    /// there's a session and the setting is on.
+    fn log_taa(&self) {
+        eprintln!(
+            "[quality] taa: {}",
+            if self.settings.taa { "on" } else { "off" }
+        );
+    }
+
     /// Act on what the menu decided. Keeps the renderer and event loop out of
     /// `Menu` itself, so its logic stays pure and testable.
     fn handle_menu_outcome(&mut self, outcome: MenuOutcome, event_loop: &ActiveEventLoop) {
@@ -2937,6 +2972,10 @@ impl App {
             MenuOutcome::ApplyFxaa => {
                 self.apply_fxaa();
                 self.persist(config::graphics::Key::Fxaa);
+            }
+            MenuOutcome::ApplyTaa => {
+                self.log_taa();
+                self.persist(config::graphics::Key::Taa);
             }
             MenuOutcome::ApplyBloom => {
                 // Nothing to push: the frame reads the setting as it draws.
@@ -3099,6 +3138,11 @@ impl App {
                     self.apply_fxaa();
                     self.persist(config::graphics::Key::Fxaa);
                 }
+                Action::ToggleTaa => {
+                    self.settings.taa = !self.settings.taa;
+                    self.log_taa();
+                    self.persist(config::graphics::Key::Taa);
+                }
                 Action::ToggleFullscreen => {
                     self.settings.display = self.settings.display.toggled();
                     self.apply_display();
@@ -3203,6 +3247,7 @@ impl ApplicationHandler for App {
         let exposure_pass = ExposurePass::new(&renderer);
         let ao_pass = AoPass::new(&renderer);
         let fxaa = FxaaPass::new(&renderer);
+        let taa = TaaPass::new(&renderer);
         let ui = UiPass::new(&renderer);
 
         self.tonemap = Some(tonemap);
@@ -3210,6 +3255,7 @@ impl ApplicationHandler for App {
         self.exposure_pass = Some(exposure_pass);
         self.ao_pass = Some(ao_pass);
         self.fxaa = Some(fxaa);
+        self.taa = Some(taa);
         self.ui = Some(ui);
         self.renderer = Some(renderer);
         self.window = Some(window);
@@ -3505,6 +3551,26 @@ impl ApplicationHandler for App {
                         }
                     }
                     let view_proj = look.view_proj(eye, aspect, fov_y);
+                    // TAA (§13): the prepass, main pass and sky draw with a
+                    // sub-pixel jitter; culling, LOD and the clusters keep the
+                    // true camera, which the reprojection uses too.
+                    let draw_view_proj = if self.settings.taa {
+                        let px =
+                            glam::Vec2::new(size.width.max(1) as f32, size.height.max(1) as f32);
+                        feather_render::jittered(
+                            view_proj,
+                            feather_render::jitter(self.taa_frame),
+                            px,
+                        )
+                    } else {
+                        view_proj
+                    };
+                    let reproject = feather_render::reprojection(
+                        self.prev_view_proj.unwrap_or(view_proj),
+                        view_proj,
+                    );
+                    self.prev_view_proj = Some(view_proj);
+                    self.taa_frame += 1;
                     let cluster_view = ClusterView {
                         view: look.view(eye),
                         fov_y,
@@ -3513,7 +3579,7 @@ impl ApplicationHandler for App {
                         far: CAMERA_FAR,
                         viewport_height: size.height.max(1) as f32,
                     };
-                    let inv_view_proj = view_proj.inverse();
+                    let inv_view_proj = draw_view_proj.inverse();
                     let light_dir = self.light_dir;
                     let camera_pos = eye;
 
@@ -3643,8 +3709,9 @@ impl ApplicationHandler for App {
                         b.stats = s.mesh.frame_stats();
                     }
                     frame_view = Some(FrameView {
-                        view_proj,
+                        view_proj: draw_view_proj,
                         inv_view_proj,
+                        reproject,
                         light_dir,
                         camera_pos,
                     });
@@ -3742,13 +3809,23 @@ impl ApplicationHandler for App {
                     self.exposure_reset = false;
                 }
                 let mut metered = None;
-                if let (Some(r), Some(tm), Some(bp), Some(ep), Some(ap), Some(fx), Some(ui)) = (
+                if let (
+                    Some(r),
+                    Some(tm),
+                    Some(bp),
+                    Some(ep),
+                    Some(ap),
+                    Some(fx),
+                    Some(tp),
+                    Some(ui),
+                ) = (
                     self.renderer.as_mut(),
                     self.tonemap.as_mut(),
                     self.bloom.as_mut(),
                     self.exposure_pass.as_mut(),
                     self.ao_pass.as_mut(),
                     self.fxaa.as_mut(),
+                    self.taa.as_mut(),
                     self.ui.as_ref(),
                 ) {
                     let exposure_state = ep.state_buffer();
@@ -3757,6 +3834,18 @@ impl ApplicationHandler for App {
                     // No session, or shadows off: the cascade passes collapse to
                     // one layered clear rather than four empty passes.
                     r.set_shadow_casters(self.session.is_some() && self.settings.shadows.casts());
+                    // TAA runs over a level only; the menu's frame is a
+                    // clear. Turning it on starts a new history, so a new
+                    // session begins without the last one's.
+                    r.set_taa(self.settings.taa && self.session.is_some());
+                    let taa_views = r.taa_views();
+                    let scene_hdr_view = r.scene_hdr_view();
+                    let taa_push = TaaPush {
+                        reproject: frame_view.map_or(Mat4::IDENTITY, |v| v.reproject),
+                        history_valid: r.taa_history_valid(),
+                        exposure,
+                        auto_exposure: auto_on,
+                    };
                     let hdr_view = r.hdr_view();
                     let ldr_view = r.ldr_view();
                     let hdr_sampler = r.hdr_sampler();
@@ -3850,6 +3939,20 @@ impl ApplicationHandler for App {
                                 s.sky
                                     .draw(cmd, extent, v.inv_view_proj, v.camera_pos, v.light_dir);
                             }
+                        },
+                        // TAA (§13): only invoked while it's on.
+                        |cmd, extent, frame| {
+                            tp.update(
+                                frame,
+                                scene_hdr_view,
+                                depth_view,
+                                taa_views.0,
+                                taa_views.1,
+                                exposure_state,
+                                hdr_sampler,
+                                nearest,
+                            );
+                            tp.dispatch(cmd, frame, extent, &taa_push);
                         },
                         // Bloom (§13): down the chain and back up, before the
                         // tonemap mixes it in.
@@ -4167,6 +4270,7 @@ fn parse_args(
             // For A/B timing: --bench ignores config/, so this is how a
             // bench run turns these off.
             "--no-bloom" => settings.bloom = false,
+            "--no-taa" => settings.taa = false,
             "--no-auto-exposure" => settings.auto_exposure = false,
             "--no-ao" => settings.ambient_occlusion = false,
             "--no-sky-occlusion" => settings.sky_occlusion = false,
@@ -4243,12 +4347,13 @@ fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     eprintln!(
-        "[config] effective: display {}, fov {}, shadows {}, msaa {}, fxaa {}, bloom {}, auto exposure {}, ambient occlusion {}",
+        "[config] effective: display {}, fov {}, shadows {}, msaa {}, fxaa {}, taa {}, bloom {}, auto exposure {}, ambient occlusion {}",
         settings.display.config_name(),
         settings.fov_deg,
         settings.shadows.config_name(),
         settings.msaa,
         settings.fxaa,
+        settings.taa,
         settings.bloom,
         settings.auto_exposure,
         settings.ambient_occlusion
@@ -5082,18 +5187,19 @@ mod tests {
                 "--no-auto-exposure",
                 "--no-sky-occlusion",
                 "--no-ao",
+                "--no-taa",
             ]),
             &mut s,
         );
         assert_eq!(scenes, ["a.glb", "b.gltf"]);
         assert!(bench);
         assert_eq!((s.bloom, s.msaa, s.lod, s.bake), (false, 4, false, true));
-        assert!(!s.auto_exposure && !s.sky_occlusion && !s.ambient_occlusion);
+        assert!(!s.auto_exposure && !s.sky_occlusion && !s.ambient_occlusion && !s.taa);
         // A bad sample count is ignored, not taken as a scene.
         let mut s = GraphicsSettings::default();
         let (scenes, bench) = parse_args(args(&["--msaa", "x", "--no-bake"]), &mut s);
         assert!(scenes.is_empty() && !bench);
-        assert_eq!((s.msaa, s.bake, s.bloom), (1, false, true));
+        assert_eq!((s.msaa, s.bake, s.bloom, s.taa), (1, false, true, true));
     }
 
     #[test]
@@ -5108,6 +5214,18 @@ mod tests {
             MenuOutcome::ApplyFxaa
         );
         assert_eq!(s.fxaa, !before, "FXAA row did not toggle the setting");
+
+        // TAA is on out of the box (§13), and its row turns it off.
+        assert!(s.taa);
+        assert_eq!(
+            activate(&mut m, &mut s, MenuAction::ToggleTaa),
+            MenuOutcome::ApplyTaa
+        );
+        assert!(!s.taa, "TAA row did not toggle the setting");
+        assert_eq!(
+            label_of(&m, &s, &Controls::default(), MenuAction::ToggleTaa),
+            "TAA  OFF"
+        );
 
         let before = s.bloom;
         assert_eq!(

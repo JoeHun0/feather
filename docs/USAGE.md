@@ -91,6 +91,7 @@ on a HiDPI desktop) and is resizable; `--bench` uses a fixed 1920×1080.
 | `--no-bloom` | Turn bloom off for this run (never saved). Mainly for `--bench` A/B runs, which ignore the config files. |
 | `--no-auto-exposure` | Fixed exposure for this run (never saved), likewise. |
 | `--no-ao` | GTAO off for this run (never saved), for `--bench` A/B runs like `--no-bloom`. |
+| `--no-taa` | TAA off for this run (never saved), for `--bench` A/B runs like `--no-bloom`: `--bench` runs with it on otherwise. |
 | `--no-sky-occlusion` | Ignore the level's baked sky visibility, so the ambient light is unoccluded, as before it existed. For A/B runs; there's no menu option, as it's part of the look. |
 | `--bench` | Scripted timing run: skips the menu, sweeps the camera 360°, prints a summary and exits. Ignores the config files. See §7. |
 
@@ -111,7 +112,7 @@ each with defaults and comments; delete one to reset it. All are a flat
 `[sections]`.
 
 **`graphics.toml`** — saved when you change a setting in the menu or with the
-F1 / F2 bindings. Only that key's value is rewritten; comments, other lines and
+F1 / F2 / F3 bindings. Only that key's value is rewritten; comments, other lines and
 hand edits made while the game runs are kept. (It was `settings.toml` before
 controls got their own file; an old one is renamed on first run.)
 
@@ -122,6 +123,7 @@ controls got their own file; an old one is renamed on first run.)
 | `shadows` | `"high"`, `"medium"`, `"low"`, `"off"` | `"high"` |
 | `msaa` | `1`, `2`, `4`, `8` (clamped to the device) | `1` |
 | `fxaa` | `true`, `false` | `false` |
+| `taa` | `true`, `false` (temporal AA: smooths edges, foliage and shimmer, slightly softens textures) | `true` |
 | `bloom` | `true`, `false` | `true` |
 | `auto_exposure` | `true`, `false` | `true` |
 | `ambient_occlusion` | `true`, `false` (GTAO: contact shadows in corners and under objects) | `true` |
@@ -132,7 +134,7 @@ something in OPTIONS > CONTROLS or OPTIONS > GAMEPLAY (same in-place editing as
 
 - `action = ["Key", ...]`: one or more keys, or `[]` to unbind. Actions:
   `forward`, `back`, `left`, `right`, `jump` (also fly up in noclip), `down`,
-  `noclip`, `exposure_down`, `exposure_up`, `cycle_shadows`, `toggle_fxaa`,
+  `noclip`, `exposure_down`, `exposure_up`, `cycle_shadows`, `toggle_fxaa`, `toggle_taa`,
   `toggle_fullscreen`. A file from before an action existed still gets its
   default key.
   Defaults are in the Controls table below.
@@ -184,6 +186,7 @@ Defaults, rebindable in OPTIONS > CONTROLS or `config/controls.toml` (Esc isn't)
 | `[` / `]` | exposure down / up (compensation, with auto-exposure on) |
 | F1 | cycle shadow quality: OFF → LOW (4×512) → MEDIUM (4×1024) → HIGH (4×2048) |
 | F2 | FXAA on/off |
+| F3 | TAA on/off |
 | F11 | windowed / fullscreen |
 | Esc | pause |
 
@@ -194,7 +197,7 @@ screen, and resumes play only from the pause menu's top level.
 - **Pause menu:** CONTINUE / OPTIONS / MAIN MENU / EXIT
 - **OPTIONS:** GRAPHICS / CONTROLS / SOUND / GAMEPLAY / BACK.
 - **OPTIONS > GRAPHICS:** DISPLAY (windowed / fullscreen), shadows, FXAA,
-  BLOOM and AUTO EXPOSURE are live; MSAA can change only from
+  TAA, BLOOM and AUTO EXPOSURE are live; MSAA can change only from
   the main menu, because the mesh and sky pipelines bake the sample count
   (in-game it reads `MENU ONLY`).
 - **OPTIONS > CONTROLS:** one row per action with its keys (`JUMP  SPACE`).
@@ -230,7 +233,7 @@ Every clip is normalised to its event's level, so recorded and synthesised
 sounds play equally loud. With no audio device the game logs
 `[audio] unavailable` and runs silent.
 
-Defaults: shadows HIGH, FXAA off, bloom on, auto-exposure on, MSAA 1×.
+Defaults: shadows HIGH, FXAA off, TAA on, bloom on, auto-exposure on, MSAA 1×.
 
 ---
 
@@ -488,6 +491,19 @@ corrugation grooves and rust flakes, and seams on the barrels and the
 compressor, with no black blotches. It stays with GTAO off, which only removes
 the contact shadowing.
 
+**What to look for** when judging TAA (OPTIONS > GRAPHICS > TAA, or F3,
+live):
+- Edges, fence wire, pole crossarms and the sun disk: smooth, and steady as
+  you turn slowly. Leaves and grass should shimmer much less than with it
+  off.
+- Textures read a little softer than without it (it averages samples across
+  each pixel); a sharpen isn't built yet.
+- No trails behind trunks, poles or the fence as you strafe past them, and
+  none when you stop. The orb demo's moving orbs do trail a little: only the
+  camera's motion is followed.
+- Nothing lags or smears after a resize or a level load (the history
+  restarts).
+
 **What to look for** when judging GTAO (OPTIONS > GRAPHICS > AMBIENT
 OCCLUSION, live):
 - A soft darkening along wall-floor and wall-ceiling creases, in the corners
@@ -668,6 +684,7 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | Controls | app | key names round-trip; reserved menu keys are refused; a key on two actions warns; two keys on one action hold until both are released; toggles ignore auto-repeat but exposure repeats; a rebound jump moves; `toggle_fullscreen` defaults to F11 (also in files that predate it) and ignores auto-repeat; `rebind` steals the key and refuses menu/unnamed keys; sensitivity presets step and wrap; saved literals parse back, and saving every binding into the template keeps its comments; every key's menu label is drawable |
 | Texture slots | render | one slot per unique image × colour space; sRGB and UNORM uses of the same pixels stay separate; overflow past the capacity is counted and falls back to the defaults |
 | Light clusters | render | GLSL grid constants + `MAX_LIGHTS` match the Rust ones |
+| TAA | render, app | a Rust reference of `taa.comp`: the Halton jitter covers the pixel evenly; jittering moves the image by exactly its offset and keeps depth; the reprojection finds last frame's pixel; the colour transforms round-trip; Catmull-Rom is exact at texel centres and along rows; the clip keeps the inside and pulls in the outside; a still edge converges to its coverage (control: no jitter, hard edge); a pan keeps its image (control: an unfollowed history smears); the shader declares the reference's constants and formulas; the GRAPHICS row, `taa` key, `--no-taa` and F3 |
 
 ### What tests cannot cover
 
@@ -693,8 +710,8 @@ Everything goes to stderr.
 | `[gfx] device: …` | the GPU picked at startup. Check it: machines with an iGPU + dGPU list both |
 | `[gfx] MSAA: …` | requested vs actual sample count |
 | `[vulkan] …` | validation messages (debug builds), or the "layer not found" warning |
-| `[gpu] shadow … cluster … geo … ao … bloom … expo … post … frame …` | smoothed per-pass GPU ms, about once a second |
-| `[quality] shadows / fxaa / bloom / auto exposure: …` | a setting changed |
+| `[gpu] shadow … cluster … geo … ao … taa … bloom … expo … post … frame …` | smoothed per-pass GPU ms, about once a second |
+| `[quality] shadows / fxaa / taa / bloom / auto exposure: …` | a setting changed |
 | `[config] …` | a config file created / loaded / renamed, a line ignored or a key bound twice, plus the effective graphics settings at startup |
 | `[light] N visible lights exceeds MAX_LIGHTS` | lights past 128 were dropped this frame |
 | `[audio] started …; sounds: R recorded, S synthesised` / `… not found (…fetch_assets.py…)` / `footstep_grass_000.ogg: …; grass steps use the concrete ones (…)` / `unavailable: …` / `N lamps humming` | the mixer came up (or why not; the game then runs silent), which surfaces lack their own steps, and how many lamps a session gave a hum. With the whole pack: 35 recorded, 0 synthesised |
@@ -740,11 +757,15 @@ Bloom and auto-exposure are on by default, so a bench's `frame` includes
 them (~0.10 and ~0.06 ms with pinned clocks). So is sky occlusion when the
 scene's volume is baked (`geo` +0.04 ms on the zone, +0.06 on `lights120`),
 and so is GTAO (its own `ao` line, 0.12 ms on the zone; its upsample runs in
-the main pass, inside `geo`). `geo` also times the
+the main pass, inside `geo`), and TAA (its own `taa` line; on by default in
+`--bench` too, so it's in every frame from its commit on). TAA reads a lot of
+memory, and unpinned the memory clock wanders (96 to 1218 MHz within one run
+here): its median held at 0.12–0.14 ms while its mean doubled, so time it
+pinned. `geo` also times the
 depth prepass, which now runs on its own before GTAO. Pinned clocks run below
 boost, so these read higher than unpinned numbers. Compare pinned only with
 pinned; debug and release measure the same. To compare with numbers from before they existed, add
-`--no-bloom --no-auto-exposure --no-sky-occlusion --no-ao`. The zone gained trees
+`--no-bloom --no-auto-exposure --no-sky-occlusion --no-ao --no-taa`. The zone gained trees
 and bushes after most of ARCHITECTURE.md's zone figures were taken (frame 0.72 →
 1.10 ms pinned, 1.01 once far foliage shadows took coarser LODs). Regenerating an older zone isn't possible from this script, so
 compare only zones generated by the same version.

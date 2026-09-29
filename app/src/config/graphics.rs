@@ -26,6 +26,7 @@ pub enum Key {
     Shadows,
     Msaa,
     Fxaa,
+    Taa,
     Bloom,
     AutoExposure,
     AmbientOcclusion,
@@ -39,6 +40,7 @@ impl Key {
             Self::Shadows => "shadows",
             Self::Msaa => "msaa",
             Self::Fxaa => "fxaa",
+            Self::Taa => "taa",
             Self::Bloom => "bloom",
             Self::AutoExposure => "auto_exposure",
             Self::AmbientOcclusion => "ambient_occlusion",
@@ -53,6 +55,7 @@ impl Key {
             Self::Shadows => format!("\"{}\"", s.shadows.config_name()),
             Self::Msaa => s.msaa.to_string(),
             Self::Fxaa => s.fxaa.to_string(),
+            Self::Taa => s.taa.to_string(),
             Self::Bloom => s.bloom.to_string(),
             Self::AutoExposure => s.auto_exposure.to_string(),
             Self::AmbientOcclusion => s.ambient_occlusion.to_string(),
@@ -88,6 +91,10 @@ msaa = {}
 # FXAA post-process anti-aliasing: true or false. F2 toggles it in game.
 fxaa = {}
 
+# TAA, temporal anti-aliasing: smooths edges, foliage and shimmer by
+# blending each frame into the last few. true or false. F3 toggles it in game.
+taa = {}
+
 # Bloom: bright light glows softly into its surroundings. true or false.
 bloom = {}
 
@@ -104,6 +111,7 @@ ambient_occlusion = {}
         Key::Shadows.value(&d),
         Key::Msaa.value(&d),
         Key::Fxaa.value(&d),
+        Key::Taa.value(&d),
         Key::Bloom.value(&d),
         Key::AutoExposure.value(&d),
         Key::AmbientOcclusion.value(&d),
@@ -160,6 +168,11 @@ pub fn parse(text: &str, s: &mut GraphicsSettings) -> Vec<String> {
                 "true" => s.ambient_occlusion = true,
                 "false" => s.ambient_occlusion = false,
                 _ => warn(format!("ambient_occlusion must be true or false, got {v}")),
+            },
+            "taa" => match v {
+                "true" => s.taa = true,
+                "false" => s.taa = false,
+                _ => warn(format!("taa must be true or false, got {v}")),
             },
             _ => warn(format!("unknown key `{k}`")),
         }
@@ -262,6 +275,7 @@ mod tests {
                 s.shadows,
                 s.msaa,
                 s.fxaa,
+                s.taa,
                 s.bloom,
                 s.auto_exposure,
                 s.ambient_occlusion,
@@ -281,10 +295,10 @@ mod tests {
     #[test]
     fn values_apply() {
         let (s, w) =
-            parsed("shadows = \"low\"  # cheap\nmsaa = 4\n  fxaa=true\ndisplay = \"fullscreen\"\nbloom = false\nauto_exposure = false\nambient_occlusion = false\n");
+            parsed("shadows = \"low\"  # cheap\nmsaa = 4\n  fxaa=true\ndisplay = \"fullscreen\"\nbloom = false\nauto_exposure = false\nambient_occlusion = false\ntaa = false\n");
         assert!(w.is_empty(), "{w:?}");
         assert_eq!((s.shadows, s.msaa, s.fxaa), (ShadowQuality::Low, 4, true));
-        assert!(!s.bloom && !s.auto_exposure && !s.ambient_occlusion);
+        assert!(!s.bloom && !s.auto_exposure && !s.ambient_occlusion && !s.taa);
         assert_eq!(s.display, DisplayMode::Fullscreen);
         let (s, w) = parsed("fov = 30\n");
         assert!(w.is_empty(), "{w:?}");
@@ -303,6 +317,7 @@ mod tests {
             "bloom = 1",
             "auto_exposure = yes",
             "ambient_occlusion = on",
+            "taa = 1",
             "shadows = \"ultra\"",
             "shadows = low",
             "display = \"borderless\"",
