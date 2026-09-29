@@ -30,6 +30,7 @@ layout(set = 0, binding = 4) uniform Globals {
     // render::Atmosphere. mesh.frag and sky.frag declare this block text for
     // text (a test checks).
     vec4 sun_radiance;   // rgb = the directional light's colour × intensity
+    vec4 sun_dir;        // xyz = towards the sun, whose glow the sky shows
     vec4 sky_zenith;     // rgb, w = the sky's intensity
     vec4 sky_horizon;    // rgb, w = the sun's glow
     vec4 sky_ground;     // rgb, w = the sun's disk
@@ -41,6 +42,7 @@ layout(set = 0, binding = 4) uniform Globals {
 // The atmosphere's parts, by the names sky() and the fog functions use; both
 // shaders define the same (a test checks).
 #define SUN_RADIANCE g.sun_radiance.rgb
+#define SUN_DIR g.sun_dir.xyz
 #define SKY_ZENITH g.sky_zenith.rgb
 #define SKY_INTENSITY g.sky_zenith.w
 #define SKY_HORIZON g.sky_horizon.rgb
@@ -59,7 +61,9 @@ layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_color; // linear HDR
 
 vec3 sky(vec3 d) {
-    vec3 sundir = normalize(-pc.light_dir.xyz);
+    // The sun's glow, even with the moon as the light (§13's weather): it
+    // lingers on the horizon after sunset.
+    vec3 sundir = SUN_DIR;
     float up = clamp(d.y, 0.0, 1.0);
     float down = clamp(-d.y, 0.0, 1.0);
     vec3 col = mix(SKY_HORIZON, SKY_ZENITH, pow(up, 0.5));
@@ -101,7 +105,7 @@ float fog_optical_depth(vec3 eye, vec3 dir, float dist) {
 vec3 fog_color(vec3 dir) {
     vec3 col = FOG_SKY > 0.5 ? sky(dir) : FOG_COLOR;
     if (FOG_SUN > 0.0) {
-        float s = max(dot(dir, normalize(-pc.light_dir.xyz)), 0.0);
+        float s = max(dot(dir, SUN_DIR), 0.0);
         col += SUN_COLOR * FOG_SUN * pow(s, 8.0);
     }
     return col;

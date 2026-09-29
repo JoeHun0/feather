@@ -1364,7 +1364,8 @@ starts from the level's.
     away.
   - `MeshRenderer::set_fog` and `SkyPass::draw` take it from the app, which
     starts from the level's `Environment`.
-- **TIME OF DAY moves the sun only:** DAWN, MORNING, NOON, AFTERNOON and DUSK
+- **TIME OF DAY moved the sun only** (since replaced by the weather
+  engine's clock, below): DAWN, MORNING, NOON, AFTERNOON and DUSK
   are elevations and azimuths, put through `sun_travel`. Shadows, the sun's
   light and its glow follow, but the sky keeps the level's colours, so the
   row reads `SUN ONLY`.
@@ -1391,9 +1392,11 @@ starts from the level's.
 
 **Landed (§26): the whole atmosphere per frame.** The weather engine's
 groundwork. Nothing about a level's look is baked into a pipeline any more.
-- **`render::Atmosphere`** (seven vec4s, 112 B) is the tail of mesh.frag's
+- **`render::Atmosphere`** (eight vec4s, 128 B) is the tail of mesh.frag's
   globals UBO:
   - the directional light's radiance;
+  - the direction towards the sun, for the sky's glow (added with the
+    weather engine, below: the light may be the moon);
   - the sky's zenith, horizon and ground colours, whose `w` carry the sky's
     intensity, the sun's glow and its disk;
   - the glow's tint (`w`: the fog's sun glow);
@@ -1435,6 +1438,119 @@ groundwork. Nothing about a level's look is baked into a pipeline any more.
     became uniform loads at no measurable cost.
 - **Validation with sync:** 0 at 1× and at MSAA 8× on the zone and
   `lights120` (after §8's filter).
+
+**Landed (§26): the weather engine (groundwork).** The weather and the time
+of day, built as X-Ray builds them. `app/src/weather.rs` is plain data and
+maths, testable without a GPU. Each frame `SessionWeather::frame` turns the
+level's `Environment`, the clock and the chosen weather into that frame's
+`Environment` and light direction.
+- **The clock:**
+  - Hours of local solar time, advanced by the fixed steps that ran, so it
+    stops while paused. It stands still in `--bench`, which must repeat.
+  - Its speed is game seconds per real second: 10 by default, like X-Ray's.
+- **The sun's path** (`SolarPath`):
+  - Cooper's declination and the hour angle, from the level's `latitude`
+    (default 51.3° N) and `day_of_year` (default 120);
+  - on the default, sunrise is at 04:44 and sunset at 19:16, with the sun
+    53.3° up at noon, due south;
+  - east is +X and north −Z, as `sun_azimuth` has them.
+- **The light: the sun by day, a full moon opposite it by night.**
+  - Whichever body is above the horizon is the directional light, so the
+    moon casts shadows through the same cascades.
+  - Each fades in over its first 3°, so the switch happens while the light
+    is ~0 and its shadows can't be seen to jump. A test steps through
+    sunrise and sunset a second at a time.
+  - **Why `Atmosphere` gained `sun_dir`:** the sky's glow (in `sky()`,
+    reflections and the fog's sun glow) follows the *sun* even while the
+    moon lights the scene, so twilight glows over the western horizon, not
+    round the moon. The disk is drawn at the light, so by night it's the
+    moon's.
+- **Weathers are hourly keyframes** (`Weather`, `Key`): the whole
+  atmosphere, and each key carries both the sunlight and the moonlight.
+  - Keys are authored against a **reference day,** an equinox (sunrise 6,
+    sunset 18). The clock is warped onto it piecewise-linearly through
+    midnight, sunrise, noon and sunset (`reference_hour`), so an authored
+    dawn lands on the real one in any season.
+  - Sampling wraps round midnight.
+  - Radiometric values (colours, intensities, fog density, the exposure
+    range) blend in log space, since they span decades between night and
+    day. Shapes (glow, disk, falloff) blend linearly.
+  - The fog's height and the exposure compensation stay the level's.
+- **Three weathers, as Rust tables:**
+  - **CLEAR:** the old default palette at noon. Its dawn and dusk sun colours
+    are seeded from a Rayleigh + Mie + ozone transmittance by air mass.
+  - **OVERCAST:** its 15:00 key is the zone's own `environment`, which a test
+    reads from `gen_zonescene.py`.
+  - **FOGGY:** a white morning mist that thins through the afternoon.
+
+  The night keys widen auto-exposure's range (to 16) and the twilight keys
+  cap it at 4, so twilight stays dusky instead of being metered up to day.
+  All of it is a starting point for tuning by eye.
+- **Transitions:**
+  - Picking a weather blends from what was on screen to the new weather's
+    keys over 30 game minutes, with a smoothstep. It runs at no less than
+    10× even with the clock PAUSED.
+  - A pick mid-way starts from the current blend, so no frame jumps.
+  - To and from LEVEL (the level's own palette, which isn't a weather's) is
+    instant.
+- **LEVEL is the level's own look, exactly,** while there's no clock. A
+  level without `weather`/`time` keeps its `sun_dir` fixed, so benches and
+  old levels look and measure as before. Once the clock runs under LEVEL,
+  it moves the sun only (`SUN ONLY`): the sun sets, and there's no moon.
+- **Where it starts:**
+  - The `environment` marker's `weather`, `time`, `time_speed`, `latitude`
+    and `day_of_year`.
+  - A weather without a `time` starts where the sun stands nearest the
+    level's own (`hour_nearest`).
+  - The zone keeps LEVEL for now.
+- **OPTIONS > WEATHER** (still temporary, session only):
+  - WEATHER (LEVEL/CLEAR/OVERCAST/FOGGY, `ARRIVING` while it blends);
+  - TIME (+1 h a press, `HH MM`);
+  - SPEED (PAUSED/1X/10X/60X/600X);
+  - FOG DENSITY and FOG HEIGHT, now overrides on top of the weather.
+- **Tests** (each shown to fail against a mutation):
+  - the solar path: noon elevation and bearing, morning east, the equinox at
+    6 and 18, sunrise on the horizon, polar days;
+  - the warp;
+  - log-space blending and exact ends;
+  - sampling at, between and across keys;
+  - the tables are well formed, and OVERCAST at 15:00 is the zone's;
+  - the light switch is continuous;
+  - the clock's speed and wrap;
+  - LEVEL exactly;
+  - a weather's frame: key, fog height, sun and moon;
+  - transitions start from the screen and stay continuous through a re-pick;
+  - the menu rows, the SPEED presets, and the marker's keys and bad values.
+- **The look,** from HDR dumps (temporary harness, auto-exposure on, the
+  zone's yard at ten hours in each weather, sheets sent for review):
+  - LEVEL against the previous commit: bit-identical, but for the lanterns'
+    sway.
+  - Dawn and dusk warm, the sun sets in the west, and nights are moonlit and
+    dark (metered at the cap of 16).
+  - The first seeds let twilight meter up to ×8–12 and blew the moon's disk
+    up into a floodlight. The twilight cap and a faint night disk (0.15)
+    came from that.
+- **Cost** (pinned, 3 interleaved rounds against the previous commit, at
+  LEVEL):
+  - zone `geo` 0.44 → 0.43–0.44 ms, frame 1.20 in both;
+  - `lights120` `geo` 0.94 → 0.91–0.92, frame 1.59 → 1.57.
+  - I predicted no change; `lights120` came out faster, and I wouldn't bank
+    it. `mesh.frag` lost 2 of 1917 instructions (`sky()` no longer
+    normalizes the light) with the same 72 VGPRs and 20 waves, too little
+    to explain 3%: §13's register-allocation noise.
+- **Validation with sync:** 0 at 1× and MSAA 8× on the zone and
+  `lights120`, and with a weather forced on (CLEAR at midnight under the
+  moon, OVERCAST at 05:00).
+- **Limits:**
+  - The moon is full and has no phase or path of its own. Its disk is the
+    sun's shape, only fainter, so it still reads as a soft glow 2° wide.
+  - No stars, clouds or rain; no random weather schedule.
+  - **The fog's in-scatter ignores occlusion,** so a dark interior metered up
+    (the hangar at noon: ×3.3 under LEVEL, ×8 under CLEAR) shows the fog as
+    a bright haze. That's pre-existing: the zone's own look does it (the
+    same hangar dump, LEVEL against OVERCAST 15:00, 0.17 against 0.18 mean
+    luminance). Scaling the fog colour by the sky visibility would fix it.
+  - Keys are only as good as their authoring: none has been tuned by eye.
 
 **Landed (§26): height fog.** Fog was uniform (`1 − e^{−density·dist}`,
 towards the sky's colour), only on geometry, so the horizon stayed crisp and
@@ -3255,7 +3371,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   BRDF LUT) is the follow-up. Sun shadows (§11 CSM) and punctual point lights
   (§12) now exist. Bloom, auto-exposure and TAA landed (§13). The whole
   atmosphere (sky palette, sun colour, fog) travels per frame in the globals
-  UBO the sky pass shares (§13); OPTIONS > WEATHER sets the fog live. The ambient is
+  UBO the sky pass shares (§13), and a weather engine drives it: a clock, the
+  sun's real path with a moon by night, hourly keyframed weathers and
+  transitions (OPTIONS > WEATHER, a level's `environment`). The ambient is
   occluded by a baked per-level sky-visibility volume (§13, §17) and by the
   lower of half-resolution GTAO and the material's own AO (glTF
   `occlusionTexture`, §13). The tonemap curve is a drop-in point for AgX.
@@ -3339,7 +3457,7 @@ layers pending; ropes, §15, are their own Verlet solver);
 skinning; UI/HUD (§19's lightweight quad/text renderer + the Esc pause menu
 landed, with keyboard *and* mouse navigation, an OPTIONS screen tree, and live
 display-mode/shadow-quality/FXAA/TAA controls under GRAPHICS, and in game a temporary
-WEATHER screen (fog density and height, a sun-only time of day; session only, §13) — MSAA is changeable
+WEATHER screen (weather, time, clock speed, fog density and height; session only, §13's weather engine) — MSAA is changeable
 there only from the main menu, since the session's mesh and sky pipelines bake
 the sample count; all of them, plus the GAMEPLAY field of view, persist in
 `config/graphics.toml` (§13), and key bindings + mouse look live in

@@ -197,13 +197,19 @@ screen, and resumes play only from the pause menu's top level.
 - **Pause menu:** CONTINUE / OPTIONS / MAIN MENU / EXIT
 - **OPTIONS:** GRAPHICS / CONTROLS / SOUND / GAMEPLAY / BACK, and in game
   WEATHER.
-- **OPTIONS > WEATHER** (in game only, a stand-in for the weather engine):
-  FOG DENSITY (LEVEL, OFF, THIN, LIGHT, MEDIUM, THICK, HEAVY), FOG HEIGHT
-  (LEVEL, EVEN, TALL, MEDIUM, LOW, GROUND: how fast it thins upwards, EVEN
-  the same at every height) and TIME OF DAY (LEVEL, DAWN, MORNING, NOON,
-  AFTERNOON, DUSK; `SUN ONLY`: it moves the sun and its shadows, but the sky
-  keeps the level's colours). LEVEL is the level's own. All live, never
-  saved; a new game starts from the level's.
+- **OPTIONS > WEATHER** (in game only; the weather engine's temporary
+  controls, ARCHITECTURE §13). All rows are live and never saved; a new game
+  starts from the level's.
+  - WEATHER: LEVEL, CLEAR, OVERCAST, FOGGY. LEVEL is the level's own look.
+    Between two weathers the change takes 30 game minutes (`ARRIVING` while
+    it blends); to and from LEVEL it's at once.
+  - TIME: +1 h a press, as `HH MM` in local solar time. `LEVEL` means the
+    level's own fixed sun. Under LEVEL a clock moves the sun only
+    (`SUN ONLY`).
+  - SPEED: PAUSED, 1X, 10X, 60X, 600X (game seconds per real second).
+  - FOG DENSITY (WEATHER, OFF, THIN, LIGHT, MEDIUM, THICK, HEAVY) and FOG
+    HEIGHT (WEATHER, EVEN, TALL, MEDIUM, LOW, GROUND: how fast it thins
+    upwards, EVEN the same at every height) override the weather's.
 - **OPTIONS > GRAPHICS:** DISPLAY (windowed / fullscreen), shadows, FXAA,
   TAA, BLOOM and AUTO EXPOSURE are live; MSAA can change only from
   the main menu, because the mesh and sky pipelines bake the sample count
@@ -306,7 +312,7 @@ if absent. A node's `extras` can name a prefab:
 |---|---|---|
 | `player_start` | `yaw` degrees (keep the default look direction) | where NEW GAME spawns the player; first one wins |
 | `prop` | `collide` (true), `shadow` (true), `collider` (`auto`) | a mesh with optional collider / shadow casting. `collider`: `auto` (exact mesh up to 2048 triangles; above that, the finest baked LOD under 2048 triangles within 5 cm, else a convex hull), `mesh` (always the full mesh), `hull`, `box`, `none`. Bake a scene so its detailed props get LOD collision instead of hulls, which fill every hollow |
-| `environment` | `sun_elevation` 63° and `sun_azimuth` 127° (degrees above the horizon, and clockwise from north, -Z, seen from above), `sun_color` [1,1,1], `sun_intensity` 8, `sky_zenith` [0.10,0.22,0.55], `sky_horizon` [0.55,0.65,0.85], `sky_ground` [0.17,0.18,0.19], `sky_sun_color` [1,0.95,0.85] (the tint of the sun's glow and disk), `sky_intensity` 1 (also the ambient light), `sun_glow` 0.6, `sun_disk` 60 (0 hides the sun), `fog_density` 0.010 per metre (at `fog_height` 0; OPTIONS > WEATHER can override it and `fog_falloff` in game), `fog_falloff` 0 (per metre; above 0 the fog thins with height, by e every 1/falloff metres, and the sky background fogs through it too), `fog_color` (unset: the sky's colour), `fog_sun` 0 (a glow towards the sun in the fog), `exposure` 1 (with auto-exposure on, compensation: a multiplier on the metered exposure; off, the fixed exposure), `exposure_min` 0.125 and `exposure_max` 8 (the range auto-exposure may choose from), `wind_speed` 2 m/s and `wind_azimuth` 90° (the direction it blows towards, clockwise from north like the sun's; ropes sway in it) | the level's atmosphere, on a bare marker; first one wins. Colours are linear. Left-out params keep the default look; unknown or unreadable ones print `[scene] environment: can't use param …` and are ignored |
+| `environment` | `sun_elevation` 63° and `sun_azimuth` 127° (degrees above the horizon, and clockwise from north, -Z, seen from above), `sun_color` [1,1,1], `sun_intensity` 8, `sky_zenith` [0.10,0.22,0.55], `sky_horizon` [0.55,0.65,0.85], `sky_ground` [0.17,0.18,0.19], `sky_sun_color` [1,0.95,0.85] (the tint of the sun's glow and disk), `sky_intensity` 1 (also the ambient light), `sun_glow` 0.6, `sun_disk` 60 (0 hides the sun), `fog_density` 0.010 per metre (at `fog_height` 0; OPTIONS > WEATHER can override it and `fog_falloff` in game), `fog_falloff` 0 (per metre; above 0 the fog thins with height, by e every 1/falloff metres, and the sky background fogs through it too), `fog_color` (unset: the sky's colour), `fog_sun` 0 (a glow towards the sun in the fog), `exposure` 1 (with auto-exposure on, compensation: a multiplier on the metered exposure; off, the fixed exposure), `exposure_min` 0.125 and `exposure_max` 8 (the range auto-exposure may choose from), `wind_speed` 2 m/s and `wind_azimuth` 90° (the direction it blows towards, clockwise from north like the sun's; ropes sway in it), `weather` `level` (or `clear`, `overcast`, `foggy`: a new game's weather, any case), `time` unset (the hour a new game starts at, 0–24 local solar time; unset, LEVEL keeps the level's own fixed sun and a weather starts where the sun is nearest it), `time_speed` 10 (game seconds per real second), `latitude` 51.3 and `day_of_year` 120 (the sun's path: sunrise 04:44, sunset 19:16) | the level's atmosphere, on a bare marker; first one wins. Colours are linear. Left-out params keep the default look; unknown or unreadable ones print `[scene] environment: can't use param …` and are ignored |
 | `hanging` | `length` 1.5 m, `segments` 12, `radius` 0.008 m, `wind` 1 (how strongly it feels the level's wind), `shadow` (true), `light` (none: an object of `point_light`'s params, same defaults, plus `at` [0,0,0], the light's position in the item's own space) | something on a rope (§15 in ARCHITECTURE.md): the node is the item at rest, hung by its mesh's origin, and the rope is tied `length` straight above it. It sways in the level's wind; neither rope nor item collides. Bad or unknown params print `[scene] hanging: can't use param …` |
 | `point_light` | `color` [1,1,1], `intensity` 12, `radius` 10, `source_radius` 0.1 | on a bare marker or on geometry (a lamp that also renders). `source_radius` is the emitter's physical size, clamped to [0, radius]: it sets the size of the highlight on shiny surfaces. Match it to the lamp's geometry; 0 is a true point, which makes a pinprick-bright highlight on smooth metal |
 
@@ -502,11 +508,33 @@ corrugation grooves and rust flakes, and seams on the barrels and the
 compressor, with no black blotches. It stays with GTAO off, which only removes
 the contact shadowing.
 
-**What to look for** in OPTIONS > WEATHER (in game): each row changes the
-view at once. OFF clears the air, HEAVY buries the hangar, GROUND keeps the
-haze low with the walls clear above it, and the TIME OF DAY sun swings the
-shadows round (DAWN long and westwards). The sky's colour doesn't follow the
-sun yet. A new game starts from the level's own.
+**What to look for** in OPTIONS > WEATHER (in game).
+
+The fog rows change the view at once:
+- OFF clears the air;
+- HEAVY buries the hangar;
+- GROUND keeps the haze low, with the walls clear above it.
+
+For the weather engine, pick CLEAR and set SPEED to 600X: a day passes in
+2.4 minutes.
+- **Dawn** (about 04:45 on the default day) warms from the east.
+- **Noon** is the old default look.
+- **Dusk** sets in the west, with an orange glow that lingers over the
+  horizon after sunset. It follows the sun, not the moon.
+- **Night:** moonlit and dark. The moon's shadows come from the side
+  opposite the sun, the lanterns carry the hangar, and the moon's disk is a
+  faint soft glow.
+- **Two points to judge:**
+  - where the light switches (sunrise and sunset), nothing should jump;
+  - between two weathers, OVERCAST should arrive over 30 game minutes with
+    no pop.
+
+Known gaps:
+- a bright interior haze by day (the fog ignores occlusion, as it always
+  has);
+- no stars or clouds.
+
+All the keys are first seeds, to be tuned by eye.
 
 **What to look for** in the hangar's lanterns (the zone; one hangs near
 the door, visible from outside):
@@ -700,7 +728,8 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
 | Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs; `environment`: no marker and an empty one keep the default look, every param lands, left-out params keep defaults and bad ones are reported, the sun's elevation/azimuth convention, and (end-to-end) a level's marker reaches `build_world`; the orb demo's obstacle boxes stand in the demo but not in a loaded level (end-to-end) |
 | Materials | assets, render | glTF `alphaMode`/`alphaCutoff`/`doubleSided` load as `AlphaMode::Mask`(cutoff, default 0.5)/`Blend`/`Opaque` and the flag; the GPU record carries the cutoff only for MASK and the double-sided bit, which matches `mesh.frag`'s; glTF `occlusionTexture` and its strength load (an ARM map shares MR's image, one conversion), and the GPU record packs its slot above the flags (MR's own slot for an ARM map, 0 for none) with the strength in `params.z`, at the shift `mesh.frag` declares; `mesh.frag`'s occlusion follows glTF's strength rule and combines with GTAO by `min`; masked instances' runs follow every opaque one (one pipeline switch a pass), with the same instances and triangles, and a scene without masked materials builds the runs it always did; `mesh.frag` never discards or demotes (masked materials rely on its early-Z, testing depth for EQUAL against the prepass's cut) |
-| Environment | render | nothing is baked (no specialization constant in either compiled shader); `Environment::default()`'s atmosphere is the old defaults slot by slot, and every field reaches it; mesh.frag's `Globals` block is the Rust struct's size with `Atmosphere` at its tail, and sky.frag declares it and the `#define`s over it text for text; height fog's closed form equals numeric integration of its density (rays up, down and level), uniform fog is exactly `density·dist`, the sky's infinite-ray limit; `sky()` and the fog functions are textually identical in both shaders; sky.frag's push block is the 96 bytes the pass pushes; the WEATHER screen's presets, `effective_fog`/`effective_sun`, and that it's in game only |
+| Environment | render | nothing is baked (no specialization constant in either compiled shader); `Environment::default()`'s atmosphere is the old defaults slot by slot, and every field reaches it; mesh.frag's `Globals` block is the Rust struct's size with `Atmosphere` at its tail, and sky.frag declares it and the `#define`s over it text for text; height fog's closed form equals numeric integration of its density (rays up, down and level), uniform fog is exactly `density·dist`, the sky's infinite-ray limit; `sky()` and the fog functions are textually identical in both shaders; sky.frag's push block is the 96 bytes the pass pushes |
+| Weather | app | the sun's path (noon elevation and bearing, morning east, an equinox rising at 6 and setting at 18, sunrise on the horizon, polar days, a level's sun found again); the reference-day warp; log-space key blending with exact ends; sampling at, between and across keys; every weather's keys sorted and usable, OVERCAST's 15:00 key the zone's `environment` (read from `gen_zonescene.py`); the sun/moon switch continuous through sunrise and sunset; the clock's speed and wrap; LEVEL exactly the level's look; a weather's frame (key, fog height, sun and moon); transitions start from the screen and stay continuous through a re-pick; SPEED presets; the WEATHER rows cycle and wrap, and it's in game only; the marker's `weather`/`time`/`time_speed`/`latitude`/`day_of_year` and their bad values |
 | Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one texture, which isn't decoded until asked and then matches the old RGB→RGBA expansion; a material's `extras.surface` is read (a non-string one warns and is dropped) |
 | Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |
 | Texture bake | assets, bake | keys separate content and kind (sRGB colour vs data), and are computed from the encoded bytes without decoding; BC7 level sizes round partial blocks up; baked files round-trip and reject truncation, wrong sizes or an unknown kind; sRGB mips average *light* (black/white → 188, not 128); chains end at 1×1; every baked level has exactly the blocks Vulkan copies |

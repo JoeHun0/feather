@@ -88,6 +88,9 @@ impl Default for Environment {
 pub struct Atmosphere {
     /// rgb = the directional light's colour × intensity.
     pub sun_radiance: [f32; 4],
+    /// xyz = the unit direction towards the sun, whose glow the sky shows.
+    /// The directional light may be the moon (§13's weather).
+    pub sun_dir: [f32; 4],
     /// rgb, w = the sky's intensity.
     pub sky_zenith: [f32; 4],
     /// rgb, w = the sun's glow.
@@ -103,12 +106,15 @@ pub struct Atmosphere {
 }
 
 impl Environment {
-    /// What the shaders read of this environment, each frame. The sun's
-    /// direction and the exposure travel separately.
+    /// What the shaders read of this environment, each frame. The exposure
+    /// travels separately, as does the directional light's direction: the
+    /// sun's by day, but the moon's at night, while the sky still glows
+    /// towards the sun (`sun_dir`).
     pub fn atmosphere(&self) -> Atmosphere {
         let v = |c: Vec3, w: f32| c.extend(w).to_array();
         Atmosphere {
             sun_radiance: v(self.sun_color * self.sun_intensity, 0.0),
+            sun_dir: v(-self.sun_dir, 0.0),
             sky_zenith: v(self.sky_zenith, self.sky_intensity),
             sky_horizon: v(self.sky_horizon, self.sun_glow),
             sky_ground: v(self.sky_ground, self.sun_disk),
@@ -175,6 +181,9 @@ mod tests {
     fn the_default_atmosphere_is_the_old_look() {
         let a = Environment::default().atmosphere();
         assert_eq!(a.sun_radiance[..3], [8.0, 8.0, 8.0]);
+        // The glow's direction was `normalize(-light_dir)`, the sun's.
+        let to_sun = -Environment::default().sun_dir;
+        assert_eq!(a.sun_dir[..3], to_sun.to_array());
         assert_eq!(a.sky_zenith, [0.10, 0.22, 0.55, 1.0]); // w: intensity
         assert_eq!(a.sky_horizon, [0.55, 0.65, 0.85, 0.6]); // w: glow
         assert_eq!(a.sky_ground, [0.17, 0.18, 0.19, 60.0]); // w: disk
@@ -184,7 +193,7 @@ mod tests {
     }
 
     /// Every part of an environment the shaders use reaches them through
-    /// `atmosphere()`; the sun's direction and the exposure travel apart.
+    /// `atmosphere()`; the exposure travels apart.
     #[test]
     fn the_atmosphere_carries_every_field() {
         let base = Environment::default();
@@ -193,7 +202,8 @@ mod tests {
             change(&mut env);
             env
         };
-        let changed: [(&str, Environment); 14] = [
+        let changed: [(&str, Environment); 15] = [
+            ("sun_dir", with(|e| e.sun_dir = Vec3::NEG_Y)),
             ("sun_color", with(|e| e.sun_color = Vec3::X)),
             ("sun_intensity", with(|e| e.sun_intensity = 2.0)),
             ("sky_zenith", with(|e| e.sky_zenith = Vec3::X)),
@@ -213,7 +223,6 @@ mod tests {
             assert_ne!(env.atmosphere(), base.atmosphere(), "{field}");
         }
         let apart = Environment {
-            sun_dir: Vec3::X,
             exposure: 2.0,
             exposure_min: 1.0,
             exposure_max: 4.0,
@@ -382,6 +391,7 @@ mod tests {
             .collect();
         let atmosphere = [
             "sun_radiance",
+            "sun_dir",
             "sky_zenith",
             "sky_horizon",
             "sky_ground",
@@ -408,6 +418,7 @@ mod tests {
         assert_eq!(defines(mesh), defines(sky), "the #defines differ");
         for def in [
             "#define SUN_RADIANCE g.sun_radiance.rgb",
+            "#define SUN_DIR g.sun_dir.xyz",
             "#define SKY_ZENITH g.sky_zenith.rgb",
             "#define SKY_INTENSITY g.sky_zenith.w",
             "#define SKY_HORIZON g.sky_horizon.rgb",

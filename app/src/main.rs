@@ -30,6 +30,7 @@
 mod audio;
 mod config;
 mod rope;
+mod weather;
 
 use audio::{Audio, AudioSettings, StepTracker, Surface};
 use config::controls::{Action, Controls};
@@ -289,9 +290,9 @@ struct GraphicsSettings {
     /// Pick LODs per view (§17). `--no-lod` pins LOD0 while keeping the baked
     /// vertex order, so an A/B separates the ordering win from the LOD win.
     lod: bool,
-    /// The session's weather (§13), from OPTIONS > WEATHER: never saved, and
-    /// reset by each new game.
-    weather: WeatherOverride,
+    /// The session's weather (§13): the clock, the chosen weather and OPTIONS
+    /// > WEATHER's fog overrides. Never saved, and reset by each new game.
+    weather: weather::SessionWeather,
     /// Occlude the ambient light by the level's baked sky visibility (§13),
     /// when it has one. `--no-sky-occlusion` turns it off for A/B runs; not a
     /// menu option, since it's part of the look rather than a cost to trade.
@@ -334,7 +335,7 @@ impl Default for GraphicsSettings {
             bake: true,
             lod: true,
             sky_occlusion: true,
-            weather: WeatherOverride::default(),
+            weather: weather::SessionWeather::default(),
         }
     }
 }
@@ -404,10 +405,13 @@ enum MenuAction {
     ToggleInvertY,
     /// Next FIELD OF VIEW preset.
     CycleFov,
-    /// Next WEATHER preset: fog density, fog height, time of day.
+    /// Next WEATHER choice or preset (§13): the weather, the time (+1 h),
+    /// the clock's speed, the fog's density and height.
+    CycleWeather,
+    StepTime,
+    CycleSpeed,
     CycleFogDensity,
     CycleFogHeight,
-    CycleTimeOfDay,
     /// Next step of one SOUND volume.
     CycleVolume(config::audio::Key),
     /// Wait for a key to bind to this action.
@@ -519,24 +523,46 @@ fn screen_rows(
         .chain(in_session.then(|| MenuRow::new("WEATHER", MenuAction::Enter(MenuScreen::Weather))))
         .chain([MenuRow::new("BACK", MenuAction::Back)])
         .collect(),
-        MenuScreen::Weather => vec![
-            MenuRow::new(
-                format!("FOG DENSITY  {}", FOG_DENSITIES[s.weather.fog_density].0),
-                MenuAction::CycleFogDensity,
-            ),
-            MenuRow::new(
-                format!("FOG HEIGHT  {}", FOG_HEIGHTS[s.weather.fog_height].0),
-                MenuAction::CycleFogHeight,
-            ),
-            MenuRow::new(
-                format!(
-                    "TIME OF DAY  {}  SUN ONLY",
-                    TIMES_OF_DAY[s.weather.time_of_day].0
+        MenuScreen::Weather => {
+            let w = &s.weather;
+            // Under LEVEL a clock moves the level's sun and nothing else.
+            let sun_only = if w.choice == 0 && w.clock.is_some() {
+                "  SUN ONLY"
+            } else {
+                ""
+            };
+            vec![
+                MenuRow::new(
+                    format!(
+                        "WEATHER  {}{}",
+                        weather::choice_name(w.choice),
+                        if w.transition().is_some() {
+                            "  ARRIVING"
+                        } else {
+                            ""
+                        }
+                    ),
+                    MenuAction::CycleWeather,
                 ),
-                MenuAction::CycleTimeOfDay,
-            ),
-            MenuRow::new("BACK", MenuAction::Back),
-        ],
+                MenuRow::new(
+                    format!("TIME  {}{sun_only}", w.time_label()),
+                    MenuAction::StepTime,
+                ),
+                MenuRow::new(
+                    format!("SPEED  {}", w.speed_label()),
+                    MenuAction::CycleSpeed,
+                ),
+                MenuRow::new(
+                    format!("FOG DENSITY  {}", weather::FOG_DENSITIES[w.fog_density].0),
+                    MenuAction::CycleFogDensity,
+                ),
+                MenuRow::new(
+                    format!("FOG HEIGHT  {}", weather::FOG_HEIGHTS[w.fog_height].0),
+                    MenuAction::CycleFogHeight,
+                ),
+                MenuRow::new("BACK", MenuAction::Back),
+            ]
+        }
         MenuScreen::Graphics => vec![
             MenuRow::new(
                 format!("DISPLAY  {}", s.display.menu_label()),
@@ -819,19 +845,26 @@ impl Menu {
                 s.step_fov();
                 MenuOutcome::ApplyFov
             }
+            MenuAction::CycleWeather => {
+                s.weather.cycle_weather();
+                MenuOutcome::ApplyWeather
+            }
+            MenuAction::StepTime => {
+                s.weather.step_time();
+                MenuOutcome::ApplyWeather
+            }
+            MenuAction::CycleSpeed => {
+                s.weather.cycle_speed();
+                MenuOutcome::ApplyWeather
+            }
             MenuAction::CycleFogDensity => {
                 let w = &mut s.weather;
-                w.fog_density = (w.fog_density + 1) % FOG_DENSITIES.len();
+                w.fog_density = (w.fog_density + 1) % weather::FOG_DENSITIES.len();
                 MenuOutcome::ApplyWeather
             }
             MenuAction::CycleFogHeight => {
                 let w = &mut s.weather;
-                w.fog_height = (w.fog_height + 1) % FOG_HEIGHTS.len();
-                MenuOutcome::ApplyWeather
-            }
-            MenuAction::CycleTimeOfDay => {
-                let w = &mut s.weather;
-                w.time_of_day = (w.time_of_day + 1) % TIMES_OF_DAY.len();
+                w.fog_height = (w.fog_height + 1) % weather::FOG_HEIGHTS.len();
                 MenuOutcome::ApplyWeather
             }
             MenuAction::CycleVolume(k) => {
@@ -2520,9 +2553,14 @@ fn player_start(nodes: &[feather_assets::SceneNode]) -> (Vec3, Option<f32>) {
 }
 
 /// The parameters an `environment` marker (§13, §18) may carry.
-const ENVIRONMENT_PARAMS: [&str; 21] = [
+const ENVIRONMENT_PARAMS: [&str; 26] = [
     "wind_speed",
     "wind_azimuth",
+    "weather",
+    "time",
+    "time_speed",
+    "latitude",
+    "day_of_year",
     "sun_elevation",
     "sun_azimuth",
     "sun_color",
@@ -2574,6 +2612,50 @@ fn level_wind(nodes: &[feather_assets::SceneNode]) -> (rope::Wind, Vec<String>) 
         }
     }
     (wind, bad)
+}
+
+/// The level's weather (§13): the first `environment` marker's `weather`
+/// (a name, or `level` for the level's own look), `time` (the hour a new game
+/// starts at, 0–24), `time_speed` (game seconds per real second, at least 0),
+/// `latitude` (degrees, −89 to 89) and `day_of_year` (1–366), over
+/// `LevelWeather::default()`. Also the params it couldn't read.
+fn level_weather(nodes: &[feather_assets::SceneNode]) -> (weather::LevelWeather, Vec<String>) {
+    let mut w = weather::LevelWeather::default();
+    let mut bad = Vec::new();
+    let Some(spec) = nodes
+        .iter()
+        .filter_map(|n| n.prefab.as_ref())
+        .find(|s| s.id == "environment")
+    else {
+        return (w, bad);
+    };
+    let has = |key: &str| spec.params.get(key).is_some();
+    if has("weather") {
+        match spec.str("weather").and_then(weather::choice_named) {
+            Some(c) => w.choice = c,
+            None => bad.push("weather".to_string()),
+        }
+    }
+    let mut num = |key: &str, ok: fn(f32) -> bool| {
+        let v = spec.f32(key).filter(|v| ok(*v));
+        if has(key) && v.is_none() {
+            bad.push(key.to_string());
+        }
+        v
+    };
+    if let Some(t) = num("time", |v| (0.0..24.0).contains(&v)) {
+        w.time = Some(t);
+    }
+    if let Some(v) = num("time_speed", |v| v >= 0.0) {
+        w.speed = v;
+    }
+    if let Some(v) = num("latitude", |v| (-89.0..=89.0).contains(&v)) {
+        w.path.latitude = v;
+    }
+    if let Some(v) = num("day_of_year", |v| (1.0..=366.0).contains(&v)) {
+        w.path.day_of_year = v;
+    }
+    (w, bad)
 }
 
 /// The level's atmosphere (§13): the first `environment` marker's params over
@@ -2660,72 +2742,6 @@ fn sun_angles(travel: Vec3) -> (f32, f32) {
     (elevation, azimuth)
 }
 
-/// The session's weather overrides (§13): an index into each preset table,
-/// 0 being the level's own. A stand-in for the weather engine.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct WeatherOverride {
-    fog_density: usize,
-    fog_height: usize,
-    time_of_day: usize,
-}
-
-/// FOG DENSITY's presets: per metre at the fog's height (the zone's own is
-/// 0.035). `None` is the level's.
-const FOG_DENSITIES: [(&str, Option<f32>); 7] = [
-    ("LEVEL", None),
-    ("OFF", Some(0.0)),
-    ("THIN", Some(0.008)),
-    ("LIGHT", Some(0.018)),
-    ("MEDIUM", Some(0.035)),
-    ("THICK", Some(0.06)),
-    ("HEAVY", Some(0.1)),
-];
-
-/// FOG HEIGHT's presets: the falloff, per metre (the density falls by e
-/// every 1/falloff metres up; 0 is even, the same at every height; the
-/// zone's own is 0.08). `None` is the level's.
-const FOG_HEIGHTS: [(&str, Option<f32>); 6] = [
-    ("LEVEL", None),
-    ("EVEN", Some(0.0)),
-    ("TALL", Some(0.03)),
-    ("MEDIUM", Some(0.08)),
-    ("LOW", Some(0.2)),
-    ("GROUND", Some(0.5)),
-];
-
-/// TIME OF DAY's presets, a placeholder until the weather engine: where the
-/// sun stands, (elevation, azimuth) in degrees as `environment` takes them.
-/// Only the sun moves; the sky keeps the level's colours. `None` is the
-/// level's.
-const TIMES_OF_DAY: [(&str, Option<(f32, f32)>); 6] = [
-    ("LEVEL", None),
-    ("DAWN", Some((4.0, 95.0))),
-    ("MORNING", Some((25.0, 125.0))),
-    ("NOON", Some((60.0, 180.0))),
-    ("AFTERNOON", Some((35.0, 235.0))),
-    ("DUSK", Some((4.0, 265.0))),
-];
-
-/// The fog this frame: (density at height, height, falloff), the level's
-/// where the weather doesn't say.
-fn effective_fog(env: &Environment, w: &WeatherOverride) -> Vec3 {
-    Vec3::new(
-        FOG_DENSITIES[w.fog_density].1.unwrap_or(env.fog_density),
-        env.fog_height,
-        FOG_HEIGHTS[w.fog_height].1.unwrap_or(env.fog_falloff),
-    )
-}
-
-/// The direction sunlight travels this frame: the level's, or the time of
-/// day's.
-fn effective_sun(env: &Environment, w: &WeatherOverride) -> Vec3 {
-    TIMES_OF_DAY[w.time_of_day]
-        .1
-        .map_or(env.sun_dir, |(elevation, azimuth)| {
-            sun_travel(elevation, azimuth)
-        })
-}
-
 /// The direction sunlight travels from a sun at `elevation` and `azimuth`
 /// (degrees, as `environment` takes them).
 fn sun_travel(elevation: f32, azimuth: f32) -> Vec3 {
@@ -2766,10 +2782,12 @@ struct Session {
     /// pipelines it is the only thing that bakes `Renderer::samples()`, which is
     /// precisely why MSAA can change while no session exists.
     sky: SkyPass,
-    /// The level's atmosphere (§13). Each frame hands `mesh` (and so `sky`)
-    /// its `Atmosphere`; the app takes the sun direction and starting
-    /// exposure from it.
+    /// The level's atmosphere (§13). Each frame the weather makes this
+    /// frame's from it and hands `mesh` (and so `sky`) its `Atmosphere`.
     environment: Environment,
+    /// The level's weather and sun's path (§13): where a new game's clock and
+    /// weather start.
+    level_weather: weather::LevelWeather,
     /// Per-mesh transform that centers + unit-scales it into the demo grid.
     /// Identity for scene meshes — a level must keep its authored size.
     fits: Vec<Mat4>,
@@ -2830,6 +2848,7 @@ impl Session {
             mesh,
             sky,
             environment: b.environment,
+            level_weather: b.level_weather,
             fits: b.fits,
             mesh_spheres: b.mesh_spheres,
             accumulator: 0.0,
@@ -2854,6 +2873,8 @@ struct WorldBuild {
     mesh_spheres: Vec<(Vec3, f32)>,
     /// The level's atmosphere (§13), from its `environment` marker.
     environment: Environment,
+    /// Its weather and sun's path (§13), from the same marker.
+    level_weather: weather::LevelWeather,
     /// The first scene's baked sky visibility (§13), if there is one.
     sky: Option<feather_assets::bake::SkyVolume>,
     /// Time spent loading the scenes and bake, for the `[load]` line.
@@ -2917,6 +2938,8 @@ fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> WorldBu
     let (environment, mut bad_params) = environment(&scene_nodes);
     let (wind, bad_wind) = level_wind(&scene_nodes);
     bad_params.extend(bad_wind);
+    let (level_weather, bad_weather) = level_weather(&scene_nodes);
+    bad_params.extend(bad_weather);
     for key in bad_params {
         eprintln!("[scene] environment: can't use param {key:?}; ignored");
     }
@@ -3113,6 +3136,7 @@ fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> WorldBu
         fits,
         mesh_spheres,
         environment,
+        level_weather,
         sky,
         t_scenes,
     }
@@ -3295,10 +3319,12 @@ impl App {
             MenuOutcome::ApplyWeather => {
                 let w = self.settings.weather;
                 eprintln!(
-                    "[quality] weather: fog density {}, fog height {}, time of day {}",
-                    FOG_DENSITIES[w.fog_density].0,
-                    FOG_HEIGHTS[w.fog_height].0,
-                    TIMES_OF_DAY[w.time_of_day].0
+                    "[quality] weather: {}, time {}, speed {}, fog density {}, fog height {}",
+                    weather::choice_name(w.choice),
+                    w.time_label(),
+                    w.speed_label(),
+                    weather::FOG_DENSITIES[w.fog_density].0,
+                    weather::FOG_HEIGHTS[w.fog_height].0
                 );
             }
             MenuOutcome::ApplyBloom => {
@@ -3408,7 +3434,7 @@ impl App {
         let env = session.environment;
         self.light_dir = env.sun_dir.extend(0.0);
         // A new game has the level's own weather.
-        self.settings.weather = WeatherOverride::default();
+        self.settings.weather = weather::SessionWeather::new(&session.level_weather, env.sun_dir);
         self.exposure = env.exposure;
         self.exposure_range = (env.exposure_min, env.exposure_max);
         self.exposure_reset = true;
@@ -3906,19 +3932,19 @@ impl ApplicationHandler for App {
                         viewport_height: size.height.max(1) as f32,
                     };
                     let inv_view_proj = draw_view_proj.inverse();
-                    // The weather (§13): the time of day's sun and the fog.
-                    self.light_dir =
-                        effective_sun(&s.environment, &self.settings.weather).extend(0.0);
-                    let fog = effective_fog(&s.environment, &self.settings.weather);
-                    s.mesh.set_atmosphere(
-                        Environment {
-                            fog_density: fog.x,
-                            fog_height: fog.y,
-                            fog_falloff: fog.z,
-                            ..s.environment
-                        }
-                        .atmosphere(),
-                    );
+                    // The weather (§13): the clock moves with the simulation
+                    // (not while paused, nor in a bench, which must repeat),
+                    // and this frame's atmosphere and light follow.
+                    if self.bench.is_none() {
+                        self.settings.weather.advance(steps as f32 * FIXED_DT);
+                    }
+                    let (env, light) = self
+                        .settings
+                        .weather
+                        .frame(&s.environment, &s.level_weather.path);
+                    self.light_dir = light.extend(0.0);
+                    self.exposure_range = (env.exposure_min, env.exposure_max);
+                    s.mesh.set_atmosphere(env.atmosphere());
                     let light_dir = self.light_dir;
                     let camera_pos = eye;
 
@@ -5333,95 +5359,51 @@ mod tests {
         assert_eq!(options(true).last().unwrap().action, MenuAction::Back);
     }
 
-    /// Each WEATHER row steps through its presets, wraps back to LEVEL, and
-    /// says so; the override starts as the level's own.
+    /// Each WEATHER row steps through its choices and wraps, and says so. A
+    /// clock under LEVEL moves the sun only, and the row says that too.
     #[test]
     fn weather_rows_cycle_their_presets() {
         let mut s = GraphicsSettings::default();
-        assert_eq!(s.weather, WeatherOverride::default());
+        s.weather = weather::SessionWeather::new(&weather::LevelWeather::default(), Vec3::NEG_Y);
         let mut m = in_game_menu();
         m.screen = MenuScreen::Weather;
-        for (action, len, label) in [
-            (
-                MenuAction::CycleFogDensity,
-                FOG_DENSITIES.len(),
-                "FOG DENSITY  ",
-            ),
-            (
-                MenuAction::CycleFogHeight,
-                FOG_HEIGHTS.len(),
-                "FOG HEIGHT  ",
-            ),
-            (
-                MenuAction::CycleTimeOfDay,
-                TIMES_OF_DAY.len(),
-                "TIME OF DAY  ",
-            ),
+        let label = |m: &Menu, s: &GraphicsSettings, a| label_of(m, s, &Controls::default(), a);
+        assert_eq!(label(&m, &s, MenuAction::CycleWeather), "WEATHER  LEVEL");
+        assert_eq!(label(&m, &s, MenuAction::StepTime), "TIME  LEVEL");
+        assert_eq!(label(&m, &s, MenuAction::CycleSpeed), "SPEED  10X");
+        for (action, len) in [
+            (MenuAction::CycleWeather, weather::WEATHERS.len() + 1),
+            (MenuAction::CycleSpeed, weather::SPEEDS.len()),
+            (MenuAction::CycleFogDensity, weather::FOG_DENSITIES.len()),
+            (MenuAction::CycleFogHeight, weather::FOG_HEIGHTS.len()),
         ] {
-            assert_eq!(
-                label_of(&m, &s, &Controls::default(), action),
-                match action {
-                    MenuAction::CycleTimeOfDay => format!("{label}LEVEL  SUN ONLY"),
-                    _ => format!("{label}LEVEL"),
-                }
-            );
+            let first = label(&m, &s, action);
             let mut seen = Vec::new();
             for _ in 0..len {
                 assert_eq!(activate(&mut m, &mut s, action), MenuOutcome::ApplyWeather);
-                seen.push(label_of(&m, &s, &Controls::default(), action));
+                seen.push(label(&m, &s, action));
             }
-            assert!(
-                seen.last().unwrap().contains("LEVEL"),
+            assert_eq!(
+                seen.last(),
+                Some(&first),
                 "{action:?} didn't wrap: {seen:?}"
             );
             seen.sort();
             seen.dedup();
-            assert_eq!(seen.len(), len, "{action:?} repeated a preset");
+            assert_eq!(seen.len(), len, "{action:?} repeated a choice");
         }
-        assert_eq!(
-            s.weather,
-            WeatherOverride::default(),
-            "a full cycle ends where it began"
-        );
-    }
-
-    /// The weather's effect: the level's own under LEVEL, a preset's value
-    /// otherwise, and the time of day moves the sun only.
-    #[test]
-    fn the_weather_overrides_the_levels_fog_and_sun() {
-        let env = Environment {
-            fog_density: 0.035,
-            fog_height: -9.0,
-            fog_falloff: 0.08,
-            ..Default::default()
-        };
-        let level = WeatherOverride::default();
-        assert_eq!(effective_fog(&env, &level), Vec3::new(0.035, -9.0, 0.08));
-        assert_eq!(effective_sun(&env, &level), env.sun_dir);
-        let heavy = FOG_DENSITIES.iter().position(|p| p.0 == "HEAVY").unwrap();
-        let ground = FOG_HEIGHTS.iter().position(|p| p.0 == "GROUND").unwrap();
-        let w = WeatherOverride {
-            fog_density: heavy,
-            fog_height: ground,
-            ..level
-        };
-        assert_eq!(effective_fog(&env, &w), Vec3::new(0.1, -9.0, 0.5));
-        let off = WeatherOverride {
-            fog_density: FOG_DENSITIES.iter().position(|p| p.0 == "OFF").unwrap(),
-            ..level
-        };
-        assert_eq!(effective_fog(&env, &off).x, 0.0);
-        // DAWN: 4 degrees up, in the east (+X), so its light travels west
-        // and down.
-        let dawn = WeatherOverride {
-            time_of_day: TIMES_OF_DAY.iter().position(|p| p.0 == "DAWN").unwrap(),
-            ..level
-        };
-        let (elevation, azimuth) = sun_angles(effective_sun(&env, &dawn));
-        assert!((elevation - 4.0).abs() < 1e-3 && (azimuth - 95.0).abs() < 1e-3);
-        let travel = effective_sun(&env, &dawn);
-        assert!(travel.x < -0.9 && travel.y < 0.0, "{travel}");
-        assert_eq!(effective_fog(&env, &dawn), effective_fog(&env, &level));
+        // A weather under a sun straight up starts the clock at noon; TIME
+        // steps it an hour a press, and back under LEVEL it moves the sun only.
+        activate(&mut m, &mut s, MenuAction::CycleWeather);
+        assert_eq!(label(&m, &s, MenuAction::CycleWeather), "WEATHER  CLEAR");
+        assert_eq!(label(&m, &s, MenuAction::StepTime), "TIME  12 00");
+        activate(&mut m, &mut s, MenuAction::StepTime);
+        assert_eq!(label(&m, &s, MenuAction::StepTime), "TIME  13 00");
+        for _ in 0..weather::WEATHERS.len() {
+            activate(&mut m, &mut s, MenuAction::CycleWeather);
+        }
+        assert_eq!(label(&m, &s, MenuAction::CycleWeather), "WEATHER  LEVEL");
+        assert_eq!(label(&m, &s, MenuAction::StepTime), "TIME  13 00  SUN ONLY");
     }
 
     /// OPTIONS > CONTROLS, as a player gets there from the pause menu.
@@ -6519,6 +6501,48 @@ mod tests {
         let (w, bad) = level_wind(std::slice::from_ref(&marker));
         assert_eq!(bad, ["wind_speed", "wind_azimuth"]);
         assert_eq!(w.speed, rope::Wind::default().speed);
+        // environment() knows the keys, so it doesn't call them unknown.
+        assert!(environment(&[marker]).1.is_empty());
+    }
+
+    /// The level's weather comes from its `environment` marker; bad values
+    /// are reported and leave the defaults.
+    #[test]
+    fn the_environment_sets_the_weather() {
+        assert_eq!(
+            level_weather(&[]),
+            (weather::LevelWeather::default(), Vec::new())
+        );
+        let marker = node(
+            Some("environment"),
+            serde_json::json!({ "weather": "Overcast", "time": 6.5, "time_speed": 60.0,
+                                "latitude": 45.0, "day_of_year": 172.0 }),
+        );
+        let (w, bad) = level_weather(&[marker]);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(
+            w,
+            weather::LevelWeather {
+                path: weather::SolarPath {
+                    latitude: 45.0,
+                    day_of_year: 172.0
+                },
+                choice: 2,
+                time: Some(6.5),
+                speed: 60.0,
+            }
+        );
+        let marker = node(
+            Some("environment"),
+            serde_json::json!({ "weather": "stormy", "time": 24.0, "time_speed": -1.0,
+                                "latitude": 95.0, "day_of_year": 0.0 }),
+        );
+        let (w, bad) = level_weather(std::slice::from_ref(&marker));
+        assert_eq!(
+            bad,
+            ["weather", "time", "time_speed", "latitude", "day_of_year"]
+        );
+        assert_eq!(w, weather::LevelWeather::default());
         // environment() knows the keys, so it doesn't call them unknown.
         assert!(environment(&[marker]).1.is_empty());
     }
