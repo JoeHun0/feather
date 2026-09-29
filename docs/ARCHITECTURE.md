@@ -1725,21 +1725,25 @@ reads the resolved HDR, so it runs on top of any sample count.
   - With a fixed exposure, two runs are bit-identical. With auto-exposure
     they differ slightly: the blend's compression follows the metered
     exposure, which adapts in wall-clock time.
-- **Cost** (release, clocks **unpinned**, 3 interleaved rounds against the
-  previous binary, medians):
+- **Cost** (release, clocks pinned, 3 interleaved rounds against the previous
+  binary, medians; every round repeated to 0.01 ms):
 
   | | zone frame | lights120 frame | `taa` |
   |---|---|---|---|
-  | before | 1.02–1.09 | 1.25–1.26 | – |
-  | `--no-taa` | 1.05–1.08 | 1.24–1.25 | 0 |
-  | TAA | 1.23–1.24 | 1.53–1.60 | 0.12–0.14 |
+  | before | 1.01 | 1.40–1.41 | – |
+  | `--no-taa` | 1.01–1.02 | 1.40–1.41 | 0 |
+  | TAA | 1.19 | 1.59 | 0.15 |
 
-  - I predicted the pass at 0.08–0.15 ms (it held) and frames +0.1–0.2 (zone
-    held, lights120 didn't).
-  - The pass's mean is 0.26–0.30 ms and its p90 0.5–0.7. Sampling the
-    memory clock during a run found it moving between 96 and 1218 MHz, and
-    this pass is bandwidth-bound. Unpinned, its cost is mostly the
-    governor's; pinned numbers are still to take.
+  - The pass costs 0.15 ms in every frame (min = p90 = max). I predicted
+    0.10–0.14, slightly low. Frames +0.18 and +0.19, within my +0.12–0.20.
+    `geo`, shadows and bloom are unchanged.
+  - Exposure and the tonemap each gained 0.01 ms, which I didn't predict. A
+    guess, not tested: they now read a storage image, which the driver may
+    keep uncompressed, instead of the render target.
+  - **Unpinned** it's misleading: the median held at 0.12–0.14 ms, but the
+    mean doubled, and the frame's p90 rose 0.7 ms. Sampling the memory
+    clock during a run found it moving between 96 and 1218 MHz (pinned, it
+    sits at 1218), and this pass is bandwidth-bound.
 - **Validation:** sync-clean at 1× and MSAA 4× (filtered, USAGE §8), with TAA
   toggled live four times and the targets recreated twice mid-run.
 - **Not done:** per-object motion vectors, a sharpen, a negative texture-LOD
@@ -3159,4 +3163,4 @@ CPU-side zones pending); GPU-driven culling; streaming; stage pipelining;
 anti-aliasing (**MSAA** `--msaa N` at startup, **FXAA** on `F2` and **TAA** on
 `F3`, on by default, all landed, §13 — **SMAA** is still absent, as are live
 MSAA switching, a tonemapped resolve to stop bright HDR edges sparkling, and,
-for TAA, per-object motion vectors, a sharpen and pinned cost numbers).
+for TAA, per-object motion vectors and a sharpen).
