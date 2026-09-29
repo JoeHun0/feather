@@ -416,7 +416,19 @@ electricity poles. You spawn on the road outside the gate, facing it.
 - **Interiors** get the sky's light only through their openings once the
   zone is baked: the hangar is dim and lit mostly by its door, roof holes and
   lamp, and the office is darker still. Unbaked, they're as bright as the yard.
-- **Known limits:** no leafy trees yet.
+- **Trees and bushes:** birch-like trees and bushes the script draws and
+  builds, thick outside the fence and scattered in the yard (41 trees and 65
+  bushes at the default seed). Leaf cards are single-sided MASK with normals
+  pointing out of the crown (ARCHITECTURE.md §5). Trunks block you; crowns
+  and bushes don't. `--check` fails if a leaf goes double-sided, a crown or
+  bush collides, a trunk doesn't, or a trunk stands on the road or near the
+  spawn.
+- **What to look for:**
+  - crowns lit on the sun side and darker away from it, not flat;
+  - dappled cutout shadows under the trees and on the fence;
+  - no dark or light fringes round the leaves;
+  - no leaves popping or crowns thinning as you walk away (LODs);
+  - trunks stop you, bushes don't.
 
 ### Baking — `feather-bake`
 
@@ -635,7 +647,7 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice at every FOV from 30° to 120°; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
 | Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs; `environment`: no marker and an empty one keep the default look, every param lands, left-out params keep defaults and bad ones are reported, the sun's elevation/azimuth convention, and (end-to-end) a level's marker reaches `build_world`; the orb demo's obstacle boxes stand in the demo but not in a loaded level (end-to-end) |
-| Materials | assets, render | glTF `alphaMode`/`alphaCutoff`/`doubleSided` load as `AlphaMode::Mask`(cutoff, default 0.5)/`Blend`/`Opaque` and the flag; the GPU record carries the cutoff only for MASK and the double-sided bit, which matches `mesh.frag`'s; glTF `occlusionTexture` and its strength load (an ARM map shares MR's image, one conversion), and the GPU record packs its slot above the flags (MR's own slot for an ARM map, 0 for none) with the strength in `params.z`, at the shift `mesh.frag` declares; `mesh.frag`'s occlusion follows glTF's strength rule and combines with GTAO by `min`; masked instances' runs follow every opaque one (one pipeline switch a pass), with the same instances and triangles, and a scene without masked materials builds the runs it always did; `cutout_alpha()` is textually identical in `mesh.frag` and `mask.frag`; `mesh.frag` declares `MASKED` at the id the masked pipeline sets, defaulting to false |
+| Materials | assets, render | glTF `alphaMode`/`alphaCutoff`/`doubleSided` load as `AlphaMode::Mask`(cutoff, default 0.5)/`Blend`/`Opaque` and the flag; the GPU record carries the cutoff only for MASK and the double-sided bit, which matches `mesh.frag`'s; glTF `occlusionTexture` and its strength load (an ARM map shares MR's image, one conversion), and the GPU record packs its slot above the flags (MR's own slot for an ARM map, 0 for none) with the strength in `params.z`, at the shift `mesh.frag` declares; `mesh.frag`'s occlusion follows glTF's strength rule and combines with GTAO by `min`; masked instances' runs follow every opaque one (one pipeline switch a pass), with the same instances and triangles, and a scene without masked materials builds the runs it always did; `mesh.frag` never discards or demotes (masked materials rely on its early-Z, testing depth for EQUAL against the prepass's cut) |
 | Environment | render | the specialization constants `mesh.frag` and `sky.frag` declare (read from their compiled SPIR-V) match the Rust map by id and name, with GLSL defaults equal to `Environment::default()`; the map lays the values out in id order; height fog's closed form equals numeric integration of its density (rays up, down and level), uniform fog is exactly `density·dist`, the sky's infinite-ray limit; `sky()` and the fog functions are textually identical in both shaders |
 | Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one texture, which isn't decoded until asked and then matches the old RGB→RGBA expansion; a material's `extras.surface` is read (a non-string one warns and is dropped) |
 | Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |
@@ -720,12 +732,15 @@ defaults and CLI flags only.
 Bloom and auto-exposure are on by default, so a bench's `frame` includes
 them (~0.10 and ~0.06 ms with pinned clocks). So is sky occlusion when the
 scene's volume is baked (`geo` +0.04 ms on the zone, +0.06 on `lights120`),
-and so is GTAO (its own `ao` line, 0.11 ms on the zone; its upsample runs in
+and so is GTAO (its own `ao` line, 0.12 ms on the zone; its upsample runs in
 the main pass, inside `geo`). `geo` also times the
 depth prepass, which now runs on its own before GTAO. Pinned clocks run below
 boost, so these read higher than unpinned numbers. Compare pinned only with
 pinned; debug and release measure the same. To compare with numbers from before they existed, add
-`--no-bloom --no-auto-exposure --no-sky-occlusion --no-ao`.
+`--no-bloom --no-auto-exposure --no-sky-occlusion --no-ao`. The zone gained trees
+and bushes after most of ARCHITECTURE.md's zone figures were taken (frame 0.72 →
+1.10 ms pinned). Regenerating an older zone isn't possible from this script, so
+compare only zones generated by the same version.
 
 ### A/B recipe
 

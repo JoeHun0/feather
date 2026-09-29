@@ -41,6 +41,11 @@ What is in it
   cutout's alpha from the base colour, so the fence's colour and opacity maps
   are merged into one RGBA PNG (a stdlib decoder; the result is cached beside
   the pack).
+* Trees and bushes (§5 cutouts): birch-like trees and bushes, drawn and built
+  here, thick in the belt outside the fence and scattered in the yard. Leaf
+  cards are single-sided MASK with normals pointing out of the crown: the
+  main pass doesn't cull, so both sides draw, lit as one soft volume. Trunks
+  collide; crowns and bushes don't.
 * Dim warm lamps in the hangar and the office, `player_start` outside the
   gate, and the overcast `environment`.
 
@@ -154,6 +159,14 @@ FENCE_MAPS = "Fence006_1K-PNG"
 CHAINLINK_TILE = 1.0  # metres per texture repeat
 ENCLOSURE = (16.8, 23.2, -6.2, 0.2)  # x0, x1, z0, z1
 ENCLOSURE_BAY, ENCLOSURE_HEIGHT = 3.2, 2.0
+# Trees and bushes (§5 cutouts): how many to place, outside the fence and
+# in the yard, and the variants built.
+TREES_OUT, TREES_IN = 35, 6
+BUSHES_OUT, BUSHES_IN = 40, 25
+TREE_VARIANTS, BUSH_VARIANTS = 3, 2
+BELT = 38.0  # trees and bushes stay inside |x|, |z| <= this (the ground is ±40)
+SPAWN_XZ = (0.0, 37.0)  # player_start, which foliage keeps 6 m from
+ROAD_X = 6.0  # the road and gate apron, |x| < this south of the hangar
 GRASS_TUFTS = 600
 GRASS_TUFT = (0.9, 0.55)  # width, height of each of a tuft's three cards
 
@@ -238,8 +251,9 @@ class Zone(gds.Level):
         return self.textures[key]
 
     def cutout_material(self, key, base_png, normal_png=None, metallic=0.0, roughness=0.9,
-                        surface=None):
-        """A double-sided MASK material (§5) from an RGBA base colour."""
+                        surface=None, double_sided=True):
+        """A MASK material (§5) from an RGBA base colour: double-sided by
+        default. Leaves are single-sided on purpose (see `foliage`)."""
         if key not in self.mats:
             m = {
                 "name": key,
@@ -250,7 +264,7 @@ class Zone(gds.Level):
                 },
                 "alphaMode": "MASK",
                 "alphaCutoff": 0.5,
-                "doubleSided": True,
+                "doubleSided": double_sided,
             }
             if normal_png is not None:
                 m["normalTexture"] = {"index": self._png(normal_png, key + "/normal")}
@@ -259,6 +273,40 @@ class Zone(gds.Level):
             self.doc["materials"].append(m)
             self.mats[key] = len(self.doc["materials"]) - 1
         return self.mats[key]
+
+    def png_material(self, key, base_png, roughness=0.9, surface=None):
+        """An opaque material from a PNG base colour (bark)."""
+        if key not in self.mats:
+            m = {
+                "name": key,
+                "pbrMetallicRoughness": {
+                    "baseColorTexture": {"index": self._png(base_png, key + "/base")},
+                    "metallicFactor": 0.0,
+                    "roughnessFactor": roughness,
+                },
+            }
+            if surface:
+                m["extras"] = {"surface": surface}
+            self.doc["materials"].append(m)
+            self.mats[key] = len(self.doc["materials"]) - 1
+        return self.mats[key]
+
+    def mesh(self, prims, name):
+        """One mesh from primitives (positions, normals, uvs, indices,
+        material), triangle lists."""
+        out = []
+        for pos, nrm, uv, idx, material in prims:
+            out.append({
+                "attributes": {
+                    "POSITION": self._accessor(pos, "f", "VEC3", 5126, 34962, minmax=True),
+                    "NORMAL": self._accessor(nrm, "f", "VEC3", 5126, 34962),
+                    "TEXCOORD_0": self._accessor(uv, "f", "VEC2", 5126, 34962),
+                },
+                "indices": self._accessor(idx, "I", "SCALAR", 5125, 34963),
+                "material": material,
+            })
+        self.doc["meshes"].append({"name": name, "primitives": out})
+        return len(self.doc["meshes"]) - 1
 
     def cards(self, quads, material, name):
         """One mesh of flat double-sided quads, one primitive. Each quad is
@@ -799,6 +847,370 @@ def grass(z):
     return placed
 
 
+# --- trees and bushes ---------------------------------------------------------
+
+def _add(a, b):
+    return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+
+
+def _mul(a, k):
+    return [a[0] * k, a[1] * k, a[2] * k]
+
+
+def _cross(a, b):
+    return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
+
+def _norm(a):
+    ln = math.sqrt(sum(c * c for c in a)) or 1.0
+    return [c / ln for c in a]
+
+
+def leaf_rgba(rng, size=512, leaves=52):
+    """A leaf cluster card: pointed oval birch-like leaves, each with a
+    paler midrib, on thin twigs from the bottom centre. Muted greens for an
+    overcast day, a few yellowing. Transparent texels carry the mid leaf
+    colour, as grass_rgba's do, so mips don't fringe the cut edge."""
+    fill = (74, 86, 42, 0)
+    px = [[list(fill) for _ in range(size)] for _ in range(size)]
+
+    def dot(x, y, col):
+        if 0 <= x < size and 0 <= y < size:
+            px[y][x] = list(col) + [255]
+
+    # Twigs: from the bottom centre, fanning up.
+    tips = []
+    for _ in range(7):
+        a = math.radians(rng.uniform(-70, 70))
+        length = rng.uniform(0.45, 0.85) * size
+        x0, y0 = size / 2 + rng.uniform(-10, 10), size - 4
+        for k in range(int(length)):
+            t = k / length
+            x = x0 + math.sin(a) * k + math.sin(a * 2) * 12 * t * t
+            y = y0 - math.cos(a) * k
+            w = max(1, int(3 * (1 - t)))
+            for dx in range(-w // 2, w // 2 + 1):
+                dot(int(x) + dx, int(y), (62, 50, 36))
+            if k % 9 == 0 and t > 0.2:
+                tips.append((x, y, a))
+    # Leaves along the twigs, and a few loose ones to fill the cluster.
+    spots = rng.sample(tips, min(len(tips), leaves - 10))
+    spots += [(rng.uniform(0.2, 0.8) * size, rng.uniform(0.15, 0.7) * size,
+               rng.uniform(-1.2, 1.2)) for _ in range(leaves - len(spots))]
+    for cx, cy, a in spots:
+        length = rng.uniform(34, 58)
+        width = length * rng.uniform(0.42, 0.55)
+        ang = a + rng.uniform(-1.3, 1.3) - math.pi / 2  # along x', pointing out
+        ca, sa = math.cos(ang), math.sin(ang)
+        base = rng.choice([(72, 92, 38), (84, 100, 44), (62, 80, 34), (96, 104, 46),
+                           (120, 118, 52)])
+        r = int(length) + 2
+        for y in range(int(cy) - r, int(cy) + r + 1):
+            for x in range(int(cx) - r, int(cx) + r + 1):
+                dx, dy = x - cx, y - cy
+                u = dx * ca + dy * sa  # along the leaf, 0 at its stalk
+                v = -dx * sa + dy * ca
+                if not 0.0 <= u <= length:
+                    continue
+                half = width / 2 * math.sin(math.pi * u / length) ** 0.8
+                if abs(v) > half:
+                    continue
+                edge = abs(v) / max(half, 1e-3)
+                shade = 1.0 - 0.28 * edge - 0.10 * (u / length)
+                col = [min(255, int(c * shade)) for c in base]
+                if abs(v) < 0.9:
+                    col = [min(255, c + 22) for c in col]  # the midrib
+                dot(x, y, col)
+    rows = [bytearray(v for p in row for v in p) for row in px]
+    return gts.png_rgba(size, size, rows)
+
+
+def bark_rgba(rng, w=128, h=256):
+    """Birch-like bark, tiling round (u) and along (v) the stem: pale grey
+    with dark horizontal lenticels and a few dark patches."""
+    px = []
+    for y in range(h):
+        row = []
+        for x in range(w):
+            n = rng.uniform(-10, 10)
+            g = 196 + n
+            row.append([int(g), int(g - 2), int(g - 10)])
+        px.append(row)
+    for _ in range(140):
+        y, x0 = rng.randrange(h), rng.randrange(w)
+        length, thick = rng.randint(5, 24), rng.choice([1, 1, 2])
+        tone = rng.randint(30, 70)
+        for k in range(length):
+            for t in range(thick):
+                px[(y + t) % h][(x0 + k) % w] = [tone, tone - 2, tone - 4]
+    for _ in range(10):
+        cy, cx, r = rng.randrange(h), rng.randrange(w), rng.randint(4, 10)
+        for y in range(cy - r, cy + r):
+            for x in range(cx - r, cx + r):
+                if (x - cx) ** 2 + (y - cy) ** 2 < r * r:
+                    px[y % h][x % w] = [52, 50, 46]
+    rows = [bytearray(c for p in row for c in p + [255]) for row in px]
+    return gts.png_rgba(w, h, rows)
+
+
+def tube(points, radii, sides, u_repeat, v_len, out):
+    """A tube along `points` with `radii`, appended to `out` = (pos, nrm,
+    uv, idx). UV u runs round it `u_repeat` times, v along it per `v_len`
+    metres. No caps: trunk tops end inside crowns, branch tips are thin."""
+    pos, nrm, uv, idx = out
+    along = 0.0
+    ring0 = len(pos)
+    for i, p in enumerate(points):
+        t = _norm([points[min(i + 1, len(points) - 1)][k] - points[max(i - 1, 0)][k]
+                   for k in range(3)])
+        ref = [0.0, 0.0, 1.0] if abs(t[2]) < 0.9 else [1.0, 0.0, 0.0]
+        x = _norm(_cross(t, ref))
+        y = _cross(t, x)
+        if i:
+            along += math.dist(points[i], points[i - 1])
+        for j in range(sides + 1):
+            a = 2 * math.pi * j / sides
+            d = _add(_mul(x, math.cos(a)), _mul(y, math.sin(a)))
+            pos.append(_add(p, _mul(d, radii[i])))
+            nrm.append(d)
+            uv.append([u_repeat * j / sides, -along / v_len])
+    for i in range(len(points) - 1):
+        for j in range(sides):
+            a = ring0 + i * (sides + 1) + j
+            b = a + sides + 1
+            idx += [a, b, a + 1, a + 1, b, b + 1]
+
+
+def leaf_cards(rng, centres, sizes, out):
+    """Leaf cards at `centres`, appended to `out`. Each faces roughly out
+    of the crown, turned at random about that; every vertex's normal points
+    out of the crown's ellipsoid (from the cards' own spread), so the crown
+    shades as one volume. The material is single-sided and the main pass
+    doesn't cull, so both faces draw with that normal."""
+    pos, nrm, uv, idx = out
+    n = len(centres)
+    c = [sum(p[k] for p in centres) / n for k in range(3)]
+    spread = [max(0.3, math.sqrt(sum((p[k] - c[k]) ** 2 for p in centres) / n)) for k in range(3)]
+    for p, s in zip(centres, sizes):
+        out_dir = _norm([(p[k] - c[k]) / spread[k] for k in range(3)])
+        facing = _norm(_add(out_dir, [rng.uniform(-0.9, 0.9) for _ in range(3)]))
+        side = _norm(_cross(facing, _norm([rng.uniform(-1, 1) for _ in range(3)])))
+        up = _cross(facing, side)
+        base = len(pos)
+        for a, b in ((-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)):
+            q = _add(p, _add(_mul(side, a * s), _mul(up, b * s)))
+            pos.append(q)
+            nrm.append(_norm([(q[k] - c[k]) / spread[k] ** 2 for k in range(3)]))
+            uv.append([a + 0.5, 0.5 - b])
+        idx += [base, base + 1, base + 2, base, base + 2, base + 3]
+
+
+def tree_meshes(z, rng, leaf, bark, variant):
+    """One tree: (trunk mesh, crown mesh). Birch-like, 7-12 m: a leaning,
+    tapered trunk, branches reaching up, leaf cards on their outer parts and
+    round the top. The crown mesh holds the branches too."""
+    height = rng.uniform(7.0, 12.0)
+    r0 = rng.uniform(0.13, 0.22)
+    lean = [rng.uniform(-0.06, 0.06), 0.0, rng.uniform(-0.06, 0.06)]
+    segs = 10
+    trunk_pts = [[lean[0] * height * (i / segs) ** 1.5, height * i / segs,
+                  lean[2] * height * (i / segs) ** 1.5] for i in range(segs + 1)]
+    trunk_r = [r0 * (1.0 - 0.8 * i / segs) for i in range(segs + 1)]
+    trunk = ([], [], [], [])
+    tube(trunk_pts, trunk_r, 8, 2.0, 1.2, trunk)
+    branches = ([], [], [], [])
+    centres, sizes = [], []
+    n_br = rng.randint(6, 10)
+    for b in range(n_br):
+        t0 = rng.uniform(0.38, 0.85)
+        start = [trunk_pts[0][k] + (trunk_pts[-1][k] - trunk_pts[0][k]) * t0 for k in range(3)]
+        az = 2 * math.pi * (b + rng.uniform(-0.3, 0.3)) / n_br
+        el = math.radians(rng.uniform(30, 55))
+        length = height * rng.uniform(0.28, 0.42) * (1.15 - t0)
+        d = [math.cos(az) * math.cos(el), math.sin(el), math.sin(az) * math.cos(el)]
+        pts = [_add(start, _add(_mul(d, length * i / 5), [0.0, 0.25 * length * (i / 5) ** 2, 0.0]))
+               for i in range(6)]
+        tube(pts, [r0 * 0.35 * (1 - 0.8 * i / 5) for i in range(6)], 5, 1.0, 0.8, branches)
+        for _ in range(rng.randint(22, 34)):
+            t = rng.uniform(0.35, 1.0)
+            i = min(4, int(t * 5))
+            f = t * 5 - i
+            p = [pts[i][k] + (pts[i + 1][k] - pts[i][k]) * f for k in range(3)]
+            spread = 0.35 + 0.75 * t
+            centres.append(_add(p, [rng.uniform(-spread, spread) for _ in range(3)]))
+            sizes.append(rng.uniform(0.8, 1.4))
+    top = trunk_pts[-1]
+    for _ in range(rng.randint(40, 60)):
+        centres.append(_add(top, [rng.uniform(-1.3, 1.3), rng.uniform(-1.8, 0.9),
+                                  rng.uniform(-1.3, 1.3)]))
+        sizes.append(rng.uniform(0.8, 1.3))
+    leaves = ([], [], [], [])
+    leaf_cards(rng, centres, sizes, leaves)
+    trunk_mesh = z.mesh([(*trunk, bark)], f"tree_trunk_{variant}")
+    crown_mesh = z.mesh([(*branches, bark), (*leaves, leaf)], f"tree_crown_{variant}")
+    # How far the crown reaches from the trunk's foot, horizontally.
+    reach = max(math.hypot(p[0], p[2]) for p in branches[0] + leaves[0])
+    return trunk_mesh, crown_mesh, r0, reach
+
+
+def bush_mesh(z, rng, leaf, bark, variant):
+    """One bush, 1-2.5 m: a squashed ball of leaf cards on a few stems."""
+    radius = rng.uniform(0.7, 1.2)
+    height = radius * rng.uniform(1.1, 1.6)
+    stems = ([], [], [], [])
+    for _ in range(rng.randint(3, 5)):
+        a = rng.uniform(0, 2 * math.pi)
+        tip = [math.cos(a) * radius * 0.6, height * rng.uniform(0.5, 0.8), math.sin(a) * radius * 0.6]
+        pts = [_mul(tip, i / 3) for i in range(4)]
+        tube(pts, [0.04, 0.03, 0.02, 0.012], 5, 1.0, 0.8, stems)
+    centres, sizes = [], []
+    for _ in range(rng.randint(60, 90)):
+        while True:
+            q = [rng.uniform(-1, 1) for _ in range(3)]
+            if sum(c * c for c in q) <= 1.0:
+                break
+        size = rng.uniform(0.55, 0.95)
+        # Above the ground whichever way the card turns.
+        y = max(size * 0.72, height * 0.55 + q[1] * height * 0.45)
+        centres.append([q[0] * radius, y, q[2] * radius])
+        sizes.append(size)
+    leaves = ([], [], [], [])
+    leaf_cards(rng, centres, sizes, leaves)
+    return z.mesh([(*stems, bark), (*leaves, leaf)], f"bush_{variant}")
+
+
+def foliage(z):
+    """Trees and bushes: thick in the belt between the fence and the
+    ground's edge, a few in the yard. Trunks collide (a trimesh of the trunk
+    alone) and join the solids; crowns and bushes don't collide."""
+    rng = z.rng
+    leaf = z.cutout_material("leaf", leaf_rgba(rng), roughness=0.7, surface="grass",
+                             double_sided=False)
+    bark = z.png_material("bark", bark_rgba(rng), roughness=0.85)
+    trees = [tree_meshes(z, rng, leaf, bark, v) for v in range(TREE_VARIANTS)]
+    bushes = [bush_mesh(z, rng, leaf, bark, v) for v in range(BUSH_VARIANTS)]
+    hx0, hx1, hz0, hz1 = HANGAR
+    ox0, ox1, oz0, oz1 = OFFICE
+    fx0, fx1, fz0, fz1 = FENCE
+    ex0, ex1, ez0, ez1 = ENCLOSURE
+
+    def clear(x, zz, r):
+        if abs(x) > BELT or abs(zz) > BELT:
+            return False
+        if abs(x) < ROAD_X + r and zz > hz1 - 1.0:
+            return False  # the road, the gate and its apron
+        if math.dist((x, zz), SPAWN_XZ) < 6.0 + r:
+            return False
+        for a, b, c, d, m in ((hx0, hx1, hz0, hz1, 1.5), (ox0, ox1, oz0, oz1, 1.5),
+                              (ex0, ex1, ez0, ez1, 1.0), (-16.0, 16.0, hz1, 22.0, 0.5)):
+            if a - m - r <= x <= b + m + r and c - m - r <= zz <= d + m + r:
+                return False
+        on_fence_x = min(abs(x - fx0), abs(x - fx1)) < 0.8 + r and fz0 - 1 <= zz <= fz1 + 1
+        on_fence_z = min(abs(zz - fz0), abs(zz - fz1)) < 0.8 + r and fx0 - 1 <= x <= fx1 + 1
+        return not (on_fence_x or on_fence_z)
+
+    def clear_of_buildings(x, zz, r):
+        for a, b, c, d in ((hx0, hx1, hz0, hz1), (ox0, ox1, oz0, oz1), (ex0, ex1, ez0, ez1)):
+            if a - r <= x <= b + r and c - r <= zz <= d + r:
+                return False
+        return True
+
+    def inside(x, zz):
+        return fx0 < x < fx1 and fz0 < zz < fz1
+
+    def spot(want_inside, near_edge):
+        for _ in range(400):
+            if want_inside:
+                x, zz = rng.uniform(fx0 + 1, fx1 - 1), rng.uniform(fz0 + 1, fz1 - 1)
+                # Along the fence and the buildings' walls, where the mower never went.
+                if near_edge and min(x - fx0, fx1 - x, zz - fz0, fz1 - zz) > 4.0 \
+                        and rng.random() < 0.8:
+                    continue
+            else:
+                x, zz = rng.uniform(-BELT, BELT), rng.uniform(-BELT, BELT)
+                if inside(x, zz):
+                    continue
+                # Thicker towards the corners.
+                corner = min(abs(abs(x) - BELT), abs(abs(zz) - BELT))
+                if corner > 4.0 and rng.random() < 0.35:
+                    continue
+            yield x, zz
+
+    counts = {"trees": 0, "bushes": 0}
+
+    def place_tree(want_inside, n):
+        placed = 0
+        for x, zz in spot(want_inside, False):
+            if placed == n:
+                break
+            k = rng.randrange(len(trees))
+            trunk, crown, r0, reach = trees[k]
+            scale = rng.uniform(0.8, 1.2)
+            r = r0 * scale + 0.15
+            # The whole crown on the ground (the check's 80 x 80) and clear
+            # of the buildings; over the fence is fine, it's higher.
+            if max(abs(x), abs(zz)) + reach * scale > gts.GROUND_HALF - 0.1:
+                continue
+            if not clear(x, zz, 1.0) or not clear_of_buildings(x, zz, reach * scale):
+                continue
+            aabb = ([x - r, G, zz - r], [x + r, G + 3.0, zz + r])
+            if any(gts.overlaps(aabb, s, 0.8) for s in z.solid):
+                continue
+            rot = yaw_q(rng.uniform(0, 360))
+            t = (x, MUD_TOP, zz)
+            z.place(trunk, t, rot, {"prefab": "prop", "params": {}}, name="tree_trunk", scale=scale)
+            z.place(crown, t, rot, {"prefab": "prop", "params": {"collide": False}},
+                    name="tree_crown", scale=scale)
+            z.solid.append(aabb)
+            placed += 1
+        return placed
+
+    def place_bush(want_inside, n):
+        placed = 0
+        for x, zz in spot(want_inside, True):
+            if placed == n:
+                break
+            scale = rng.uniform(0.8, 1.25)
+            if not clear(x, zz, 1.2 * scale):
+                continue
+            r = 1.0 * scale
+            aabb = ([x - r, G, zz - r], [x + r, G + 1.5, zz + r])
+            if any(gts.overlaps(aabb, s, 0.1) for s in z.solid):
+                continue
+            z.place(bushes[rng.randrange(len(bushes))], (x, MUD_TOP, zz),
+                    yaw_q(rng.uniform(0, 360)), {"prefab": "prop", "params": {"collide": False}},
+                    name="bush", scale=scale)
+            placed += 1
+        return placed
+
+    counts["trees"] = place_tree(False, TREES_OUT) + place_tree(True, TREES_IN)
+    counts["bushes"] = place_bush(False, BUSHES_OUT) + place_bush(True, BUSHES_IN)
+    return counts
+
+
+def check_foliage(doc):
+    """Leaves are single-sided MASK (the crown-normal trick needs no
+    back-face flip); crowns and bushes don't collide, trunks do; no trunk
+    stands on the road or near the spawn."""
+    bad = []
+    for m in doc["materials"]:
+        if m.get("name") == "leaf" and (m.get("alphaMode") != "MASK" or m.get("doubleSided")):
+            bad.append("leaf material must be single-sided MASK")
+    for n in doc["nodes"]:
+        name, params = n.get("name"), n.get("extras", {}).get("params", {})
+        if name in ("tree_crown", "bush") and params.get("collide", True):
+            bad.append(f"{name} at {n['translation']} collides")
+        if name == "tree_trunk":
+            x, _, zz = n["translation"]
+            if params.get("collide", True) is False:
+                bad.append(f"tree_trunk at {n['translation']} doesn't collide")
+            if (abs(x) < ROAD_X and zz > HANGAR[3] - 1.0) or math.dist((x, zz), SPAWN_XZ) < 6.0:
+                bad.append(f"tree_trunk at {n['translation']} on the road or spawn")
+    if bad:
+        print(f"check: {len(bad)} foliage problems: {bad[:5]}", file=sys.stderr)
+    return not bad
+
+
 def markers(z):
     lamp = {"prefab": "point_light", "params": LAMP}
     for x, y, zz in ((-6.0, 6.8, 0.0), (6.0, 6.8, 6.0),
@@ -818,6 +1230,7 @@ def build(seed):
     fence(z)
     enclosure(z)
     counts = props(z)
+    counts.update(foliage(z))
     counts["grass"] = grass(z)
     markers(z)
     return z, counts
@@ -847,7 +1260,8 @@ def main():
     print(f"wrote {args.out} ({os.path.getsize(args.out) / 1e6:.1f} MB): "
           + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
           + f"\n  {tris:,} triangles placed, {len(z.doc['images'])} images")
-    if args.check and not (gts.check(z.doc) and check_occlusion(z.doc)):
+    if args.check and not (gts.check(z.doc) and check_occlusion(z.doc)
+                           and check_foliage(z.doc)):
         return 1
     return 0
 

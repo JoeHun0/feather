@@ -158,11 +158,7 @@ impl Environment {
     }
 }
 
-/// `mesh.frag`'s `MASKED` constant (§5): the masked-material variant of the
-/// main pipeline. Outside the environment's id range on purpose.
-pub(crate) const MASKED_ID: u32 = 100;
-
-/// An environment's specialization data (and optionally `MASKED`), owned so
+/// An environment's specialization data, owned so
 /// that a `vk::SpecializationInfo` borrowing it lives as long as pipeline
 /// creation. Every value is 4 bytes: an f32, or a VkBool32.
 pub(crate) struct Specialization {
@@ -180,12 +176,6 @@ impl Specialization {
             spec.push(id as u32, v.to_bits());
         }
         spec
-    }
-
-    /// The same, with `MASKED` set: the main pipeline for masked materials.
-    pub(crate) fn masked(mut self) -> Self {
-        self.push(MASKED_ID, vk::TRUE);
-        self
     }
 
     fn push(&mut self, constant_id: u32, value: u32) {
@@ -280,9 +270,6 @@ mod tests {
         ];
         for (shader, spv) in shaders {
             for (id, (name, value)) in spec_constants(spv) {
-                if id == MASKED_ID {
-                    continue; // not the environment's; checked below
-                }
                 let i = id as usize;
                 assert!(i < SPEC_COUNT, "{shader}: constant_id {id} isn't mapped");
                 if let Some(name) = name {
@@ -300,27 +287,6 @@ mod tests {
         for (i, u) in used.iter().enumerate() {
             assert!(u, "no shader declares {}", SPEC_NAMES[i]);
         }
-    }
-
-    /// `mesh.frag` declares `MASKED` at the id `Specialization::masked`
-    /// sets, defaulting to false: the opaque pipeline, which sets nothing
-    /// there, must not cut anything out.
-    #[test]
-    fn mesh_frag_declares_masked() {
-        let spv = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"));
-        let (name, value) = spec_constants(spv)
-            .remove(&MASKED_ID)
-            .expect("mesh.frag declares no constant at MASKED_ID");
-        if let Some(name) = name {
-            assert_eq!(name, "MASKED");
-        }
-        assert_eq!(value, 0.0, "MASKED must default to false");
-        let spec = Specialization::new(&Environment::default()).masked();
-        let entry = spec.entries.last().unwrap();
-        assert_eq!(
-            (entry.constant_id, spec.data.last()),
-            (MASKED_ID, Some(&vk::TRUE))
-        );
     }
 
     /// The shaders' `fog_optical_depth`, transcribed: the reference the

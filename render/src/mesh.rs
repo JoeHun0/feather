@@ -1100,27 +1100,20 @@ impl MeshRenderer {
                 .expect("graphics pipeline")[0]
         };
 
-        // ---- Masked materials (§5): the same pass with `MASKED` set, so only
-        // these fragments pay for the cutout, and only this pipeline loses
-        // early-Z's shortcuts. It still needs its own cut: where the prepass
-        // cut a hole, the depth behind passes LESS_OR_EQUAL.
-        let masked_spec = Specialization::new(env).masked();
-        let masked_spec_info = masked_spec.info();
-        let masked_stages = [
-            stages[0],
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(frag)
-                .name(c"main")
-                .specialization_info(&masked_spec_info),
-        ];
-        // A copy of the opaque pipeline's create info (its rendering-info
-        // chain included), with only the stages swapped.
+        // ---- Masked materials (§5): the opaque pipeline, testing depth for
+        // EQUAL. The prepass already cut them (mask.frag) and wrote the
+        // surviving texels' depth, bit-identical here (the same mesh.vert).
+        // Where it cut a hole, the stored depth is the surface behind, so the
+        // card's fragment fails EQUAL; where it kept one, it passes. So the
+        // main pass needs no cut of its own, and keeps early-Z: a crown's
+        // hidden layers are rejected before mesh.frag runs, not after
+        // (zone geo 0.54 -> 0.43 ms with trees, §5).
+        let masked_depth = depth_stencil.depth_compare_op(vk::CompareOp::EQUAL);
         let masked_pipeline = unsafe {
             device
                 .create_graphics_pipelines(
                     vk::PipelineCache::null(),
-                    &[pipeline_info.stages(&masked_stages)],
+                    &[pipeline_info.depth_stencil_state(&masked_depth)],
                     None,
                 )
                 .map_err(|(_, e)| e)
@@ -2230,21 +2223,20 @@ mod tests {
         assert_eq!(plan.uploads.len(), 2, "the ARM image uploads once");
     }
 
-    /// The alpha test is written out in mesh.frag (the main pass) and
-    /// mask.frag (the depth prepass and shadows). Different texts would cut
-    /// different holes in depth and in colour, so they must match exactly.
+    /// Masked materials reach mesh.frag through a depth test for EQUAL
+    /// against the prepass's cut (§5), which only saves anything while the
+    /// shader keeps early-Z: a discard or demote in it would lose that for
+    /// every material.
     #[test]
-    fn the_shaders_share_the_cutout() {
-        let body = |src: &str| -> String {
-            let sig = "float cutout_alpha(Material m, vec2 uv)";
-            let start = src.find(sig).expect("no cutout_alpha");
-            let len = src[start..].find("\n}\n").expect("function end") + 3;
-            src[start..start + len].to_string()
-        };
-        assert_eq!(
-            body(include_str!("../shaders/mesh.frag")),
-            body(include_str!("../shaders/mask.frag"))
-        );
+    fn mesh_frag_never_cuts() {
+        let src = include_str!("../shaders/mesh.frag");
+        for word in ["discard", "demote"] {
+            assert!(
+                !src.lines()
+                    .any(|l| !l.trim_start().starts_with("//") && l.contains(word)),
+                "mesh.frag uses `{word}`"
+            );
+        }
     }
 
     /// mesh.frag decodes and blends the sky volume by hand, with its own

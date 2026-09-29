@@ -22,9 +22,8 @@ layout(location = 2) in vec2 v_uv;
 
 // Cutout (§5): the base colour's alpha for material `m` at `uv`, raised
 // with the mip level, since box-filtered mips average alpha down and a cutout
-// would otherwise thin away with distance.
-// NOTE: must match the other shader's copy, character for character (a test
-// checks).
+// would otherwise thin away with distance. The only cut: the main pass tests
+// masked materials' depth for EQUAL against what this left (§5).
 float cutout_alpha(Material m, vec2 uv) {
     float a = texture(textures[nonuniformEXT(m.tex.x)], uv).a * m.base_color_factor.a;
     float lod = textureQueryLod(textures[nonuniformEXT(m.tex.x)], uv).x;

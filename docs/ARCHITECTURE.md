@@ -186,20 +186,61 @@ double-sided, cull — used to pick pipeline and draw bucket.
     culling**, unlike the opaque shadow pass (front-face culling): a card is
     usually one quad, which would drop out of the map whenever it faced the
     sun.
-  - **Main:** `mesh.frag` specialized with `MASKED` (constant ID 100).
-    - It has to cut too: where the prepass cut a hole, the depth behind it
-      passes `LESS_OR_EQUAL`.
-    - It **demotes** rather than discards (Vulkan 1.3's mandatory
-      `shaderDemoteToHelperInvocation`, now enabled). Normal mapping and mip
-      selection still need derivatives in the cut fragments' quads, which
-      `discard` would leave undefined.
-    - Opaque materials keep a pipeline with no cut at all, and so their
-      early-Z.
-- **The alpha test** is `cutout_alpha()`, written out in both shaders (a
-  test keeps the texts identical). It's base-colour alpha × factor, scaled up
-  by `1 + 0.25 · mip level`: box-filtered mips average alpha down, so without
+  - **Main:** the opaque pipeline (`mesh.frag`, no cut), testing depth for
+    **`EQUAL`**.
+    - Where the prepass cut a hole, the stored depth is whatever's behind,
+      so the card fails the test. Where it kept a texel, the depth matches
+      bit for bit (the same `mesh.vert`).
+    - So the main pass needs no cut and keeps early-Z: a crown's hidden
+      layers are rejected before shading.
+    - *Changed with foliage.* It used to be `mesh.frag` specialized with a
+      `MASKED` constant that demoted cut fragments, under the opaque pass's
+      `LESS_OR_EQUAL`. That lost early-Z for every masked fragment: with the
+      zone's trees, `geo` 0.54 → 0.43 ms and frames 1.25 → 1.10 ms
+      (pinned, release, 3 interleaved rounds; `lights120`, with no masked
+      materials, unchanged).
+    - Against the old path, HDR dumps from three zone views are
+      99.98–100% bit-identical, at 1× and MSAA 4×, with identical depth
+      and no holes. A few dozen pixels a view differ, where the old main
+      pass's own cut could disagree with the prepass's near the cutoff
+      (different derivatives, so a different mip). The old binary against
+      itself is bit-identical, so these are real, if tiny.
+    - A test keeps `discard` and `demote` out of `mesh.frag`, which this
+      relies on.
+- **The alpha test** is `cutout_alpha()`, now only in `mask.frag` (the
+  prepass and shadows). It's base-colour alpha × factor, scaled up by
+  `1 + 0.25 · mip level`: box-filtered mips average alpha down, so without
   that a cutout thins away with distance. It works the same for raw and baked
   (BC7 with alpha) textures.
+
+**Landed (§26): foliage.** The zone's trees and bushes
+(`gen_zonescene.py`), procedural like its grass:
+- **Leaves:** a painted 512² leaf-cluster card and pale birch bark.
+- **Trees:** 3 birch-like variants, 7–12 m, a tapered leaning trunk with
+  6–10 branches and ~350 leaf cards; 35 outside the fence, 6 in the yard.
+- **Bushes:** 2 variants of ~60–90 cards, 40 outside the fence and 25
+  inside.
+- **The shading recipe:** the leaf material is **single-sided** MASK with
+  vertex normals pointing out of the crown's ellipsoid.
+  - The main pass never culls, and only double-sided materials flip a back
+    face's normal, so both sides of a card draw with the outward normal.
+  - The crown shades as one volume, lit on the sun side, and the cutout CSM
+    shadows dapple it and the ground.
+- **Collision:** a tree is two nodes. The trunk collides (a trimesh of the
+  stem alone); the crown (branches and leaves) doesn't, and nor do bushes.
+- **Cost** (pinned, release, the final engine, the zone before against
+  after):
+  - `shadow` 0.13 → 0.35 ms, `geo` 0.29 → 0.43, `ao` +0.01, frame 0.72 →
+    1.10 ms;
+  - the bench's metered exposure 1.38 → 1.49.
+  - I predicted `geo` +0.05–0.15 (it held only after the `EQUAL` change;
+    before it, +0.25), `shadow` +0.03–0.08 (wrong: +0.22) and frames
+    +0.1–0.25 (wrong: +0.38).
+  - Half the leaf cards cost `shadow` 0.25 and `geo` 0.37 (frame 0.95), but
+    the crowns looked sparse; full density was kept.
+  - The shadow cost is the lever left, e.g. foliage in fewer cascades.
+- **LODs:** crowns get LODs, whose `Prune` drops cards smaller than the
+  LOD's error, which the runtime keeps under its screen-space budget.
 - **Double-sided:** a back face of a double-sided material flips its normal,
   which also fixes its shadow lookup's normal offset. Culling stays NONE for
   everything, as before.
@@ -2500,9 +2541,9 @@ and punctuation.
     - `put()` now centres each prop's *bounds* on its spot, not its origin:
       the compressor's origin is ~4 m from its geometry, which the enclosure
       exposed.
-  - **Known look limits:** the ambient light isn't occluded, so interiors are
-    too bright; there are no leafy trees yet; and shadows are sharp even
-    under an overcast sky (no PCSS).
+  - **Known look limits:** shadows are sharp even under an overcast sky (no
+    PCSS). (The ambient's occlusion and leafy trees have since landed: §13,
+    §5.)
 - **RenderDoc:** in-application API, capture on a keybind.
 - **Object naming:** `vkSetDebugUtilsObjectName` on buffers/images/pipelines
   from the start (readable validation + captures).

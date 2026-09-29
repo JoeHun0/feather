@@ -1,6 +1,5 @@
 #version 450
 #extension GL_EXT_nonuniform_qualifier : require
-#extension GL_EXT_demote_to_helper_invocation : require
 
 layout(push_constant) uniform Push {
     mat4 view_proj;
@@ -28,20 +27,9 @@ const uint MATERIAL_DOUBLE_SIDED = 1u;
 // tex.w's bits above the flags: the occlusion texture's slot (render::mesh's
 // MATERIAL_OCCLUSION_SHIFT; a test checks).
 const uint MATERIAL_OCCLUSION_SHIFT = 8u;
-// The masked-material variant of this pipeline (§5): cut out below the
-// material's alpha cutoff. Not part of the environment's constants.
-layout(constant_id = 100) const bool MASKED = false;
-
-// Cutout (§5): the base colour's alpha for material `m` at `uv`, raised
-// with the mip level, since box-filtered mips average alpha down and a cutout
-// would otherwise thin away with distance.
-// NOTE: must match the other shader's copy, character for character (a test
-// checks).
-float cutout_alpha(Material m, vec2 uv) {
-    float a = texture(textures[nonuniformEXT(m.tex.x)], uv).a * m.base_color_factor.a;
-    float lod = textureQueryLod(textures[nonuniformEXT(m.tex.x)], uv).x;
-    return a * (1.0 + max(lod, 0.0) * 0.25);
-}
+// Masked (cutout) materials run this same shader: the depth prepass cut
+// them (mask.frag), and their pipeline tests depth for EQUAL, so a cut texel
+// never gets here (§5).
 // Cascades in the sun shadow map. MUST match feather_gfx::SHADOW_CASCADES.
 const int SHADOW_CASCADES = 4;
 // How far to push the sample along the surface normal, in shadow texels (§11's
@@ -553,12 +541,6 @@ vec3 punctual(Light l, vec3 N, vec3 V, vec3 R, vec3 world_pos, vec3 albedo, vec3
 
 void main() {
     Material m = materials[v_material];
-    // Demote rather than discard: the quad's other fragments still need
-    // their derivatives (normal mapping, mip selection) below.
-    if (MASKED && cutout_alpha(m, v_uv) < m.params.w) {
-        demote;
-    }
-
     vec3 albedo = texture(textures[nonuniformEXT(m.tex.x)], v_uv).rgb * m.base_color_factor.rgb;
     // green = roughness, blue = metallic; red = occlusion if it's an ARM map.
     vec3 arm = texture(textures[nonuniformEXT(m.tex.z)], v_uv).rgb;
