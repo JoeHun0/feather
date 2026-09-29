@@ -1467,6 +1467,7 @@ impl MeshRenderer {
             masked: &self.masked,
             keyed: &mut self.keyed,
             scratch: &mut self.scratch,
+            min_masked_lod: 0,
         };
         let main_stats = runs.build(main, enabled.then_some(screen), &mut self.main_runs, 0);
         stats.main_tris = main_stats.tris;
@@ -1478,6 +1479,7 @@ impl MeshRenderer {
                 .get(cascade)
                 .map(|c| LodRule::Texel(c.texel_world))
                 .filter(|_| enabled);
+            runs.min_masked_lod = MASKED_SHADOW_MIN_LOD[cascade];
             let st = runs.build(casters, rule, &mut self.shadow_runs[cascade], base);
             stats.shadow_tris += st.tris;
             stats.shadow_masked += st.masked;
@@ -1782,7 +1784,20 @@ struct Runs<'a> {
     masked: &'a [bool],
     keyed: &'a mut Vec<(u32, InstanceData)>,
     scratch: &'a mut Vec<InstanceData>,
+    /// The coarsest LOD a masked instance must take, as far as its mesh has
+    /// one (`MASKED_SHADOW_MIN_LOD`); 0 for the main pass. Only with LODs on.
+    min_masked_lod: usize,
 }
+
+/// The coarsest LOD a masked (foliage) shadow caster takes, per cascade
+/// (§11, §17), over what its texel error allows. A tree crown's LODs drop
+/// whole leaf cards (the bake's `Prune`), so their error is most of a metre
+/// and the one-texel rule never picks them; yet in the far cascades (9-60 m)
+/// half or a quarter of the cards casts nearly the same shadow, while the
+/// full crowns were most of the pass: zone `shadow` 0.35 -> 0.25 ms, with
+/// <= 1% of pixels changing by more than 2% (§26). Near cascades keep every
+/// card. Meshes without LODs (bushes, grass, chain-link) are unaffected.
+const MASKED_SHADOW_MIN_LOD: [usize; SHADOW_CASCADES] = [0, 0, 2, 2];
 
 /// Run sort key bit: the instance's material is masked. The top bit, so a
 /// view's runs sort opaque first, then masked.
@@ -1806,13 +1821,18 @@ impl Runs<'_> {
         self.keyed.extend(items.iter().filter_map(|(mesh, inst)| {
             // Unknown meshes are dropped here, as the draw loop always did.
             let slice = self.slices.get(mesh.0 as usize)?;
+            let masked = self.masked.get(inst.material_id as usize) == Some(&true);
             let lod = rule.map_or(0, |r| {
-                pick_lod(
+                let lod = pick_lod(
                     &slice.lods,
                     r.budget(&inst.model, slice.center, slice.radius),
-                )
+                );
+                if masked {
+                    lod.max(self.min_masked_lod.min(slice.lods.len() - 1))
+                } else {
+                    lod
+                }
             });
-            let masked = self.masked.get(inst.material_id as usize) == Some(&true);
             let key = (mesh.0 << 4) | lod as u32;
             debug_assert!(
                 key & KEY_MASKED == 0,
@@ -2057,6 +2077,7 @@ mod tests {
             masked: &[],
             keyed: &mut keyed,
             scratch: &mut scratch,
+            min_masked_lod: 0,
         };
         let st = b.build(&items, Some(screen()), &mut runs, 10);
         let got: Vec<(u32, u32, i32, u32, u32)> = runs
@@ -2092,6 +2113,7 @@ mod tests {
             masked: &[],
             keyed: &mut keyed,
             scratch: &mut scratch,
+            min_masked_lod: 0,
         };
         let st = b.build(&items, None, &mut runs, 0);
         assert_eq!(st.lods[0], 5);
@@ -2102,6 +2124,52 @@ mod tests {
     /// mesh, so a pass switches pipeline once; within each half the runs
     /// split by (mesh, LOD) as before, and the instances and triangles are
     /// the same as without masking.
+    /// A masked shadow caster takes at least the cascade's floor, clamped
+    /// to the coarsest LOD its mesh has; an opaque one, the same floor
+    /// notwithstanding, only what its error allows; and with LODs off, LOD0.
+    #[test]
+    fn masked_shadow_casters_take_the_cascade_floor() {
+        // Errors a texel rule of 1 cm never accepts past LOD0, like a
+        // crown's pruned levels.
+        let slices = vec![MeshSlice {
+            vertex_offset: 0,
+            lods: lods(&[0.0, 0.8, 0.9]),
+            center: Vec3::ZERO,
+            radius: 0.5,
+        }];
+        let masked = [false, true];
+        let items = vec![
+            (MeshId(0), InstanceData::new(Mat4::IDENTITY, 1)),
+            (MeshId(0), InstanceData::new(Mat4::IDENTITY, 0)),
+        ];
+        // (masked LOD, opaque LOD), from the runs' first indices.
+        let build = |floor: usize, rule: Option<LodRule>| {
+            let (mut keyed, mut scratch, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+            Runs {
+                slices: &slices,
+                masked: &masked,
+                keyed: &mut keyed,
+                scratch: &mut scratch,
+                min_masked_lod: floor,
+            }
+            .build(&items, rule, &mut runs, 0);
+            let lod = |m: bool| {
+                let r = runs.iter().find(|r| r.masked == m).expect("a run");
+                (r.first_index / 300) as usize
+            };
+            (lod(true), lod(false))
+        };
+        let texel = Some(LodRule::Texel(0.01));
+        assert_eq!(build(0, texel), (0, 0), "no floor: the texel rule's LOD0");
+        assert_eq!(build(2, texel), (2, 0), "the floor, for masked only");
+        assert_eq!(build(5, texel), (2, 0), "clamped to the coarsest LOD");
+        assert_eq!(build(2, None), (0, 0), "LODs off: LOD0 regardless");
+        // Near cascades keep every card, and the floor never falls with
+        // distance.
+        assert_eq!(MASKED_SHADOW_MIN_LOD[0], 0);
+        assert!(MASKED_SHADOW_MIN_LOD.windows(2).all(|w| w[0] <= w[1]));
+    }
+
     #[test]
     fn masked_runs_follow_the_opaque_ones() {
         let slices: Vec<MeshSlice> = (0..3)
@@ -2130,6 +2198,7 @@ mod tests {
                 masked,
                 keyed: &mut keyed,
                 scratch: &mut scratch,
+                min_masked_lod: 0,
             }
             .build(&items, None, &mut runs, 0);
             (runs, st, scratch)

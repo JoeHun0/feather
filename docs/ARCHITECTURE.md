@@ -238,7 +238,38 @@ double-sided, cull — used to pick pipeline and draw bucket.
     +0.1–0.25 (wrong: +0.38).
   - Half the leaf cards cost `shadow` 0.25 and `geo` 0.37 (frame 0.95), but
     the crowns looked sparse; full density was kept.
-  - The shadow cost is the lever left, e.g. foliage in fewer cascades.
+  - **Shadow cost, then cut** (`MASKED_SHADOW_MIN_LOD`, §11). A temporary
+    harness split the shadow pass (pinned, release, 2 rounds, identical):
+    - the foliage cost per cascade (0–4 / 4–9 / 9–20 / 20–60 m) was ~0.01 /
+      0.05 / 0.10 / 0.07 ms. I predicted the near cascades would dominate,
+      and was wrong: the far ones see the whole tree belt.
+    - the alpha test was ~0.11 of it (solid cards: 0.24); the rest was
+      geometry.
+  - **Why the far cascades drew full crowns:** the leaf primitives' LODs
+    (608 > 304 > 152 > 76 triangles) err by 0.76–0.91 m, as `Prune` drops
+    whole cards. The one-texel shadow rule never took them.
+  - **Now masked casters take at least LOD2 in cascades 2–3.** Options
+    measured:
+
+    | rule | `shadow` | frame |
+    |---|---|---|
+    | as it was | 0.35 | 1.10 |
+    | LOD1 from cascade 3 | 0.32 | 1.08 |
+    | LOD1 from cascade 2 | 0.29 | 1.05 |
+    | LOD2 from cascade 2 | 0.25 | 1.01 |
+
+    - Landed, 3 interleaved rounds against 235596b: zone `shadow` 0.35 →
+      0.25 ms, frame 1.10 → 1.01–1.02; `lights120` unchanged. Both as
+      predicted.
+    - Shadow triangles fell only 0.30 → 0.28 M, so most of the saving is
+      alpha-tested fragments.
+  - **The look:** HDR dumps against 235596b from four views, one 3 m from a
+    tree.
+    - Every pixel within 9 m (cascades 0–1) is bit-identical.
+    - Beyond, 0.04–1.7% of pixels change by more than 2% (mean luminance ≤
+      +0.0004): slightly lighter shadows under far trees.
+  - **What's left:** the alpha test itself (~0.1 ms), and the leaves' main
+    pass.
 - **LODs:** crowns get LODs, whose `Prune` drops cards smaller than the
   LOD's error, which the runtime keeps under its screen-space budget.
 - **Double-sided:** a back face of a double-sided material flips its normal,
@@ -613,6 +644,16 @@ and the fix. Cost: none measurable (`--bench` identical to 0.01 ms).
 layers must share an extent, so §11's "far cascade 1024²" is not expressible in
 a single array — the sphere fit already gives far cascades more world per texel,
 which is that line's intent).
+
+**Landed (§26): a LOD floor for foliage casters.** Masked shadow casters
+take at least `MASKED_SHADOW_MIN_LOD[cascade]` (`[0, 0, 2, 2]`),
+clamped to the coarsest LOD their mesh has.
+- **Why:** tree crowns' LODs drop whole leaf cards, so their error is most
+  of a metre, and the one-texel rule never picks them.
+- **The trade:** in the 9–60 m cascades, a quarter of the cards casts
+  nearly the same shadow, for 0.10 ms of the zone's 0.35.
+- **Scope:** only with LODs on; near cascades, opaque casters and the main
+  pass are unaffected. Details and the look check: §5, foliage.
 
 ## 12. Clustered lighting
 
