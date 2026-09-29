@@ -205,6 +205,21 @@ double-sided, cull — used to pick pipeline and draw bucket.
       pass's own cut could disagree with the prepass's near the cutoff
       (different derivatives, so a different mip). The old binary against
       itself is bit-identical, so these are real, if tiny.
+    - **At MSAA 2× and 8×** (three more zone views: 3 m under a tree
+      looking up, the tree belt at 18–22 m, bushes and crowns at 5–25 m),
+      the new path is 99.99% bit-identical at 2× (98–192 pixels a view) and
+      99.97–99.98% at 8× (381–695), with identical depth and mean luminance
+      equal to five digits. More samples mean more partly covered edge
+      pixels for the two cuts to disagree on.
+    - **No holes, not even one sample:** both binaries were rebuilt with a
+      magenta clear colour of 100, which only a sample nothing covered can
+      show, and even 1 of 8 samples would add 12 to red and blue. None shows
+      at 2× or 8×, and the renders are bit-identical to the normal ones.
+      As a control, the masked main pass testing `NEVER` turns 270–340 k
+      pixels a view magenta, exactly the crowns, bushes and grass.
+    - **The detail scenes** (low, med, high) have no MASK materials (their
+      grass is BLEND, drawn opaque), so the change can't reach them: HDR and
+      depth are bit-identical at 1× and 4×, three views each, as predicted.
     - A test keeps `discard` and `demote` out of `mesh.frag`, which this
       relies on.
 - **The alpha test** is `cutout_alpha()`, now only in `mask.frag` (the
