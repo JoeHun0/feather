@@ -18,6 +18,9 @@ macro_rules! spv {
     };
 }
 
+/// `sky.frag`'s push block: inv_view_proj, camera_pos, light_dir, fog.
+pub(crate) const SKY_PUSH_SIZE: u32 = 112;
+
 pub struct SkyPass {
     device: ash::Device,
     layout: vk::PipelineLayout,
@@ -81,7 +84,7 @@ impl SkyPass {
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(96)]; // mat4 inv_view_proj + vec4 camera_pos + vec4 light_dir
+            .size(SKY_PUSH_SIZE)]; // mat4 inv_view_proj + vec4 camera_pos + vec4 light_dir + vec4 fog
         let layout = unsafe {
             device
                 .create_pipeline_layout(
@@ -139,12 +142,16 @@ impl SkyPass {
         inv_view_proj: Mat4,
         camera_pos: Vec3,
         light_dir: Vec4,
+        fog: Vec3,
     ) {
-        let mut push = [0f32; 24];
+        let mut push = [0f32; 28];
         push[..16].copy_from_slice(&inv_view_proj.to_cols_array());
         push[16..19].copy_from_slice(&camera_pos.to_array());
-        push[20..].copy_from_slice(&light_dir.to_array());
-        let push_bytes = unsafe { std::slice::from_raw_parts(push.as_ptr() as *const u8, 96) };
+        push[20..24].copy_from_slice(&light_dir.to_array());
+        push[24..27].copy_from_slice(&fog.to_array());
+        let push_bytes = unsafe {
+            std::slice::from_raw_parts(push.as_ptr() as *const u8, SKY_PUSH_SIZE as usize)
+        };
 
         unsafe {
             self.device

@@ -289,6 +289,9 @@ struct GraphicsSettings {
     /// Pick LODs per view (§17). `--no-lod` pins LOD0 while keeping the baked
     /// vertex order, so an A/B separates the ordering win from the LOD win.
     lod: bool,
+    /// The session's weather (§13), from OPTIONS > WEATHER: never saved, and
+    /// reset by each new game.
+    weather: WeatherOverride,
     /// Occlude the ambient light by the level's baked sky visibility (§13),
     /// when it has one. `--no-sky-occlusion` turns it off for A/B runs; not a
     /// menu option, since it's part of the look rather than a cost to trade.
@@ -331,6 +334,7 @@ impl Default for GraphicsSettings {
             bake: true,
             lod: true,
             sky_occlusion: true,
+            weather: WeatherOverride::default(),
         }
     }
 }
@@ -357,6 +361,9 @@ enum MenuScreen {
     Gameplay,
     /// Key bindings (§14): one row per action, Enter to rebind.
     Controls,
+    /// The session's weather (§13), in game only: a temporary stand-in until
+    /// the weather engine.
+    Weather,
 }
 
 impl MenuScreen {
@@ -369,6 +376,7 @@ impl MenuScreen {
             Self::Sound => "SOUND",
             Self::Gameplay => "GAMEPLAY",
             Self::Controls => "CONTROLS",
+            Self::Weather => "WEATHER",
         }
     }
 }
@@ -396,6 +404,10 @@ enum MenuAction {
     ToggleInvertY,
     /// Next FIELD OF VIEW preset.
     CycleFov,
+    /// Next WEATHER preset: fog density, fog height, time of day.
+    CycleFogDensity,
+    CycleFogHeight,
+    CycleTimeOfDay,
     /// Next step of one SOUND volume.
     CycleVolume(config::audio::Key),
     /// Wait for a key to bind to this action.
@@ -450,6 +462,8 @@ enum MenuOutcome {
     ApplyDisplay,
     /// The FOV changed: nothing to rebuild (the next frame uses it), just save.
     ApplyFov,
+    /// The weather changed: the next frame uses it; never saved.
+    ApplyWeather,
     /// A volume changed: set it on the mixer and save it.
     ApplyAudio(config::audio::Key),
     StartSession,
@@ -498,6 +512,29 @@ fn screen_rows(
             MenuRow::new("CONTROLS", MenuAction::Enter(MenuScreen::Controls)),
             MenuRow::new("SOUND", MenuAction::Enter(MenuScreen::Sound)),
             MenuRow::new("GAMEPLAY", MenuAction::Enter(MenuScreen::Gameplay)),
+        ]
+        .into_iter()
+        // The weather is the session's, reset by each new game: from the
+        // main menu it would change nothing.
+        .chain(in_session.then(|| MenuRow::new("WEATHER", MenuAction::Enter(MenuScreen::Weather))))
+        .chain([MenuRow::new("BACK", MenuAction::Back)])
+        .collect(),
+        MenuScreen::Weather => vec![
+            MenuRow::new(
+                format!("FOG DENSITY  {}", FOG_DENSITIES[s.weather.fog_density].0),
+                MenuAction::CycleFogDensity,
+            ),
+            MenuRow::new(
+                format!("FOG HEIGHT  {}", FOG_HEIGHTS[s.weather.fog_height].0),
+                MenuAction::CycleFogHeight,
+            ),
+            MenuRow::new(
+                format!(
+                    "TIME OF DAY  {}  SUN ONLY",
+                    TIMES_OF_DAY[s.weather.time_of_day].0
+                ),
+                MenuAction::CycleTimeOfDay,
+            ),
             MenuRow::new("BACK", MenuAction::Back),
         ],
         MenuScreen::Graphics => vec![
@@ -781,6 +818,21 @@ impl Menu {
             MenuAction::CycleFov => {
                 s.step_fov();
                 MenuOutcome::ApplyFov
+            }
+            MenuAction::CycleFogDensity => {
+                let w = &mut s.weather;
+                w.fog_density = (w.fog_density + 1) % FOG_DENSITIES.len();
+                MenuOutcome::ApplyWeather
+            }
+            MenuAction::CycleFogHeight => {
+                let w = &mut s.weather;
+                w.fog_height = (w.fog_height + 1) % FOG_HEIGHTS.len();
+                MenuOutcome::ApplyWeather
+            }
+            MenuAction::CycleTimeOfDay => {
+                let w = &mut s.weather;
+                w.time_of_day = (w.time_of_day + 1) % TIMES_OF_DAY.len();
+                MenuOutcome::ApplyWeather
             }
             MenuAction::CycleVolume(k) => {
                 k.set(a, audio::step_volume(k.get(a)));
@@ -2608,6 +2660,72 @@ fn sun_angles(travel: Vec3) -> (f32, f32) {
     (elevation, azimuth)
 }
 
+/// The session's weather overrides (§13): an index into each preset table,
+/// 0 being the level's own. A stand-in for the weather engine.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct WeatherOverride {
+    fog_density: usize,
+    fog_height: usize,
+    time_of_day: usize,
+}
+
+/// FOG DENSITY's presets: per metre at the fog's height (the zone's own is
+/// 0.035). `None` is the level's.
+const FOG_DENSITIES: [(&str, Option<f32>); 7] = [
+    ("LEVEL", None),
+    ("OFF", Some(0.0)),
+    ("THIN", Some(0.008)),
+    ("LIGHT", Some(0.018)),
+    ("MEDIUM", Some(0.035)),
+    ("THICK", Some(0.06)),
+    ("HEAVY", Some(0.1)),
+];
+
+/// FOG HEIGHT's presets: the falloff, per metre (the density falls by e
+/// every 1/falloff metres up; 0 is even, the same at every height; the
+/// zone's own is 0.08). `None` is the level's.
+const FOG_HEIGHTS: [(&str, Option<f32>); 6] = [
+    ("LEVEL", None),
+    ("EVEN", Some(0.0)),
+    ("TALL", Some(0.03)),
+    ("MEDIUM", Some(0.08)),
+    ("LOW", Some(0.2)),
+    ("GROUND", Some(0.5)),
+];
+
+/// TIME OF DAY's presets, a placeholder until the weather engine: where the
+/// sun stands, (elevation, azimuth) in degrees as `environment` takes them.
+/// Only the sun moves; the sky keeps the level's colours. `None` is the
+/// level's.
+const TIMES_OF_DAY: [(&str, Option<(f32, f32)>); 6] = [
+    ("LEVEL", None),
+    ("DAWN", Some((4.0, 95.0))),
+    ("MORNING", Some((25.0, 125.0))),
+    ("NOON", Some((60.0, 180.0))),
+    ("AFTERNOON", Some((35.0, 235.0))),
+    ("DUSK", Some((4.0, 265.0))),
+];
+
+/// The fog this frame: (density at height, height, falloff), the level's
+/// where the weather doesn't say.
+fn effective_fog(env: &Environment, w: &WeatherOverride) -> Vec3 {
+    Vec3::new(
+        FOG_DENSITIES[w.fog_density].1.unwrap_or(env.fog_density),
+        env.fog_height,
+        FOG_HEIGHTS[w.fog_height].1.unwrap_or(env.fog_falloff),
+    )
+}
+
+/// The direction sunlight travels this frame: the level's, or the time of
+/// day's.
+fn effective_sun(env: &Environment, w: &WeatherOverride) -> Vec3 {
+    TIMES_OF_DAY[w.time_of_day]
+        .1
+        .map_or(env.sun_dir, |(elevation, azimuth)| {
+            sun_travel(elevation, azimuth)
+        })
+}
+
 /// The direction sunlight travels from a sun at `elevation` and `azimuth`
 /// (degrees, as `environment` takes them).
 fn sun_travel(elevation: f32, azimuth: f32) -> Vec3 {
@@ -2622,6 +2740,8 @@ fn sun_travel(elevation: f32, azimuth: f32) -> Vec3 {
 struct FrameView {
     /// What the camera passes draw with: jittered under TAA (§13).
     view_proj: Mat4,
+    /// This frame's fog (§13): (density at height, height, falloff).
+    fog: Vec3,
     inv_view_proj: Mat4,
     /// TAA's reprojection: this frame's unjittered clip space to last frame's.
     reproject: Mat4,
@@ -3174,6 +3294,15 @@ impl App {
                 self.log_taa();
                 self.persist(config::graphics::Key::Taa);
             }
+            MenuOutcome::ApplyWeather => {
+                let w = self.settings.weather;
+                eprintln!(
+                    "[quality] weather: fog density {}, fog height {}, time of day {}",
+                    FOG_DENSITIES[w.fog_density].0,
+                    FOG_HEIGHTS[w.fog_height].0,
+                    TIMES_OF_DAY[w.time_of_day].0
+                );
+            }
             MenuOutcome::ApplyBloom => {
                 // Nothing to push: the frame reads the setting as it draws.
                 eprintln!(
@@ -3280,6 +3409,8 @@ impl App {
         // already baked into the session's pipelines.
         let env = session.environment;
         self.light_dir = env.sun_dir.extend(0.0);
+        // A new game has the level's own weather.
+        self.settings.weather = WeatherOverride::default();
         self.exposure = env.exposure;
         self.exposure_range = (env.exposure_min, env.exposure_max);
         self.exposure_reset = true;
@@ -3777,6 +3908,11 @@ impl ApplicationHandler for App {
                         viewport_height: size.height.max(1) as f32,
                     };
                     let inv_view_proj = draw_view_proj.inverse();
+                    // The weather (§13): the time of day's sun and the fog.
+                    self.light_dir =
+                        effective_sun(&s.environment, &self.settings.weather).extend(0.0);
+                    let fog = effective_fog(&s.environment, &self.settings.weather);
+                    s.mesh.set_fog(fog);
                     let light_dir = self.light_dir;
                     let camera_pos = eye;
 
@@ -3939,6 +4075,7 @@ impl ApplicationHandler for App {
                     }
                     frame_view = Some(FrameView {
                         view_proj: draw_view_proj,
+                        fog,
                         inv_view_proj,
                         reproject,
                         light_dir,
@@ -4165,8 +4302,14 @@ impl ApplicationHandler for App {
                                     v.light_dir,
                                     v.camera_pos,
                                 );
-                                s.sky
-                                    .draw(cmd, extent, v.inv_view_proj, v.camera_pos, v.light_dir);
+                                s.sky.draw(
+                                    cmd,
+                                    extent,
+                                    v.inv_view_proj,
+                                    v.camera_pos,
+                                    v.light_dir,
+                                    v.fog,
+                                );
                             }
                         },
                         // TAA (§13): only invoked while it's on.
@@ -4994,7 +5137,7 @@ mod tests {
         (320.0, 200.0),
     ];
 
-    const SCREENS: [MenuScreen; 7] = [
+    const SCREENS: [MenuScreen; 8] = [
         MenuScreen::MainRoot,
         MenuScreen::Root,
         MenuScreen::Options,
@@ -5002,6 +5145,7 @@ mod tests {
         MenuScreen::Sound,
         MenuScreen::Gameplay,
         MenuScreen::Controls,
+        MenuScreen::Weather,
     ];
 
     fn rows_of(screen: MenuScreen) -> Vec<MenuRow> {
@@ -5162,6 +5306,117 @@ mod tests {
             .find(|r| r.action == want)
             .map(|r| r.label)
             .unwrap_or_else(|| panic!("no {want:?} row"))
+    }
+
+    /// WEATHER is under OPTIONS in game only: a new game resets it.
+    #[test]
+    fn weather_is_in_the_pause_menus_options_only() {
+        let s = GraphicsSettings::default();
+        let options = |in_session| {
+            screen_rows(
+                MenuScreen::Options,
+                &s,
+                &Controls::default(),
+                &AudioSettings::default(),
+                in_session,
+                None,
+            )
+        };
+        let weather = MenuAction::Enter(MenuScreen::Weather);
+        assert!(options(true).iter().any(|r| r.action == weather));
+        assert!(!options(false).iter().any(|r| r.action == weather));
+        assert_eq!(options(true).last().unwrap().action, MenuAction::Back);
+    }
+
+    /// Each WEATHER row steps through its presets, wraps back to LEVEL, and
+    /// says so; the override starts as the level's own.
+    #[test]
+    fn weather_rows_cycle_their_presets() {
+        let mut s = GraphicsSettings::default();
+        assert_eq!(s.weather, WeatherOverride::default());
+        let mut m = in_game_menu();
+        m.screen = MenuScreen::Weather;
+        for (action, len, label) in [
+            (
+                MenuAction::CycleFogDensity,
+                FOG_DENSITIES.len(),
+                "FOG DENSITY  ",
+            ),
+            (
+                MenuAction::CycleFogHeight,
+                FOG_HEIGHTS.len(),
+                "FOG HEIGHT  ",
+            ),
+            (
+                MenuAction::CycleTimeOfDay,
+                TIMES_OF_DAY.len(),
+                "TIME OF DAY  ",
+            ),
+        ] {
+            assert_eq!(
+                label_of(&m, &s, &Controls::default(), action),
+                match action {
+                    MenuAction::CycleTimeOfDay => format!("{label}LEVEL  SUN ONLY"),
+                    _ => format!("{label}LEVEL"),
+                }
+            );
+            let mut seen = Vec::new();
+            for _ in 0..len {
+                assert_eq!(activate(&mut m, &mut s, action), MenuOutcome::ApplyWeather);
+                seen.push(label_of(&m, &s, &Controls::default(), action));
+            }
+            assert!(
+                seen.last().unwrap().contains("LEVEL"),
+                "{action:?} didn't wrap: {seen:?}"
+            );
+            seen.sort();
+            seen.dedup();
+            assert_eq!(seen.len(), len, "{action:?} repeated a preset");
+        }
+        assert_eq!(
+            s.weather,
+            WeatherOverride::default(),
+            "a full cycle ends where it began"
+        );
+    }
+
+    /// The weather's effect: the level's own under LEVEL, a preset's value
+    /// otherwise, and the time of day moves the sun only.
+    #[test]
+    fn the_weather_overrides_the_levels_fog_and_sun() {
+        let env = Environment {
+            fog_density: 0.035,
+            fog_height: -9.0,
+            fog_falloff: 0.08,
+            ..Default::default()
+        };
+        let level = WeatherOverride::default();
+        assert_eq!(effective_fog(&env, &level), Vec3::new(0.035, -9.0, 0.08));
+        assert_eq!(effective_sun(&env, &level), env.sun_dir);
+        let heavy = FOG_DENSITIES.iter().position(|p| p.0 == "HEAVY").unwrap();
+        let ground = FOG_HEIGHTS.iter().position(|p| p.0 == "GROUND").unwrap();
+        let w = WeatherOverride {
+            fog_density: heavy,
+            fog_height: ground,
+            ..level
+        };
+        assert_eq!(effective_fog(&env, &w), Vec3::new(0.1, -9.0, 0.5));
+        let off = WeatherOverride {
+            fog_density: FOG_DENSITIES.iter().position(|p| p.0 == "OFF").unwrap(),
+            ..level
+        };
+        assert_eq!(effective_fog(&env, &off).x, 0.0);
+        // DAWN: 4 degrees up, in the east (+X), so its light travels west
+        // and down.
+        let dawn = WeatherOverride {
+            time_of_day: TIMES_OF_DAY.iter().position(|p| p.0 == "DAWN").unwrap(),
+            ..level
+        };
+        let (elevation, azimuth) = sun_angles(effective_sun(&env, &dawn));
+        assert!((elevation - 4.0).abs() < 1e-3 && (azimuth - 95.0).abs() < 1e-3);
+        let travel = effective_sun(&env, &dawn);
+        assert!(travel.x < -0.9 && travel.y < 0.0, "{travel}");
+        assert_eq!(effective_fog(&env, &dawn), effective_fog(&env, &level));
     }
 
     /// OPTIONS > CONTROLS, as a player gets there from the pause menu.

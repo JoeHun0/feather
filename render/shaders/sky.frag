@@ -8,7 +8,13 @@ layout(push_constant) uniform Push {
     mat4 inv_view_proj;
     vec4 camera_pos;  // xyz
     vec4 light_dir;   // xyz = direction the light travels
+    vec4 fog;         // x = density at y = height, z = falloff (§13, per frame)
 } pc;
+
+// The fog travels per frame; mesh.frag reads the same names from its globals.
+#define FOG_DENSITY pc.fog.x
+#define FOG_HEIGHT pc.fog.y
+#define FOG_FALLOFF pc.fog.z
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_color; // linear HDR
@@ -32,14 +38,11 @@ layout(constant_id = 14) const float SKY_SUN_B = 0.85;
 layout(constant_id = 15) const float SKY_INTENSITY = 1.0;
 layout(constant_id = 16) const float SUN_GLOW = 0.6;
 layout(constant_id = 17) const float SUN_DISK = 60.0;
-layout(constant_id = 18) const float FOG_DENSITY = 0.010; // per metre, at FOG_HEIGHT
-layout(constant_id = 19) const float FOG_HEIGHT = 0.0;
-layout(constant_id = 20) const float FOG_FALLOFF = 0.0;
-layout(constant_id = 21) const float FOG_R = 0.5;
-layout(constant_id = 22) const float FOG_G = 0.5;
-layout(constant_id = 23) const float FOG_B = 0.5;
-layout(constant_id = 24) const float FOG_SKY = 1.0; // 1: the fog takes the sky's colour
-layout(constant_id = 25) const float FOG_SUN = 0.0;
+layout(constant_id = 18) const float FOG_R = 0.5;
+layout(constant_id = 19) const float FOG_G = 0.5;
+layout(constant_id = 20) const float FOG_B = 0.5;
+layout(constant_id = 21) const float FOG_SKY = 1.0; // 1: the fog takes the sky's colour
+layout(constant_id = 22) const float FOG_SUN = 0.0;
 const vec3 FOG_COLOR = vec3(FOG_R, FOG_G, FOG_B);
 
 const vec3 SKY_ZENITH = vec3(SKY_ZENITH_R, SKY_ZENITH_G, SKY_ZENITH_B);
@@ -68,8 +71,8 @@ vec3 sky(vec3 d) {
 // NOTE: must match the other shader's copy, character for character (a test
 // checks), as must sky().
 float fog_optical_depth(vec3 eye, vec3 dir, float dist) {
-    // Specialization constants fold, `x * 0.0` can't (x may be NaN): this is
-    // what makes uniform fog cost what it always did.
+    // Per frame, not per pixel: the branch is the same across a draw, and
+    // it's what keeps uniform fog as cheap as it was.
     if (FOG_FALLOFF == 0.0) {
         return dist < 0.0 ? 1e9 : FOG_DENSITY * dist;
     }

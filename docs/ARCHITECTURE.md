@@ -1323,7 +1323,7 @@ which is exactly the look every level had before.
   fog density (fog blends towards the sky, so it takes the sky's colour); and
   the tonemap's starting exposure.
 - **How it reaches the GPU: specialization constants.** `render::Environment`
-  fills 19 `constant_id`s that `mesh.frag` and `sky.frag` declare, baked when
+  fills the `constant_id`s (23 now) that `mesh.frag` and `sky.frag` declare, baked when
   a session builds its pipelines (`MeshRenderer::new`, `SkyPass::new`).
   - A level's atmosphere is fixed for its session, so this costs nothing
     per frame and needs no descriptor or push-constant space. The sky pass's
@@ -1342,9 +1342,50 @@ which is exactly the look every level had before.
 - **Measured:** `--bench scratch/lights120.gltf`, old and new binaries
   interleaved (clocks not pinned): frame median 0.72/0.71 ms either way, as
   predicted. The constants fold as the literals did.
-- **Limit:** changing the atmosphere *during* a session (weather, time of
-  day) means rebuilding two pipelines. The runtime route is the globals UBO
-  (§25).
+- **Limit:** changing the rest of the atmosphere *during* a session (the
+  sky's colours, the sun's) means rebuilding two pipelines. The runtime
+  route is the one the fog took (below).
+
+**Landed (§26): the weather's first knobs, live.** A temporary WEATHER
+screen (OPTIONS, in game only) until the weather engine: FOG DENSITY, FOG
+HEIGHT and a TIME OF DAY placeholder. Each steps through presets, the first
+being the level's own. They're session only: never saved, and a new game
+starts from the level's.
+- **The fog moved from baked to per frame.** Its density, height and falloff
+  left the specialization constants (ids renumbered, 23 left), and travel in
+  mesh.frag's globals UBO (`vec4 fog`) and sky.frag's push constants (now
+  112 of 128 bytes).
+  - Each shader `#define`s `FOG_DENSITY`/`FOG_HEIGHT`/`FOG_FALLOFF` over its
+    own source, so the shared `fog_optical_depth` is still text for text the
+    same in both, as its test demands.
+  - Its uniform-fog branch is now uniform across a draw rather than folded
+    away.
+  - `MeshRenderer::set_fog` and `SkyPass::draw` take it from the app, which
+    starts from the level's `Environment`.
+- **TIME OF DAY moves the sun only:** DAWN, MORNING, NOON, AFTERNOON and DUSK
+  are elevations and azimuths, put through `sun_travel`. Shadows, the sun's
+  light and its glow follow, but the sky keeps the level's colours, so the
+  row reads `SUN ONLY`.
+- **Tests:**
+  - the fog's amount bakes nothing (control: its colour does);
+  - the globals block ends with `fog`, both shaders define the three names
+    over it, and sky.frag's push block is the 112 bytes the pass pushes;
+  - `effective_fog`/`effective_sun`: LEVEL is the level's, presets are
+    theirs, and DAWN is 4° up in the east;
+  - WEATHER is in the pause menu's OPTIONS but not the main menu's, and each
+    row cycles its presets and wraps.
+  - Mutations (WEATHER shown in the main menu, the density preset ignored, a
+    stale constant id in sky.frag) each fail one.
+- **The look,** from HDR dumps (temporary harness, TAA off):
+  - LEVEL against the previous binary: 98.3% of the pixels that differ,
+    beyond what two runs of the same binary differ by (the lanterns' sway),
+    are within one half-float step, the folded constants turned uniforms.
+    The rest are in the hangar doorway, where the lanterns swing.
+  - OFF, HEAVY and GROUND clear, bury and lower the haze, and DAWN darkens
+    the yard (mean luminance 0.242 against 0.256).
+- **Cost** (pinned, 3 interleaved rounds against the previous binary): zone
+  `geo` 0.43–0.44 both, frame 1.19–1.20; `lights120` `geo` 0.93–0.94, frame
+  1.58–1.59. Predicted within ±0.02.
 
 **Landed (§26): height fog.** Fog was uniform (`1 − e^{−density·dist}`,
 towards the sky's colour), only on geometry, so the horizon stayed crisp and
@@ -2918,9 +2959,10 @@ skinning; animation state machines; local reflection probes / irradiance
 volumes; audio occlusion + reverb zones; user-selectable anti-aliasing mode
 (SMAA / MSAA 2×/4×; the geometry sample-count seam is in place, §26);
 streaming + stage pipelining; X-Ray (`.ogf`/level) importer for the SoC-rebuild
-stretch dream (becomes just another importer feeding the same bake); changing
-a level's atmosphere during a session (weather, time of day: §13's constants
-would move into the globals UBO).
+stretch dream (becomes just another importer feeding the same bake); the rest
+of a level's atmosphere changing during a session (the sky's and sun's
+colours for weather and time of day: §13's constants would move into the
+globals UBO, as the fog's amount already has).
 
 ## 26. Implementation status
 

@@ -349,6 +349,9 @@ struct Globals {
     sky_dims: [f32; 4],
     /// x = 1 when GTAO's result (§13, binding 8) is this frame's to use.
     ao_params: [f32; 4],
+    /// The fog (§13): x = density at y = height, z = falloff. Per frame, so
+    /// the weather can change it.
+    fog: [f32; 4],
 }
 
 /// One punctual light, std430, 32 bytes (§12).
@@ -446,6 +449,8 @@ pub struct MeshRenderer {
     sky_params: [[f32; 4]; 2],
     /// Whether GTAO ran this frame (`set_ao`), for `Globals::ao_params`.
     ao_on: bool,
+    /// The fog `prepare_frame` writes: (density, height, falloff).
+    fog: glam::Vec3,
     /// The full-resolution size GTAO's result is upsampled to, likewise.
     ao_size: [f32; 2],
     /// The `Renderer::targets_generation` bindings 8 and 9 point into.
@@ -1327,6 +1332,7 @@ impl MeshRenderer {
             sky_sampler,
             sky_params,
             ao_on: false,
+            fog: glam::Vec3::new(env.fog_density, env.fog_height, env.fog_falloff),
             ao_size: [1.0, 1.0],
             ao_generation: renderer.targets_generation(),
             slices,
@@ -1354,6 +1360,12 @@ impl MeshRenderer {
     /// the generation only changes when the targets were recreated, which
     /// waits for the device to go idle, and no frame has been submitted
     /// since: nothing can be using a set.
+    /// The fog (§13) from the next `prepare_frame` on: (density at height,
+    /// height, falloff). It starts as the level's.
+    pub fn set_fog(&mut self, fog: glam::Vec3) {
+        self.fog = fog;
+    }
+
     pub fn set_ao(
         &mut self,
         on: bool,
@@ -1524,6 +1536,7 @@ impl MeshRenderer {
                 self.ao_size[1],
                 0.0,
             ],
+            fog: self.fog.extend(0.0).to_array(),
         };
         for (i, c) in cascades.iter().enumerate().take(SHADOW_CASCADES) {
             globals.light_view_proj[i] = c.view_proj.to_cols_array();

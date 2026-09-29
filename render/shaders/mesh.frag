@@ -55,7 +55,14 @@ layout(set = 0, binding = 4) uniform Globals {
     vec4 sky_origin;     // sky volume: xyz = minimum corner, w = 1 / cell
     vec4 sky_dims;       // xyz = cells per axis, w = 1 if there is a volume
     vec4 ao_params;      // x = 1 if GTAO ran this frame, yz = the full-resolution size
+    vec4 fog;            // x = density at y = height, z = falloff (§13, per frame)
 } g;
+
+// The fog (§13) travels per frame, so the weather can change it; sky.frag
+// reads the same names from its push constants.
+#define FOG_DENSITY g.fog.x
+#define FOG_HEIGHT g.fog.y
+#define FOG_FALLOFF g.fog.z
 
 // Punctual lights (§12), shaded only if this fragment's cluster lists them.
 struct Light {
@@ -115,14 +122,11 @@ layout(constant_id = 13) const float SKY_SUN_G = 0.95;
 layout(constant_id = 14) const float SKY_SUN_B = 0.85;
 layout(constant_id = 15) const float SKY_INTENSITY = 1.0;
 layout(constant_id = 16) const float SUN_GLOW = 0.6;
-layout(constant_id = 18) const float FOG_DENSITY = 0.010; // per metre, at FOG_HEIGHT
-layout(constant_id = 19) const float FOG_HEIGHT = 0.0;
-layout(constant_id = 20) const float FOG_FALLOFF = 0.0;
-layout(constant_id = 21) const float FOG_R = 0.5;
-layout(constant_id = 22) const float FOG_G = 0.5;
-layout(constant_id = 23) const float FOG_B = 0.5;
-layout(constant_id = 24) const float FOG_SKY = 1.0; // 1: the fog takes the sky's colour
-layout(constant_id = 25) const float FOG_SUN = 0.0;
+layout(constant_id = 18) const float FOG_R = 0.5;
+layout(constant_id = 19) const float FOG_G = 0.5;
+layout(constant_id = 20) const float FOG_B = 0.5;
+layout(constant_id = 21) const float FOG_SKY = 1.0; // 1: the fog takes the sky's colour
+layout(constant_id = 22) const float FOG_SUN = 0.0;
 const vec3 FOG_COLOR = vec3(FOG_R, FOG_G, FOG_B);
 
 const vec3 SUN_RADIANCE = vec3(SUN_RADIANCE_R, SUN_RADIANCE_G, SUN_RADIANCE_B);
@@ -156,8 +160,8 @@ vec3 sky(vec3 d) {
 // NOTE: must match the other shader's copy, character for character (a test
 // checks), as must sky().
 float fog_optical_depth(vec3 eye, vec3 dir, float dist) {
-    // Specialization constants fold, `x * 0.0` can't (x may be NaN): this is
-    // what makes uniform fog cost what it always did.
+    // Per frame, not per pixel: the branch is the same across a draw, and
+    // it's what keeps uniform fog as cheap as it was.
     if (FOG_FALLOFF == 0.0) {
         return dist < 0.0 ? 1e9 : FOG_DENSITY * dist;
     }
