@@ -407,8 +407,12 @@ electricity poles. You spawn on the road outside the gate, facing it.
   `ENVIRONMENT` at the top of the script and regenerate.
 - **The app's slab:** the grey ground slab the app puts under every level is
   under the mud. (The orb demo's brown boxes don't appear in loaded scenes.)
-- **Options:** `--seed N` (props, missing fence panels, roof holes), `-o PATH`,
-  `--check`.
+- **Options:** `--seed N` (props, missing fence panels, roof holes, and the
+  trees' and bushes' shapes and places), `-o PATH`, `--check`. On top of the
+  shared checks, the zone's `--check` reads the written vertices: no leaf or
+  branch inside a solid (crowns may top the fence and poles), no bush
+  through a trunk, no trunk in a solid, and every tree and bush placed.
+  Seeds 1–200 all pass.
 - **Cutouts:** grass tufts on the mud, and a rusty chain-link enclosure round
   the compressor (ambientCG's Fence006, CC0, SHA-256 pinned). The first run
   merges the fence's colour and opacity maps into

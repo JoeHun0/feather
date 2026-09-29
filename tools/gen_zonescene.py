@@ -212,6 +212,9 @@ class Zone(gds.Level):
         # Everything solid placed so far, plus what the app puts in every
         # level: props look for room among these.
         self.solid = list(gts.keep_out_boxes())
+        # ids of the solids a tree crown may grow through: the fence line
+        # (it's lower), trunks (crowns interleave) and poles (overgrown).
+        self.crown_through = set()
 
     # --- materials ---------------------------------------------------------
 
@@ -589,6 +592,10 @@ def fence(z):
             rot = quat_mul(yaw_q(yaw), quat_axis((1, 0, 0), 12.0))
             y = MUD_TOP + math.cos(math.radians(12)) * PANEL[1] / 2
         z.place(panel, (cx, y, cz), rot, extras, name="fence_panel")
+        if i == fallen:
+            # Out in the yard, past the fence line's solid below.
+            z.solid.append(gts.node_aabb(([-a / 2 for a in PANEL], [a / 2 for a in PANEL]),
+                                         (cx, y, cz), rot))
     posts = set()
     for cx, cz, yaw in bays:
         for s in (-1, 1):
@@ -603,6 +610,7 @@ def fence(z):
                    ((x0 - t, G, z0 - t), (x0 + t, G + 3, z1 + t)),
                    ((x1 - t, G, z0 - t), (x1 + t, G + 3, z1 + t))):
         z.solid.append((list(lo), list(hi)))
+        z.crown_through.add(id(z.solid[-1]))
 
 
 def props(z):
@@ -659,8 +667,10 @@ def props(z):
         z.model(key, path=PROPS["poles"], keep=keep, shift=(-px, 0.0, 0.0))
     for i, x in enumerate((-30.0, -18.0, -6.0, 6.0, 18.0, 30.0)):
         count("pole", z.put(f"pole_{i % 3 + 1}", x, 34.5, rot=yaw_q(90)))
+        z.crown_through.add(id(z.solid[-1]))
     for i, zz in enumerate((-24.0, -8.0, 8.0)):
         count("pole", z.put(f"pole_{(i + 1) % 3 + 1}", -36.0, zz, rot=yaw_q(0)))
+        z.crown_through.add(id(z.solid[-1]))
     return counts
 
 
@@ -1049,8 +1059,9 @@ def tree_meshes(z, rng, leaf, bark, variant):
     trunk_mesh = z.mesh([(*trunk, bark)], f"tree_trunk_{variant}")
     crown_mesh = z.mesh([(*branches, bark), (*leaves, leaf)], f"tree_crown_{variant}")
     # How far the crown reaches from the trunk's foot, horizontally.
-    reach = max(math.hypot(p[0], p[2]) for p in branches[0] + leaves[0])
-    return trunk_mesh, crown_mesh, r0, reach
+    crown_pts = branches[0] + leaves[0]
+    reach = max(math.hypot(p[0], p[2]) for p in crown_pts)
+    return trunk_mesh, crown_mesh, r0, reach, crown_pts
 
 
 def bush_mesh(z, rng, leaf, bark, variant):
@@ -1063,6 +1074,10 @@ def bush_mesh(z, rng, leaf, bark, variant):
         tip = [math.cos(a) * radius * 0.6, height * rng.uniform(0.5, 0.8), math.sin(a) * radius * 0.6]
         pts = [_mul(tip, i / 3) for i in range(4)]
         tube(pts, [0.04, 0.03, 0.02, 0.012], 5, 1.0, 0.8, stems)
+    # A leaning stem's foot ring dips below its origin; level it on the
+    # ground, or scaled-up bushes sink under the check's tolerance.
+    for p in stems[0]:
+        p[1] = max(p[1], 0.0)
     centres, sizes = [], []
     for _ in range(rng.randint(60, 90)):
         while True:
@@ -1076,7 +1091,7 @@ def bush_mesh(z, rng, leaf, bark, variant):
         sizes.append(size)
     leaves = ([], [], [], [])
     leaf_cards(rng, centres, sizes, leaves)
-    return z.mesh([(*stems, bark), (*leaves, leaf)], f"bush_{variant}")
+    return z.mesh([(*stems, bark), (*leaves, leaf)], f"bush_{variant}"), stems[0] + leaves[0]
 
 
 def foliage(z):
@@ -1144,7 +1159,7 @@ def foliage(z):
             if placed == n:
                 break
             k = rng.randrange(len(trees))
-            trunk, crown, r0, reach = trees[k]
+            trunk, crown, r0, reach, crown_pts = trees[k]
             scale = rng.uniform(0.8, 1.2)
             r = r0 * scale + 0.15
             # The whole crown on the ground (the check's 80 x 80) and clear
@@ -1158,10 +1173,18 @@ def foliage(z):
                 continue
             rot = yaw_q(rng.uniform(0, 360))
             t = (x, MUD_TOP, zz)
+            # Tested once the draws are made, so a candidate that passes
+            # leaves the random stream as it was.
+            if not on_ground(z, (trunk, crown), t, rot, scale):
+                continue
+            if pokes_into(placed_pts(crown_pts, t, rot, scale),
+                          [s for s in z.solid if id(s) not in z.crown_through]):
+                continue
             z.place(trunk, t, rot, {"prefab": "prop", "params": {}}, name="tree_trunk", scale=scale)
             z.place(crown, t, rot, {"prefab": "prop", "params": {"collide": False}},
                     name="tree_crown", scale=scale)
             z.solid.append(aabb)
+            z.crown_through.add(id(aabb))
             placed += 1
         return placed
 
@@ -1177,8 +1200,14 @@ def foliage(z):
             aabb = ([x - r, G, zz - r], [x + r, G + 1.5, zz + r])
             if any(gts.overlaps(aabb, s, 0.1) for s in z.solid):
                 continue
-            z.place(bushes[rng.randrange(len(bushes))], (x, MUD_TOP, zz),
-                    yaw_q(rng.uniform(0, 360)), {"prefab": "prop", "params": {"collide": False}},
+            bush, pts = bushes[rng.randrange(len(bushes))]
+            rot = yaw_q(rng.uniform(0, 360))
+            t = (x, MUD_TOP, zz)
+            # That box is the bush's middle; its leaves reach further.
+            if not on_ground(z, (bush,), t, rot, scale) \
+                    or pokes_into(placed_pts(pts, t, rot, scale), z.solid):
+                continue
+            z.place(bush, t, rot, {"prefab": "prop", "params": {"collide": False}},
                     name="bush", scale=scale)
             placed += 1
         return placed
@@ -1188,10 +1217,47 @@ def foliage(z):
     return counts
 
 
-def check_foliage(doc):
+def on_ground(z, meshes, t, rot, scale):
+    """What gts.check asks of a placed node: its rotated bounds on the
+    80 x 80 ground and not below it. Those bounds reach further than the
+    vertices do, but they're what the check tests."""
+    for m in meshes:
+        lo, hi = [1e30] * 3, [-1e30] * 3
+        for p in z.doc["meshes"][m]["primitives"]:
+            a = z.doc["accessors"][p["attributes"]["POSITION"]]
+            lo = [min(u, v) for u, v in zip(lo, a["min"])]
+            hi = [max(u, v) for u, v in zip(hi, a["max"])]
+        lo, hi = gts.node_aabb((lo, hi), t, rot, [scale] * 3)
+        if min(lo[0], lo[2]) < -gts.GROUND_HALF or max(hi[0], hi[2]) > gts.GROUND_HALF \
+                or lo[1] < gts.GROUND_Y - 0.01:
+            return False
+    return True
+
+
+def placed_pts(pts, t, rot, scale):
+    """Local points scaled, rotated and moved to `t`."""
+    m = gts.quat_matrix(rot)
+    return [[(m[i][0] * p[0] + m[i][1] * p[1] + m[i][2] * p[2]) * scale + t[i] for i in range(3)]
+            for p in pts]
+
+
+def pokes_into(pts, boxes):
+    """Whether any point lies inside any of `boxes` (checking only the boxes
+    that the points' bounds overlap)."""
+    lo = [min(p[i] for p in pts) for i in range(3)]
+    hi = [max(p[i] for p in pts) for i in range(3)]
+    near = [b for b in boxes if gts.overlaps((lo, hi), b)]
+    return any(all(b[0][i] < p[i] < b[1][i] for i in range(3)) for b in near for p in pts)
+
+
+def check_foliage(doc, blob):
     """Leaves are single-sided MASK (the crown-normal trick needs no
     back-face flip); crowns and bushes don't collide, trunks do; no trunk
-    stands on the road or near the spawn."""
+    stands on the road or near the spawn. From the written vertices (`blob`
+    is the binary chunk): no crown or bush point inside a solid's bounds,
+    bar the concrete fence's parts and, for crowns, the poles they may
+    overgrow; no trunk's lower 3 m in a solid, fence included; no bush
+    grows through a trunk."""
     bad = []
     for m in doc["materials"]:
         if m.get("name") == "leaf" and (m.get("alphaMode") != "MASK" or m.get("doubleSided")):
@@ -1206,9 +1272,72 @@ def check_foliage(doc):
                 bad.append(f"tree_trunk at {n['translation']} doesn't collide")
             if (abs(x) < ROAD_X and zz > HANGAR[3] - 1.0) or math.dist((x, zz), SPAWN_XZ) < 6.0:
                 bad.append(f"tree_trunk at {n['translation']} on the road or spawn")
+    bad += foliage_overlaps(doc, blob)
     if bad:
         print(f"check: {len(bad)} foliage problems: {bad[:5]}", file=sys.stderr)
     return not bad
+
+
+def foliage_overlaps(doc, blob):
+    """check_foliage's vertex-level half: a list of problems."""
+    def points(node):
+        m = gts.quat_matrix(node.get("rotation", (0.0, 0.0, 0.0, 1.0)))
+        s, t = node.get("scale", [1.0] * 3), node["translation"]
+        out = []
+        for p in doc["meshes"][node["mesh"]]["primitives"]:
+            a = doc["accessors"][p["attributes"]["POSITION"]]
+            v = doc["bufferViews"][a["bufferView"]]
+            off, stride = v.get("byteOffset", 0) + a.get("byteOffset", 0), v.get("byteStride", 12)
+            for i in range(a["count"]):
+                q = struct.unpack_from("<3f", blob, off + i * stride)
+                out.append([sum(m[r][c] * q[c] * s[c] for c in range(3)) + t[r] for r in range(3)])
+        return out
+
+    def bounds(node):
+        lo, hi = [1e30] * 3, [-1e30] * 3
+        for p in doc["meshes"][node["mesh"]]["primitives"]:
+            a = doc["accessors"][p["attributes"]["POSITION"]]
+            lo = [min(u, w) for u, w in zip(lo, a["min"])]
+            hi = [max(u, w) for u, w in zip(hi, a["max"])]
+        return gts.node_aabb((lo, hi), node["translation"], node.get("rotation"),
+                             node.get("scale"))
+
+    named = lambda n: [x for x in doc["nodes"] if x.get("name") == n]
+    bad = []
+    exempt = {"tree_trunk", "tree_crown", "bush", "grass", "fence_post", "fence_panel",
+              "apron", "road", "mud", "hangar_floor", "office_floor"}
+    solids = [(bounds(n), n["name"]) for n in doc["nodes"] if "mesh" in n
+              and n.get("name") not in exempt
+              and n.get("extras", {}).get("params", {}).get("collide", True)]
+    fence = [(bounds(n), n["name"]) for n in named("fence_panel") + named("fence_post")]
+    trunks = []
+    for n in named("tree_trunk"):
+        # Its bounds, not its points: rings a metre apart straddle a
+        # fallen panel.
+        foot = [p for p in points(n) if p[1] < MUD_TOP + 3.0]
+        foot = ([min(p[i] for p in foot) for i in range(3)],
+                [max(p[i] for p in foot) for i in range(3)])
+        for box, name in solids + fence:
+            if gts.overlaps(foot, box):
+                bad.append(f"tree_trunk at ({n['translation'][0]:.1f}, "
+                           f"{n['translation'][2]:.1f}) stands in {name}")
+        low = [p for p in points(n) if p[1] < MUD_TOP + 2.0]
+        c = [sum(p[0] for p in low) / len(low), sum(p[2] for p in low) / len(low)]
+        trunks.append((c, max(math.dist(c, (p[0], p[2])) for p in low)))
+    for n in named("tree_crown") + named("bush"):
+        pts = points(n)
+        where = f"{n['name']} at ({n['translation'][0]:.1f}, {n['translation'][2]:.1f})"
+        for box, name in solids:
+            if n["name"] == "tree_crown" and name.startswith("pole"):
+                continue
+            if pokes_into(pts, [box]):
+                bad.append(f"{where} has leaves inside {name}")
+        if n["name"] == "bush":
+            low = [p for p in pts if p[1] < MUD_TOP + 2.0]
+            for c, r in trunks:
+                if any(math.dist(c, (p[0], p[2])) < r for p in low):
+                    bad.append(f"{where} grows through the trunk at ({c[0]:.1f}, {c[1]:.1f})")
+    return bad
 
 
 def markers(z):
@@ -1260,8 +1389,14 @@ def main():
     print(f"wrote {args.out} ({os.path.getsize(args.out) / 1e6:.1f} MB): "
           + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
           + f"\n  {tris:,} triangles placed, {len(z.doc['images'])} images")
+    # Placement gives up after so many candidates, silently; check it didn't.
+    short = [f"{k} {counts[k]} of {want}" for k, want in
+             (("trees", TREES_OUT + TREES_IN), ("bushes", BUSHES_OUT + BUSHES_IN))
+             if counts[k] < want]
+    if short:
+        print(f"check: foliage fell short: {', '.join(short)}", file=sys.stderr)
     if args.check and not (gts.check(z.doc) and check_occlusion(z.doc)
-                           and check_foliage(z.doc)):
+                           and check_foliage(z.doc, z.bin) and not short):
         return 1
     return 0
 

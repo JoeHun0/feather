@@ -231,8 +231,9 @@ double-sided, cull — used to pick pipeline and draw bucket.
 **Landed (§26): foliage.** The zone's trees and bushes
 (`gen_zonescene.py`), procedural like its grass:
 - **Leaves:** a painted 512² leaf-cluster card and pale birch bark.
-- **Trees:** 3 birch-like variants, 7–12 m, a tapered leaning trunk with
-  6–10 branches and ~350 leaf cards; 35 outside the fence, 6 in the yard.
+- **Trees:** 3 birch-like variants, a tapered leaning trunk of 7–12 m
+  (before a 0.8–1.2 scale) with 6–10 branches and ~270 leaf cards; 35
+  outside the fence, 6 in the yard.
 - **Bushes:** 2 variants of ~60–90 cards, 40 outside the fence and 25
   inside.
 - **The shading recipe:** the leaf material is **single-sided** MASK with
@@ -243,6 +244,43 @@ double-sided, cull — used to pick pipeline and draw bucket.
     shadows dapple it and the ground.
 - **Collision:** a tree is two nodes. The trunk collides (a trimesh of the
   stem alone); the crown (branches and leaves) doesn't, and nor do bushes.
+- **Placement, any seed.** At first only 5 of seeds 1–50 passed `--check`
+  (seed 11, the default, among them). None of the failures was visible:
+  - **Bush stems** dipped up to 2.7 cm below their origin: a leaning
+    stem's foot ring sits across it. Scaled up and set on the mud, some sank
+    1.2 cm under the ground, past the check's 1 cm. Their feet are now
+    levelled.
+  - **"Past the ground"** was the check's rotated bounding box. Placement
+    kept every vertex within the crown's reach (none beyond 39.72 of 40),
+    but a box turned 45° sticks out further.
+  - An independent vertex-level audit also found what the check didn't
+    look for: bush leaves in poles, barriers and tyres (a bush's test box
+    was its middle, ~half its reach), bushes grazing trunks by ≤ 0.1 m, and
+    crown tips in the hangar wall (the building test used the footprint,
+    without the wall).
+  - **The fallen fence panel** lay 1.6 m inside its gap, past the fence
+    line's solid, so nothing kept off it. A sweep caught trunks through it
+    in 4 of 200 seeds, and in seed 11 a grass tuft grew through it. It's
+    solid now.
+  - **Now** each tree and bush is tested once its rotation is drawn: the
+    check's own ground test, and no leaf or branch point inside a solid.
+    Crowns may grow over the fence (it's lower), through each other and
+    round the pole tops (an overgrown line); bushes keep off everything.
+    Testing after the draws leaves a seed that never trips them unchanged.
+    In seed 11, every tree, bush and prop is where it was; 18 stem vertices
+    move up by ≤ 2.4 cm, and the 79 grass tufts placed after the one on the
+    panel land elsewhere. Frame, `geo` and `shadow` are unchanged (6
+    interleaved rounds, release, clocks unpinned, ±0.03 ms).
+  - `--check` reads the written vertices for the same rules, from the file
+    alone: leaf and branch points against solids' bounds, a bush's low
+    points against each trunk's radius, and a trunk's lower 3 m by its
+    bounds (its rings, a metre apart, straddle a lying panel). It also fails
+    when placement falls short of its counts (it gives up after 400
+    candidates, silently). Points only: a card crossing a thin solid
+    edge-on, with no corner inside, still passes.
+  - **Seeds 1–200** all pass `--check`, with every tree and bush placed,
+    and a separate vertex-level audit finds nothing. Trees top out at
+    6.6–16.1 m, with 193–379 cards.
 - **Cost** (pinned, release, the final engine, the zone before against
   after):
   - `shadow` 0.13 → 0.35 ms, `geo` 0.29 → 0.43, `ao` +0.01, frame 0.72 →
