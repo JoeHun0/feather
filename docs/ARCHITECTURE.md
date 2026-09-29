@@ -1325,9 +1325,10 @@ which is exactly the look every level had before.
 - **How it reaches the GPU: specialization constants.** `render::Environment`
   fills the `constant_id`s (23 now) that `mesh.frag` and `sky.frag` declare, baked when
   a session builds its pipelines (`MeshRenderer::new`, `SkyPass::new`).
-  - A level's atmosphere is fixed for its session, so this costs nothing
-    per frame and needs no descriptor or push-constant space. The sky pass's
-    push constants were already 96 of the guaranteed 128 bytes.
+  - What's baked is fixed for the session, so it costs nothing per frame and
+    needs no descriptor or push-constant space. (The fog's amount has since
+    moved per frame, below; the sky pass's push constants are now 112 of the
+    guaranteed 128 bytes.)
   - One struct feeds both shaders, which used to repeat the palette by
     hand. Their `sky()` functions still have to agree by hand.
   - A test parses the compiled SPIR-V: every constant a shader declares must
@@ -3207,7 +3208,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   *is* now drawn as a visible background (SkyPass) matching the reflected
   environment. Real cubemap IBL (equirect→cube, irradiance/prefilter passes,
   BRDF LUT) is the follow-up. Sun shadows (§11 CSM) and punctual point lights
-  (§12) now exist. Bloom, auto-exposure and TAA landed (§13). The ambient is
+  (§12) now exist. Bloom, auto-exposure and TAA landed (§13). The fog's amount
+  travels per frame (OPTIONS > WEATHER sets it live); the sky and sun colours
+  are still baked per session. The ambient is
   occluded by a baked per-level sky-visibility volume (§13, §17) and by the
   lower of half-resolution GTAO and the material's own AO (glTF
   `occlusionTexture`, §13). The tonemap curve is a drop-in point for AgX.
@@ -3290,7 +3293,8 @@ colliders and the ECS↔rapier sync systems landed — dynamic bodies and collis
 layers pending; ropes, §15, are their own Verlet solver);
 skinning; UI/HUD (§19's lightweight quad/text renderer + the Esc pause menu
 landed, with keyboard *and* mouse navigation, an OPTIONS screen tree, and live
-display-mode/shadow-quality/FXAA/TAA controls under GRAPHICS — MSAA is changeable
+display-mode/shadow-quality/FXAA/TAA controls under GRAPHICS, and in game a temporary
+WEATHER screen (fog density and height, a sun-only time of day; session only, §13) — MSAA is changeable
 there only from the main menu, since the session's mesh and sky pipelines bake
 the sample count; all of them, plus the GAMEPLAY field of view, persist in
 `config/graphics.toml` (§13), and key bindings + mouse look live in
