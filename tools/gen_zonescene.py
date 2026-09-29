@@ -1360,6 +1360,13 @@ def foliage_overlaps(doc, blob):
 LANTERNS = ((-5.0, 1, 2.0), (3.0, 2, 1.4), (-2.0, 3, 2.4), (1.0, 4, 2.2))
 LANTERN_WIND = 0.35
 LANTERN_SCALE = 1.3
+# Each lantern's flame (§12's point light, carried as it swings), at the
+# chimney's centre in the mesh's own units. Four of these light the hangar,
+# about as much in all as the two roof lamps they replaced (2 at 10).
+LANTERN_LIGHT = {"color": [1.0, 0.72, 0.42], "intensity": 6.0, "radius": 11.0,
+                 "source_radius": 0.05, "at": [0.0, -0.17, 0.0]}
+# The glass glows with it (glTF emissiveFactor, linear).
+LANTERN_GLOW = [1.0, 0.72, 0.38]
 
 
 def lantern_mesh(z):
@@ -1369,6 +1376,7 @@ def lantern_mesh(z):
     rust = z.material("rust")
     glass = z.png_material("lantern_glass", gts.png_rgba(
         4, 4, [bytearray([214, 205, 170, 255] * 4) for _ in range(4)]), roughness=0.25)
+    z.doc["materials"][glass]["emissiveFactor"] = LANTERN_GLOW
     metal, pane = ([], [], [], []), ([], [], [], [])
     # The handle: a half circle standing up from the cap.
     arc = [[0.07 * math.cos(a), -0.07 + 0.07 * math.sin(a), 0.0]
@@ -1407,7 +1415,8 @@ def lanterns(z):
         beam_z = z0 - 0.2 + row * d
         underside = G + HANGAR_HEIGHT - 0.4
         z.place(mesh, (x, underside - length, beam_z), yaw_q(35.0 * k),
-                {"prefab": "hanging", "params": {"length": length, "wind": LANTERN_WIND}},
+                {"prefab": "hanging", "params": {"length": length, "wind": LANTERN_WIND,
+                                                 "light": LANTERN_LIGHT}},
                 name="lantern", scale=LANTERN_SCALE)
     return len(LANTERNS)
 
@@ -1415,7 +1424,8 @@ def lanterns(z):
 def check_hanging(doc, blob):
     """Each `hanging` node's rope is tied to the underside of something solid
     (within 5 cm, inside its footprint), is a positive length, and at rest
-    neither the rope nor what hangs from it is inside a solid."""
+    neither the rope nor what hangs from it is inside a solid. A light it
+    carries has a positive intensity and radius and sits within the item."""
     solids = solid_nodes(doc)
     bad = []
     for n in doc["nodes"]:
@@ -1427,6 +1437,18 @@ def check_hanging(doc, blob):
         if not isinstance(length, (int, float)) or length <= 0:
             bad.append(f"{where}: rope length {length!r}")
             continue
+        light = n["extras"].get("params", {}).get("light")
+        if light is not None:
+            if not (light.get("intensity", 12.0) > 0 and light.get("radius", 10.0) > 0):
+                bad.append(f"{where}: its light has no intensity or radius")
+            if "mesh" in n:
+                (lo, hi), c = node_bounds(doc, n), light.get("at", [0.0, 0.0, 0.0])
+                sc = n.get("scale", [1.0] * 3)
+                m = gts.quat_matrix(n.get("rotation", (0.0, 0.0, 0.0, 1.0)))
+                p = [sum(m[r][k] * c[k] * sc[k] for k in range(3)) + n["translation"][r]
+                     for r in range(3)]
+                if not all(lo[i] <= p[i] <= hi[i] for i in range(3)):
+                    bad.append(f"{where}: its light is outside it")
         top = y + length
         if not any(lo[0] < x < hi[0] and lo[2] < zz < hi[2] and 0 <= lo[1] - top <= 0.05
                    for (lo, hi), _ in solids):
@@ -1445,8 +1467,8 @@ def check_hanging(doc, blob):
 
 def markers(z):
     lamp = {"prefab": "point_light", "params": LAMP}
-    for x, y, zz in ((-6.0, 6.8, 0.0), (6.0, 6.8, 6.0),
-                     (22.0, SLAB + STOREY - 0.4, -16.0), (21.0, SLAB + 2 * STOREY - 0.4, -16.0)):
+    # The office's; the hangar is lit by its lanterns (see `lanterns`).
+    for x, y, zz in ((22.0, SLAB + STOREY - 0.4, -16.0), (21.0, SLAB + 2 * STOREY - 0.4, -16.0)):
         z.place(None, (x, G + y, zz), extras=lamp, name="lamp")
     z.place(None, (0.0, PAVE_TOP, 37.0), name="player_start",
             extras={"prefab": "player_start", "params": {"yaw": 270.0}})

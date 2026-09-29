@@ -976,6 +976,9 @@ struct Hanging {
     rope: rope::Rope,
     item: Option<(MeshId, u32, Mat4)>,
     casts: bool,
+    /// A light carried by the item (§12), at a point in the item's own
+    /// space: a lantern's flame.
+    light: Option<(PointLight, Vec3)>,
 }
 
 /// The level's wind (§13's `environment`), which ropes sway in.
@@ -1796,7 +1799,7 @@ struct App {
 
 /// A punctual light (§12). Position comes from the entity's `Transform`, so a
 /// light can ride on geometry (a lamp that emits) or on a bare marker node.
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
 struct PointLight {
     /// Linear colour.
     color: Vec3,
@@ -1825,21 +1828,31 @@ impl Default for PointLight {
 /// Culled by **sphere**, not point: a light whose centre is off-screen still
 /// lights what is on-screen if its radius reaches in, which a naive point test
 /// gets wrong and which shows up as lights popping at the screen edge.
-fn extract_lights(world: &mut World, frustum: &Frustum) -> Vec<GpuLight> {
+///
+/// A light carried by something on a rope moves with it: it's placed with the
+/// item's own matrix, interpolated by `alpha` like the item is drawn.
+fn extract_lights(world: &mut World, frustum: &Frustum, alpha: f32) -> Vec<GpuLight> {
     let mut out = Vec::new();
+    let mut push = |pos: Vec3, l: &PointLight| {
+        if frustum.contains_sphere(pos, l.radius) {
+            let c = l.color * l.intensity;
+            out.push(GpuLight {
+                pos_radius: [pos.x, pos.y, pos.z, l.radius],
+                radiance_source: [c.x, c.y, c.z, l.source_radius],
+            });
+        }
+    };
     let mut q = world.query::<(&Transform, &PointLight)>();
     for (t, l) in q.iter(world) {
-        let pos = t.0.transform_point3(Vec3::ZERO);
-        if !frustum.contains_sphere(pos, l.radius) {
-            continue;
+        push(t.0.transform_point3(Vec3::ZERO), l);
+    }
+    let mut qh = world.query::<&Hanging>();
+    for h in qh.iter(world) {
+        if let Some((l, at)) = &h.light {
+            let local = h.item.map_or(Mat4::IDENTITY, |(_, _, local)| local);
+            let item = rope::item_matrix(&h.rope.interpolated(alpha), local);
+            push(item.transform_point3(*at), l);
         }
-        out.push(GpuLight {
-            pos_radius: [pos.x, pos.y, pos.z, l.radius],
-            radiance_source: {
-                let c = l.color * l.intensity;
-                [c.x, c.y, c.z, l.source_radius]
-            },
-        });
     }
     out
 }
@@ -2253,7 +2266,62 @@ fn prefab_registry() -> HashMap<&'static str, SpawnFn> {
 }
 
 /// The parameters a `hanging` node (§15) may carry.
-const HANGING_PARAMS: [&str; 5] = ["length", "segments", "radius", "wind", "shadow"];
+const HANGING_PARAMS: [&str; 6] = ["length", "segments", "radius", "wind", "shadow", "light"];
+
+/// What a `hanging` node's `light` object may carry.
+const HANGING_LIGHT_PARAMS: [&str; 5] = ["color", "intensity", "radius", "source_radius", "at"];
+
+/// A `hanging` node's light (§12), if its params have a `light` object:
+/// `point_light`'s params over its defaults, plus `at`, where the light sits
+/// in the item's own space (default its origin). Also the keys it couldn't
+/// use, as `light.<key>`.
+fn hanging_light(
+    spec: Option<&feather_assets::PrefabSpec>,
+) -> (Option<(PointLight, Vec3)>, Vec<String>) {
+    let Some(value) = spec.and_then(|s| s.params.get("light")) else {
+        return (None, Vec::new());
+    };
+    let Some(object) = value.as_object() else {
+        return (None, vec!["light".to_string()]);
+    };
+    let l = feather_assets::PrefabSpec {
+        id: "light".into(),
+        params: value.clone(),
+    };
+    let mut bad: Vec<String> = object
+        .keys()
+        .filter(|k| !HANGING_LIGHT_PARAMS.contains(&k.as_str()))
+        .map(|k| format!("light.{k}"))
+        .collect();
+    let mut light = PointLight::default();
+    let mut at = Vec3::ZERO;
+    for key in HANGING_LIGHT_PARAMS {
+        if !object.contains_key(key) {
+            continue;
+        }
+        let ok = match key {
+            "color" => l
+                .vec3(key)
+                .filter(|c| c.min_element() >= 0.0)
+                .map(|c| light.color = c),
+            "at" => l.vec3(key).map(|v| at = v),
+            "intensity" => l
+                .f32(key)
+                .filter(|v| *v >= 0.0)
+                .map(|v| light.intensity = v),
+            "radius" => l.f32(key).filter(|v| *v > 0.0).map(|v| light.radius = v),
+            _ => l
+                .f32(key)
+                .filter(|v| *v >= 0.0)
+                .map(|v| light.source_radius = v),
+        };
+        if ok.is_none() {
+            bad.push(format!("light.{key}"));
+        }
+    }
+    light.source_radius = light.source_radius.min(light.radius);
+    (Some((light, at)), bad)
+}
 
 /// A `hanging` node's rope, over `RopeParams::default()`, and the params it
 /// couldn't use: unknown ones, and ones out of range or not numbers.
@@ -2301,7 +2369,9 @@ fn hanging_params(spec: Option<&feather_assets::PrefabSpec>) -> (rope::RopeParam
 /// mesh's origin, and the rope's anchor is `length` straight above it. The
 /// rope sways in the level's wind; neither it nor the item collides.
 fn spawn_hanging(world: &mut World, args: &SpawnArgs) {
-    let (params, bad) = hanging_params(args.spec);
+    let (params, mut bad) = hanging_params(args.spec);
+    let (light, bad_light) = hanging_light(args.spec);
+    bad.extend(bad_light);
     for key in bad {
         eprintln!("[scene] hanging: can't use param {key:?}; ignored");
     }
@@ -2311,6 +2381,7 @@ fn spawn_hanging(world: &mut World, args: &SpawnArgs) {
         rope: rope::Rope::new(at + Vec3::Y * params.length, params),
         item: args.mesh.map(|m| (m, args.material, local)),
         casts: args.flag("shadow", true),
+        light,
     });
 }
 
@@ -3745,7 +3816,7 @@ impl ApplicationHandler for App {
                     let light_frusta: [Frustum; SHADOW_CASCADES] = std::array::from_fn(|i| {
                         Frustum::from_view_proj(&cascades[i].view_proj).without_near()
                     });
-                    let lights = extract_lights(&mut s.world, &camera_frustum);
+                    let lights = extract_lights(&mut s.world, &camera_frustum, alpha);
 
                     // Extract: interpolate each entity's sim state (prev -> curr) by
                     // alpha, build its model matrix, and route it to the camera-visible
@@ -6079,6 +6150,90 @@ mod tests {
         );
     }
 
+    /// A `hanging` node's `light` (§12): off without one; its params over
+    /// `point_light`'s defaults, `at` in the item's space; bad keys named.
+    #[test]
+    fn a_hanging_light_is_parsed() {
+        let spec = |v| feather_assets::PrefabSpec {
+            id: "hanging".into(),
+            params: v,
+        };
+        assert_eq!(
+            hanging_light(Some(&spec(serde_json::json!({ "length": 2.0 })))).0,
+            None
+        );
+        let (l, bad) = hanging_light(Some(&spec(serde_json::json!({ "light": {
+            "color": [1.0, 0.7, 0.4], "intensity": 6.0, "radius": 11.0,
+            "source_radius": 0.05, "at": [0.0, -0.17, 0.0]
+        } }))));
+        assert!(bad.is_empty(), "{bad:?}");
+        let (l, at) = l.unwrap();
+        assert_eq!(l.color, Vec3::new(1.0, 0.7, 0.4));
+        assert_eq!((l.intensity, l.radius, l.source_radius), (6.0, 11.0, 0.05));
+        assert_eq!(at, Vec3::new(0.0, -0.17, 0.0));
+        // An empty object is a default light at the item's origin.
+        let (l, bad) = hanging_light(Some(&spec(serde_json::json!({ "light": {} }))));
+        assert!(bad.is_empty());
+        assert_eq!(l, Some((PointLight::default(), Vec3::ZERO)));
+        let (l, mut bad) = hanging_light(Some(&spec(serde_json::json!({ "light": {
+            "radius": -1.0, "color": [1, 1], "flicker": true, "intensity": 3.0
+        } }))));
+        bad.sort();
+        assert_eq!(bad, ["light.color", "light.flicker", "light.radius"]);
+        assert_eq!(l.unwrap().0.intensity, 3.0);
+        let (l, bad) = hanging_light(Some(&spec(serde_json::json!({ "light": true }))));
+        assert_eq!((l, bad), (None, vec!["light".to_string()]));
+        // hanging_params knows the key, so it isn't unknown there.
+        assert!(
+            hanging_params(Some(&spec(serde_json::json!({ "light": {} }))))
+                .1
+                .is_empty()
+        );
+    }
+
+    /// The light a lantern carries is where the lantern is drawn: at rest,
+    /// the node's transform applied to `at`; swung, carried with the item.
+    #[test]
+    fn a_hanging_light_rides_its_item() {
+        let look = Look::new();
+        let vp = look.view_proj(Vec3::ZERO, 16.0 / 9.0, GraphicsSettings::default().fov_y());
+        let frustum = Frustum::from_view_proj(&vp);
+        let at = Vec3::new(0.0, -0.17, 0.0);
+        let local = Mat4::from_scale(Vec3::splat(1.3));
+        let node = Vec3::new(1.0, 2.0, -10.0);
+        let hang = |lit: bool| Hanging {
+            rope: rope::Rope::new(node + Vec3::Y * 1.5, rope::RopeParams::default()),
+            item: Some((MeshId(0), 0, local)),
+            casts: true,
+            light: lit.then_some((PointLight::default(), at)),
+        };
+        let mut w = World::new();
+        w.spawn(hang(true));
+        let lights = extract_lights(&mut w, &frustum, 1.0);
+        assert_eq!(lights.len(), 1);
+        let want = node + local.transform_vector3(at);
+        let got = Vec3::from_slice(&lights[0].pos_radius[..3]);
+        assert!((got - want).length() < 1e-5, "{got} vs {want}");
+        // Swing it: the light follows the item's matrix, not the node.
+        let mut w = World::new();
+        let mut h = hang(true);
+        for p in h.rope.points.iter_mut().skip(1) {
+            *p += Vec3::new(0.4, 0.0, 0.0);
+        }
+        let item = rope::item_matrix(&h.rope.points, local);
+        w.spawn(h);
+        let got = Vec3::from_slice(&extract_lights(&mut w, &frustum, 1.0)[0].pos_radius[..3]);
+        assert!((got - item.transform_point3(at)).length() < 1e-5);
+        assert!(
+            (got - want).x > 0.3,
+            "it didn't move with the lantern: {got}"
+        );
+        // Control: unlit, no light.
+        let mut w = World::new();
+        w.spawn(hang(false));
+        assert!(extract_lights(&mut w, &frustum, 1.0).is_empty());
+    }
+
     /// The level's wind comes from its `environment` marker.
     #[test]
     fn the_environment_sets_the_wind() {
@@ -7005,7 +7160,7 @@ mod tests {
             },
         ));
 
-        let lights = extract_lights(&mut w, &frustum);
+        let lights = extract_lights(&mut w, &frustum, 1.0);
         assert_eq!(
             lights.len(),
             2,

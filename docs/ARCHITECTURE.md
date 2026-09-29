@@ -734,7 +734,8 @@ clamped to the coarsest LOD their mesh has.
 
 **Landed (§26): punctual lights (stage A), then clustering (stage B, below).** Stage A of the above:
 a `PointLight` component placed by §18's `point_light` prefab (on a marker node,
-or on geometry so a lamp both emits and renders), extracted per frame into a
+or on geometry so a lamp both emits and renders; or carried by something on a
+rope, §15, which moves it every frame), extracted per frame into a
 `GpuLight[]` SSBO at set 0 binding 5, and shaded in `mesh.frag` with the same
 Cook-Torrance terms as the sun — reusing the BRDF rather than adding a second
 lighting path. Falloff is windowed inverse-square, the window driving the light
@@ -2106,8 +2107,39 @@ player. It's its own small solver, not rapier:
   with no ropes, 1.59 on both this and the previous binary. I predicted
   ≤ +0.01 ms and unchanged.
 - **Validation:** sync-clean at 1× and MSAA 4× (filtered).
-- **Not done:** a lit lantern (a moving `point_light`), the player pushing
-  a rope, rope collisions, a rope between two anchors (a laundry line), and
+- **Landed: a lit item.** A `hanging` node's `light` object (`point_light`'s
+  params, plus `at`, a point in the item's own space) gives it a light.
+  - `extract_lights` places the light with the item's own interpolated
+    matrix, so it never leaves the glass, and the clusters are rebuilt every
+    frame anyway.
+  - Point lights are unshadowed (§12), so the light moves over the floor,
+    but nothing it lights casts a shadow from it.
+  - It hums in no one's ear: audio hums only lights on mesh entities.
+  - **The zone's hangar is lit by its four lanterns now:**
+    - Its two roof lamps (2 at intensity 10) are gone. Each lantern carries
+      one at intensity 6, radius 11, warm [1, 0.72, 0.42], at its chimney's
+      centre, and its glass glows (`emissiveFactor` [1, 0.72, 0.38]).
+    - The office keeps its two lamps. Seed 11's scene differs from the
+      last only by the two lamp markers, the lanterns' `light` and the glass.
+    - `check_hanging` adds: a light has intensity and radius, and sits within
+      its item (controls: none, 1 m below).
+  - **The look,** measured from HDR dumps against the lamps (temporary
+    harness):
+    - the hangar's floor, seen from the door looking down, is 7% brighter on
+      average and more even (p90/p10 3.91 → 3.40): the lanterns fill the
+      dark middle the two lamps left;
+    - the glass is now the brightest thing in view (1.07 against 0.55);
+    - the light's pool moves only slightly with the sway. Frame-to-frame
+      change on the floor was 0.00026 against 0.00015 with fixed lamps: a few
+      centimetres of swing 5.8 m up.
+  - **Tests:** the `light` param (defaults, `at`, bad keys, not an object),
+    and the light riding its item (at rest, where the node puts it; swung,
+    with the item; control: unlit gives none).
+  - **Cost** (pinned, 3 interleaved rounds, the same binary on the zone with
+    lamps and with lanterns): frame 1.19–1.20 both. `lights120` 1.59 on both
+    binaries. Predicted ±0.02 and unchanged.
+- **Not done:** the player pushing a rope, rope collisions, a rope between
+  two anchors (a laundry line), shadows from the lanterns' light, and
   per-object motion vectors for TAA.
 
 ## 16. Skinned / animated meshes

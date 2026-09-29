@@ -299,7 +299,7 @@ if absent. A node's `extras` can name a prefab:
 | `player_start` | `yaw` degrees (keep the default look direction) | where NEW GAME spawns the player; first one wins |
 | `prop` | `collide` (true), `shadow` (true), `collider` (`auto`) | a mesh with optional collider / shadow casting. `collider`: `auto` (exact mesh up to 2048 triangles; above that, the finest baked LOD under 2048 triangles within 5 cm, else a convex hull), `mesh` (always the full mesh), `hull`, `box`, `none`. Bake a scene so its detailed props get LOD collision instead of hulls, which fill every hollow |
 | `environment` | `sun_elevation` 63° and `sun_azimuth` 127° (degrees above the horizon, and clockwise from north, -Z, seen from above), `sun_color` [1,1,1], `sun_intensity` 8, `sky_zenith` [0.10,0.22,0.55], `sky_horizon` [0.55,0.65,0.85], `sky_ground` [0.17,0.18,0.19], `sky_sun_color` [1,0.95,0.85] (the tint of the sun's glow and disk), `sky_intensity` 1 (also the ambient light), `sun_glow` 0.6, `sun_disk` 60 (0 hides the sun), `fog_density` 0.010 per metre (at `fog_height` 0), `fog_falloff` 0 (per metre; above 0 the fog thins with height, by e every 1/falloff metres, and the sky background fogs through it too), `fog_color` (unset: the sky's colour), `fog_sun` 0 (a glow towards the sun in the fog), `exposure` 1 (with auto-exposure on, compensation: a multiplier on the metered exposure; off, the fixed exposure), `exposure_min` 0.125 and `exposure_max` 8 (the range auto-exposure may choose from), `wind_speed` 2 m/s and `wind_azimuth` 90° (the direction it blows towards, clockwise from north like the sun's; ropes sway in it) | the level's atmosphere, on a bare marker; first one wins. Colours are linear. Left-out params keep the default look; unknown or unreadable ones print `[scene] environment: can't use param …` and are ignored |
-| `hanging` | `length` 1.5 m, `segments` 12, `radius` 0.008 m, `wind` 1 (how strongly it feels the level's wind), `shadow` (true) | something on a rope (§15 in ARCHITECTURE.md): the node is the item at rest, hung by its mesh's origin, and the rope is tied `length` straight above it. It sways in the level's wind; neither rope nor item collides. Bad or unknown params print `[scene] hanging: can't use param …` |
+| `hanging` | `length` 1.5 m, `segments` 12, `radius` 0.008 m, `wind` 1 (how strongly it feels the level's wind), `shadow` (true), `light` (none: an object of `point_light`'s params, same defaults, plus `at` [0,0,0], the light's position in the item's own space) | something on a rope (§15 in ARCHITECTURE.md): the node is the item at rest, hung by its mesh's origin, and the rope is tied `length` straight above it. It sways in the level's wind; neither rope nor item collides. Bad or unknown params print `[scene] hanging: can't use param …` |
 | `point_light` | `color` [1,1,1], `intensity` 12, `radius` 10, `source_radius` 0.1 | on a bare marker or on geometry (a lamp that also renders). `source_radius` is the emitter's physical size, clamped to [0, radius]: it sets the size of the highlight on shiny surfaces. Match it to the lamp's geometry; 0 is a true point, which makes a pinprick-bright highlight on smooth metal |
 
 An unknown prefab name falls back to static geometry. Up to 128 point lights
@@ -395,7 +395,7 @@ Soviet precast-panel fence, a brick and rusty-iron hangar with holes in the
 roof, a two-storey office block you can walk into and climb, broken asphalt
 and mud, road barriers, barrels, tyres, pipework, a covered car and lines of
 electricity poles. Kerosene lanterns hang on ropes from the hangar's roof
-beams, swaying in the draught. You spawn on the road outside the gate,
+beams, swaying in the draught, and are its only lamps. You spawn on the road outside the gate,
 facing it.
 
 - **Assets:** 8 tiling Poly Haven textures at 2K (precast concrete, factory
@@ -502,6 +502,9 @@ the door, visible from outside):
   meets the beam and the lantern's handle.
 - With TAA on, the thin rope reads fainter than with it off (it's about a
   pixel wide from the floor), and nothing trails the moving lantern.
+- Their light is the hangar's: warm pools under each, glowing glass, and the
+  light shifting slightly with the sway. The middle of the floor should no
+  longer be the darkest part.
 
 **What to look for** when judging TAA (OPTIONS > GRAPHICS > TAA, or F3,
 live):
@@ -696,7 +699,7 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | Controls | app | key names round-trip; reserved menu keys are refused; a key on two actions warns; two keys on one action hold until both are released; toggles ignore auto-repeat but exposure repeats; a rebound jump moves; `toggle_fullscreen` defaults to F11 (also in files that predate it) and ignores auto-repeat; `rebind` steals the key and refuses menu/unnamed keys; sensitivity presets step and wrap; saved literals parse back, and saving every binding into the template keeps its comments; every key's menu label is drawable |
 | Texture slots | render | one slot per unique image × colour space; sRGB and UNORM uses of the same pixels stay separate; overflow past the capacity is counted and falls back to the defaults |
 | Light clusters | render | GLSL grid constants + `MAX_LIGHTS` match the Rust ones |
-| Ropes | assets, app | still, a rope hangs straight at its length (control: one pass, no attachment, stretches); released, it swings with a pendulum's period, dies down and never grows (control: 4× gravity halves the period); wind leans it downwind within 1% of its length (control: still air); an unweighted rope bows (control: one segment); segment and item matrices sit on the points, and at rest the item is drawn as authored; determinism and interpolation; the unit tube; `hanging` params, spawn (anchor above the node, no collider) and the level's wind params |
+| Ropes | assets, app | still, a rope hangs straight at its length (control: one pass, no attachment, stretches); released, it swings with a pendulum's period, dies down and never grows (control: 4× gravity halves the period); wind leans it downwind within 1% of its length (control: still air); an unweighted rope bows (control: one segment); segment and item matrices sit on the points, and at rest the item is drawn as authored; determinism and interpolation; the unit tube; `hanging` params, spawn (anchor above the node, no collider) and the level's wind params; a `light` on it (params, bad keys) rides the item: at rest where the node puts it, swung with it (control: unlit, no light) |
 | TAA | render, app | a Rust reference of `taa.comp`: the Halton jitter covers the pixel evenly; jittering moves the image by exactly its offset and keeps depth; the reprojection finds last frame's pixel; the colour transforms round-trip; Catmull-Rom is exact at texel centres and along rows; the clip keeps the inside and pulls in the outside; a still edge converges to its coverage (control: no jitter, hard edge); a pan keeps its image (control: an unfollowed history smears); the shader declares the reference's constants and formulas; the GRAPHICS row, `taa` key, `--no-taa` and F3 |
 
 ### What tests cannot cover
