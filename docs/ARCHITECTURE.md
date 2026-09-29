@@ -1322,7 +1322,8 @@ which is exactly the look every level had before.
   sun's glow and of its disk (0 hides the sun, as behind cloud); exponential
   fog density (fog blends towards the sky, so it takes the sky's colour); and
   the tonemap's starting exposure.
-- **How it reaches the GPU: specialization constants.** `render::Environment`
+- **How it first reached the GPU: specialization constants.** (Superseded:
+  all of it now travels per frame, in the globals UBO, below.) `render::Environment`
   fills the `constant_id`s (23 now) that `mesh.frag` and `sky.frag` declare, baked when
   a session builds its pipelines (`MeshRenderer::new`, `SkyPass::new`).
   - What's baked is fixed for the session, so it costs nothing per frame and
@@ -1343,9 +1344,9 @@ which is exactly the look every level had before.
 - **Measured:** `--bench scratch/lights120.gltf`, old and new binaries
   interleaved (clocks not pinned): frame median 0.72/0.71 ms either way, as
   predicted. The constants fold as the literals did.
-- **Limit:** changing the rest of the atmosphere *during* a session (the
-  sky's colours, the sun's) means rebuilding two pipelines. The runtime
-  route is the one the fog took (below).
+- **Limit (lifted since, below):** changing the rest of the atmosphere
+  *during* a session (the sky's colours, the sun's) meant rebuilding two
+  pipelines. The runtime route was the one the fog took.
 
 **Landed (§26): the weather's first knobs, live.** A temporary WEATHER
 screen (OPTIONS, in game only) until the weather engine: FOG DENSITY, FOG
@@ -1355,7 +1356,7 @@ starts from the level's.
 - **The fog moved from baked to per frame.** Its density, height and falloff
   left the specialization constants (ids renumbered, 23 left), and travel in
   mesh.frag's globals UBO (`vec4 fog`) and sky.frag's push constants (now
-  112 of 128 bytes).
+  112 of 128 bytes; since moved into the shared globals, below).
   - Each shader `#define`s `FOG_DENSITY`/`FOG_HEIGHT`/`FOG_FALLOFF` over its
     own source, so the shared `fog_optical_depth` is still text for text the
     same in both, as its test demands.
@@ -1387,6 +1388,53 @@ starts from the level's.
 - **Cost** (pinned, 3 interleaved rounds against the previous binary): zone
   `geo` 0.43–0.44 both, frame 1.19–1.20; `lights120` `geo` 0.93–0.94, frame
   1.58–1.59. Predicted within ±0.02.
+
+**Landed (§26): the whole atmosphere per frame.** The weather engine's
+groundwork. Nothing about a level's look is baked into a pipeline any more.
+- **`render::Atmosphere`** (seven vec4s, 112 B) is the tail of mesh.frag's
+  globals UBO:
+  - the directional light's radiance;
+  - the sky's zenith, horizon and ground colours, whose `w` carry the sky's
+    intensity, the sun's glow and its disk;
+  - the glow's tint (`w`: the fog's sun glow);
+  - the fog's colour (`w`: take the sky's instead);
+  - the fog's amount.
+
+  `Environment::atmosphere()` fills it and `MeshRenderer::set_atmosphere`
+  takes it each frame. The specialization constants are gone, so
+  `MeshRenderer::new` and `SkyPass::new` no longer take an environment.
+- **The sky pass reads the same UBO.** Its pipeline layout is built from
+  `MeshRenderer::set_layout()`, and it binds that frame's set 0
+  (`frame_set`), so the sky and what it lights read one copy. Its push block
+  shrank to 96 B: the matrix, the camera, the light's direction.
+- **sky.frag declares mesh.frag's `Globals` block text for text,** with the
+  same `SHADOW_CASCADES`. Both `#define` the same names over it
+  (`SKY_ZENITH` is `g.sky_zenith.rgb`, and so on), so `sky()` and the fog
+  functions stay textually shared.
+- **Tests:**
+  - the GLSL block's size is the Rust struct's, with the atmosphere at its
+    tail;
+  - both shaders' blocks and `#define`s are identical;
+  - neither SPIR-V declares a specialization constant;
+  - the default atmosphere is the old GLSL defaults, slot by slot;
+  - every field reaches the atmosphere, but the sun's direction and the
+    exposure don't;
+  - the sky's push size.
+
+  Each failed against a mutation.
+- **The look,** from HDR dumps (temporary harness, TAA and auto-exposure
+  off, MSAA 8×) against 12df494, from the zone's spawn, its hangar and a
+  view of the sky, and from `lights120`:
+  - bit-identical, apart from ≤ 0.001% of the pixels by one half-float step;
+  - in the hangar, 0.009% differ by more, where the lanterns sway. A rerun of
+    the same binary differs there too.
+- **Cost** (pinned, 3 interleaved rounds against 12df494):
+  - zone `geo` 0.43 → 0.44 ms, frame 1.19–1.20 → 1.20;
+  - `lights120` `geo` 0.94 and frame 1.59 in both.
+  - I predicted 0.43 ± 0.02 and 0.93–0.96; both held. The folded constants
+    became uniform loads at no measurable cost.
+- **Validation with sync:** 0 at 1× and at MSAA 8× on the zone and
+  `lights120` (after §8's filter).
 
 **Landed (§26): height fog.** Fog was uniform (`1 − e^{−density·dist}`,
 towards the sky's colour), only on geometry, so the horizon stayed crisp and
@@ -2960,10 +3008,7 @@ skinning; animation state machines; local reflection probes / irradiance
 volumes; audio occlusion + reverb zones; user-selectable anti-aliasing mode
 (SMAA / MSAA 2×/4×; the geometry sample-count seam is in place, §26);
 streaming + stage pipelining; X-Ray (`.ogf`/level) importer for the SoC-rebuild
-stretch dream (becomes just another importer feeding the same bake); the rest
-of a level's atmosphere changing during a session (the sky's and sun's
-colours for weather and time of day: §13's constants would move into the
-globals UBO, as the fog's amount already has).
+stretch dream (becomes just another importer feeding the same bake).
 
 ## 26. Implementation status
 
@@ -3208,9 +3253,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   *is* now drawn as a visible background (SkyPass) matching the reflected
   environment. Real cubemap IBL (equirect→cube, irradiance/prefilter passes,
   BRDF LUT) is the follow-up. Sun shadows (§11 CSM) and punctual point lights
-  (§12) now exist. Bloom, auto-exposure and TAA landed (§13). The fog's amount
-  travels per frame (OPTIONS > WEATHER sets it live); the sky and sun colours
-  are still baked per session. The ambient is
+  (§12) now exist. Bloom, auto-exposure and TAA landed (§13). The whole
+  atmosphere (sky palette, sun colour, fog) travels per frame in the globals
+  UBO the sky pass shares (§13); OPTIONS > WEATHER sets the fog live. The ambient is
   occluded by a baked per-level sky-visibility volume (§13, §17) and by the
   lower of half-resolution GTAO and the material's own AO (glTF
   `occlusionTexture`, §13). The tonemap curve is a drop-in point for AgX.

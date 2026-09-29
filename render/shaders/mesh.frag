@@ -55,11 +55,31 @@ layout(set = 0, binding = 4) uniform Globals {
     vec4 sky_origin;     // sky volume: xyz = minimum corner, w = 1 / cell
     vec4 sky_dims;       // xyz = cells per axis, w = 1 if there is a volume
     vec4 ao_params;      // x = 1 if GTAO ran this frame, yz = the full-resolution size
-    vec4 fog;            // x = density at y = height, z = falloff (§13, per frame)
+    // The atmosphere (§13), per frame so the weather can change it:
+    // render::Atmosphere. mesh.frag and sky.frag declare this block text for
+    // text (a test checks).
+    vec4 sun_radiance;   // rgb = the directional light's colour × intensity
+    vec4 sky_zenith;     // rgb, w = the sky's intensity
+    vec4 sky_horizon;    // rgb, w = the sun's glow
+    vec4 sky_ground;     // rgb, w = the sun's disk
+    vec4 sky_sun;        // rgb = the glow's and disk's tint, w = the fog's sun glow
+    vec4 fog_color;      // rgb, w = 1 to take the sky's colour instead
+    vec4 fog;            // x = density at y = height, z = falloff
 } g;
 
-// The fog (§13) travels per frame, so the weather can change it; sky.frag
-// reads the same names from its push constants.
+// The atmosphere's parts, by the names sky() and the fog functions use; both
+// shaders define the same (a test checks).
+#define SUN_RADIANCE g.sun_radiance.rgb
+#define SKY_ZENITH g.sky_zenith.rgb
+#define SKY_INTENSITY g.sky_zenith.w
+#define SKY_HORIZON g.sky_horizon.rgb
+#define SUN_GLOW g.sky_horizon.w
+#define SKY_GROUND g.sky_ground.rgb
+#define SUN_DISK g.sky_ground.w
+#define SUN_COLOR g.sky_sun.rgb
+#define FOG_SUN g.sky_sun.w
+#define FOG_COLOR g.fog_color.rgb
+#define FOG_SKY g.fog_color.w
 #define FOG_DENSITY g.fog.x
 #define FOG_HEIGHT g.fog.y
 #define FOG_FALLOFF g.fog.z
@@ -102,43 +122,9 @@ layout(location = 3) in vec3 v_world_pos;
 layout(location = 0) out vec4 o_color; // linear HDR (RGBA16F target)
 
 const float PI = 3.14159265359;
-// The level's atmosphere (§13): specialization constants that
-// render::Environment fills, by constant_id, for this shader and sky.frag
-// alike. The defaults here are Environment::default() (a test checks).
-layout(constant_id = 0) const float SUN_RADIANCE_R = 8.0;
-layout(constant_id = 1) const float SUN_RADIANCE_G = 8.0;
-layout(constant_id = 2) const float SUN_RADIANCE_B = 8.0;
-layout(constant_id = 3) const float SKY_ZENITH_R = 0.10;
-layout(constant_id = 4) const float SKY_ZENITH_G = 0.22;
-layout(constant_id = 5) const float SKY_ZENITH_B = 0.55;
-layout(constant_id = 6) const float SKY_HORIZON_R = 0.55;
-layout(constant_id = 7) const float SKY_HORIZON_G = 0.65;
-layout(constant_id = 8) const float SKY_HORIZON_B = 0.85;
-layout(constant_id = 9) const float SKY_GROUND_R = 0.17;
-layout(constant_id = 10) const float SKY_GROUND_G = 0.18;
-layout(constant_id = 11) const float SKY_GROUND_B = 0.19;
-layout(constant_id = 12) const float SKY_SUN_R = 1.0;
-layout(constant_id = 13) const float SKY_SUN_G = 0.95;
-layout(constant_id = 14) const float SKY_SUN_B = 0.85;
-layout(constant_id = 15) const float SKY_INTENSITY = 1.0;
-layout(constant_id = 16) const float SUN_GLOW = 0.6;
-layout(constant_id = 18) const float FOG_R = 0.5;
-layout(constant_id = 19) const float FOG_G = 0.5;
-layout(constant_id = 20) const float FOG_B = 0.5;
-layout(constant_id = 21) const float FOG_SKY = 1.0; // 1: the fog takes the sky's colour
-layout(constant_id = 22) const float FOG_SUN = 0.0;
-const vec3 FOG_COLOR = vec3(FOG_R, FOG_G, FOG_B);
-
-const vec3 SUN_RADIANCE = vec3(SUN_RADIANCE_R, SUN_RADIANCE_G, SUN_RADIANCE_B);
-
 // Analytic procedural sky (stand-in for a precomputed IBL cubemap). Linear HDR.
 // NOTE: sky() and the fog functions below are copies of sky.frag's, text for
 // text (a test checks). Only sky.frag's background adds the sharp sun disk.
-const vec3 SKY_ZENITH = vec3(SKY_ZENITH_R, SKY_ZENITH_G, SKY_ZENITH_B);
-const vec3 SKY_HORIZON = vec3(SKY_HORIZON_R, SKY_HORIZON_G, SKY_HORIZON_B);
-const vec3 SKY_GROUND = vec3(SKY_GROUND_R, SKY_GROUND_G, SKY_GROUND_B);
-const vec3 SUN_COLOR = vec3(SKY_SUN_R, SKY_SUN_G, SKY_SUN_B);
-
 vec3 sky(vec3 d) {
     vec3 sundir = normalize(-pc.light_dir.xyz);
     float up = clamp(d.y, 0.0, 1.0);

@@ -1,17 +1,14 @@
 //! A level's atmosphere (§13): the sun, the analytic sky, fog and exposure.
 //!
-//! The sky palette, the sun's colour and the fog's colour reach `mesh.frag`
-//! and `sky.frag` as **specialization constants**, baked into both pipelines
-//! when a session builds them: fixed for the session, free per frame, and one
-//! struct feeds both shaders, which used to repeat the same constants by hand.
+//! All of it travels per frame, so the weather and the time of day can change
+//! any of it (§13's weather engine):
+//! - the sky palette, the sun's colour and the fog as an `Atmosphere`, the
+//!   tail of the globals UBO that `mesh.frag` and `sky.frag` both read;
+//! - the sun's *direction* and the exposure as push constants.
 //!
-//! What the weather changes travels per frame instead, and the app takes its
-//! starting value from here: the sun's *direction* and the exposure (push
-//! constants), and the fog's density, height and falloff (mesh.frag's globals,
-//! sky.frag's push constants; OPTIONS > WEATHER sets them). The rest would
-//! follow the same way for a weather engine (§25).
+//! A level's `environment` marker fills an `Environment`, and the app turns it
+//! into those each frame.
 
-use ash::vk;
 use glam::Vec3;
 
 /// See the module docs. `Default` is exactly the look every scene had before
@@ -83,203 +80,146 @@ impl Default for Environment {
     }
 }
 
-/// The specialization constants, in `constant_id` order: the name each
-/// shader declares at that id. A shader need not declare them all (the sky
-/// has no fog, the mesh no disk); Vulkan ignores map entries a shader lacks.
-const SPEC_NAMES: [&str; 23] = [
-    "SUN_RADIANCE_R",
-    "SUN_RADIANCE_G",
-    "SUN_RADIANCE_B",
-    "SKY_ZENITH_R",
-    "SKY_ZENITH_G",
-    "SKY_ZENITH_B",
-    "SKY_HORIZON_R",
-    "SKY_HORIZON_G",
-    "SKY_HORIZON_B",
-    "SKY_GROUND_R",
-    "SKY_GROUND_G",
-    "SKY_GROUND_B",
-    "SKY_SUN_R",
-    "SKY_SUN_G",
-    "SKY_SUN_B",
-    "SKY_INTENSITY",
-    "SUN_GLOW",
-    "SUN_DISK",
-    "FOG_R",
-    "FOG_G",
-    "FOG_B",
-    "FOG_SKY",
-    "FOG_SUN",
-];
-const SPEC_COUNT: usize = SPEC_NAMES.len();
+/// The atmosphere as the shaders read it each frame (§13): the tail of
+/// mesh.frag's `Globals`, whose block sky.frag declares too (tests check
+/// both, field for field). std140: every field a vec4.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Atmosphere {
+    /// rgb = the directional light's colour × intensity.
+    pub sun_radiance: [f32; 4],
+    /// rgb, w = the sky's intensity.
+    pub sky_zenith: [f32; 4],
+    /// rgb, w = the sun's glow.
+    pub sky_horizon: [f32; 4],
+    /// rgb, w = the sun's disk.
+    pub sky_ground: [f32; 4],
+    /// rgb = the glow's and disk's tint, w = the fog's glow towards the sun.
+    pub sky_sun: [f32; 4],
+    /// rgb = the fog's own colour, w = 1 to take the sky's instead.
+    pub fog_color: [f32; 4],
+    /// x = density at y = height, z = falloff.
+    pub fog: [f32; 4],
+}
 
 impl Environment {
-    /// This environment's specialization constants, by `constant_id`.
-    fn spec_values(&self) -> [f32; SPEC_COUNT] {
-        let sun = self.sun_color * self.sun_intensity;
-        let [zr, zg, zb] = self.sky_zenith.to_array();
-        let [hr, hg, hb] = self.sky_horizon.to_array();
-        let [gr, gg, gb] = self.sky_ground.to_array();
-        let [sr, sg, sb] = self.sky_sun_color.to_array();
-        // FOG_SKY = 1 takes the sky's colour; FOG_R/G/B are then unused.
-        let fog = self.fog_color.unwrap_or(Vec3::splat(0.5));
-        [
-            sun.x,
-            sun.y,
-            sun.z,
-            zr,
-            zg,
-            zb,
-            hr,
-            hg,
-            hb,
-            gr,
-            gg,
-            gb,
-            sr,
-            sg,
-            sb,
-            self.sky_intensity,
-            self.sun_glow,
-            self.sun_disk,
-            fog.x,
-            fog.y,
-            fog.z,
-            if self.fog_color.is_some() { 0.0 } else { 1.0 },
-            self.fog_sun,
-        ]
-    }
-}
-
-/// An environment's specialization data, owned so
-/// that a `vk::SpecializationInfo` borrowing it lives as long as pipeline
-/// creation. Every value is 4 bytes: an f32, or a VkBool32.
-pub(crate) struct Specialization {
-    entries: Vec<vk::SpecializationMapEntry>,
-    data: Vec<u32>,
-}
-
-impl Specialization {
-    pub(crate) fn new(env: &Environment) -> Self {
-        let mut spec = Self {
-            entries: Vec::new(),
-            data: Vec::new(),
-        };
-        for (id, v) in env.spec_values().into_iter().enumerate() {
-            spec.push(id as u32, v.to_bits());
+    /// What the shaders read of this environment, each frame. The sun's
+    /// direction and the exposure travel separately.
+    pub fn atmosphere(&self) -> Atmosphere {
+        let v = |c: Vec3, w: f32| c.extend(w).to_array();
+        Atmosphere {
+            sun_radiance: v(self.sun_color * self.sun_intensity, 0.0),
+            sky_zenith: v(self.sky_zenith, self.sky_intensity),
+            sky_horizon: v(self.sky_horizon, self.sun_glow),
+            sky_ground: v(self.sky_ground, self.sun_disk),
+            sky_sun: v(self.sky_sun_color, self.fog_sun),
+            // Without a colour of its own the fog takes the sky's, and rgb is
+            // unused.
+            fog_color: match self.fog_color {
+                Some(c) => v(c, 0.0),
+                None => v(Vec3::splat(0.5), 1.0),
+            },
+            fog: [self.fog_density, self.fog_height, self.fog_falloff, 0.0],
         }
-        spec
-    }
-
-    fn push(&mut self, constant_id: u32, value: u32) {
-        self.entries.push(vk::SpecializationMapEntry {
-            constant_id,
-            offset: (self.data.len() * 4) as u32,
-            size: 4,
-        });
-        self.data.push(value);
-    }
-
-    pub(crate) fn info(&self) -> vk::SpecializationInfo<'_> {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.data.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(self.data.as_slice()),
-            )
-        };
-        vk::SpecializationInfo::default()
-            .map_entries(&self.entries)
-            .data(bytes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
-    /// The `(name, default)` of every specialization constant a SPIR-V module
-    /// declares, by `SpecId`. Names come from `OpName`, so need a debug build
-    /// of the shaders (tests are one); a release build yields `None` names.
-    fn spec_constants(spv: &[u8]) -> HashMap<u32, (Option<String>, f32)> {
+    /// How many specialization constants a SPIR-V module declares: its
+    /// `OpDecorate … SpecId` instructions.
+    fn spec_constant_count(spv: &[u8]) -> usize {
         let words: Vec<u32> = spv
             .chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
             .collect();
         assert_eq!(words[0], 0x0723_0203, "not SPIR-V");
-        let (mut names, mut spec_ids, mut values) =
-            (HashMap::new(), HashMap::new(), HashMap::new());
+        let mut count = 0;
         let mut i = 5; // past the header
         while i < words.len() {
-            let (count, op) = ((words[i] >> 16) as usize, words[i] & 0xffff);
-            let args = &words[i + 1..i + count];
-            match op {
-                // OpName: target id, then a nul-terminated UTF-8 string.
-                5 => {
-                    let bytes: Vec<u8> = args[1..].iter().flat_map(|w| w.to_le_bytes()).collect();
-                    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                    names.insert(args[0], String::from_utf8_lossy(&bytes[..end]).into_owned());
-                }
-                // OpDecorate target SpecId(1) literal.
-                71 if args[1] == 1 => {
-                    spec_ids.insert(args[0], args[2]);
-                }
-                // OpSpecConstant result-type result-id value (a 32-bit float here).
-                50 => {
-                    values.insert(args[1], f32::from_bits(args[2]));
-                }
-                // OpSpecConstantTrue / OpSpecConstantFalse: bools, as 1 / 0.
-                48 | 49 => {
-                    values.insert(args[1], if op == 48 { 1.0 } else { 0.0 });
-                }
-                _ => {}
+            let (len, op) = ((words[i] >> 16) as usize, words[i] & 0xffff);
+            // OpDecorate (71) target SpecId (1) literal.
+            if op == 71 && words[i + 2] == 1 {
+                count += 1;
             }
-            i += count.max(1);
+            i += len.max(1);
         }
-        spec_ids
-            .iter()
-            .map(|(target, &id)| (id, (names.get(target).cloned(), values[target])))
-            .collect()
+        count
     }
 
-    /// Every specialization constant the two shaders declare must be in the
-    /// map at the id the Rust side fills, under the name it expects, and with
-    /// a GLSL default equal to `Environment::default()`'s value. A mismatch
-    /// would compile and silently shade with the wrong number; this catches
-    /// it without a device. Between them the shaders must use every entry.
+    /// Nothing of the atmosphere is baked into a pipeline any more: all of it
+    /// travels per frame, so the weather can change it (§13). A constant
+    /// left behind would compile, and then ignore the weather.
     #[test]
-    fn shaders_declare_the_environment_constants() {
-        let defaults = Environment::default().spec_values();
-        let mut used = [false; SPEC_COUNT];
-        let shaders: [(&str, &[u8]); 2] = [
+    fn the_shaders_bake_nothing() {
+        for (shader, spv) in [
             (
                 "mesh.frag",
-                include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv")),
+                &include_bytes!(concat!(env!("OUT_DIR"), "/mesh.frag.spv"))[..],
             ),
             (
                 "sky.frag",
-                include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv")),
+                &include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv"))[..],
             ),
+        ] {
+            assert_eq!(spec_constant_count(spv), 0, "{shader}");
+        }
+    }
+
+    /// `Environment::default()` reaches the shaders as exactly the values
+    /// their specialization constants used to default to, each in its slot:
+    /// the look every level without an `environment` marker had.
+    #[test]
+    fn the_default_atmosphere_is_the_old_look() {
+        let a = Environment::default().atmosphere();
+        assert_eq!(a.sun_radiance[..3], [8.0, 8.0, 8.0]);
+        assert_eq!(a.sky_zenith, [0.10, 0.22, 0.55, 1.0]); // w: intensity
+        assert_eq!(a.sky_horizon, [0.55, 0.65, 0.85, 0.6]); // w: glow
+        assert_eq!(a.sky_ground, [0.17, 0.18, 0.19, 60.0]); // w: disk
+        assert_eq!(a.sky_sun, [1.0, 0.95, 0.85, 0.0]); // w: fog_sun
+        assert_eq!(a.fog_color, [0.5, 0.5, 0.5, 1.0]); // w: the sky's colour
+        assert_eq!(a.fog[..3], [0.010, 0.0, 0.0]);
+    }
+
+    /// Every part of an environment the shaders use reaches them through
+    /// `atmosphere()`; the sun's direction and the exposure travel apart.
+    #[test]
+    fn the_atmosphere_carries_every_field() {
+        let base = Environment::default();
+        let with = |change: fn(&mut Environment)| {
+            let mut env = base;
+            change(&mut env);
+            env
+        };
+        let changed: [(&str, Environment); 14] = [
+            ("sun_color", with(|e| e.sun_color = Vec3::X)),
+            ("sun_intensity", with(|e| e.sun_intensity = 2.0)),
+            ("sky_zenith", with(|e| e.sky_zenith = Vec3::X)),
+            ("sky_horizon", with(|e| e.sky_horizon = Vec3::X)),
+            ("sky_ground", with(|e| e.sky_ground = Vec3::X)),
+            ("sky_sun_color", with(|e| e.sky_sun_color = Vec3::X)),
+            ("sky_intensity", with(|e| e.sky_intensity = 2.0)),
+            ("sun_glow", with(|e| e.sun_glow = 0.1)),
+            ("sun_disk", with(|e| e.sun_disk = 0.0)),
+            ("fog_density", with(|e| e.fog_density = 0.5)),
+            ("fog_height", with(|e| e.fog_height = 3.0)),
+            ("fog_falloff", with(|e| e.fog_falloff = 0.2)),
+            ("fog_color", with(|e| e.fog_color = Some(Vec3::X))),
+            ("fog_sun", with(|e| e.fog_sun = 0.5)),
         ];
-        for (shader, spv) in shaders {
-            for (id, (name, value)) in spec_constants(spv) {
-                let i = id as usize;
-                assert!(i < SPEC_COUNT, "{shader}: constant_id {id} isn't mapped");
-                if let Some(name) = name {
-                    assert_eq!(name, SPEC_NAMES[i], "{shader}: constant_id {id}");
-                }
-                assert!(
-                    (value - defaults[i]).abs() <= 1e-6 * defaults[i].abs().max(1.0),
-                    "{shader}: {} defaults to {value} in GLSL, {} in Rust",
-                    SPEC_NAMES[i],
-                    defaults[i]
-                );
-                used[i] = true;
-            }
+        for (field, env) in changed {
+            assert_ne!(env.atmosphere(), base.atmosphere(), "{field}");
         }
-        for (i, u) in used.iter().enumerate() {
-            assert!(u, "no shader declares {}", SPEC_NAMES[i]);
-        }
+        let apart = Environment {
+            sun_dir: Vec3::X,
+            exposure: 2.0,
+            exposure_min: 1.0,
+            exposure_max: 4.0,
+            ..base
+        };
+        assert_eq!(apart.atmosphere(), base.atmosphere());
     }
 
     /// The shaders' `fog_optical_depth`, transcribed: the reference the
@@ -408,67 +348,87 @@ mod tests {
         }
     }
 
+    /// The block both shaders read the atmosphere from: mesh.frag's
+    /// `Globals`, which sky.frag declares text for text (with the same
+    /// cascade count, which sizes it). Its tail is `Atmosphere`, field for
+    /// field, and both shaders name its parts with the same `#define`s, so
+    /// the shared functions above read the same values in each.
     #[test]
-    fn the_map_lays_the_values_out_in_order() {
-        let env = Environment {
-            fog_sun: 0.5,
-            ..Default::default()
-        };
-        let spec = Specialization::new(&env);
-        let info = spec.info();
-        assert_eq!(info.map_entry_count as usize, SPEC_COUNT);
-        assert_eq!(info.data_size, SPEC_COUNT * 4);
-        let last = spec.entries[SPEC_COUNT - 1];
-        assert_eq!(last.constant_id, 22);
-        assert_eq!(f32::from_bits(spec.data[22]), 0.5);
-    }
-
-    /// The fog's density, height and falloff travel per frame (the weather
-    /// changes them), so they bake nothing into the pipelines.
-    #[test]
-    fn the_fog_amount_is_not_baked() {
-        let foggy = Environment {
-            fog_density: 0.5,
-            fog_height: 3.0,
-            fog_falloff: 0.2,
-            ..Default::default()
-        };
-        let data = |e: &Environment| Specialization::new(e).data;
-        assert_eq!(data(&foggy), data(&Environment::default()));
-        assert!(!SPEC_NAMES
-            .iter()
-            .any(|n| ["FOG_DENSITY", "FOG_HEIGHT", "FOG_FALLOFF"].contains(n)));
-        // Control: its colour still is.
-        let tinted = Environment {
-            fog_color: Some(Vec3::new(0.2, 0.3, 0.4)),
-            ..Default::default()
-        };
-        assert_ne!(data(&tinted), data(&Environment::default()));
-    }
-
-    /// The per-frame fog's blocks: mesh.frag's globals end with it, as the
-    /// Rust struct does, and sky.frag's push block is the size the pass pushes.
-    #[test]
-    fn the_fog_travels_in_the_blocks_the_passes_fill() {
+    fn the_shaders_read_the_atmosphere_from_the_globals() {
         let mesh = include_str!("../shaders/mesh.frag");
-        let globals = &mesh[mesh.find("uniform Globals {").unwrap()..];
-        let globals = &globals[..globals.find("} g;").unwrap()];
-        assert!(globals.trim_end().ends_with(
-            "vec4 fog;            // x = density at y = height, z = falloff (§13, per frame)"
-        ));
-        for (name, src, via) in [
-            ("mesh.frag", mesh, "g.fog"),
-            ("sky.frag", include_str!("../shaders/sky.frag"), "pc.fog"),
-        ] {
-            for (k, c) in [
-                ("FOG_DENSITY", 'x'),
-                ("FOG_HEIGHT", 'y'),
-                ("FOG_FALLOFF", 'z'),
-            ] {
-                let def = format!("#define {k} {via}.{c}");
-                assert!(src.contains(&def), "{name} lacks `{def}`");
-            }
+        let sky = include_str!("../shaders/sky.frag");
+        let block = |src: &str| -> String {
+            let start = src
+                .find("layout(set = 0, binding = 4) uniform Globals {")
+                .expect("Globals");
+            let len = src[start..].find("} g;").expect("end of Globals") + 4;
+            src[start..start + len].to_string()
+        };
+        assert_eq!(block(mesh), block(sky), "the Globals blocks differ");
+        let cascades = format!(
+            "const int SHADOW_CASCADES = {};",
+            feather_gfx::SHADOW_CASCADES
+        );
+        for (name, src) in [("mesh.frag", mesh), ("sky.frag", sky)] {
+            assert!(src.contains(&cascades), "{name} lacks `{cascades}`");
         }
+
+        let fields: Vec<String> = block(mesh)
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim().strip_prefix("vec4 ")?;
+                Some(l[..l.find(';')?].to_string())
+            })
+            .collect();
+        let atmosphere = [
+            "sun_radiance",
+            "sky_zenith",
+            "sky_horizon",
+            "sky_ground",
+            "sky_sun",
+            "fog_color",
+            "fog",
+        ];
+        assert_eq!(fields[fields.len() - atmosphere.len()..], atmosphere);
+        assert_eq!(
+            std::mem::size_of::<Atmosphere>(),
+            atmosphere.len() * 16,
+            "all vec4"
+        );
+
+        let defines = |src: &str| -> Vec<String> {
+            let mut d: Vec<String> = src
+                .lines()
+                .filter(|l| l.starts_with("#define "))
+                .map(String::from)
+                .collect();
+            d.sort();
+            d
+        };
+        assert_eq!(defines(mesh), defines(sky), "the #defines differ");
+        for def in [
+            "#define SUN_RADIANCE g.sun_radiance.rgb",
+            "#define SKY_ZENITH g.sky_zenith.rgb",
+            "#define SKY_INTENSITY g.sky_zenith.w",
+            "#define SKY_HORIZON g.sky_horizon.rgb",
+            "#define SUN_GLOW g.sky_horizon.w",
+            "#define SKY_GROUND g.sky_ground.rgb",
+            "#define SUN_DISK g.sky_ground.w",
+            "#define SUN_COLOR g.sky_sun.rgb",
+            "#define FOG_SUN g.sky_sun.w",
+            "#define FOG_COLOR g.fog_color.rgb",
+            "#define FOG_SKY g.fog_color.w",
+            "#define FOG_DENSITY g.fog.x",
+            "#define FOG_HEIGHT g.fog.y",
+            "#define FOG_FALLOFF g.fog.z",
+        ] {
+            assert!(mesh.contains(def), "mesh.frag lacks `{def}`");
+        }
+    }
+
+    /// sky.frag's push block is the size the pass pushes.
+    #[test]
+    fn the_sky_pushes_its_block() {
         let sky = include_str!("../shaders/sky.frag");
         let push = &sky[sky.find("uniform Push {").unwrap()..];
         let push = &push[..push.find("} pc;").unwrap()];

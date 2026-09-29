@@ -2740,8 +2740,6 @@ fn sun_travel(elevation: f32, azimuth: f32) -> Vec3 {
 struct FrameView {
     /// What the camera passes draw with: jittered under TAA (§13).
     view_proj: Mat4,
-    /// This frame's fog (§13): (density at height, height, falloff).
-    fog: Vec3,
     inv_view_proj: Mat4,
     /// TAA's reprojection: this frame's unjittered clip space to last frame's.
     reproject: Mat4,
@@ -2768,8 +2766,9 @@ struct Session {
     /// pipelines it is the only thing that bakes `Renderer::samples()`, which is
     /// precisely why MSAA can change while no session exists.
     sky: SkyPass,
-    /// The level's atmosphere (§13). Baked into `mesh` and `sky`; the app
-    /// takes the sun direction and starting exposure from it.
+    /// The level's atmosphere (§13). Each frame hands `mesh` (and so `sky`)
+    /// its `Atmosphere`; the app takes the sun direction and starting
+    /// exposure from it.
     environment: Environment,
     /// Per-mesh transform that centers + unit-scales it into the demo grid.
     /// Identity for scene meshes — a level must keep its authored size.
@@ -2809,7 +2808,6 @@ impl Session {
             &b.materials,
             MAX_INSTANCES,
             bake_dir,
-            &b.environment,
             b.sky.as_ref().filter(|_| sky),
         );
         mesh.set_lod_enabled(lod);
@@ -2823,7 +2821,7 @@ impl Session {
             t_renderer.as_secs_f32(),
             t_total.as_secs_f32(),
         );
-        let sky = SkyPass::new(renderer, &b.environment);
+        let sky = SkyPass::new(renderer, mesh.set_layout());
 
         Self {
             world: b.world,
@@ -3405,8 +3403,8 @@ impl App {
             eprintln!("[audio] {} lamps humming", a.lamp_count());
         }
         self.steps = StepTracker::default();
-        // The level's sun and starting exposure (§13); its sky and fog are
-        // already baked into the session's pipelines.
+        // The level's sun and starting exposure (§13); its sky and fog go to
+        // the GPU each frame.
         let env = session.environment;
         self.light_dir = env.sun_dir.extend(0.0);
         // A new game has the level's own weather.
@@ -3912,7 +3910,15 @@ impl ApplicationHandler for App {
                     self.light_dir =
                         effective_sun(&s.environment, &self.settings.weather).extend(0.0);
                     let fog = effective_fog(&s.environment, &self.settings.weather);
-                    s.mesh.set_fog(fog);
+                    s.mesh.set_atmosphere(
+                        Environment {
+                            fog_density: fog.x,
+                            fog_height: fog.y,
+                            fog_falloff: fog.z,
+                            ..s.environment
+                        }
+                        .atmosphere(),
+                    );
                     let light_dir = self.light_dir;
                     let camera_pos = eye;
 
@@ -4075,7 +4081,6 @@ impl ApplicationHandler for App {
                     }
                     frame_view = Some(FrameView {
                         view_proj: draw_view_proj,
-                        fog,
                         inv_view_proj,
                         reproject,
                         light_dir,
@@ -4305,10 +4310,10 @@ impl ApplicationHandler for App {
                                 s.sky.draw(
                                     cmd,
                                     extent,
+                                    s.mesh.frame_set(frame),
                                     v.inv_view_proj,
                                     v.camera_pos,
                                     v.light_dir,
-                                    v.fog,
                                 );
                             }
                         },

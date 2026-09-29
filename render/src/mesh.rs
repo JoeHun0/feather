@@ -10,7 +10,7 @@ use ash::vk;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::environment::{Environment, Specialization};
+use crate::environment::{Atmosphere, Environment};
 use feather_assets::bake::{
     baked_path, texture_key, BakedMesh, BakedTexture, SkyFree, SkyVis, SkyVolume, TexKind,
     MIN_LOD_TRIS, TEX_DIR,
@@ -349,9 +349,9 @@ struct Globals {
     sky_dims: [f32; 4],
     /// x = 1 when GTAO's result (§13, binding 8) is this frame's to use.
     ao_params: [f32; 4],
-    /// The fog (§13): x = density at y = height, z = falloff. Per frame, so
-    /// the weather can change it.
-    fog: [f32; 4],
+    /// The atmosphere (§13): the sky, the sun's colour and the fog. Per
+    /// frame, so the weather can change it; the sky pass reads it too.
+    atmosphere: Atmosphere,
 }
 
 /// One punctual light, std430, 32 bytes (§12).
@@ -449,8 +449,8 @@ pub struct MeshRenderer {
     sky_params: [[f32; 4]; 2],
     /// Whether GTAO ran this frame (`set_ao`), for `Globals::ao_params`.
     ao_on: bool,
-    /// The fog `prepare_frame` writes: (density, height, falloff).
-    fog: glam::Vec3,
+    /// The atmosphere `prepare_frame` writes (`set_atmosphere`).
+    atmosphere: Atmosphere,
     /// The full-resolution size GTAO's result is upsampled to, likewise.
     ao_size: [f32; 2],
     /// The `Renderer::targets_generation` bindings 8 and 9 point into.
@@ -501,7 +501,6 @@ impl MeshRenderer {
         materials: &[Material],
         max_instances: u32,
         bake_dir: Option<&std::path::Path>,
-        env: &Environment,
         sky: Option<&SkyVolume>,
     ) -> (Self, Vec<MeshId>) {
         let device = renderer.device();
@@ -994,9 +993,6 @@ impl MeshRenderer {
 
         let vert = load_shader(&device, spv!("mesh.vert"));
         let frag = load_shader(&device, spv!("mesh.frag"));
-        // The level's sky, sun and fog, baked in (§13).
-        let spec = Specialization::new(env);
-        let spec_info = spec.info();
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -1005,8 +1001,7 @@ impl MeshRenderer {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(frag)
-                .name(c"main")
-                .specialization_info(&spec_info),
+                .name(c"main"),
         ];
 
         let vbindings = [vk::VertexInputBindingDescription::default()
@@ -1332,7 +1327,7 @@ impl MeshRenderer {
             sky_sampler,
             sky_params,
             ao_on: false,
-            fog: glam::Vec3::new(env.fog_density, env.fog_height, env.fog_falloff),
+            atmosphere: Environment::default().atmosphere(),
             ao_size: [1.0, 1.0],
             ao_generation: renderer.targets_generation(),
             slices,
@@ -1350,6 +1345,23 @@ impl MeshRenderer {
         (renderer, ids)
     }
 
+    /// The atmosphere (§13) from the next `prepare_frame` on. It starts as
+    /// `Environment::default()`'s; the app sets it every frame.
+    pub fn set_atmosphere(&mut self, atmosphere: Atmosphere) {
+        self.atmosphere = atmosphere;
+    }
+
+    /// Set 0's layout, for a pass that reads the globals too (the sky, §13).
+    pub fn set_layout(&self) -> vk::DescriptorSetLayout {
+        self.set_layout
+    }
+
+    /// Frame `frame`'s set 0, whose globals `prepare_frame` and `draw_shadow`
+    /// fill: bind it only after those, as the sky pass does.
+    pub fn frame_set(&self, frame: usize) -> vk::DescriptorSet {
+        self.sets[frame]
+    }
+
     /// This frame's GTAO state (§13): whether it ran (`on`), the images to
     /// read (the half-resolution result and the depth levels), which move
     /// when the renderer's targets are recreated (`generation`,
@@ -1360,12 +1372,6 @@ impl MeshRenderer {
     /// the generation only changes when the targets were recreated, which
     /// waits for the device to go idle, and no frame has been submitted
     /// since: nothing can be using a set.
-    /// The fog (§13) from the next `prepare_frame` on: (density at height,
-    /// height, falloff). It starts as the level's.
-    pub fn set_fog(&mut self, fog: glam::Vec3) {
-        self.fog = fog;
-    }
-
     pub fn set_ao(
         &mut self,
         on: bool,
@@ -1536,7 +1542,7 @@ impl MeshRenderer {
                 self.ao_size[1],
                 0.0,
             ],
-            fog: self.fog.extend(0.0).to_array(),
+            atmosphere: self.atmosphere,
         };
         for (i, c) in cascades.iter().enumerate().take(SHADOW_CASCADES) {
             globals.light_view_proj[i] = c.view_proj.to_cols_array();
@@ -2319,6 +2325,34 @@ mod tests {
                 "mesh.frag uses `{word}`"
             );
         }
+    }
+
+    /// `Globals` is mesh.frag's block, byte for byte. Both are only vec4s and
+    /// mat4s, so under std140 the block's size is the sum of its members',
+    /// and a field added on one side alone shifts everything after it. The
+    /// atmosphere (§13) is the tail the sky pass reads too.
+    #[test]
+    fn the_globals_are_mesh_frags_block() {
+        let src = include_str!("../shaders/mesh.frag");
+        let start = src.find("uniform Globals {").expect("Globals");
+        let block = &src[start..start + src[start..].find("} g;").expect("end")];
+        let bytes: usize = block
+            .lines()
+            .skip(1)
+            .map(|l| l.split("//").next().unwrap().trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| match l.split(' ').next() {
+                Some("mat4") if l.contains("[SHADOW_CASCADES]") => 64 * SHADOW_CASCADES,
+                Some("mat4") => 64,
+                Some("vec4") => 16,
+                _ => panic!("unexpected member `{l}`"),
+            })
+            .sum();
+        assert_eq!(bytes, std::mem::size_of::<Globals>());
+        assert_eq!(
+            std::mem::offset_of!(Globals, atmosphere),
+            std::mem::size_of::<Globals>() - std::mem::size_of::<Atmosphere>()
+        );
     }
 
     /// mesh.frag decodes and blends the sky volume by hand, with its own

@@ -4,10 +4,11 @@
 //! geometry (LESS_OR_EQUAL, no write), so it shades only pixels the geometry
 //! didn't cover rather than the whole screen and then being overdrawn.
 //!
-//! No descriptors — the inverse view-projection, camera position, and light
-//! direction come in through a push constant.
+//! The inverse view-projection, camera position and light direction come in
+//! through a push constant. The atmosphere (§13) is the meshes' own: the pass
+//! binds `MeshRenderer`'s set 0 and reads its per-frame globals, so the sky
+//! and what it lights can't disagree.
 
-use crate::environment::{Environment, Specialization};
 use ash::vk;
 use feather_gfx::Renderer;
 use glam::{Mat4, Vec3, Vec4};
@@ -18,8 +19,8 @@ macro_rules! spv {
     };
 }
 
-/// `sky.frag`'s push block: inv_view_proj, camera_pos, light_dir, fog.
-pub(crate) const SKY_PUSH_SIZE: u32 = 112;
+/// `sky.frag`'s push block: inv_view_proj, camera_pos, light_dir.
+pub(crate) const SKY_PUSH_SIZE: u32 = 96;
 
 pub struct SkyPass {
     device: ash::Device,
@@ -28,14 +29,13 @@ pub struct SkyPass {
 }
 
 impl SkyPass {
-    /// `env` is the level's atmosphere, baked into the pipeline (§13).
-    pub fn new(renderer: &Renderer, env: &Environment) -> Self {
+    /// `set_layout` is `MeshRenderer::set_layout()`: the sky reads the
+    /// atmosphere from the meshes' globals (§13).
+    pub fn new(renderer: &Renderer, set_layout: vk::DescriptorSetLayout) -> Self {
         let device = renderer.device();
 
         let vert = load_shader(&device, spv!("fullscreen.vert"));
         let frag = load_shader(&device, spv!("sky.frag"));
-        let spec = Specialization::new(env);
-        let spec_info = spec.info();
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -44,8 +44,7 @@ impl SkyPass {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(frag)
-                .name(c"main")
-                .specialization_info(&spec_info),
+                .name(c"main"),
         ];
 
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
@@ -84,11 +83,14 @@ impl SkyPass {
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(SKY_PUSH_SIZE)]; // mat4 inv_view_proj + vec4 camera_pos + vec4 light_dir + vec4 fog
+            .size(SKY_PUSH_SIZE)]; // mat4 inv_view_proj + vec4 camera_pos + vec4 light_dir
+        let set_layouts = [set_layout];
         let layout = unsafe {
             device
                 .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_ranges),
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&set_layouts)
+                        .push_constant_ranges(&push_ranges),
                     None,
                 )
                 .expect("sky pipeline layout")
@@ -134,21 +136,22 @@ impl SkyPass {
     /// Fills the *background* with the sky. Call inside the geometry pass **after**
     /// the depth prepass and opaque draws — the depth test then rejects it wherever
     /// geometry is, so only visible background pixels are shaded.
-    /// `inv_view_proj` is the inverse of the same matrix the meshes use.
+    /// `inv_view_proj` is the inverse of the same matrix the meshes use, and
+    /// `set` this frame's `MeshRenderer::frame_set`, whose globals hold the
+    /// atmosphere.
     pub fn draw(
         &self,
         cmd: vk::CommandBuffer,
         extent: vk::Extent2D,
+        set: vk::DescriptorSet,
         inv_view_proj: Mat4,
         camera_pos: Vec3,
         light_dir: Vec4,
-        fog: Vec3,
     ) {
-        let mut push = [0f32; 28];
+        let mut push = [0f32; 24];
         push[..16].copy_from_slice(&inv_view_proj.to_cols_array());
         push[16..19].copy_from_slice(&camera_pos.to_array());
         push[20..24].copy_from_slice(&light_dir.to_array());
-        push[24..27].copy_from_slice(&fog.to_array());
         let push_bytes = unsafe {
             std::slice::from_raw_parts(push.as_ptr() as *const u8, SKY_PUSH_SIZE as usize)
         };
@@ -156,6 +159,14 @@ impl SkyPass {
         unsafe {
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &[set],
+                &[],
+            );
             self.device.cmd_push_constants(
                 cmd,
                 self.layout,
