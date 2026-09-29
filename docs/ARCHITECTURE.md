@@ -1348,7 +1348,10 @@ which is exactly the look every level had before.
   *during* a session (the sky's colours, the sun's) meant rebuilding two
   pipelines. The runtime route was the one the fog took.
 
-**Landed (§26): the weather's first knobs, live.** A temporary WEATHER
+**Landed (§26): the weather's first knobs, live.** (History: the two notes
+below replaced its constants, its push block and TIME OF DAY; its names
+here, `set_fog`, `effective_fog`/`effective_sun`, the 112-byte push, are
+gone.) A temporary WEATHER
 screen (OPTIONS, in game only) until the weather engine: FOG DENSITY, FOG
 HEIGHT and a TIME OF DAY placeholder. Each steps through presets, the first
 being the level's own. They're session only: never saved, and a new game
@@ -3434,6 +3437,10 @@ base-color/normal/MR textures landed); clustered lighting (**landed** — a `poi
 bitmasks, plus sphere-light specular via `source_radius`, §12; spot lights and
 point-light shadows pending);
 precomputed cubemap/HDR IBL (analytic-sky IBL landed);
+weather beyond its groundwork (a clock, the sun's path with a moon, keyframed
+weathers and transitions landed, §13; tuned keys, a random schedule, stars and
+moon phases, clouds and rain, and fog in-scatter that respects occlusion
+pending);
 shadows: **4-cascade CSM + 3×3 PCF landed** (§11) — practical splits, sphere-fit
 and texel-snapped per cascade, a depth array layer each, per-cascade caster
 culling, projection-based selection with an edge blend, and normal-offset bias;
