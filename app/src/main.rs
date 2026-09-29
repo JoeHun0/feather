@@ -2226,10 +2226,7 @@ fn build_collider(
     let world = |p: Vec3| to_rapier(transform.transform_point3(p));
     let trimesh = |physics: &mut Physics, vertices: &[feather_assets::Vertex], indices: &[u32]| {
         let verts: Vec<Vector> = vertices.iter().map(|v| world(Vec3::from(v.pos))).collect();
-        let tris: Vec<[u32; 3]> = indices
-            .chunks_exact(3)
-            .map(|t| [t[0], t[1], t[2]])
-            .collect();
+        let tris: Vec<[u32; 3]> = indices.as_chunks::<3>().0.to_vec();
         physics.add_static_trimesh(verts, tris)
     };
     let exact = |physics: &mut Physics| {

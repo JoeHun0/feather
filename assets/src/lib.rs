@@ -727,7 +727,7 @@ fn primitive_mesh(
 /// ships no normals).
 fn compute_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
     let mut acc = vec![Vec3::ZERO; positions.len()];
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let (ia, ib, ic) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
         if ia >= positions.len() || ib >= positions.len() || ic >= positions.len() {
             continue;
