@@ -1685,10 +1685,16 @@ reads the resolved HDR, so it runs on top of any sample count.
   what bloom, exposure and the tonemap read (`Renderer::hdr_view`). The
   history restarts when the targets are recreated and when TAA is turned on,
   which includes every new session.
-- **Camera motion only.** Nothing but the camera moves in a level, so
-  reprojecting by depth is exact there. The orb demo's orbs fall back to
-  their neighbourhood's box, which leaves a short trail. Per-object motion
-  vectors come with something that moves.
+- **Camera motion only.** Reprojecting by depth is exact for everything
+  that doesn't move. The orb demo's orbs fall back to their neighbourhood's
+  box, which leaves a short trail. The zone's lanterns (§15's ropes) are
+  the first things in a level that move. Measured on the nearest, swinging
+  about 40 px either way, its centre with TAA stayed within 1.2 px of
+  without, so there's no visible trail yet. Per-object motion vectors come
+  when something moves faster.
+  - **Thin moving geometry reads faint.** The 8 mm rope (about 1.2 px wide
+    there) has 45% of its no-AA contrast under TAA: averaged down to its real
+    coverage, where without AA it's a solid, aliased line.
 - **Found on the way:** the main pass stored its depth `DONT_CARE`, which
   counts as a write that leaves it undefined. At 1× TAA reads that depth
   after the pass, and sync validation flagged it. It's stored `NONE` now,
@@ -2041,6 +2047,68 @@ hold, repeat, rebinding) is unit-tested without a GPU through
     strips the retry's nudge on every pass. Nothing in the game is one yet;
     NPCs would be. The tiles stay boxes, which measured the same as
     trimeshes.
+
+**Landed (§26): ropes.** Something hanging on a rope (`app/src/rope.rs`,
+the `hanging` prefab), the first simulated thing in a level besides the
+player. It's its own small solver, not rapier:
+- **The chain:** points from a fixed anchor down to the item, stepped in the
+  fixed schedule (`ropes`). Each step is Verlet: every free point carries on
+  with its last motion, plus gravity and the drag of the air moving past it,
+  and the segments are pulled back to length, lightest end most. The item is
+  40× a rope point, so the rope drapes from the anchor and bends where the
+  wind catches it, rather than swinging as one rod.
+- **Holding the length:**
+  - Pair passes alone converge slowly under a heavy end: at rest, 24 of them
+    left it 5.5% long.
+  - So every pass ends with long-range attachment (Kim et al. 2012): no
+    point further from the anchor than the rope above it is long.
+  - In gusts, segments still stretched (the bowed rope stays within that
+    bound). Sub-stepping held them better than more passes. The worst
+    segment over a minute in a 6 m/s gusting wind was 1.0% long at 1 step
+    × 96 passes, 0.9% at 4 × 12, and 0.4% at **8 × 8, which it runs**.
+- **Wind:** the level's (`environment`'s `wind_speed`, `wind_azimuth`), a
+  steady part plus slow gusts whose phase shifts with position, so
+  neighbours sway alike but not in lockstep. Sim time is the step count, so
+  a run replays. Each rope's `wind` scales it (the hangar's: 0.35).
+- **Drawing needs no renderer changes:**
+  - Each segment is an instance of a built-in unit tube (`MESH_ROPE`, 8
+    sides, a dark hemp material) stretched between its two points,
+    overlapping its neighbours by the radius so a bend shows no gap.
+  - The item is an instance turned so its +Y runs up the last segment.
+  - Both are interpolated like any moving entity, culled per view, and cast
+    shadows.
+- **The node is the item at rest:** its mesh's origin is where the rope ties
+  on, and the anchor is `length` straight above it. Neither the rope nor the
+  item collides. An engine without the prefab draws the item still.
+- **The zone:** four procedural kerosene lanterns (1.3× a 30 cm lantern: a
+  wire handle, a cap, a glass chimney in guard wires, a base) on 1.4–2.4 m
+  ropes under the hangar's roof beams, one near the door so it's visible
+  from outside. They're built last and draw nothing from the seed, so the
+  rest of a level is byte-identical. `--check` adds `check_hanging` (tied to
+  the underside of something solid, a positive length, nothing in a solid
+  at rest; controls: untied, 20 cm short, through a beam, negative length,
+  in a wall). Seeds 1–20 pass.
+- **Tests** (`rope`, each with a control):
+  - still, it hangs straight at its length (control: one pass and no
+    attachment stretch it);
+  - released, it swings with a pendulum's period within 10%, dies down and
+    never grows over 10 minutes (control: 4× gravity halves the period);
+  - wind leans it downwind, further when stronger, within 1% of its length
+    (control: still air doesn't lean it);
+  - a rope with no weight on it bows (control: one segment can't);
+  - the segment and item matrices sit on the points, and the item at rest is
+    drawn as authored;
+  - it's deterministic, and interpolates between steps.
+  - In the app: `hanging` params and defaults, bad ones named, the anchor
+    `length` above the node with no collider, and the wind params.
+- **Cost** (pinned, release, 3 interleaved rounds, the same binary on the
+  zone with and without its lanterns): frame 1.19 → 1.19 ms. `lights120`,
+  with no ropes, 1.59 on both this and the previous binary. I predicted
+  ≤ +0.01 ms and unchanged.
+- **Validation:** sync-clean at 1× and MSAA 4× (filtered).
+- **Not done:** a lit lantern (a moving `point_light`), the player pushing
+  a rope, rope collisions, a rope between two anchors (a laundry line), and
+  per-object motion vectors for TAA.
 
 ## 16. Skinned / animated meshes
 
@@ -3140,11 +3208,12 @@ the **texture bake** — BC7 mip chains in a content-addressed cache, §17 — t
 the mesh LOD bake and a per-scene **sky-visibility volume**, §17; material /
 scene bake, runtime blob and handle tables are not); **scene spawning landed**
 (§18: `extras` → `PrefabSpec`, a prefab registry, marker nodes, `player_start`
-and a parameterised `prop` with per-node collider/shadow opt-outs; unknown ids
+and a parameterised `prop` with per-node collider/shadow opt-outs, and `hanging`,
+§15's ropes; unknown ids
 fall back to static geometry; chunk membership and light/trigger prefabs
 pending) / save; rapier beyond the player (kinematic FPS controller, static
 colliders and the ECS↔rapier sync systems landed — dynamic bodies and collision
-layers pending);
+layers pending; ropes, §15, are their own Verlet solver);
 skinning; UI/HUD (§19's lightweight quad/text renderer + the Esc pause menu
 landed, with keyboard *and* mouse navigation, an OPTIONS screen tree, and live
 display-mode/shadow-quality/FXAA/TAA controls under GRAPHICS — MSAA is changeable

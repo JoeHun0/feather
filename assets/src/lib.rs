@@ -256,6 +256,34 @@ impl MeshData {
         }
         Self { vertices, indices, material: Material::default() }
     }
+
+    /// An open tube of diameter 1 and height 1 along Y, centred, with
+    /// `slices` sides and outward normals: stretched between two points, a
+    /// segment of rope (§15). No caps: a rope's segments overlap.
+    pub fn cylinder(slices: u32) -> Self {
+        let mut vertices = Vec::with_capacity(2 * (slices as usize + 1));
+        for j in 0..=slices {
+            let theta = std::f32::consts::TAU * j as f32 / slices as f32;
+            let (s, c) = theta.sin_cos();
+            for y in [-0.5, 0.5] {
+                vertices.push(Vertex {
+                    pos: [0.5 * c, y, 0.5 * s],
+                    normal: [c, 0.0, s],
+                    uv: [j as f32 / slices as f32, y + 0.5],
+                });
+            }
+        }
+        let mut indices = Vec::with_capacity(slices as usize * 6);
+        for j in 0..slices {
+            let a = 2 * j;
+            indices.extend_from_slice(&[a, a + 1, a + 2, a + 1, a + 3, a + 2]);
+        }
+        Self {
+            vertices,
+            indices,
+            material: Material::default(),
+        }
+    }
 }
 
 /// The gameplay half of a node (§18): which prefab to spawn, plus its
@@ -718,6 +746,33 @@ fn compute_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rope's cylinder: unit diameter and height, centred, normals out
+    /// of its axis, and every triangle on its side.
+    #[test]
+    fn the_cylinder_is_a_unit_tube() {
+        let m = MeshData::cylinder(8);
+        let (min, max) = m.bounds();
+        assert!(
+            (min - Vec3::new(-0.5, -0.5, -0.5)).abs().max_element() < 1e-6,
+            "{min}"
+        );
+        assert!(
+            (max - Vec3::new(0.5, 0.5, 0.5)).abs().max_element() < 1e-6,
+            "{max}"
+        );
+        for v in &m.vertices {
+            let p = Vec3::from(v.pos);
+            let radial = Vec3::new(p.x, 0.0, p.z);
+            assert!((radial.length() - 0.5).abs() < 1e-6);
+            assert!((Vec3::from(v.normal) - radial * 2.0).length() < 1e-6);
+        }
+        assert_eq!(m.indices.len(), 8 * 6);
+        for t in m.indices.chunks(3) {
+            let [a, b, c] = [0, 1, 2].map(|k| Vec3::from(m.vertices[t[k] as usize].pos));
+            assert!((b - a).cross(c - a).length() > 1e-4, "degenerate triangle");
+        }
+    }
 
     /// Minimal glTF fixture: one triangle mesh referenced by three nodes, one of
     /// which is a child, so a single file covers per-primitive meshes, mesh

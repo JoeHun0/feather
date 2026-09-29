@@ -29,6 +29,7 @@
 
 mod audio;
 mod config;
+mod rope;
 
 use audio::{Audio, AudioSettings, StepTracker, Surface};
 use config::controls::{Action, Controls};
@@ -964,7 +965,31 @@ const PALETTE: u32 = 24;
 const MESH_SPHERE: u32 = 0;
 const MESH_CUBE: u32 = 1;
 const MESH_LEVEL_CUBE: u32 = 2;
-const MESH_BUILTIN_COUNT: u32 = 3;
+/// The unit cylinder a rope's segments are drawn with (§15, `rope`).
+const MESH_ROPE: u32 = 3;
+const MESH_BUILTIN_COUNT: u32 = 4;
+
+/// Something hanging on a rope (§15): the simulated rope, and the item on its
+/// end (mesh, material, and its authored rotation and scale).
+#[derive(Component)]
+struct Hanging {
+    rope: rope::Rope,
+    item: Option<(MeshId, u32, Mat4)>,
+    casts: bool,
+}
+
+/// The level's wind (§13's `environment`), which ropes sway in.
+#[derive(Resource, Default)]
+struct LevelWind(rope::Wind);
+
+/// Every rope, one fixed step on. Sim time is the step count, not the wall
+/// clock, so a run replays the same.
+fn ropes(mut q: Query<&mut Hanging>, wind: Res<LevelWind>, frame: Res<FrameCount>) {
+    let t = frame.0 as f32 * FIXED_DT;
+    for mut h in &mut q {
+        h.rope.step(FIXED_DT, t, &wind.0);
+    }
+}
 
 /// One fixed step: snapshot the current state into `Prev*`, then advance
 /// position by velocity and the spin angle by angular velocity. Runs at
@@ -2223,7 +2248,70 @@ fn prefab_registry() -> HashMap<&'static str, SpawnFn> {
     let mut r: HashMap<&'static str, SpawnFn> = HashMap::new();
     r.insert("prop", spawn_prop as SpawnFn);
     r.insert("point_light", spawn_point_light as SpawnFn);
+    r.insert("hanging", spawn_hanging as SpawnFn);
     r
+}
+
+/// The parameters a `hanging` node (§15) may carry.
+const HANGING_PARAMS: [&str; 5] = ["length", "segments", "radius", "wind", "shadow"];
+
+/// A `hanging` node's rope, over `RopeParams::default()`, and the params it
+/// couldn't use: unknown ones, and ones out of range or not numbers.
+fn hanging_params(spec: Option<&feather_assets::PrefabSpec>) -> (rope::RopeParams, Vec<String>) {
+    let mut p = rope::RopeParams::default();
+    let Some(spec) = spec else {
+        return (p, Vec::new());
+    };
+    let mut bad: Vec<String> = spec
+        .params
+        .as_object()
+        .into_iter()
+        .flat_map(|o| o.keys())
+        .filter(|k| !HANGING_PARAMS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    let mut num = |key: &str, ok: fn(f32) -> bool| match spec.params.get(key) {
+        None => None,
+        Some(_) => match spec.f32(key).filter(|&v| ok(v)) {
+            Some(v) => Some(v),
+            None => {
+                bad.push(key.to_string());
+                None
+            }
+        },
+    };
+    if let Some(v) = num("length", |v| v > 0.0 && v <= 50.0) {
+        p.length = v;
+    }
+    if let Some(v) = num("segments", |v| {
+        v.fract() == 0.0 && (1.0..=64.0).contains(&v)
+    }) {
+        p.segments = v as usize;
+    }
+    if let Some(v) = num("radius", |v| v > 0.0 && v <= 0.5) {
+        p.radius = v;
+    }
+    if let Some(v) = num("wind", |v| (0.0..=10.0).contains(&v)) {
+        p.wind = v;
+    }
+    (p, bad)
+}
+
+/// Something on a rope (§15): the node is the item at rest, hung by its
+/// mesh's origin, and the rope's anchor is `length` straight above it. The
+/// rope sways in the level's wind; neither it nor the item collides.
+fn spawn_hanging(world: &mut World, args: &SpawnArgs) {
+    let (params, bad) = hanging_params(args.spec);
+    for key in bad {
+        eprintln!("[scene] hanging: can't use param {key:?}; ignored");
+    }
+    let (scale, rotation, at) = args.transform.to_scale_rotation_translation();
+    let local = Mat4::from_scale_rotation_translation(scale, rotation, Vec3::ZERO);
+    world.spawn(Hanging {
+        rope: rope::Rope::new(at + Vec3::Y * params.length, params),
+        item: args.mesh.map(|m| (m, args.material, local)),
+        casts: args.flag("shadow", true),
+    });
 }
 
 /// Load the mesh registry and every CLI scene. Runs before the world exists,
@@ -2239,6 +2327,7 @@ fn load_scenes(scenes: &[String]) -> (Vec<MeshData>, Vec<feather_assets::SceneNo
         MeshData::uv_sphere(16, 24, 0.5),
         MeshData::cube(1.0),
         MeshData::cube(1.0),
+        rope_mesh(),
     ];
     let mut nodes: Vec<feather_assets::SceneNode> = Vec::new();
     let mut sky_key = None;
@@ -2308,7 +2397,9 @@ fn player_start(nodes: &[feather_assets::SceneNode]) -> (Vec3, Option<f32>) {
 }
 
 /// The parameters an `environment` marker (§13, §18) may carry.
-const ENVIRONMENT_PARAMS: [&str; 19] = [
+const ENVIRONMENT_PARAMS: [&str; 21] = [
+    "wind_speed",
+    "wind_azimuth",
     "sun_elevation",
     "sun_azimuth",
     "sun_color",
@@ -2329,6 +2420,38 @@ const ENVIRONMENT_PARAMS: [&str; 19] = [
     "exposure_min",
     "exposure_max",
 ];
+
+/// The level's wind (§15's ropes sway in it): the first `environment`
+/// marker's `wind_speed` (m/s, at least 0) and `wind_azimuth` (the direction
+/// it blows towards, degrees clockwise from north, -Z, as for the sun), over
+/// `Wind::default()`. Also the params it couldn't read.
+fn level_wind(nodes: &[feather_assets::SceneNode]) -> (rope::Wind, Vec<String>) {
+    let mut wind = rope::Wind::default();
+    let mut bad = Vec::new();
+    let Some(spec) = nodes
+        .iter()
+        .filter_map(|n| n.prefab.as_ref())
+        .find(|s| s.id == "environment")
+    else {
+        return (wind, bad);
+    };
+    if spec.params.get("wind_speed").is_some() {
+        match spec.f32("wind_speed").filter(|v| *v >= 0.0) {
+            Some(v) => wind.speed = v,
+            None => bad.push("wind_speed".to_string()),
+        }
+    }
+    if spec.params.get("wind_azimuth").is_some() {
+        match spec.f32("wind_azimuth") {
+            Some(deg) => {
+                let (s, c) = deg.to_radians().sin_cos();
+                wind.dir = Vec3::new(s, 0.0, -c);
+            }
+            None => bad.push("wind_azimuth".to_string()),
+        }
+    }
+    (wind, bad)
+}
 
 /// The level's atmosphere (§13): the first `environment` marker's params over
 /// `Environment::default()`, which is also what a level without one gets.
@@ -2602,7 +2725,9 @@ fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> WorldBu
     });
     let t_scenes = t_start.elapsed();
     let (start_pos, start_yaw) = player_start(&scene_nodes);
-    let (environment, bad_params) = environment(&scene_nodes);
+    let (environment, mut bad_params) = environment(&scene_nodes);
+    let (wind, bad_wind) = level_wind(&scene_nodes);
+    bad_params.extend(bad_wind);
     for key in bad_params {
         eprintln!("[scene] environment: can't use param {key:?}; ignored");
     }
@@ -2616,6 +2741,7 @@ fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> WorldBu
 
     let mut world = World::new();
     world.insert_resource(FrameCount::default());
+    world.insert_resource(LevelWind(wind));
     world.insert_resource(ColliderStats::default());
     let mut physics = Physics::new();
     // Feet on the ground. The player is a normal ECS entity: sim state in
@@ -2669,7 +2795,7 @@ fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> WorldBu
 
     let mut schedule = Schedule::default();
     schedule.set_executor_kind(ExecutorKind::MultiThreaded);
-    schedule.add_systems((integrate, tick));
+    schedule.add_systems((integrate, tick, ropes));
     // §15's coupling: ECS -> rapier, the step, then rapier -> ECS. Chained so
     // the bracket order is explicit (they all touch `Physics`, so bevy_ecs
     // would serialise them regardless).
@@ -3694,6 +3820,38 @@ impl ApplicationHandler for App {
                         }
                     }
 
+                    // Ropes (§15): each segment a stretched unit cylinder, then
+                    // the item, all interpolated like the moving entities.
+                    let rope_fit = fits[MESH_ROPE as usize];
+                    let rope_mat = PALETTE + MESH_ROPE;
+                    let mut qh = s.world.query::<&Hanging>();
+                    for h in qh.iter(&s.world) {
+                        let points = h.rope.interpolated(alpha);
+                        let radius = h.rope.params.radius;
+                        let segments = points.windows(2).map(|w| {
+                            let model = rope::segment_matrix(w[0], w[1], radius) * rope_fit;
+                            (MESH_ROPE as usize, model, rope_mat)
+                        });
+                        let item = h.item.map(|(mesh, material, local)| {
+                            let id = (mesh.0 as usize).min(mesh_max);
+                            (id, rope::item_matrix(&points, local) * fits[id], material)
+                        });
+                        for (id, model, material) in segments.chain(item) {
+                            let item = (MeshId(id as u32), InstanceData::new(model, material));
+                            let (c, radius) = world_sphere(&model, spheres[id]);
+                            if camera_frustum.contains_sphere(c, radius) {
+                                main_items.push(item);
+                            }
+                            if casts && h.casts {
+                                for (ci, f) in light_frusta.iter().enumerate() {
+                                    if f.contains_sphere(c, radius) {
+                                        shadow_items[ci].push(item);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // CPU prep once (sort + stage instances/globals); the shadow
                     // and main passes then replay them. Uploads happen in
                     // draw_shadow, after the frame fence.
@@ -4126,6 +4284,15 @@ fn spawn_static(world: &mut World, center: Vec3, size: Vec3, mesh: u32, material
 
 /// A plain untextured material for level geometry. Base color is treated as
 /// already-linear (the values here are low, so no sRGB decode needed).
+/// `MESH_ROPE`: an 8-sided unit tube in a dark, rough hemp, which every
+/// rope's segments share.
+fn rope_mesh() -> MeshData {
+    MeshData {
+        material: level_material([0.12, 0.085, 0.05], 0.92),
+        ..MeshData::cylinder(8)
+    }
+}
+
 fn level_material(base_linear: [f32; 3], roughness: f32) -> feather_assets::Material {
     feather_assets::Material {
         base_color: [base_linear[0], base_linear[1], base_linear[2], 1.0],
@@ -5837,6 +6004,108 @@ mod tests {
         spawn_one(&mut w, n.prefab.as_ref(), &cube);
         assert_eq!(w.query::<&Mesh>().iter(&w).count(), 1);
         assert_eq!(w.query::<&ColliderRef>().iter(&w).count(), 1);
+    }
+
+    /// `hanging` (§15): params land, defaults fill in, and bad ones are named.
+    #[test]
+    fn hanging_params_apply_and_bad_ones_are_named() {
+        let d = rope::RopeParams::default();
+        assert_eq!(hanging_params(None), (d, Vec::new()));
+        let spec = |v| feather_assets::PrefabSpec {
+            id: "hanging".into(),
+            params: v,
+        };
+        let (p, bad) = hanging_params(Some(&spec(serde_json::json!({
+            "length": 2.5, "segments": 16, "radius": 0.01, "wind": 0.35, "shadow": false
+        }))));
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(
+            p,
+            rope::RopeParams {
+                length: 2.5,
+                segments: 16,
+                radius: 0.01,
+                wind: 0.35
+            }
+        );
+        let (p, mut bad) = hanging_params(Some(&spec(serde_json::json!({
+            "length": -1.0, "segments": 2.5, "radius": "thin", "wind": 0.5, "colour": 1
+        }))));
+        bad.sort();
+        assert_eq!(bad, ["colour", "length", "radius", "segments"]);
+        assert_eq!(p, rope::RopeParams { wind: 0.5, ..d });
+    }
+
+    /// The node is the item at rest; the anchor is `length` above it, and
+    /// nothing collides.
+    #[test]
+    fn a_hanging_node_hangs_its_item_below_the_anchor() {
+        let cube = MeshData::cube(1.0);
+        let mut w = prefab_world();
+        let spec = feather_assets::PrefabSpec {
+            id: "hanging".into(),
+            params: serde_json::json!({ "length": 2.0 }),
+        };
+        let at = Vec3::new(3.0, 4.0, -1.0);
+        let placed = Mat4::from_scale_rotation_translation(
+            Vec3::splat(1.5),
+            glam::Quat::from_rotation_y(0.6),
+            at,
+        );
+        let args = SpawnArgs {
+            transform: placed,
+            mesh: Some(MeshId(0)),
+            material: 7,
+            mesh_data: Some(&cube),
+            baked: None,
+            spec: Some(&spec),
+            surface: Surface::default(),
+        };
+        spawn_hanging(&mut w, &args);
+        let h = w.query::<&Hanging>().single(&w).unwrap();
+        assert_eq!(h.rope.anchor(), at + Vec3::Y * 2.0);
+        assert!((h.rope.end() - at).length() < 1e-5);
+        let (mesh, material, local) = h.item.unwrap();
+        assert_eq!((mesh, material), (MeshId(0), 7));
+        // Drawn at rest exactly where the node put it.
+        let drawn = rope::item_matrix(&h.rope.points, local);
+        assert!(drawn.abs_diff_eq(placed, 1e-5), "{drawn} vs {placed}");
+        assert!(h.casts);
+        assert_eq!(w.query::<&ColliderRef>().iter(&w).count(), 0);
+        assert_eq!(
+            w.query::<&Mesh>().iter(&w).count(),
+            0,
+            "drawn by its rope, not as a prop"
+        );
+    }
+
+    /// The level's wind comes from its `environment` marker.
+    #[test]
+    fn the_environment_sets_the_wind() {
+        let (w, bad) = level_wind(&[]);
+        assert!(bad.is_empty());
+        assert_eq!(
+            (w.dir, w.speed),
+            (rope::Wind::default().dir, rope::Wind::default().speed)
+        );
+        let marker = node(
+            Some("environment"),
+            serde_json::json!({ "wind_speed": 3.5, "wind_azimuth": 180.0 }),
+        );
+        let (w, bad) = level_wind(&[marker]);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(w.speed, 3.5);
+        // Azimuth 180 blows south, +Z.
+        assert!((w.dir - Vec3::Z).length() < 1e-6, "{}", w.dir);
+        let marker = node(
+            Some("environment"),
+            serde_json::json!({ "wind_speed": -1.0, "wind_azimuth": "north" }),
+        );
+        let (w, bad) = level_wind(std::slice::from_ref(&marker));
+        assert_eq!(bad, ["wind_speed", "wind_azimuth"]);
+        assert_eq!(w.speed, rope::Wind::default().speed);
+        // environment() knows the keys, so it doesn't call them unknown.
+        assert!(environment(&[marker]).1.is_empty());
     }
 
     /// A level without an `environment` marker keeps the look every level had

@@ -1278,37 +1278,50 @@ def check_foliage(doc, blob):
     return not bad
 
 
+def node_points(doc, blob, node):
+    """A mesh node's vertices, in the world, read from the binary chunk."""
+    m = gts.quat_matrix(node.get("rotation", (0.0, 0.0, 0.0, 1.0)))
+    s, t = node.get("scale", [1.0] * 3), node["translation"]
+    out = []
+    for p in doc["meshes"][node["mesh"]]["primitives"]:
+        a = doc["accessors"][p["attributes"]["POSITION"]]
+        v = doc["bufferViews"][a["bufferView"]]
+        off, stride = v.get("byteOffset", 0) + a.get("byteOffset", 0), v.get("byteStride", 12)
+        for i in range(a["count"]):
+            q = struct.unpack_from("<3f", blob, off + i * stride)
+            out.append([sum(m[r][c] * q[c] * s[c] for c in range(3)) + t[r] for r in range(3)])
+    return out
+
+
+def node_bounds(doc, node):
+    """A mesh node's world bounds, from its accessors' min/max, as gts.check."""
+    lo, hi = [1e30] * 3, [-1e30] * 3
+    for p in doc["meshes"][node["mesh"]]["primitives"]:
+        a = doc["accessors"][p["attributes"]["POSITION"]]
+        lo = [min(u, w) for u, w in zip(lo, a["min"])]
+        hi = [max(u, w) for u, w in zip(hi, a["max"])]
+    return gts.node_aabb((lo, hi), node["translation"], node.get("rotation"),
+                         node.get("scale"))
+
+
+def solid_nodes(doc, exempt=()):
+    """(bounds, name) of every colliding mesh node that isn't foliage, a flat
+    ground piece, something hanging, or in `exempt`."""
+    skip = {"tree_trunk", "tree_crown", "bush", "grass", "apron", "road", "mud",
+            "hangar_floor", "office_floor", "lantern"} | set(exempt)
+    return [(node_bounds(doc, n), n["name"]) for n in doc["nodes"] if "mesh" in n
+            and n.get("name") not in skip
+            and n.get("extras", {}).get("prefab") != "hanging"
+            and n.get("extras", {}).get("params", {}).get("collide", True)]
+
+
 def foliage_overlaps(doc, blob):
     """check_foliage's vertex-level half: a list of problems."""
-    def points(node):
-        m = gts.quat_matrix(node.get("rotation", (0.0, 0.0, 0.0, 1.0)))
-        s, t = node.get("scale", [1.0] * 3), node["translation"]
-        out = []
-        for p in doc["meshes"][node["mesh"]]["primitives"]:
-            a = doc["accessors"][p["attributes"]["POSITION"]]
-            v = doc["bufferViews"][a["bufferView"]]
-            off, stride = v.get("byteOffset", 0) + a.get("byteOffset", 0), v.get("byteStride", 12)
-            for i in range(a["count"]):
-                q = struct.unpack_from("<3f", blob, off + i * stride)
-                out.append([sum(m[r][c] * q[c] * s[c] for c in range(3)) + t[r] for r in range(3)])
-        return out
-
-    def bounds(node):
-        lo, hi = [1e30] * 3, [-1e30] * 3
-        for p in doc["meshes"][node["mesh"]]["primitives"]:
-            a = doc["accessors"][p["attributes"]["POSITION"]]
-            lo = [min(u, w) for u, w in zip(lo, a["min"])]
-            hi = [max(u, w) for u, w in zip(hi, a["max"])]
-        return gts.node_aabb((lo, hi), node["translation"], node.get("rotation"),
-                             node.get("scale"))
-
+    points = lambda node: node_points(doc, blob, node)
+    bounds = lambda node: node_bounds(doc, node)
     named = lambda n: [x for x in doc["nodes"] if x.get("name") == n]
     bad = []
-    exempt = {"tree_trunk", "tree_crown", "bush", "grass", "fence_post", "fence_panel",
-              "apron", "road", "mud", "hangar_floor", "office_floor"}
-    solids = [(bounds(n), n["name"]) for n in doc["nodes"] if "mesh" in n
-              and n.get("name") not in exempt
-              and n.get("extras", {}).get("params", {}).get("collide", True)]
+    solids = solid_nodes(doc, exempt=("fence_post", "fence_panel"))
     fence = [(bounds(n), n["name"]) for n in named("fence_panel") + named("fence_post")]
     trunks = []
     for n in named("tree_trunk"):
@@ -1340,6 +1353,96 @@ def foliage_overlaps(doc, blob):
     return bad
 
 
+# --- things on ropes (§15) ------------------------------------------------------
+
+# Under the hangar's roof beams: (x, beam row 1-4, rope length). A draught
+# through the door and the roof's holes sways them, weaker than outside.
+LANTERNS = ((-5.0, 1, 2.0), (3.0, 2, 1.4), (-2.0, 3, 2.4), (1.0, 4, 2.2))
+LANTERN_WIND = 0.35
+LANTERN_SCALE = 1.3
+
+
+def lantern_mesh(z):
+    """A kerosene lantern hung by its handle: a wire loop, a conical cap, a
+    glass chimney in four guard wires, a base with a floor. Its origin is the
+    top of the handle, where the rope ties on; it hangs down -Y."""
+    rust = z.material("rust")
+    glass = z.png_material("lantern_glass", gts.png_rgba(
+        4, 4, [bytearray([214, 205, 170, 255] * 4) for _ in range(4)]), roughness=0.25)
+    metal, pane = ([], [], [], []), ([], [], [], [])
+    # The handle: a half circle standing up from the cap.
+    arc = [[0.07 * math.cos(a), -0.07 + 0.07 * math.sin(a), 0.0]
+           for a in [math.pi * k / 10 for k in range(11)]]
+    tube(arc, [0.004] * len(arc), 6, 1.0, 0.3, metal)
+    tube([[0, -0.10, 0], [0, -0.075, 0]], [0.075, 0.02], 16, 2.0, 0.3, metal)  # cap
+    tube([[0, -0.235, 0], [0, -0.20, 0], [0, -0.135, 0], [0, -0.10, 0]],
+         [0.045, 0.06, 0.06, 0.045], 16, 1.0, 0.3, pane)  # chimney
+    for k in range(4):
+        a = math.pi / 4 + k * math.pi / 2
+        x, zz = 0.068 * math.cos(a), 0.068 * math.sin(a)
+        tube([[x, -0.24, zz], [x, -0.10, zz]], [0.004, 0.004], 5, 1.0, 0.3, metal)
+    tube([[0, -0.30, 0], [0, -0.235, 0]], [0.07, 0.07], 16, 2.0, 0.3, metal)  # base
+    pos, nrm, uv, idx = metal
+    centre = len(pos)
+    pos.append([0.0, -0.30, 0.0])
+    nrm.append([0.0, -1.0, 0.0])
+    uv.append([0.5, 0.5])
+    for k in range(17):
+        a = 2 * math.pi * k / 16
+        pos.append([0.07 * math.cos(a), -0.30, 0.07 * math.sin(a)])
+        nrm.append([0.0, -1.0, 0.0])
+        uv.append([0.5 + 0.5 * math.cos(a), 0.5 + 0.5 * math.sin(a)])
+    idx += [i for k in range(16) for i in (centre, centre + 1 + k, centre + 2 + k)]
+    return z.mesh([(*metal, rust), (*pane, glass)], "lantern")
+
+
+def lanterns(z):
+    """The hangar's lanterns, each a `hanging` node (§15) at its rest pose:
+    the lantern's handle `length` below the underside of a roof beam. Built
+    last, drawing nothing from the seed, so the rest of a level is unchanged."""
+    x0, x1, z0, z1 = HANGAR
+    d = (z1 - z0 + 0.4) / 5  # the roof's rows, as in hangar()
+    mesh = lantern_mesh(z)
+    for k, (x, row, length) in enumerate(LANTERNS):
+        beam_z = z0 - 0.2 + row * d
+        underside = G + HANGAR_HEIGHT - 0.4
+        z.place(mesh, (x, underside - length, beam_z), yaw_q(35.0 * k),
+                {"prefab": "hanging", "params": {"length": length, "wind": LANTERN_WIND}},
+                name="lantern", scale=LANTERN_SCALE)
+    return len(LANTERNS)
+
+
+def check_hanging(doc, blob):
+    """Each `hanging` node's rope is tied to the underside of something solid
+    (within 5 cm, inside its footprint), is a positive length, and at rest
+    neither the rope nor what hangs from it is inside a solid."""
+    solids = solid_nodes(doc)
+    bad = []
+    for n in doc["nodes"]:
+        if n.get("extras", {}).get("prefab") != "hanging":
+            continue
+        length = n["extras"].get("params", {}).get("length", 1.5)
+        x, y, zz = n["translation"]
+        where = f"{n.get('name')} at ({x:.1f}, {zz:.1f})"
+        if not isinstance(length, (int, float)) or length <= 0:
+            bad.append(f"{where}: rope length {length!r}")
+            continue
+        top = y + length
+        if not any(lo[0] < x < hi[0] and lo[2] < zz < hi[2] and 0 <= lo[1] - top <= 0.05
+                   for (lo, hi), _ in solids):
+            bad.append(f"{where}: its rope's top ({top:.2f}) isn't under anything solid")
+        # The rope at rest, from 5 mm under its knot, and the item.
+        rope = [[x, top - 0.005 - (length - 0.005) * k / 16, zz] for k in range(17)]
+        for box, name in solids:
+            if pokes_into(rope, [box]):
+                bad.append(f"{where}: its rope passes through {name}")
+            if "mesh" in n and pokes_into(node_points(doc, blob, n), [box]):
+                bad.append(f"{where}: it's inside {name}")
+    if bad:
+        print(f"check: {len(bad)} hanging problems: {bad[:5]}", file=sys.stderr)
+    return not bad
+
+
 def markers(z):
     lamp = {"prefab": "point_light", "params": LAMP}
     for x, y, zz in ((-6.0, 6.8, 0.0), (6.0, 6.8, 6.0),
@@ -1362,6 +1465,7 @@ def build(seed):
     counts.update(foliage(z))
     counts["grass"] = grass(z)
     markers(z)
+    counts["lanterns"] = lanterns(z)
     return z, counts
 
 
@@ -1396,7 +1500,8 @@ def main():
     if short:
         print(f"check: foliage fell short: {', '.join(short)}", file=sys.stderr)
     if args.check and not (gts.check(z.doc) and check_occlusion(z.doc)
-                           and check_foliage(z.doc, z.bin) and not short):
+                           and check_foliage(z.doc, z.bin) and check_hanging(z.doc, z.bin)
+                           and not short):
         return 1
     return 0
 
