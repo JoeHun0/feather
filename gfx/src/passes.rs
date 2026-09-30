@@ -30,6 +30,9 @@ pub enum Res {
     Hdr,
     /// Its average resolve, under MSAA only.
     HdrResolve,
+    /// The opaque scene as the transparent pass found it (§10 step 7): what
+    /// water refracts. Single-sample.
+    SceneColor,
     /// GTAO's targets (§13): raw and denoised half-resolution visibility,
     /// and the depth levels.
     AoRaw,
@@ -164,7 +167,9 @@ pub mod slot {
     pub const EXPOSURE: (u32, u32) = (14, 15);
     /// The tonemap, and FXAA when it's on (it takes the end).
     pub const POST: (u32, u32) = (16, 17);
-    pub const COUNT: u32 = 18;
+    /// The transparent pass, with the copy of the opaque scene before it.
+    pub const TRANSPARENT: (u32, u32) = (18, 19);
+    pub const COUNT: u32 = 20;
 }
 
 const WRITES: vk::AccessFlags = vk::AccessFlags::from_raw(

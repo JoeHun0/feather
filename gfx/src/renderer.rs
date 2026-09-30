@@ -156,6 +156,9 @@ pub struct GpuTimes {
     /// TAA's resolve (§13), between geometry and bloom; 0 with it off.
     pub taa_ms: f32,
     pub post_ms: f32,
+    /// The transparent pass (§10), with its copy of the opaque scene; 0
+    /// when nothing transparent is in view.
+    pub transparent_ms: f32,
     pub frame_ms: f32,
 }
 
@@ -296,6 +299,9 @@ pub struct Renderer {
     // Single-sample resolve of `hdr`, allocated only when MSAA is on. This is what
     // the tonemap pass samples — a multisampled image cannot be sampled directly.
     hdr_resolve: Option<Image>,
+    /// The opaque scene the transparent pass refracts (§10): the main
+    /// pass resolves into it under MSAA, and it's a copy of `hdr` at 1x.
+    scene_color: Option<Image>,
     // Single-sample depth, resolved (sample 0) from `depth` at the end of the
     // prepass, allocated only when MSAA is on: what GTAO reads (§13).
     depth_resolve: Option<Image>,
@@ -540,10 +546,18 @@ impl Renderer {
             eprintln!("[gfx] MSAA: requested {msaa}x, using {:?}", samples);
         }
         let depth = create_depth(&allocator, &device, sc.extent, samples);
-        let hdr = create_hdr(&allocator, &device, sc.extent, samples);
+        let hdr = create_hdr(&allocator, &device, sc.extent, samples, hdr_usage(samples));
         // Only needed when multisampling: the resolve target the tonemap samples.
-        let hdr_resolve = (samples != vk::SampleCountFlags::TYPE_1)
-            .then(|| create_hdr(&allocator, &device, sc.extent, vk::SampleCountFlags::TYPE_1));
+        let hdr_resolve = (samples != vk::SampleCountFlags::TYPE_1).then(|| {
+            create_hdr(
+                &allocator,
+                &device,
+                sc.extent,
+                vk::SampleCountFlags::TYPE_1,
+                vk::ImageUsageFlags::empty(),
+            )
+        });
+        let scene_color = create_scene_color(&allocator, &device, sc.extent);
         let ldr = create_ldr(&allocator, &device, sc.extent, sc.format.format);
         let bloom = create_bloom(&allocator, &device, sc.extent);
         let taa_history = [0, 1].map(|_| create_taa(&allocator, &device, sc.extent));
@@ -666,6 +680,7 @@ impl Renderer {
             depth: Some(depth),
             hdr: Some(hdr),
             hdr_resolve,
+            scene_color: Some(scene_color),
             depth_resolve,
             taa_history: Some(taa_history),
             taa_on: false,
@@ -805,6 +820,7 @@ impl Renderer {
         let bloom = span(slot::BLOOM);
         let exposure = span(slot::EXPOSURE);
         let post = span(slot::POST);
+        let transparent = span(slot::TRANSPARENT);
         let frame_ms = span((slot::SHADOW.0, slot::POST.1));
         self.gpu_times_raw = GpuTimes {
             shadow_ms: shadow,
@@ -815,6 +831,7 @@ impl Renderer {
             ao_ms: ao,
             taa_ms: taa,
             post_ms: post,
+            transparent_ms: transparent,
             frame_ms,
         };
 
@@ -828,6 +845,7 @@ impl Renderer {
         self.gpu_times.ao_ms += (ao - self.gpu_times.ao_ms) * a;
         self.gpu_times.taa_ms += (taa - self.gpu_times.taa_ms) * a;
         self.gpu_times.post_ms += (post - self.gpu_times.post_ms) * a;
+        self.gpu_times.transparent_ms += (transparent - self.gpu_times.transparent_ms) * a;
         self.gpu_times.frame_ms += (frame_ms - self.gpu_times.frame_ms) * a;
 
         self.ts_log_counter += 1;
@@ -835,11 +853,12 @@ impl Renderer {
             self.ts_log_counter = 0;
             let t = self.gpu_times;
             eprintln!(
-                "[gpu] shadow {:.2}ms  cluster {:.2}ms  geo {:.2}ms  ao {:.2}ms  taa {:.2}ms  bloom {:.2}ms  expo {:.2}ms  post {:.2}ms  frame {:.2}ms",
+                "[gpu] shadow {:.2}ms  cluster {:.2}ms  geo {:.2}ms  ao {:.2}ms  transp {:.2}ms  taa {:.2}ms  bloom {:.2}ms  expo {:.2}ms  post {:.2}ms  frame {:.2}ms",
                 t.shadow_ms,
                 t.cluster_ms,
                 t.geometry_ms,
                 t.ao_ms,
+                t.transparent_ms,
                 t.taa_ms,
                 t.bloom_ms,
                 t.exposure_ms,
@@ -923,6 +942,12 @@ impl Renderer {
             .as_ref()
             .unwrap_or_else(|| self.hdr.as_ref().expect("hdr target alive"))
             .view
+    }
+
+    /// The opaque scene the transparent pass refracts (§10), in
+    /// `SHADER_READ_ONLY_OPTIMAL` while that pass runs.
+    pub fn scene_color_view(&self) -> vk::ImageView {
+        self.scene_color.as_ref().expect("scene colour alive").view
     }
 
     /// TAA's history this frame (§13): last frame's output (SHADER_READ_ONLY
@@ -1814,6 +1839,7 @@ impl Renderer {
             Res::DepthResolve,
             Res::Hdr,
             Res::HdrResolve,
+            Res::SceneColor,
             Res::AoRaw,
             Res::AoHalf,
             Res::AoDepth,
@@ -2130,6 +2156,11 @@ impl Renderer {
             Res::DepthResolve => plain(self.depth_resolve.as_ref().expect("MSAA"), depth, window),
             Res::Hdr => plain(self.hdr.as_ref().unwrap(), color, window),
             Res::HdrResolve => plain(self.hdr_resolve.as_ref().expect("MSAA"), color, window),
+            Res::SceneColor => plain(
+                self.scene_color.as_ref().expect("scene colour alive"),
+                color,
+                window,
+            ),
             Res::AoRaw => plain(
                 self.ao_raw.as_ref().expect("ao alive"),
                 color,
@@ -2193,19 +2224,27 @@ impl Renderer {
             extent,
             samples,
         ));
-        self.hdr = Some(create_hdr(self.allocator(), &self.device, extent, samples));
+        self.hdr = Some(create_hdr(
+            self.allocator(),
+            &self.device,
+            extent,
+            samples,
+            hdr_usage(samples),
+        ));
         self.ldr = Some(create_ldr(
             self.allocator(),
             &self.device,
             extent,
             ldr_format,
         ));
+        self.scene_color = Some(create_scene_color(self.allocator(), &self.device, extent));
         self.hdr_resolve = (samples != vk::SampleCountFlags::TYPE_1).then(|| {
             create_hdr(
                 self.allocator(),
                 &self.device,
                 extent,
                 vk::SampleCountFlags::TYPE_1,
+                vk::ImageUsageFlags::empty(),
             )
         });
         self.bloom = Some(create_bloom(self.allocator(), &self.device, extent));
@@ -2303,6 +2342,7 @@ impl Drop for Renderer {
             self.depth.take();
             self.hdr.take();
             self.hdr_resolve.take();
+            self.scene_color.take();
             self.depth_resolve.take();
             self.ao_raw.take();
             self.ao_half.take();
@@ -2930,11 +2970,41 @@ fn create_bloom(
     }
 }
 
+/// The scene HDR image's extra usage: at 1x the transparent pass (§10)
+/// copies it; a multisampled one is resolved instead.
+fn hdr_usage(samples: vk::SampleCountFlags) -> vk::ImageUsageFlags {
+    if samples == vk::SampleCountFlags::TYPE_1 {
+        vk::ImageUsageFlags::TRANSFER_SRC
+    } else {
+        vk::ImageUsageFlags::empty()
+    }
+}
+
+/// The opaque scene the transparent pass refracts (§10): single-sample, a
+/// resolve target under MSAA and a copy destination at 1x.
+fn create_scene_color(
+    allocator: &Arc<vk_mem::Allocator>,
+    device: &Device,
+    extent: vk::Extent2D,
+) -> Image {
+    create_hdr(
+        allocator,
+        device,
+        extent,
+        vk::SampleCountFlags::TYPE_1,
+        vk::ImageUsageFlags::TRANSFER_DST,
+    )
+}
+
+/// An HDR colour target. `extra` usage on top of attachment + sampled: the
+/// transparent pass (§10) copies the 1x scene image into the scene-colour
+/// one.
 fn create_hdr(
     allocator: &Arc<vk_mem::Allocator>,
     device: &Device,
     extent: vk::Extent2D,
     samples: vk::SampleCountFlags,
+    extra: vk::ImageUsageFlags,
 ) -> Image {
     let image_ci = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
@@ -2949,7 +3019,7 @@ fn create_hdr(
         .samples(samples)
         .tiling(vk::ImageTiling::OPTIMAL)
         // Rendered into as a color attachment, then sampled by the tonemap pass.
-        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | extra)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let ai = vk_mem::AllocationCreateInfo {

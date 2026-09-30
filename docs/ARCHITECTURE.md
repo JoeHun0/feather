@@ -629,6 +629,27 @@ half.
     `profile_standard`. So the zone's frame median (0.82–0.86 vs 0.84–0.87)
     doesn't resolve 0.02 ms.
 
+**Landed (§26): the transparent seam (steps 7 and 9).** When something
+transparent is in view (`FrameOpts::transparents`), the list gains:
+- **The opaque scene, kept** in `SceneColor`, a single-sample HDR image for
+  refraction. Under MSAA the main pass resolves into it instead of
+  `HdrResolve`. At 1× a copy pass fills it from `Hdr`.
+- **The transparent pass,** after the main pass and before TAA. It loads the
+  HDR image, tests the prepass's depth read-only, samples `SceneColor` and
+  the single-sample depth, and under MSAA resolves into `HdrResolve` for
+  everything after it.
+- **Its own `[bench] transp` line,** timing the copy too.
+- **Without transparents** the list is exactly the one before, so nothing
+  changes for scenes without water.
+- **Verified,** by forcing it on with nothing to draw (a harness switch):
+  - sync validation is 0 at 1× and MSAA 4× (filtered), TAA on and off;
+  - HDR dumps from two views are bit-identical to the unforced run, at 1×
+    and MSAA 4×, with and without TAA.
+- **Its cost, empty** (zone, 2 interleaved rounds). I predicted 0.04–0.08 ms
+  at 1× for the copy and 0.08–0.15 ms under MSAA 4× for the second resolve.
+  Both were too high: `transp` 0.03 ms either way, and frame +0.00–0.02 ms
+  at 1× and +0.04–0.05 ms under MSAA.
+
 Barriers: Vulkan 1.3 **sync2** (`VkImageMemoryBarrier2`, timeline semaphores).
 Key hazards: shadow depth W→R before opaque; HDR color W→R at resolve; cluster
 buffer W(compute)→R(fragment). Queues: graphics for all passes; cluster

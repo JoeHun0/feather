@@ -426,6 +426,7 @@ impl Bench {
         eprintln!("[bench] cluster {}", col(|t| t.cluster_ms));
         eprintln!("[bench] geo     {}", col(|t| t.geometry_ms));
         eprintln!("[bench] ao      {}", col(|t| t.ao_ms));
+        eprintln!("[bench] transp  {}", col(|t| t.transparent_ms));
         eprintln!("[bench] taa     {}", col(|t| t.taa_ms));
         eprintln!("[bench] bloom   {}", col(|t| t.bloom_ms));
         eprintln!("[bench] expo    {}", col(|t| t.exposure_ms));
@@ -1759,6 +1760,8 @@ impl ApplicationHandler for App {
                         taa: r.taa_on(),
                         fxaa: r.fxaa_on(),
                         shadow_casters: r.has_shadow_casters(),
+                        // Nothing draws in the transparent pass yet.
+                        transparents: false,
                     };
                     let recorders = Recorders {
                         // Shadow pass: sun depth map (also flushes this frame's
@@ -1833,6 +1836,7 @@ impl ApplicationHandler for App {
                                 );
                             }
                         }),
+                        transparent: Box::new(|_, _, _, _| {}),
                         // TAA (§13): only invoked while it's on.
                         taa: Box::new(|cmd, extent, frame, _| {
                             tp.update(

@@ -20,16 +20,21 @@ pub struct FrameOpts {
     /// Something casts: one rendering per cascade. Otherwise one layered
     /// rendering clears them all, so every receiver reads as lit.
     pub shadow_casters: bool,
+    /// Something transparent is in view: the transparent pass runs, with
+    /// the opaque scene kept for it to refract. Otherwise the frame is as if
+    /// there were no such pass.
+    pub transparents: bool,
 }
 
-/// The app's recorders, one per pass. `taa` and `aa` only run when their
-/// pass does.
+/// The app's recorders, one per pass. `transparent`, `taa` and `aa` only
+/// run when their pass does.
 pub struct Recorders<'a> {
     pub shadow: Record<'a>,
     pub cluster: Record<'a>,
     pub prepass: Record<'a>,
     pub ao: Record<'a>,
     pub main: Record<'a>,
+    pub transparent: Record<'a>,
     pub taa: Record<'a>,
     pub bloom: Record<'a>,
     pub exposure: Record<'a>,
@@ -58,6 +63,26 @@ pub fn frame_passes(o: FrameOpts, r: Recorders<'_>) -> Vec<Pass<'_>> {
         record: Some(record),
     };
     let graphics = Kind::Graphics { per_layer: false };
+    // Under MSAA the main pass resolves into the scene colour when the
+    // transparent pass will refract it, and that pass resolves the finished
+    // image in its place.
+    let main_resolve = o.msaa.then_some(if o.transparents {
+        SceneColor
+    } else {
+        HdrResolve
+    });
+    // What a lit pass reads besides its attachments.
+    let lighting = [
+        (Shadow, sample(Stage::Fragment, Sampled::ReadOnly)),
+        (AoHalf, sample(Stage::Fragment, Sampled::General)),
+        (AoDepth, sample(Stage::Fragment, Sampled::General)),
+        (
+            Clusters,
+            Use::BufferRead {
+                stage: Stage::Fragment,
+            },
+        ),
+    ];
     let mut passes = vec![
         // The sun's cascades (§11). It also uploads the frame's buffers.
         pass(
@@ -118,11 +143,55 @@ pub fn frame_passes(o: FrameOpts, r: Recorders<'_>) -> Vec<Pass<'_>> {
         pass(
             "main",
             graphics,
-            vec![
+            [
                 (
                     Hdr,
                     Use::Color {
                         load: Load::Clear,
+                        resolve: main_resolve,
+                    },
+                ),
+                (
+                    Depth,
+                    Use::Depth {
+                        load: Load::Load,
+                        write: false,
+                        resolve: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .chain(lighting)
+            .collect(),
+            slot::MAIN,
+            r.main,
+        ),
+    ];
+    if o.transparents {
+        // §10 steps 7 and 9: the opaque scene kept (a copy at 1x; the main
+        // pass's resolve under MSAA), then the transparent pass over it,
+        // testing the prepass's depth and reading it to know how deep the
+        // water is.
+        if !o.msaa {
+            passes.push(Pass {
+                name: "scene copy",
+                kind: Kind::Copy {
+                    src: Hdr,
+                    dst: SceneColor,
+                },
+                uses: vec![(Hdr, Use::CopySrc), (SceneColor, Use::CopyDst)],
+                timer: (Some(slot::TRANSPARENT.0), None),
+                record: None,
+            });
+        }
+        let mut transparent = pass(
+            "transparent",
+            graphics,
+            [
+                (
+                    Hdr,
+                    Use::Color {
+                        load: Load::Load,
                         resolve: o.msaa.then_some(HdrResolve),
                     },
                 ),
@@ -134,20 +203,21 @@ pub fn frame_passes(o: FrameOpts, r: Recorders<'_>) -> Vec<Pass<'_>> {
                         resolve: None,
                     },
                 ),
-                (Shadow, sample(Stage::Fragment, Sampled::ReadOnly)),
-                (AoHalf, sample(Stage::Fragment, Sampled::General)),
-                (AoDepth, sample(Stage::Fragment, Sampled::General)),
-                (
-                    Clusters,
-                    Use::BufferRead {
-                        stage: Stage::Fragment,
-                    },
-                ),
-            ],
-            slot::MAIN,
-            r.main,
-        ),
-    ];
+                (SceneColor, sample(Stage::Fragment, Sampled::ReadOnly)),
+                (depth, sample(Stage::Fragment, Sampled::DepthReadOnly)),
+            ]
+            .into_iter()
+            .chain(lighting)
+            .collect(),
+            slot::TRANSPARENT,
+            r.transparent,
+        );
+        if !o.msaa {
+            // The copy started the span.
+            transparent.timer.0 = None;
+        }
+        passes.push(transparent);
+    }
     if o.taa {
         passes.push(pass(
             "taa",
@@ -264,6 +334,7 @@ mod tests {
             prepass: noop(),
             ao: noop(),
             main: noop(),
+            transparent: noop(),
             taa: noop(),
             bloom: noop(),
             exposure: noop(),
@@ -275,13 +346,14 @@ mod tests {
 
     fn every_opts() -> Vec<FrameOpts> {
         let mut v = Vec::new();
-        for bits in 0..16u32 {
+        for bits in 0..32u32 {
             let b = |i: u32| bits & (1 << i) != 0;
             v.push(FrameOpts {
                 msaa: b(0),
                 taa: b(1),
                 fxaa: b(2),
                 shadow_casters: b(3),
+                transparents: b(4),
             });
         }
         v
@@ -344,6 +416,48 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// The transparent pass refracts the opaque scene and draws over it: a
+    /// copy of it at 1x, the main pass's resolve under MSAA, where it then
+    /// resolves the finished image for everything after. Without
+    /// transparents the frame never touches the scene colour.
+    #[test]
+    fn the_transparent_pass_refracts_the_opaque_scene() {
+        for o in every_opts() {
+            let passes = frame_passes(o, recorders());
+            let named = |n: &str| passes.iter().position(|p| p.name == n);
+            let uses_scene_colour = |p: &Pass| p.uses.iter().any(|&(r, _)| r == Res::SceneColor);
+            if !o.transparents {
+                assert!(named("transparent").is_none() && named("scene copy").is_none());
+                assert!(!passes.iter().any(uses_scene_colour), "{o:?}");
+                continue;
+            }
+            let (main, t) = (named("main").unwrap(), named("transparent").unwrap());
+            assert!(passes[t].uses.contains(&(
+                Res::SceneColor,
+                Use::Sample {
+                    stage: Stage::Fragment,
+                    layout: Sampled::ReadOnly
+                }
+            )));
+            let main_resolve = passes[main].uses.iter().find_map(|&(_, u)| match u {
+                Use::Color { resolve, .. } => Some(resolve),
+                _ => None,
+            });
+            let t_resolve = passes[t].uses.iter().find_map(|&(_, u)| match u {
+                Use::Color { resolve, .. } => Some(resolve),
+                _ => None,
+            });
+            if o.msaa {
+                assert_eq!(main_resolve, Some(Some(Res::SceneColor)), "{o:?}");
+                assert_eq!(t_resolve, Some(Some(Res::HdrResolve)), "{o:?}");
+                assert!(named("scene copy").is_none());
+            } else {
+                assert_eq!(named("scene copy"), Some(main + 1), "{o:?}");
+                assert_eq!(t, main + 2);
             }
         }
     }
