@@ -170,8 +170,8 @@ double-sided, cull — used to pick pipeline and draw bucket.
 - **Loader:** it reads glTF `alphaMode`, `alphaCutoff` (default 0.5) and
   `doubleSided` into `Material`.
   - MASK materials cut out.
-  - BLEND materials still draw opaque, since there's no transparent pass;
-    the load prints how many.
+  - BLEND materials still draw opaque: the transparent pass (§10) draws
+    only water so far. The load prints how many.
   - On the GPU, `params.w` is the cutoff (0 unless MASK), and `tex.w` holds
     flags (bit 0: double-sided).
 - **Draw order:** runs sort with the masked bit on top of the
@@ -649,6 +649,52 @@ transparent is in view (`FrameOpts::transparents`), the list gains:
   at 1× for the copy and 0.08–0.15 ms under MSAA 4× for the second resolve.
   Both were too high: `transp` 0.03 ms either way, and frame +0.00–0.02 ms
   at 1× and +0.04–0.05 ms under MSAA.
+
+**Landed (§26): water, the transparent pass's first material.** A material
+whose glTF `extras.shader` is `"water"` (with an optional `clarity`, USAGE §4)
+draws there, and nowhere else.
+- **The mesh renderer** leaves it out of every view's runs: no prepass (so
+  no GTAO under it) and no shadow. It collects it back to front from the
+  eye, one instance per run at LOD0, after the view's instances in the
+  SSBO. `has_transparents()` is what turns the pass on.
+- **The shader** is `mesh.frag` compiled a second time with `WATER` defined
+  (`render/build.rs`'s variant list). Everything it adds is under `#ifdef
+  WATER`, so the standard SPIR-V is byte-identical (checked: same SHA-256
+  before and after). It reads set 1, `SceneColor` and the single-sample
+  depth, through a pipeline layout of its own: the other pipelines' layout
+  and the standard shader never name set 1. A test keeps set 1 inside the
+  `#ifdef`.
+- **Shading:**
+  - Four small travelling waves give the normal.
+  - The water's thickness is the opaque depth less the surface's (view
+    space, then along the ray).
+  - The bed is `SceneColor` shifted by the slope times up to a metre of
+    depth, so the shore doesn't move; unshifted where the shift lands on
+    something above the water.
+  - `exp(-path / clarity)` fades the bed into the base colour, which is lit
+    by the occluded sky and the shadowed sun.
+  - Fresnel (F0 0.02) mixes in the sky it mirrors, occluded by the sky
+    volume; then the sun's and the lamps' highlights, and fog as the opaque
+    pass has it.
+  - It writes the result with no blending, and its time is game time
+    (`MeshRenderer::set_time`), so the ripples stop with the sim.
+- **Verified** on a test scene (a striped ramp under a water quad, 0 → 0.75
+  m deep):
+  - no NaNs;
+  - sync validation 0 at 1× and TAA off, and under MSAA 4× after the
+    filter;
+  - controls: clarity → 0 hides the bed, luminance σ over the water 0.064
+    against 0.54 at clarity → 1000, where the stripes show with the
+    refraction's wobble.
+- **Its cost** on that scene's sweep: `transp` median 0.00, p90 0.04 ms (1×)
+  and 0.06 ms (MSAA 4×), and up to 0.42–0.47 ms with water filling the view
+  up close, about what the opaque pass costs on as many pixels.
+- **Limits:**
+  - No scene reflections (SSR is §3's hook) and nothing under water: the
+    camera just goes through the surface.
+  - TAA reprojects the water with the bed's depth, since the water writes
+    none, so it may smear a little while you move.
+  - The ripples' time is an f32 of seconds, fine for hours.
 
 Barriers: Vulkan 1.3 **sync2** (`VkImageMemoryBarrier2`, timeline semaphores).
 Key hazards: shadow depth W→R before opaque; HDR color W→R at resolve; cluster

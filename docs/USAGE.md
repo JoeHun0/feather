@@ -326,8 +326,9 @@ alpha (texture × factor) is below `alphaCutoff` (default 0.5), in the
 image and in shadows alike. Add `"doubleSided": true` for cards seen from
 both sides; their back faces are then lit like their fronts. The alpha must
 be in the base colour texture (a PNG with alpha): glTF has no separate
-opacity map. `"alphaMode": "BLEND"` still draws opaque (there's no
-transparency yet); the load prints `[mesh] N BLEND materials drawn opaque`.
+opacity map. `"alphaMode": "BLEND"` still draws opaque (the transparent pass
+draws only water so far); the load prints `[mesh] N BLEND materials drawn
+opaque`.
 
 **Footstep surfaces** belong to *materials*, not nodes: a material's `extras`
 names one, and everything drawn with it (every placement, every face) steps
@@ -341,6 +342,26 @@ Surfaces: `concrete` (the default, also for untagged materials and the
 built-in ground), `grass`, `wood`, `carpet`, `snow`, in any case. An unknown
 name logs `[scene] unknown surface "…"; using concrete` once. Only geometry
 that collides matters: the surface is read from the collider under your feet.
+
+**Water** is a material too:
+
+```json
+{ "name": "pond", "extras": { "shader": "water", "clarity": 0.35 },
+  "pbrMetallicRoughness": { "baseColorFactor": [0.06, 0.07, 0.035, 1], "roughnessFactor": 0.06 } }
+```
+
+- It draws in the transparent pass (ARCHITECTURE.md §10) over what's under
+  it, which it refracts, and it rides small procedural ripples.
+- The base colour is what the water looks like where it's deep. `clarity`
+  is how far light gets through it before 1/e is left (metres, default
+  0.35, a murky pond), so the bed fades out with depth. The roughness keeps
+  the sun's highlight tight.
+- It reflects the sky (occluded like everything else), the sun and the
+  lamps, but not the scene: there's no SSR.
+- Give its node `{"prefab": "prop", "params": {"shadow": false, "collide":
+  false}}`: water shouldn't cast, and you wade through it. It never goes in
+  the shadow map or the depth prepass anyway.
+- An unknown `shader` warns and draws standard.
 
 ### A scene from real CC0 models — Kenney Nature Kit
 
@@ -585,7 +606,7 @@ OCCLUSION, live):
 
 ## 5. Tests
 
-`cargo test --workspace` runs 260 tests, in a few seconds once built (the
+`cargo test --workspace` runs 263 tests, in a few seconds once built (the
 ones that step rapier, the ropes and the mixer take most of it).
 All of them are CPU-side: none needs a GPU, a window, a sound card or
 anything in `scratch/`, so they pass on a fresh clone.
@@ -732,7 +753,7 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | Materials | assets, render | glTF `alphaMode`/`alphaCutoff`/`doubleSided` load as `AlphaMode::Mask`(cutoff, default 0.5)/`Blend`/`Opaque` and the flag; the GPU record carries the cutoff only for MASK and the double-sided bit, which matches `mesh.frag`'s; glTF `occlusionTexture` and its strength load (an ARM map shares MR's image, one conversion), and the GPU record packs its slot above the flags (MR's own slot for an ARM map, 0 for none) with the strength in `params.z`, at the shift `mesh.frag` declares; `mesh.frag`'s occlusion follows glTF's strength rule and combines with GTAO by `min`; masked instances' runs follow every opaque one (one pipeline switch a pass), with the same instances and triangles, and a scene without masked materials builds the runs it always did; `mesh.frag` never discards or demotes (masked materials rely on its early-Z, testing depth for EQUAL against the prepass's cut) |
 | Environment | render | nothing is baked (no specialization constant in either compiled shader); `Environment::default()`'s atmosphere is the old defaults slot by slot, and every field reaches it; mesh.frag's `Globals` block is the Rust struct's size with `Atmosphere` at its tail, and sky.frag declares it and the `#define`s over it text for text; height fog's closed form equals numeric integration of its density (rays up, down and level), uniform fog is exactly `density·dist`, the sky's infinite-ray limit; `sky()` and the fog functions are textually identical in both shaders; sky.frag's push block is the 96 bytes the pass pushes |
 | Weather | game | the sun's path (noon elevation and bearing, morning east, an equinox rising at 6 and setting at 18, sunrise on the horizon, polar days, a level's sun found again); the reference-day warp; log-space key blending with exact ends; sampling at, between and across keys; every weather's keys sorted and usable, OVERCAST's 15:00 key the zone's `environment` (read from `gen_zonescene.py`); the sun/moon switch continuous through sunrise and sunset; the clock's speed and wrap; LEVEL exactly the level's look, and with a clock the level's palette under the moving sun (faded in at sunrise, no moon by night); a weather's frame (key, fog height, sun and moon); transitions start from the screen and stay continuous through a re-pick; SPEED presets; the WEATHER rows cycle and wrap, and it's in game only; the marker's `weather`/`time`/`time_speed`/`latitude`/`day_of_year` and their bad values |
-| Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one texture, which isn't decoded until asked and then matches the old RGB→RGBA expansion; a material's `extras.surface` is read (a non-string one warns and is dropped) |
+| Scene loading | assets | mesh dedup, transforms accumulate, meshes stay in local space; materials sharing an image share one texture, which isn't decoded until asked and then matches the old RGB→RGBA expansion; a material's `extras.surface` is read (a non-string one warns and is dropped), and `extras.shader: "water"` with its `clarity` (default when absent or bad, with a warning; an unknown shader warns and is standard) |
 | Mip chains | gfx | level count per texture size (square, non-square, non-power-of-two) |
 | Texture bake | assets, bake | keys separate content and kind (sRGB colour vs data), and are computed from the encoded bytes without decoding; BC7 level sizes round partial blocks up; baked files round-trip and reject truncation, wrong sizes or an unknown kind; sRGB mips average *light* (black/white → 188, not 128); chains end at 1×1; every baked level has exactly the blocks Vulkan copies |
 | Mesh bake + LOD | assets, bake, render | baked meshes round-trip and reject damage (truncation, trailing bytes, bad magic, out-of-range index, decreasing or NaN error, partial triangle, no LODs); the mesh key ignores the material; a sphere gets a chain with fewer triangles and growing error per level and LOD0 is the input reordered; small meshes stay LOD0; disconnected parts prune; the pixel and texel rules (distance, scale, non-uniform scale, inside the sphere); runs split per (mesh, LOD) |
@@ -742,6 +763,7 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | Auto-exposure | render, app | a Rust reference of the metering, whose constants and state layout the shaders must declare: luminance round-trips through its bin (black to bin 0), the 10–90% trimmed mean ignores the tails, adaptation converges, brightens faster than it darkens and is frame-rate independent, the exposure maps `KEY` and clamps, the centre weight falls off but never to 0; `exposure_min`/`exposure_max` land and bad values are reported; the GRAPHICS row and `--no-auto-exposure` |
 | Config files | app | both templates parse back to the defaults; `display` parses and rejects anything but `"windowed"` / `"fullscreen"`; `fov` accepts 30–120 whole degrees only; each bad line warns and keeps the default; saving edits one value in place; create-once, the `settings.toml` → `graphics.toml` migration, an unreadable file is left alone |
 | Controls | app | key names round-trip; reserved menu keys are refused; a key on two actions warns; two keys on one action hold until both are released; toggles ignore auto-repeat but exposure repeats; a rebound jump moves; `toggle_fullscreen` defaults to F11 (also in files that predate it) and ignores auto-repeat; `rebind` steals the key and refuses menu/unnamed keys; sensitivity presets step and wrap; saved literals parse back, and saving every binding into the template keeps its comments; every key's menu label is drawable |
+| Water | render | it's in no view's runs (no prepass, no shadow) but its own, back to front, one instance each; only mesh.frag's WATER variant names set 1; its clarity reaches the GPU where the cutoff goes |
 | Texture slots | render | one slot per unique image × colour space; sRGB and UNORM uses of the same pixels stay separate; overflow past the capacity is counted and falls back to the defaults |
 | Light clusters | render | GLSL grid constants + `MAX_LIGHTS` match the Rust ones |
 | Ropes | assets, game | still, a rope hangs straight at its length (control: one pass, no attachment, stretches); released, it swings with a pendulum's period, dies down and never grows (control: 4× gravity halves the period); wind leans it downwind within 1% of its length (control: still air); an unweighted rope bows (control: one segment); segment and item matrices sit on the points, and at rest the item is drawn as authored; determinism and interpolation; the unit tube; `hanging` params, spawn (anchor above the node, no collider) and the level's wind params; a `light` on it (params, bad keys) rides the item: at rest where the node puts it, swung with it (control: unlit, no light) |

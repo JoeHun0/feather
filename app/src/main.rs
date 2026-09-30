@@ -40,8 +40,8 @@ use std::time::Instant;
 
 use bevy_ecs::prelude::*;
 use feather_game::components::{
-    Hanging, Material, Mesh, NoShadowCast, Position, PrevPosition, PrevRotation, Rotation, Scale,
-    Transform, FIXED_DT, GRID, MESH_ROPE, PALETTE,
+    FrameCount, Hanging, Material, Mesh, NoShadowCast, Position, PrevPosition, PrevRotation,
+    Rotation, Scale, Transform, FIXED_DT, GRID, MESH_ROPE, PALETTE,
 };
 use feather_game::controller::{
     InputState, Look, Player, CAMERA_FAR, CAMERA_NEAR, DEFAULT_FOV_DEG, EYE_HEIGHT, FOV_PRESETS,
@@ -1430,6 +1430,10 @@ impl ApplicationHandler for App {
                     self.light_dir = light.extend(0.0);
                     self.exposure_range = (env.exposure_min, env.exposure_max);
                     s.mesh.set_atmosphere(env.atmosphere());
+                    // Game time, interpolated like everything else: the
+                    // water's ripples move with the sim, and stop with it.
+                    let ticks = s.world.resource::<FrameCount>().0;
+                    s.mesh.set_time((ticks as f32 + alpha) * FIXED_DT);
                     let light_dir = self.light_dir;
                     let camera_pos = eye;
 
@@ -1750,6 +1754,12 @@ impl ApplicationHandler for App {
                             r.extent(),
                             generation,
                         );
+                        // What the water refracts (§10), which moves likewise.
+                        s.mesh.set_scene(
+                            (r.scene_color_view(), depth_view),
+                            (r.hdr_sampler(), nearest),
+                            generation,
+                        );
                     }
                     // Shared immutably by the shadow and geometry closures — the
                     // draw methods take &self, only `prepare_frame` above needed
@@ -1760,8 +1770,7 @@ impl ApplicationHandler for App {
                         taa: r.taa_on(),
                         fxaa: r.fxaa_on(),
                         shadow_casters: r.has_shadow_casters(),
-                        // Nothing draws in the transparent pass yet.
-                        transparents: false,
+                        transparents: session.is_some_and(|s| s.mesh.has_transparents()),
                     };
                     let recorders = Recorders {
                         // Shadow pass: sun depth map (also flushes this frame's
@@ -1836,7 +1845,19 @@ impl ApplicationHandler for App {
                                 );
                             }
                         }),
-                        transparent: Box::new(|_, _, _, _| {}),
+                        // Water (§10), over the opaque scene it refracts.
+                        transparent: Box::new(|cmd, extent, frame, _| {
+                            if let (Some(s), Some(v)) = (session, frame_view) {
+                                s.mesh.draw_transparent(
+                                    cmd,
+                                    extent,
+                                    frame,
+                                    v.view_proj,
+                                    v.light_dir,
+                                    v.camera_pos,
+                                );
+                            }
+                        }),
                         // TAA (§13): only invoked while it's on.
                         taa: Box::new(|cmd, extent, frame, _| {
                             tp.update(

@@ -56,4 +56,32 @@ fn main() {
         fs::write(out_dir.join(format!("{name}.spv")), artifact.as_binary_u8())
             .expect("write .spv");
     }
+
+    // Variants: one source compiled again with a macro defined, so a
+    // special shading path shares every function with the standard one and
+    // the standard one's SPIR-V is untouched by it (everything it adds sits
+    // under its #ifdef).
+    for (source, out, define) in VARIANTS {
+        let path = shader_dir.join(source);
+        let src = fs::read_to_string(&path).expect("read shader source");
+        let mut opts = options.clone().expect("clone shaderc options");
+        opts.add_macro_definition(define, None);
+        let artifact = compiler
+            .compile_into_spirv(
+                &src,
+                shaderc::ShaderKind::Fragment,
+                out,
+                "main",
+                Some(&opts),
+            )
+            .unwrap_or_else(|e| panic!("shader {out}:\n{e}"));
+        fs::write(out_dir.join(format!("{out}.spv")), artifact.as_binary_u8()).expect("write .spv");
+    }
 }
+
+/// (source, output name, macro): fragment shaders compiled a second time.
+const VARIANTS: [(&str, &str, &str); 1] = [
+    // The transparent pass's water (§10): mesh.frag's lighting, refracting
+    // the opaque scene.
+    ("mesh.frag", "mesh_water.frag", "WATER"),
+];

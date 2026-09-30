@@ -137,7 +137,26 @@ pub struct Material {
     /// glTF `doubleSided`: both faces are the surface, so a back face is
     /// lit as the front seen from behind.
     pub double_sided: bool,
+    /// How it's shaded: the standard path, or one its `extras.shader`
+    /// names.
+    pub shading: Shading,
 }
+
+/// How a material is shaded, from its glTF `extras.shader`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Shading {
+    #[default]
+    Standard,
+    /// `{"shader": "water", "clarity": 0.6}`: drawn in the transparent pass
+    /// (§10), over the opaque scene it refracts. `clarity` is how far light
+    /// travels in it before 1/e is left, in metres; the base colour is what
+    /// the water itself looks like where it's deep.
+    Water { clarity: f32 },
+}
+
+/// `clarity` when a water material doesn't give one: a murky pond, its bed
+/// gone at about a metre.
+pub const WATER_CLARITY: f32 = 0.35;
 
 /// glTF's `alphaMode`: what the base colour's alpha (texture × factor)
 /// means for a material.
@@ -148,8 +167,8 @@ pub enum AlphaMode {
     /// Cutout: fragments with alpha below the cutoff aren't there (grass,
     /// chain-link, leaves).
     Mask(f32),
-    /// Blended transparency. The renderer has no transparent pass yet, so
-    /// these draw opaque.
+    /// Blended transparency. The renderer's transparent pass draws only
+    /// water so far (`Shading::Water`), so these draw opaque.
     Blend,
 }
 
@@ -170,6 +189,7 @@ impl Default for Material {
             surface: None,
             alpha_mode: AlphaMode::Opaque,
             double_sided: false,
+            shading: Shading::Standard,
         }
     }
 }
@@ -516,6 +536,7 @@ fn read_material(m: &gltf::Material, images: &ImageCache) -> Material {
         Some(ot) => (tex(ot.texture().source().index()), ot.strength()),
         None => (None, 1.0),
     };
+    let (surface, shading) = read_extras(m);
     Material {
         base_color: pbr.base_color_factor(), // linear RGBA
         metallic: pbr.metallic_factor(),
@@ -527,7 +548,8 @@ fn read_material(m: &gltf::Material, images: &ImageCache) -> Material {
         metallic_roughness_texture,
         occlusion_texture,
         occlusion_strength,
-        surface: read_surface(m),
+        surface,
+        shading,
         alpha_mode: match m.alpha_mode() {
             gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
             // glTF's default cutoff is 0.5.
@@ -538,22 +560,55 @@ fn read_material(m: &gltf::Material, images: &ImageCache) -> Material {
     }
 }
 
-/// A material's footstep surface (§20) from its `extras`, as in
-/// `{"surface": "wood"}`. Lenient like [`read_prefab`]: a value that isn't a
-/// string warns and is ignored, and extras without the key belong to other
-/// tools.
-fn read_surface(m: &gltf::Material) -> Option<String> {
-    let raw = m.extras().as_ref()?;
-    let value: serde_json::Value = match serde_json::from_str(raw.get()) {
-        Ok(v) => v,
+/// What a material's `extras` say: its footstep surface and its shading.
+/// Lenient like [`read_prefab`]: extras that aren't JSON warn and are
+/// ignored, as is a value of the wrong kind, and keys this doesn't know
+/// belong to other tools.
+fn read_extras(m: &gltf::Material) -> (Option<String>, Shading) {
+    let Some(raw) = m.extras().as_ref() else {
+        return (None, Shading::Standard);
+    };
+    match serde_json::from_str(raw.get()) {
+        Ok(value) => (read_surface(m, &value), read_shading(m, &value)),
         Err(e) => {
             eprintln!(
                 "material {}: extras is not valid JSON ({e}); ignored",
                 material_label(m)
             );
-            return None;
+            (None, Shading::Standard)
+        }
+    }
+}
+
+/// The shading `extras.shader` names: `"water"`, with an optional
+/// `clarity` in metres. Anything else warns and means standard.
+fn read_shading(m: &gltf::Material, value: &serde_json::Value) -> Shading {
+    let Some(shader) = value.get("shader") else {
+        return Shading::Standard;
+    };
+    if shader.as_str() != Some("water") {
+        eprintln!(
+            "material {}: unknown extras.shader {shader}; drawn standard",
+            material_label(m)
+        );
+        return Shading::Standard;
+    }
+    let clarity = match value.get("clarity").map(|c| c.as_f64()) {
+        None => WATER_CLARITY,
+        Some(Some(c)) if c > 0.0 && c.is_finite() => c as f32,
+        Some(_) => {
+            eprintln!(
+                "material {}: extras.clarity must be a positive number of metres; using {WATER_CLARITY}",
+                material_label(m)
+            );
+            WATER_CLARITY
         }
     };
+    Shading::Water { clarity }
+}
+
+/// A material's footstep surface (§20), as in `{"surface": "wood"}`.
+fn read_surface(m: &gltf::Material, value: &serde_json::Value) -> Option<String> {
     let surface = value.get("surface")?;
     let Some(name) = surface.as_str() else {
         eprintln!(
@@ -1030,6 +1085,63 @@ mod tests {
         assert_eq!(m[1].occlusion_strength, 1.0, "glTF's default strength");
         assert!(m[2].occlusion_texture.is_none());
         assert_eq!(m[2].occlusion_strength, 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn material_extras_pick_the_water_shader() {
+        // One primitive per case: water with and without a clarity, a bad
+        // clarity (warns, default), an unknown shader (warns, standard), and
+        // no extras.
+        let dir = fixture_dir("shaders");
+        let positions: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let bin: Vec<u8> = positions.iter().flat_map(|f| f.to_le_bytes()).collect();
+        std::fs::write(dir.join("tri.bin"), &bin).unwrap();
+        let prim =
+            |m: usize| format!(r#"{{ "attributes": {{ "POSITION": 0 }}, "material": {m} }}"#);
+        let gltf = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "scene": 0,
+  "scenes": [ {{ "nodes": [0] }} ],
+  "nodes": [ {{ "mesh": 0 }} ],
+  "meshes": [ {{ "primitives": [ {} ] }} ],
+  "materials": [
+    {{ "name": "pond", "extras": {{ "shader": "water", "clarity": 1.5 }} }},
+    {{ "name": "plain", "extras": {{ "shader": "water" }} }},
+    {{ "name": "odd", "extras": {{ "shader": "water", "clarity": -2 }} }},
+    {{ "name": "lava", "extras": {{ "shader": "lava", "surface": "snow" }} }},
+    {{ "name": "none" }}
+  ],
+  "accessors": [ {{
+    "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+    "min": [0, 0, 0], "max": [1, 1, 0]
+  }} ],
+  "bufferViews": [ {{ "byteOffset": 0, "byteLength": 36, "buffer": 0 }} ],
+  "buffers": [ {{ "byteLength": 36, "uri": "tri.bin" }} ]
+}}"#,
+            (0..5).map(prim).collect::<Vec<_>>().join(", ")
+        );
+        let path = dir.join("shaders.gltf");
+        std::fs::write(&path, gltf).unwrap();
+        let scene = load_gltf_scene(&path).unwrap();
+        let shading: Vec<Shading> = scene.meshes.iter().map(|m| m.material.shading).collect();
+        assert_eq!(
+            shading,
+            [
+                Shading::Water { clarity: 1.5 },
+                Shading::Water {
+                    clarity: WATER_CLARITY
+                },
+                Shading::Water {
+                    clarity: WATER_CLARITY
+                },
+                Shading::Standard,
+                Shading::Standard,
+            ]
+        );
+        // The shader key doesn't hide the other keys.
+        assert_eq!(scene.meshes[3].material.surface.as_deref(), Some("snow"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

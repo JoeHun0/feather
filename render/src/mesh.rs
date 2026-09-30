@@ -15,7 +15,7 @@ use feather_assets::bake::{
     baked_path, texture_key, BakedMesh, BakedTexture, SkyFree, SkyVis, SkyVolume, TexKind,
     MIN_LOD_TRIS, TEX_DIR,
 };
-use feather_assets::AlphaMode;
+use feather_assets::{AlphaMode, Shading};
 use feather_assets::{Material, MeshData, TextureData, Vertex};
 use feather_gfx::{Buffer, Image, MappedBuffer, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use glam::{Mat4, Vec3, Vec4};
@@ -250,10 +250,13 @@ pub struct FrameStats {
     pub main_masked: u32,
     /// Instances of masked materials, summed over the shadow cascades.
     pub shadow_masked: u32,
+    /// Water instances (§10's transparent pass), camera view.
+    pub main_water: u32,
 }
 
 /// GPU material record (§5): std430, 64 bytes, indexed by `material_id`.
 /// `tex.x` = base-color texture slot into the bindless array (0 = white).
+/// Water (§10) never cuts, and has its clarity in `params.w`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GpuMaterial {
@@ -276,11 +279,13 @@ const MATERIAL_OCCLUSION_SHIFT: u32 = 8;
 
 impl GpuMaterial {
     fn from_material(m: &Material, slots: [u32; 4]) -> Self {
-        // The cutoff only for masked materials (§5). BLEND has no pass to go
-        // to yet, so it draws opaque.
-        let cutoff = match m.alpha_mode {
-            AlphaMode::Mask(c) => c,
-            AlphaMode::Opaque | AlphaMode::Blend => 0.0,
+        // The cutoff only for masked materials (§5). BLEND draws opaque (the
+        // transparent pass takes only water so far). Water, which never cuts, has its
+        // clarity there instead (mesh.frag's WATER variant reads it).
+        let cutoff = match (m.shading, m.alpha_mode) {
+            (Shading::Water { clarity }, _) => clarity,
+            (_, AlphaMode::Mask(c)) => c,
+            (_, AlphaMode::Opaque | AlphaMode::Blend) => 0.0,
         };
         let flags = if m.double_sided {
             MATERIAL_DOUBLE_SIDED
@@ -413,6 +418,24 @@ pub struct MeshRenderer {
     /// Per material id: does it cut out (glTF MASK)? Picks each instance's
     /// pipeline when runs are built.
     masked: Vec<bool>,
+    /// Per material id: is it water? Water draws in the transparent pass
+    /// (§10), back to front, and in no other: no prepass, no shadow.
+    water: Vec<bool>,
+    /// The water pipeline: `mesh.vert` + `mesh_water.frag`, testing the
+    /// opaque depth without writing it, no blending (it composites what it
+    /// refracts itself). Its layout adds set 1: the opaque scene's colour
+    /// and depth.
+    water_pipeline: vk::Pipeline,
+    water_layout: vk::PipelineLayout,
+    water_set_layout: vk::DescriptorSetLayout,
+    water_pool: vk::DescriptorPool,
+    water_sets: Vec<vk::DescriptorSet>,
+    /// The `Renderer::targets_generation` set 1 points into.
+    scene_generation: u64,
+    /// This frame's water, back to front, one run per instance.
+    water_runs: Vec<Run>,
+    /// Seconds of game time, for the ripples (`set_time`).
+    time: f32,
     // Depth-only prepass into the main depth buffer (§10), so the opaque pass
     // shades each pixel once. Shares `mesh.vert` with the main pipeline.
     depth_pipeline: vk::Pipeline,
@@ -685,12 +708,16 @@ impl MeshRenderer {
             .iter()
             .map(|m| matches!(m.alpha_mode, AlphaMode::Mask(_)))
             .collect();
+        let water: Vec<bool> = materials
+            .iter()
+            .map(|m| matches!(m.shading, Shading::Water { .. }))
+            .collect();
         let blended = materials
             .iter()
             .filter(|m| m.alpha_mode == AlphaMode::Blend)
             .count();
         if blended > 0 {
-            eprintln!("[mesh] {blended} BLEND materials drawn opaque (no transparency yet)");
+            eprintln!("[mesh] {blended} BLEND materials drawn opaque (the transparent pass draws only water)");
         }
 
         let instance_buffers: Vec<MappedBuffer> = (0..FRAMES_IN_FLIGHT)
@@ -1273,11 +1300,81 @@ impl MeshRenderer {
                 .expect("masked shadow pipeline")[0]
         };
 
+        // ---- Water (§10's transparent pass): set 1 holds the opaque scene's
+        // colour and single-sample depth, and only the water pipeline's
+        // layout has it, so the other pipelines are exactly as they were.
+        let scene_bindings = [0, 1].map(|b| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(b)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        });
+        let water_set_layout = unsafe {
+            device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&scene_bindings),
+                    None,
+                )
+                .expect("water descriptor set layout")
+        };
+        let water_pool = unsafe {
+            device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(FRAMES_IN_FLIGHT as u32)
+                        .pool_sizes(&[vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .descriptor_count(2 * FRAMES_IN_FLIGHT as u32)]),
+                    None,
+                )
+                .expect("water descriptor pool")
+        };
+        let water_sets = unsafe {
+            device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(water_pool)
+                        .set_layouts(&[water_set_layout; FRAMES_IN_FLIGHT]),
+                )
+                .expect("allocate water descriptor sets")
+        };
+        let water_set_layouts = [set_layout, water_set_layout];
+        let water_layout = unsafe {
+            device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&water_set_layouts)
+                        .push_constant_ranges(&push_ranges),
+                    None,
+                )
+                .expect("water pipeline layout")
+        };
+        let water_frag = load_shader(&device, spv!("mesh_water.frag"));
+        let water_stages = [
+            stages[0],
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(water_frag)
+                .name(c"main"),
+        ];
+        let water_pipeline = unsafe {
+            device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &[pipeline_info.stages(&water_stages).layout(water_layout)],
+                    None,
+                )
+                .map_err(|(_, e)| e)
+                .expect("water pipeline")[0]
+        };
+
         unsafe {
             device.destroy_shader_module(vert, None);
             device.destroy_shader_module(frag, None);
             device.destroy_shader_module(shadow_vert, None);
             device.destroy_shader_module(mask_frag, None);
+            device.destroy_shader_module(water_frag, None);
         }
 
         // Light-cluster assignment (§12), the engine's first compute pipeline.
@@ -1310,6 +1407,16 @@ impl MeshRenderer {
             masked_depth_pipeline,
             masked_shadow_pipeline,
             masked,
+            water,
+            water_pipeline,
+            water_layout,
+            water_set_layout,
+            water_pool,
+            water_sets,
+            // Nothing written yet: the first `set_scene` writes it.
+            scene_generation: u64::MAX,
+            water_runs: Vec::new(),
+            time: 0.0,
             set_layout,
             pool,
             sets,
@@ -1406,6 +1513,52 @@ impl MeshRenderer {
         self.ao_generation = generation;
     }
 
+    /// Point set 1 (the water's, §10) at the opaque scene's colour and its
+    /// single-sample depth, when the renderer's targets are new. Like
+    /// `set_ao`, sound because a new generation means the device went idle.
+    pub fn set_scene(
+        &mut self,
+        (colour, depth): (vk::ImageView, vk::ImageView),
+        (linear, nearest): (vk::Sampler, vk::Sampler),
+        generation: u64,
+    ) {
+        if generation == self.scene_generation {
+            return;
+        }
+        let colour_info = [vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(colour)
+            .sampler(linear)];
+        let depth_info = [vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+            .image_view(depth)
+            .sampler(nearest)];
+        for &set in &self.water_sets {
+            let write = |binding, info| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(info)
+            };
+            let writes = [write(0, &colour_info), write(1, &depth_info)];
+            unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+        }
+        self.scene_generation = generation;
+    }
+
+    /// Game time in seconds, for the water's ripples, from the next
+    /// `prepare_frame` on.
+    pub fn set_time(&mut self, seconds: f32) {
+        self.time = seconds;
+    }
+
+    /// Whether the last `prepare_frame` found water in view: the transparent
+    /// pass runs only then (`render::frame`).
+    pub fn has_transparents(&self) -> bool {
+        !self.water_runs.is_empty()
+    }
+
     /// Re-point every frame's shadow-map descriptor (binding 3) at a new view —
     /// used after the shadow map is resized by the quality setting (§13).
     ///
@@ -1483,6 +1636,7 @@ impl MeshRenderer {
         let mut runs = Runs {
             slices: &self.slices,
             masked: &self.masked,
+            water: &self.water,
             keyed: &mut self.keyed,
             scratch: &mut self.scratch,
             min_masked_lod: 0,
@@ -1506,12 +1660,24 @@ impl MeshRenderer {
             }
             base += st.instances;
         }
+        // Water (§10), the camera's only: it never casts.
+        let eye = camera.view.inverse().w_axis.truncate();
+        stats.main_water = water_runs(
+            main,
+            &self.water,
+            &self.slices,
+            eye,
+            &mut self.scratch,
+            &mut self.water_runs,
+        );
         self.stats = stats;
         // Guard the shared buffer's capacity (main + every cascade could, worst
         // case, exceed it); drop the tail of scratch and any runs past the cap.
         if self.scratch.len() > cap {
             self.scratch.truncate(cap);
             self.main_runs
+                .retain(|r| r.run_start + r.run_len <= cap as u32);
+            self.water_runs
                 .retain(|r| r.run_start + r.run_len <= cap as u32);
             for runs in &mut self.shadow_runs {
                 runs.retain(|r| r.run_start + r.run_len <= cap as u32);
@@ -1521,7 +1687,7 @@ impl MeshRenderer {
         let mut globals = Globals {
             light_view_proj: [[0.0; 16]; SHADOW_CASCADES],
             texel_world: [0.0; 4],
-            light_params: [self.lights.len() as f32, 0.0, 0.0, 0.0],
+            light_params: [self.lights.len() as f32, self.time, 0.0, 0.0],
             shadow_params: [self.shadow_texel, SHADOW_DEPTH_BIAS, 0.0, 0.0],
             view: camera.view.to_cols_array(),
             cluster_params: [
@@ -1691,6 +1857,41 @@ impl MeshRenderer {
         }
     }
 
+    /// Record the transparent pass's draws (§10): this frame's water, back
+    /// to front, over the opaque scene it refracts through set 1.
+    pub fn draw_transparent(
+        &self,
+        cmd: vk::CommandBuffer,
+        extent: vk::Extent2D,
+        frame: usize,
+        view_proj: Mat4,
+        light_dir: Vec4,
+        camera_pos: glam::Vec3,
+    ) {
+        if self.water_runs.is_empty() {
+            return;
+        }
+        unsafe {
+            self.push_view_constants(cmd, view_proj, light_dir, camera_pos);
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.water_layout,
+                0,
+                &[self.sets[frame], self.water_sets[frame]],
+                &[],
+            );
+            self.set_viewport_scissor(cmd, extent);
+            self.bind_geometry(cmd);
+            self.device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.water_pipeline,
+            );
+            self.draw_runs(cmd, &self.water_runs);
+        }
+    }
+
     /// Push the shared 96 B view constants: mat4 view_proj + vec4 light_dir +
     /// vec4 camera_pos. Identical for the depth prepass and the main pass.
     unsafe fn push_view_constants(
@@ -1801,6 +2002,9 @@ struct Runs<'a> {
     slices: &'a [MeshSlice],
     /// Per material id: masked (§5)? Ids past the end are opaque.
     masked: &'a [bool],
+    /// Per material id: water? Water has runs of its own (the transparent
+    /// pass, §10), so it's left out here, of every view.
+    water: &'a [bool],
     keyed: &'a mut Vec<(u32, InstanceData)>,
     scratch: &'a mut Vec<InstanceData>,
     /// The coarsest LOD a masked instance must take, as far as its mesh has
@@ -1840,6 +2044,9 @@ impl Runs<'_> {
         self.keyed.extend(items.iter().filter_map(|(mesh, inst)| {
             // Unknown meshes are dropped here, as the draw loop always did.
             let slice = self.slices.get(mesh.0 as usize)?;
+            if self.water.get(inst.material_id as usize) == Some(&true) {
+                return None;
+            }
             let masked = self.masked.get(inst.material_id as usize) == Some(&true);
             let lod = rule.map_or(0, |r| {
                 let lod = pick_lod(
@@ -1897,6 +2104,43 @@ impl Runs<'_> {
     }
 }
 
+/// The water among `items` (§10): back to front from `eye`, so nearer water
+/// draws over farther, one run each at its finest LOD, its instances
+/// appended to `scratch`. Replaces `runs`; returns how many.
+fn water_runs(
+    items: &[(MeshId, InstanceData)],
+    water: &[bool],
+    slices: &[MeshSlice],
+    eye: Vec3,
+    scratch: &mut Vec<InstanceData>,
+    runs: &mut Vec<Run>,
+) -> u32 {
+    let mut found: Vec<(f32, &MeshSlice, InstanceData)> = items
+        .iter()
+        .filter(|(_, inst)| water.get(inst.material_id as usize) == Some(&true))
+        .filter_map(|&(mesh, inst)| {
+            let slice = slices.get(mesh.0 as usize)?;
+            let centre = inst.model.transform_point3(slice.center);
+            Some((centre.distance_squared(eye), slice, inst))
+        })
+        .collect();
+    found.sort_by(|a, b| b.0.total_cmp(&a.0));
+    runs.clear();
+    for (_, slice, inst) in &found {
+        let l = slice.lods[0];
+        runs.push(Run {
+            first_index: l.first_index,
+            index_count: l.index_count,
+            vertex_offset: slice.vertex_offset,
+            run_start: scratch.len() as u32,
+            run_len: 1,
+            masked: false,
+        });
+        scratch.push(*inst);
+    }
+    found.len() as u32
+}
+
 /// Small constant bias in light-space depth, added in the shader on top of the
 /// rasterizer slope bias, to finish off shadow acne.
 const SHADOW_DEPTH_BIAS: f32 = 0.0015;
@@ -1915,6 +2159,11 @@ impl Drop for MeshRenderer {
             self.device
                 .destroy_pipeline(self.masked_shadow_pipeline, None);
             self.device.destroy_pipeline(self.cluster_pipeline, None);
+            self.device.destroy_pipeline(self.water_pipeline, None);
+            self.device.destroy_pipeline_layout(self.water_layout, None);
+            self.device.destroy_descriptor_pool(self.water_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.water_set_layout, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_descriptor_pool(self.pool, None);
             self.device
@@ -2094,6 +2343,7 @@ mod tests {
         let mut b = Runs {
             slices: &slices,
             masked: &[],
+            water: &[],
             keyed: &mut keyed,
             scratch: &mut scratch,
             min_masked_lod: 0,
@@ -2130,6 +2380,7 @@ mod tests {
         let mut b = Runs {
             slices: &slices,
             masked: &[],
+            water: &[],
             keyed: &mut keyed,
             scratch: &mut scratch,
             min_masked_lod: 0,
@@ -2167,6 +2418,7 @@ mod tests {
             Runs {
                 slices: &slices,
                 masked: &masked,
+                water: &[],
                 keyed: &mut keyed,
                 scratch: &mut scratch,
                 min_masked_lod: floor,
@@ -2215,6 +2467,7 @@ mod tests {
             let st = Runs {
                 slices: &slices,
                 masked,
+                water: &[],
                 keyed: &mut keyed,
                 scratch: &mut scratch,
                 min_masked_lod: 0,
@@ -2244,6 +2497,87 @@ mod tests {
         assert_eq!(plain.len(), 3, "without masking, mesh 0 is one run");
     }
 
+    /// Water (§10) is in no view's runs, cast or seen: it has runs of its
+    /// own, back to front from the eye, one instance each at LOD0; unknown
+    /// meshes are dropped there too.
+    #[test]
+    fn water_draws_on_its_own_back_to_front() {
+        let slices: Vec<MeshSlice> = (0..2)
+            .map(|i| MeshSlice {
+                vertex_offset: i * 100,
+                lods: lods(&[0.0, 0.1]),
+                center: Vec3::ZERO,
+                radius: 0.5,
+            })
+            .collect();
+        // Material 1 is water.
+        let water = [false, true];
+        let at =
+            |z: f32, m: u32| InstanceData::new(Mat4::from_translation(Vec3::new(0.0, 0.0, -z)), m);
+        let items = vec![
+            (MeshId(0), at(5.0, 1)),
+            (MeshId(1), at(2.0, 0)),
+            (MeshId(1), at(40.0, 1)),
+            (MeshId(9), at(1.0, 1)),
+            (MeshId(0), at(12.0, 1)),
+        ];
+        let (mut keyed, mut scratch, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+        let st = Runs {
+            slices: &slices,
+            masked: &[],
+            water: &water,
+            keyed: &mut keyed,
+            scratch: &mut scratch,
+            min_masked_lod: 0,
+        }
+        .build(&items, Some(screen()), &mut runs, 0);
+        assert_eq!(st.instances, 1, "only the opaque one is in the view's runs");
+        assert!(scratch.iter().all(|i| i.material_id == 0));
+
+        let mut water_run = Vec::new();
+        let n = water_runs(
+            &items,
+            &water,
+            &slices,
+            Vec3::ZERO,
+            &mut scratch,
+            &mut water_run,
+        );
+        assert_eq!(n, 3, "the unknown mesh is dropped");
+        let depths: Vec<f32> = water_run
+            .iter()
+            .map(|r| -scratch[r.run_start as usize].model.w_axis.z)
+            .collect();
+        assert_eq!(depths, [40.0, 12.0, 5.0], "back to front");
+        assert!(water_run
+            .iter()
+            .all(|r| r.run_len == 1 && r.index_count == 300));
+        assert_eq!(water_run[0].run_start, 1, "after the view's instances");
+    }
+
+    /// The water variant of mesh.frag (§10) alone names set 1, the opaque
+    /// scene's colour and depth: the standard variant must never, since
+    /// those images are the main pass's attachments while it runs.
+    #[test]
+    fn only_the_water_variant_names_set_1() {
+        let src = include_str!("../shaders/mesh.frag");
+        let mut water = false;
+        let mut seen = 0;
+        for line in src.lines() {
+            match line.trim() {
+                "#ifdef WATER" => water = true,
+                "#else" | "#endif" => water = false,
+                _ => {}
+            }
+            if line.contains("set = 1") {
+                assert!(water, "outside #ifdef WATER: {line}");
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 2, "the scene's colour and depth");
+        assert!(src.trim_end().ends_with("#endif"));
+    }
+
     /// Material flags are shared with mesh.frag; the cutoff reaches the GPU
     /// only for masked materials, so opaque and BLEND ones never cut.
     #[test]
@@ -2271,6 +2605,13 @@ mod tests {
         assert_eq!(pack(AlphaMode::Mask(0.5), false), (0.5, 0));
         assert_eq!(pack(AlphaMode::Opaque, false), (0.0, 0));
         assert_eq!(pack(AlphaMode::Blend, true), (0.0, MATERIAL_DOUBLE_SIDED));
+        // Water (§10) has its clarity where the cutoff goes; it never cuts.
+        let water = Material {
+            shading: Shading::Water { clarity: 0.7 },
+            alpha_mode: AlphaMode::Mask(0.5),
+            ..Material::default()
+        };
+        assert_eq!(GpuMaterial::from_material(&water, [0; 4]).params[3], 0.7);
     }
 
     /// A material's occlusion texture reaches the GPU as a slot above the

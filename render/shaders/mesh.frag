@@ -533,6 +533,124 @@ vec3 punctual(Light l, vec3 N, vec3 V, vec3 R, vec3 world_pos, vec3 albedo, vec3
     return (kd * albedo / PI * ndl + spec * ndl_s) * radiance;
 }
 
+#ifdef WATER
+// ---- Water: the transparent pass (§10) ----
+//
+// Drawn over the opaque scene, which it refracts itself rather than blending
+// over, so the pipeline has no blending. Set 1 holds that scene's colour and
+// depth, single-sample, and only the transparent pass binds it: the
+// standard variant of this file never names it.
+layout(set = 1, binding = 0) uniform sampler2D u_scene;
+layout(set = 1, binding = 1) uniform sampler2D u_scene_depth;
+
+// Ripples: small waves crossing a sheltered pond, as a direction and
+// (wavelength m, amplitude m, speed m/s). Their slopes add up to ~7°.
+const vec2 WAVE_DIR[4] = vec2[](
+    vec2(0.80, 0.60), vec2(-0.60, 0.80), vec2(0.20, -0.98), vec2(-0.90, -0.43));
+const vec3 WAVE[4] = vec3[](
+    vec3(1.30, 0.0080, 0.55), vec3(0.75, 0.0040, 0.40),
+    vec3(0.45, 0.0022, 0.30), vec3(0.27, 0.0012, 0.22));
+// How far the ripples shift the view of the bed, in metres per unit of slope,
+// at a metre of water or more; less in the shallows, none at the shore.
+const float REFRACTION = 0.6;
+// Water's reflectance head-on (an index of 1.33).
+const float WATER_F0 = 0.02;
+
+// View-space distance of a depth-buffer value (the projection's near and
+// far, [0, 1] depth).
+float linear_depth(float d) {
+    float n = g.cluster_params.x;
+    float f = g.cluster_params.y;
+    return n * f / (f - d * (f - n));
+}
+
+// The rippled surface's normal at world `p` (xz) and time `t`: the gradient
+// of the sum of the waves' heights.
+vec3 water_normal(vec2 p, float t) {
+    vec2 grad = vec2(0.0);
+    for (int i = 0; i < 4; ++i) {
+        float k = 2.0 * PI / WAVE[i].x;
+        float phase = k * (dot(WAVE_DIR[i], p) - WAVE[i].z * t);
+        grad += WAVE_DIR[i] * (WAVE[i].y * k * cos(phase));
+    }
+    return normalize(vec3(-grad.x, 1.0, -grad.y));
+}
+
+void main() {
+    Material m = materials[v_material];
+    // What the water itself looks like where it's deep, and how far light
+    // gets through it before 1/e is left (`params.w`, render::GpuMaterial).
+    vec3 deep = m.base_color_factor.rgb;
+    float clarity = max(m.params.w, 1e-3);
+    float roughness = clamp(m.params.x, 0.02, 1.0);
+    const vec3 up = vec3(0.0, 1.0, 0.0);
+    vec3 N = water_normal(v_world_pos.xz, g.light_params.y);
+
+    vec3 to_eye = pc.camera_pos.xyz - v_world_pos;
+    float dist = length(to_eye);
+    vec3 V = to_eye / max(dist, 1e-6);
+
+    // How deep the water is behind this pixel: the opaque scene's depth less
+    // the surface's, in view space.
+    vec2 size = vec2(textureSize(u_scene, 0));
+    vec2 uv = gl_FragCoord.xy / size;
+    float z_surface = linear_depth(gl_FragCoord.z);
+    float z_bed = linear_depth(texelFetch(u_scene_depth, ivec2(gl_FragCoord.xy), 0).r);
+    float depth = max(z_bed - z_surface, 0.0);
+    // The bed seen through the ripples: shifted on screen by the slope, as
+    // much as the water is deep. Where the shifted look lands on something
+    // in front of the water (a bank, a post), the shift is dropped.
+    vec2 shift = N.xz * REFRACTION * min(depth, 1.0) / (2.0 * z_surface * g.cluster_proj.xy);
+    vec2 ruv = uv + shift;
+    float z_r = linear_depth(textureLod(u_scene_depth, ruv, 0.0).r);
+    if (z_r <= z_surface) {
+        ruv = uv;
+        z_r = z_bed;
+    }
+    vec3 bed = textureLod(u_scene, ruv, 0.0).rgb;
+    // The light's path through the water to the bed and back up this view
+    // ray: view-space depth scales to distance along it.
+    float path = max(z_r - z_surface, 0.0) * dist / max(z_surface, 1e-4);
+    float transmit = exp(-path / clarity);
+
+    // Light in the water itself: the sky it sees and the sun, on its colour.
+    vec3 L = normalize(-pc.light_dir.xyz);
+    vec4 sv = sky_visibility(v_world_pos + up / g.sky_origin.w);
+    float shadow = sun_shadow(v_world_pos, up);
+    vec3 lit = sky_irradiance_occluded(up, sv) + SUN_RADIANCE * shadow * max(L.y, 0.0);
+    vec3 below = mix(deep * lit / PI, bed, transmit);
+
+    // The surface: Fresnel between what's below and the sky it mirrors, then
+    // the sun's and the lamps' highlights.
+    float ndv = max(dot(N, V), 1e-4);
+    vec3 R = reflect(-V, N);
+    float fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - ndv, 5.0);
+    vec3 color = mix(below, sky(R) * sky_specular(sv, R), fresnel);
+    vec3 f0 = vec3(WATER_F0);
+    vec3 H = normalize(V + L);
+    float ndl = max(dot(N, L), 0.0);
+    float ndh = max(dot(N, H), 0.0);
+    float hdv = max(dot(H, V), 0.0);
+    vec3 spec = distribution_ggx(ndh, roughness) * geometry_smith(ndv, ndl, roughness)
+              * fresnel_schlick(hdv, f0) / (4.0 * ndv * ndl + 0.0001);
+    color += spec * SUN_RADIANCE * ndl * shadow;
+    uint cluster = cluster_index(v_world_pos);
+    for (uint w = 0; w < CLUSTER_WORDS; ++w) {
+        uint bits = cluster_masks[cluster * CLUSTER_WORDS + w];
+        while (bits != 0u) {
+            uint b = uint(findLSB(bits));
+            bits &= bits - 1u;
+            color += punctual(lights[w * 32u + b], N, V, R, v_world_pos, vec3(0.0), f0, roughness, 0.0);
+        }
+    }
+
+    // Height fog along the view ray, as on everything else.
+    vec3 dir = -V;
+    float fog = 1.0 - exp(-fog_optical_depth(pc.camera_pos.xyz, dir, dist));
+    color = mix(color, fog_color(dir), fog);
+    o_color = vec4(color, 1.0);
+}
+#else
 void main() {
     Material m = materials[v_material];
     vec3 albedo = texture(textures[nonuniformEXT(m.tex.x)], v_uv).rgb * m.base_color_factor.rgb;
@@ -646,3 +764,4 @@ void main() {
 
     o_color = vec4(color, 1.0);
 }
+#endif
