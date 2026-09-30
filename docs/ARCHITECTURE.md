@@ -2960,6 +2960,15 @@ being pure, it is also unit-tested without a GPU. A click off the entries does
 nothing, and hovering off them leaves the selection alone so Enter always has a
 target.
 
+**Landed (§26): the game HUD.** The same UiPass draws it while playing: a
+crosshair (centre dot + four arms), a hit marker that fades over 12 frames
+when a shot lands (`Score.last_hit_frame`; four blocks on the diagonals, the
+atlas having no rotated rects), a health bar and number bottom-left, and the
+kill count bottom-right. The layout is a pure function of the framebuffer
+size (`app/src/hud.rs`, `menu_layout`'s pattern), unit-tested at three sizes.
+It reads `Health` and `Score` straight off the world, and draws only when a
+session is live and unpaused — never over the menus, never under `--bench`.
+
 Still pending: **egui** for the dev UI (this is the *game* HUD path, not a
 replacement for it), SDF/MSDF text for scale-independent glyphs, and lower-case
 and punctuation.
@@ -2990,6 +2999,12 @@ and punctuation.
   turns the player's motion into footsteps (per 1.6 m on the ground), jump
   (leaving the ground while rising; walking off a ledge is silent) and landing
   (after falling faster than 3 m/s, louder the harder). All non-spatial, on SFX.
+- **Shots:** the hitscan weapon's sound is one synthesised clip (a noise
+  burst whose low-pass closes over it: crack, then dull body), played on the
+  render clock when `Score.shots` advances — the fixed step counts, the
+  frame plays, exactly once. Always synthesised: the pack has no gunshot.
+  The app's `last_shots` resets per session so a new game doesn't inherit
+  the count.
 - **Lamps:** every visible lamp (a point light on geometry) gets a *spatial*
   AMBIENCE sub-track looping a seamless 60 Hz hum, attenuated out to the
   light's radius. Bare light markers stay silent, which also keeps the
@@ -3489,6 +3504,13 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   health; the body teleported), noclip exempt. The zone sets `kill_y`
   explicitly, below its pond bed. 5 tests, each shown a failing mutation,
   incl. an app e2e on the real schedule.
+- **HUD + shot sound (§19/§20):** the game HUD (crosshair, hit marker,
+  health bar, kills) is a pure layout over the UiPass — menu_layout's
+  pattern — drawn only while playing, never in the menus or under `--bench`.
+  The shot sound is a synthesised clip played on the render clock when
+  `Score.shots` advances. 3 layout tests with mutation controls (the
+  left-half anchor among them), and the shot's peak in the clip
+  normalisation test.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
   sky visibility and GTAO (§13), *not* cubemap IBL;

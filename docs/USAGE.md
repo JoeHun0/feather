@@ -192,6 +192,10 @@ left-mouse fire aren't).
 | F11 | windowed / fullscreen |
 | Esc | pause |
 
+While playing you also get a HUD: a crosshair (with a brief flash when a
+shot lands), a health bar and number, and the kill count. It's hidden in
+`--bench`, where nothing may draw.
+
 **Menus:** mouse (hover + click) or arrows + Enter. **Esc** steps back one
 screen, and resumes play only from the pause menu's top level.
 
@@ -235,7 +239,8 @@ screen, and resumes play only from the pause menu's top level.
 **What you hear:** footsteps every ~1.6 m walked, sounding like what you
 stand on (concrete, grass, wood, carpet or snow, from the material's
 `surface` tag, §4; untagged is concrete), a jump sound, a thump on landings
-from more than a small step down (louder the harder), nothing in noclip, and
+from more than a small step down (louder the harder), a synthesised crack
+every shot, nothing in noclip, and
 a 60 Hz hum from every *visible* lamp (a point light on geometry, e.g. the
 testscene's two glowing orbs) that pans as you turn and fades out at the
 light's radius. Footsteps, jump and landing are **recorded** (Kenney Impact

@@ -77,6 +77,8 @@ pub enum SoundEvent {
     Jump,
     /// Touching down after falling at this speed (m/s).
     Land(f32),
+    /// The hitscan weapon firing.
+    Shot,
 }
 
 // ---- synthesis ----
@@ -147,6 +149,21 @@ pub fn land() -> Vec<f32> {
         .collect()
 }
 
+/// A hitscan shot: a sharp crack into a short dull body, ~120 ms. The
+/// low-pass closes over the burst, so it reads as a crack, not a hiss.
+pub fn shot() -> Vec<f32> {
+    let mut noise = Noise(0x5a17_0f15);
+    let mut lp = 0.0f32;
+    (0..seconds(0.12))
+        .map(|i| {
+            let t = i as f32 / SAMPLE_RATE as f32;
+            lp += (0.5 - 0.35 * (t / 0.12)).max(0.1) * (noise.next() - lp);
+            let env = (t / 0.001).min(1.0) * (-t / 0.025).exp();
+            lp * env * 1.2
+        })
+        .collect()
+}
+
 /// A lamp's electrical hum: one second of 60 Hz plus harmonics. Every partial
 /// fits a whole number of periods in the second, so the loop has no seam.
 pub fn hum() -> Vec<f32> {
@@ -199,6 +216,7 @@ pub const SOUNDS_DIR: &str = "scratch/assets/kenney_impact_sounds";
 const STEP_PEAK: f32 = 0.5;
 const JUMP_PEAK: f32 = 0.35;
 const LAND_PEAK: f32 = 0.8;
+const SHOT_PEAK: f32 = 0.6;
 
 /// A sound plus the gain (dB) that brings its peak to its event's target.
 #[derive(Clone)]
@@ -241,6 +259,8 @@ pub struct SoundSet {
     steps: [Vec<Clip>; Surface::ALL.len()],
     jumps: Vec<Clip>,
     lands: Vec<Clip>,
+    /// The hitscan weapon. Always synthesised — the pack has no gunshot.
+    shots: Vec<Clip>,
     pub recorded: usize,
     pub synthesised: usize,
     /// Why anything fell back, for the log.
@@ -266,6 +286,7 @@ impl SoundSet {
             steps: Default::default(),
             jumps: Vec::new(),
             lands: Vec::new(),
+            shots: Vec::new(),
             recorded: 0,
             synthesised: 0,
             notes: Vec::new(),
@@ -302,6 +323,10 @@ impl SoundSet {
             );
             set.lands.push(land);
         }
+        // The shot has no recorded counterpart in the pack; it's one
+        // synthesised clip, built directly rather than through `clip`'s
+        // recorded-then-fallback path (so it adds no fallback note).
+        set.shots.push(Clip::new(one_shot(shot()), SHOT_PEAK));
         // The other surfaces are recorded or nothing: if any file is missing
         // or broken, the whole surface uses the concrete steps, so a pack
         // fetched before the surfaces were kept sounds as it always did. No
@@ -445,7 +470,7 @@ pub struct Audio<B: Backend> {
     sounds: SoundSet,
     hum: StaticSoundData,
     /// Next variant per event (steps, jumps, landings).
-    next: [usize; 3],
+    next: [usize; 4],
     /// One spatial track per lamp; dropping a handle removes its track.
     lamps: Vec<SpatialTrackHandle>,
 }
@@ -496,7 +521,7 @@ impl<B: Backend> Audio<B> {
             ambience,
             sounds,
             hum: sound(hum()).loop_region(..),
-            next: [0; 3],
+            next: [0; 4],
             lamps: Vec::new(),
         })
     }
@@ -532,6 +557,7 @@ impl<B: Backend> Audio<B> {
                 let loud = ((speed - LAND_SPEED) / 7.0).clamp(0.3, 1.0);
                 (2, &self.sounds.lands, 20.0 * loud.log10())
             }
+            SoundEvent::Shot => (3, &self.sounds.shots, 0.0),
         };
         self.next[slot] = (self.next[slot] + 1) % clips.len();
         let data = clips[self.next[slot]].play(extra_db);
@@ -695,6 +721,7 @@ mod tests {
             (&steps, STEP_PEAK),
             (&set.jumps, JUMP_PEAK),
             (&set.lands, LAND_PEAK),
+            (&set.shots, SHOT_PEAK),
         ] {
             for c in clips {
                 let peak = c

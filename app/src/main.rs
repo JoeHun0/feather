@@ -29,9 +29,10 @@
 
 mod audio;
 mod config;
+mod hud;
 mod menu;
 
-use audio::{Audio, AudioSettings, StepTracker};
+use audio::{Audio, AudioSettings, SoundEvent, StepTracker};
 use config::controls::{Action, Controls};
 use menu::{menu_hit, menu_layout, ControlsSave, Menu, MenuOutcome, MenuScreen};
 
@@ -493,6 +494,9 @@ struct App {
     audio: Option<Audio<kira::DefaultBackend>>,
     /// Turns the player's motion into footsteps / jump / landing sounds.
     steps: StepTracker,
+    /// `Score.shots` last frame, so a shot the fixed step counted plays its
+    /// sound exactly once on the render clock (§20).
+    last_shots: u32,
     /// Keys currently down, so an action bound to several keys stays held
     /// until the last of them is released.
     held_keys: HashSet<KeyCode>,
@@ -670,6 +674,7 @@ impl App {
             audio_file,
             audio,
             steps: StepTracker::default(),
+            last_shots: 0,
             held_keys: HashSet::new(),
             paused: false,
             menu: Menu::new(),
@@ -915,6 +920,8 @@ impl App {
             eprintln!("[audio] {} lamps humming", a.lamp_count());
         }
         self.steps = StepTracker::default();
+        // So the new session's first frame can't inherit an old shot count.
+        self.last_shots = 0;
         // The level's sun and starting exposure (§13); its sky and fog go to
         // the GPU each frame.
         let env = session.environment;
@@ -1395,6 +1402,14 @@ impl ApplicationHandler for App {
                             for e in events {
                                 a.play(e);
                             }
+                            // A shot's sound on the render clock (§20): the
+                            // fixed step counted it, this frame plays it,
+                            // exactly once.
+                            let shots = s.world.resource::<feather_game::weapon::Score>().shots;
+                            if shots != self.last_shots {
+                                self.last_shots = shots;
+                                a.play(SoundEvent::Shot);
+                            }
                         }
                     }
                     let view_proj = look.view_proj(eye, aspect, fov_y);
@@ -1683,6 +1698,22 @@ impl ApplicationHandler for App {
                             // Text sits inset from the bar by the same padding
                             // the rect was grown by.
                             ui.text(rx + pad, ry + pad * 0.5, px, color, &row.label);
+                        }
+                    } else if self.bench.is_none() {
+                        // The HUD: crosshair, hit marker, health, kills (§19).
+                        // This arm means playing (session is Some, not
+                        // paused); never drawn in --bench, where nothing
+                        // may.
+                        let (w, h) = (size.width as f32, size.height as f32);
+                        if let Some(s) = self.session.as_ref() {
+                            let health = s
+                                .world
+                                .get::<feather_game::controller::Health>(s.player)
+                                .map(|h| (h.current / h.max).clamp(0.0, 1.0))
+                                .unwrap_or(1.0);
+                            let score = s.world.resource::<feather_game::weapon::Score>();
+                            let frame = s.world.resource::<FrameCount>().0;
+                            hud::draw(ui, w, h, health, score, frame);
                         }
                     }
                 }
