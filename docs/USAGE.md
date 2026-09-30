@@ -446,8 +446,15 @@ facing it.
 - **Atmosphere:** the level's `environment` marker (see the prefab table)
   makes it grey and hazy. Its values are starting points; tune them in
   `ENVIRONMENT` at the top of the script and regenerate.
-- **The app's slab:** the grey ground slab the app puts under every level is
-  under the mud. (The orb demo's brown boxes don't appear in loaded scenes.)
+- **The pond** is in the yard west of the hangar: round the hangar's west
+  side from the gate, about 20 m in, at (−21, −3). It's a hollow in the mud,
+  its bank sloping to a bed 1.1 m down, under murky water 15 cm below the
+  mud (ARCHITECTURE.md §10's water; `POND*` at the top of the script). You
+  can wade in: the bed holds you, and your eyes stay above the water.
+- **Its own ground:** the zone's `environment` says `ground: false`, so the
+  grey slab the app puts under other levels isn't there (it would fill the
+  pond). The mud is the ground, with the basin in its hole. (The orb demo's
+  brown boxes don't appear in loaded scenes either.)
 - **Options:** `--seed N` (props, missing fence panels, roof holes, and the
   trees' and bushes' shapes and places), `-o PATH`, `--check`. On top of the
   shared checks, the zone's `--check` reads the written vertices: no leaf or
@@ -469,6 +476,9 @@ facing it.
   bush collides, a trunk doesn't, or a trunk stands on the road or near the
   spawn.
 - **What to look for:**
+  - the pond: its colour and murk, the ripples' size and speed, the rim
+    where it meets the mud, the sky it mirrors (weather and time of day
+    change it), and any shimmer under TAA as you walk round it;
   - crowns lit on the sun side and darker away from it, not flat;
   - dappled cutout shadows under the trees and on the fence;
   - no dark or light fringes round the leaves;

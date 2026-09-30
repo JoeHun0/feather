@@ -46,6 +46,11 @@ What is in it
   cards are single-sided MASK with normals pointing out of the crown: the
   main pass doesn't cull, so both sides draw, lit as one soft volume. Trunks
   collide; crowns and bushes don't.
+* A pond in the yard west of the hangar (ARCHITECTURE.md §10's water): a
+  hollow in the mud, its bank sloping to a bed ~1.1 m down, under dark
+  water 15 cm below the mud. The level brings its own ground
+  (`environment`'s `ground: false`), since the app's slab would fill the
+  hollow.
 * Dim warm lamps in the hangar and the office, `player_start` outside the
   gate, and the overcast `environment`.
 
@@ -138,6 +143,8 @@ GATE = (-4.0, 4.0)  # x span of the gate in the south fence
 
 # Overcast, grey-green, hazy (§13): starting values, to be tuned by eye.
 ENVIRONMENT = {
+    # The level brings its own ground: the app's slab would fill the pond.
+    "ground": False,
     "sun_elevation": 35.0, "sun_azimuth": 210.0,
     "sun_color": [1.0, 0.92, 0.80], "sun_intensity": 2.5,
     "sky_zenith": [0.36, 0.39, 0.40], "sky_horizon": [0.58, 0.60, 0.56],
@@ -169,6 +176,21 @@ SPAWN_XZ = (0.0, 37.0)  # player_start, which foliage keeps 6 m from
 ROAD_X = 6.0  # the road and gate apron, |x| < this south of the hangar
 GRASS_TUFTS = 600
 GRASS_TUFT = (0.9, 0.55)  # width, height of each of a tuft's three cards
+
+# The pond: a hollow in the mud west of the hangar, where nothing else stands
+# (the app's slab is off, ENVIRONMENT's `ground`). A basin mesh fills POND's
+# rectangle: flat mud at its edges, a bank sloping to a bed POND_DEPTH down
+# in the middle of a wobbly oval POND_RADII across; the water lies
+# POND_WATER under the mud. Nothing else is placed in the rectangle, and
+# every such test runs after its candidate's random draws, so the rest of a
+# seed's level is exactly as it was without the pond.
+POND = (-26.0, -16.0, -7.0, 1.0)  # x0, x1, z0, z1
+POND_RADII = (3.6, 2.8)
+POND_DEPTH = 1.1
+POND_WATER = 0.15
+POND_CELL = 0.25  # the basin's grid
+POND_WATER_COLOR = [0.045, 0.05, 0.03]  # the water where it's deep (linear)
+POND_CLARITY = 0.35  # metres to 1/e: murky, the bed gone by about a metre
 
 FACES = {
     # face: (normal, the two in-plane axes (u, v) for UVs, as axis indices)
@@ -467,10 +489,86 @@ def wall(z, axis, fixed, a0, a1, y0, y1, thick, mats, openings=(), name="wall"):
     seg(pos, a1, y0, y1)
 
 
+def in_pond(x, zz, r=0.0):
+    """Whether a footprint of radius `r` at (x, zz) touches the pond's
+    rectangle."""
+    x0, x1, z0, z1 = POND
+    return x0 - r < x < x1 + r and z0 - r < zz < z1 + r
+
+
+def pond_depth(x, zz):
+    """How far the basin lies below the mud at (x, zz): 0 outside the
+    hollow (and so on the rectangle's edges), POND_DEPTH at its middle."""
+    x0, x1, z0, z1 = POND
+    dx = (x - (x0 + x1) / 2) / POND_RADII[0]
+    dz = (zz - (z0 + z1) / 2) / POND_RADII[1]
+    a = math.atan2(dz, dx)
+    # A hand-dug outline, not an ellipse. At most 1.25 radii out, which
+    # stays inside the rectangle.
+    wobble = 1.0 + 0.12 * math.sin(2 * a + 0.7) + 0.08 * math.sin(3 * a - 1.9) \
+        + 0.05 * math.sin(5 * a + 2.3)
+    s = 1.0 - math.hypot(dx, dz) / wobble  # 1 in the middle, 0 on the outline
+    t = min(max(s / 0.6, 0.0), 1.0)  # the bank is the outer 60%
+    return POND_DEPTH * t * t * (3 - 2 * t)
+
+
+def pond(z):
+    """The basin, a heightfield of mud over POND's rectangle (world-space
+    vertices, a trimesh collider, casting), and the water over it."""
+    x0, x1, z0, z1 = POND
+    nx, nz = round((x1 - x0) / POND_CELL), round((z1 - z0) / POND_CELL)
+    size = TEXTURES["mud"][1]
+    h = lambda x, zz: MUD_TOP - pond_depth(x, zz)
+    pos, nrm, uv, idx = [], [], [], []
+    for j in range(nz + 1):
+        for i in range(nx + 1):
+            x, zz = x0 + i * POND_CELL, z0 + j * POND_CELL
+            e = 0.05
+            n = (-(h(x + e, zz) - h(x - e, zz)) / (2 * e), 1.0,
+                 -(h(x, zz + e) - h(x, zz - e)) / (2 * e))
+            ln = math.sqrt(sum(c * c for c in n))
+            pos.append([x, h(x, zz), zz])
+            nrm.append([c / ln for c in n])
+            # The mud boxes' top-face UVs, so the texture runs on.
+            uv.append([x / size, -zz / size])
+    for j in range(nz):
+        for i in range(nx):
+            a = j * (nx + 1) + i
+            idx += [a, a + 1, a + nx + 2, a, a + nx + 2, a + nx + 1]
+    basin = z.mesh([(pos, nrm, uv, idx, z.material("mud"))], "pond_basin")
+    # Relief: a trimesh (it's concave, and too dense for `auto`), and it
+    # casts, unlike the flat ground.
+    z.place(basin, (0.0, 0.0, 0.0), extras={"prefab": "prop", "params": {"collider": "mesh"}},
+            name="pond_basin")
+    z.doc["materials"].append({
+        "name": "pond_water",
+        "pbrMetallicRoughness": {"baseColorFactor": POND_WATER_COLOR + [1.0],
+                                 "metallicFactor": 0.0, "roughnessFactor": 0.05},
+        "extras": {"shader": "water", "clarity": POND_CLARITY},
+    })
+    water_mat = len(z.doc["materials"]) - 1
+    y = MUD_TOP - POND_WATER
+    # One quad over the whole rectangle: where the basin is above it, the
+    # mud hides it.
+    corners = [[x0, y, z0], [x1, y, z0], [x1, y, z1], [x0, y, z1]]
+    water = z.mesh([(corners, [[0.0, 1.0, 0.0]] * 4, [[c[0], -c[2]] for c in corners],
+                     [0, 1, 2, 0, 2, 3], water_mat)], "pond_water")
+    z.place(water, (0.0, 0.0, 0.0),
+            extras={"prefab": "prop", "params": {"collide": False, "shadow": False}},
+            name="pond_water")
+
+
 def ground(z):
-    # Mud over the app's slab, then asphalt and concrete on the mud. All flat
-    # and shadowless (they cast nothing but would fill the shadow map).
-    z.box((-HALF, G, -HALF), (HALF, MUD_TOP, HALF), "mud", "mud", shadow=False)
+    # Mud everywhere but the pond's rectangle, which the basin fills; then
+    # asphalt and concrete on the mud. The flat parts are shadowless (they'd
+    # cast nothing but fill the shadow map).
+    x0, x1, z0, z1 = POND
+    for lo, hi in (((-HALF, G, -HALF), (HALF, MUD_TOP, z0)),
+                   ((-HALF, G, z1), (HALF, MUD_TOP, HALF)),
+                   ((-HALF, G, z0), (x0, MUD_TOP, z1)),
+                   ((x1, G, z0), (HALF, MUD_TOP, z1))):
+        z.box(lo, hi, "mud", "mud", shadow=False)
+    pond(z)
     x0, x1, z0, z1 = HANGAR
     z.box((GATE[0], MUD_TOP, z1), (GATE[1], PAVE_TOP, HALF), "asphalt", "road", shadow=False)
     for a, b in ((-16.0, GATE[0]), (GATE[1], 16.0)):
@@ -643,7 +741,8 @@ def props(z):
                                 lift=k * 0.165, check=(k == 0)))
     for _ in range(4):
         x, zz = rng.uniform(-28, 28), rng.uniform(-24, 26)
-        count("tyre", z.put("tyre", x, zz, rot=lying()))
+        rot = lying()
+        count("tyre", not in_pond(x, zz, 0.6) and z.put("tyre", x, zz, rot=rot))
     # On the walls: utility boxes (backs to the wall) and pipework.
     ox0, _, _, _ = OFFICE
     m = z.prop("utility_box")
@@ -839,7 +938,7 @@ def grass(z):
         (-16.4, 16.4, hz1, 22.4),  # the aprons
     ] + [(fx - 0.5, fx + 0.5, fz0 - 0.5, fz1 + 0.5) for fx in (fx0, fx1)] \
       + [(fx0 - 0.5, fx1 + 0.5, fz - 0.5, fz + 0.5) for fz in (fz0, fz1)]
-    placed = 0
+    placed = dropped = 0
     for _ in range(GRASS_TUFTS * 4):
         if placed == GRASS_TUFTS:
             break
@@ -851,10 +950,15 @@ def grass(z):
         aabb = ([x - r, MUD_TOP, zz - r], [x + r, MUD_TOP + h * scale, zz + r])
         if any(gts.overlaps(aabb, s_, 0.05) for s_ in z.solid):
             continue
-        z.place(tuft, (x, MUD_TOP, zz), yaw_q(rng.uniform(0, 360)),
-                {"prefab": "prop", "params": {"collide": False}}, name="grass", scale=scale)
+        yaw = rng.uniform(0, 360)
         placed += 1
-    return placed
+        if in_pond(x, zz, r):
+            # Dropped, not drawn again: every other tuft stays where it was.
+            dropped += 1
+            continue
+        z.place(tuft, (x, MUD_TOP, zz), yaw_q(yaw),
+                {"prefab": "prop", "params": {"collide": False}}, name="grass", scale=scale)
+    return placed - dropped
 
 
 # --- trees and bushes ---------------------------------------------------------
@@ -1180,6 +1284,8 @@ def foliage(z):
             if pokes_into(placed_pts(crown_pts, t, rot, scale),
                           [s for s in z.solid if id(s) not in z.crown_through]):
                 continue
+            if in_pond(x, zz, r):
+                continue  # a crown may lean over the water; a trunk stays out
             z.place(trunk, t, rot, {"prefab": "prop", "params": {}}, name="tree_trunk", scale=scale)
             z.place(crown, t, rot, {"prefab": "prop", "params": {"collide": False}},
                     name="tree_crown", scale=scale)
@@ -1205,7 +1311,8 @@ def foliage(z):
             t = (x, MUD_TOP, zz)
             # That box is the bush's middle; its leaves reach further.
             if not on_ground(z, (bush,), t, rot, scale) \
-                    or pokes_into(placed_pts(pts, t, rot, scale), z.solid):
+                    or pokes_into(placed_pts(pts, t, rot, scale), z.solid) \
+                    or in_pond(x, zz, r):
                 continue
             z.place(bush, t, rot, {"prefab": "prop", "params": {"collide": False}},
                     name="bush", scale=scale)

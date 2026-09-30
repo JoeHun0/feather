@@ -689,9 +689,25 @@ draws there, and nowhere else.
 - **Its cost** on that scene's sweep: `transp` median 0.00, p90 0.04 ms (1×)
   and 0.06 ms (MSAA 4×), and up to 0.42–0.47 ms with water filling the view
   up close, about what the opaque pass costs on as many pixels.
+- **In the zone:** a pond west of the hangar (USAGE §4), in a hollow the
+  level digs for itself (`ground: false`, §18). The generator keeps every
+  other node of seed 11 where it was (a node-by-node diff: the mud split in
+  four, 5 grass tufts dropped, the basin and the water added), and seeds
+  1–200 pass `--check`, which fails the pond without `ground: false`.
+  - A player dropped in it stands on the bed (feet −10.06 at the middle,
+    whose bed is at −10.08), and eyes stay above the water.
+  - Sync validation is 0 at 1× and TAA off, and after the filter under
+    MSAA 4×.
+  - Views from the bank and from above are HDR-dumped with no NaNs.
+  - Cost: bench medians with and without the pond are equal (3 interleaved
+    rounds, the same binary). The spawn's sweep has the pond in the frustum,
+    though mostly behind the fence, so `transp` (the copy) is 0.03 ms at
+    p90.
 - **Limits:**
   - No scene reflections (SSR is §3's hook) and nothing under water: the
     camera just goes through the surface.
+  - The pass runs whenever water is in the frustum, hidden or not
+    (culling has no occlusion), so the copy is paid behind walls too.
   - TAA reprojects the water with the bed's depth, since the water writes
     none, so it may smear a little while you move.
   - The ripples' time is an f32 of seconds, fine for hours.
@@ -3240,7 +3256,9 @@ instancing thesis, visible) + **water** (transparent bucket, custom material,
 pre-transparent resolve — the highest-value test) + masked foliage/fence + one
 dynamic light. Walkable in first person. Zone flavor (overcast, ground fog,
 concrete/rust) doubles as qualitative feature tests. Use original/CC0 props, not
-ripped SoC assets, so a public showcase is clean.
+ripped SoC assets, so a public showcase is clean. (Landed, §26: the zone has
+all of it now. Its water is the pond: the transparent pass, a water material,
+and the opaque scene kept before it, §10.)
 
 ## 24. Reversible-only-with-pain forks (decide before the dependent step)
 
@@ -3588,7 +3606,8 @@ pending**, and since array layers share an extent all
 cascades are the same resolution. Shadows now reach `SHADOW_DISTANCE` (60) rather
 than a ±16 box;
 transparents (alpha
-*cutout* landed, §5; BLEND still draws opaque); asset
+*cutout* landed, §5; the transparent pass draws water, §10, and BLEND still
+draws opaque); asset
 bake pipeline (runtime glTF scene loading + multi-mesh registry landed, and
 the **texture bake** — BC7 mip chains in a content-addressed cache, §17 — then
 the mesh LOD bake and a per-scene **sky-visibility volume**, §17; material /
