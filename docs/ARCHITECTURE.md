@@ -2789,6 +2789,13 @@ per node, so it follows the geometry into every placement. The loader passes
 the name through unchecked (`Material::surface`) and the app resolves it once
 per mesh, just as leniently: an unknown name warns once and means concrete.
 
+**Landed (§26): a level can bring its own ground.** The `environment`
+marker's `ground: false` leaves out the engine's 80×80 slab at `GROUND_Y`,
+so a level can dig below it (the zone's pond) and has only what it built
+underfoot. The default keeps the slab, so every other level is as before.
+A test builds a level both ways: without the slab, a probe finds nothing
+where it was, and a player with nothing under them falls through.
+
 **Pending:** chunk membership; the bake path (§17), since glTF is still parsed
 at runtime; and prefabs for lights and triggers, both blocked on the systems
 that would consume them. The registry lives in `game` (`prefab.rs`) beside

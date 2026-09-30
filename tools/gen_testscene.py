@@ -989,6 +989,11 @@ def check(doc, strict_dedup=True):
     keep = keep_out_boxes()
     mesh_nodes = 0
     referenced = set()
+    # A level whose `environment` says `ground: false` brings its own ground
+    # (ARCHITECTURE.md §18), so it may dig below GROUND_Y (a pond's basin).
+    own_ground = any(n.get("extras", {}).get("prefab") == "environment"
+                     and n["extras"].get("params", {}).get("ground") is False
+                     for n in doc["nodes"])
     for ni, node in enumerate(doc["nodes"]):
         if "mesh" not in node:
             continue
@@ -1002,7 +1007,7 @@ def check(doc, strict_dedup=True):
             if aabb[0][axis] < -GROUND_HALF or aabb[1][axis] > GROUND_HALF:
                 errors.append(f"node {ni} ({name}): extends past the {GROUND_HALF*2:.0f}"
                               f"x{GROUND_HALF*2:.0f} ground on axis {'xyz'[axis]}")
-        if aabb[0][1] < GROUND_Y - 0.01:
+        if aabb[0][1] < GROUND_Y - 0.01 and not own_ground:
             errors.append(f"node {ni} ({name}): sinks below GROUND_Y "
                           f"({aabb[0][1]:.2f} < {GROUND_Y})")
         # Ground cover (a flat decal lying on the ground, e.g. the nature

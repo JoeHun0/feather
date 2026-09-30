@@ -2481,6 +2481,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A level whose `environment` says `ground: false` (§18) gets no slab:
+    /// probing it finds nothing, and a player with nothing under them falls
+    /// past where its top was. The same level without the param has both.
+    #[test]
+    fn a_level_can_bring_its_own_ground() {
+        let dir = crate::config::test_dir("e2e-own-ground");
+        std::fs::create_dir_all(&dir).unwrap();
+        let level = |ground: Option<bool>| {
+            let params = match ground {
+                Some(g) => format!(r#"{{ "ground": {g} }}"#),
+                None => "{}".to_string(),
+            };
+            let path = dir.join(format!("ground-{ground:?}.gltf"));
+            let gltf = format!(
+                r#"{{
+  "asset": {{ "version": "2.0" }},
+  "scene": 0,
+  "scenes": [ {{ "nodes": [0, 1] }} ],
+  "nodes": [
+    {{ "name": "environment", "extras": {{ "prefab": "environment", "params": {params} }} }},
+    {{ "name": "player_start", "translation": [20.0, {y}, 20.0],
+       "extras": {{ "prefab": "player_start" }} }}
+  ]
+}}"#,
+                y = GROUND_Y
+            );
+            std::fs::write(&path, gltf).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let probe = |b: &WorldBuild| {
+            let ph = b.world.resource::<Physics>();
+            let queries = ph.broad_phase.as_query_pipeline(
+                ph.narrow_phase.query_dispatcher(),
+                &ph.bodies,
+                &ph.colliders,
+                QueryFilter::default(),
+            );
+            let slab = Vec3::new(-20.0, GROUND_Y - 0.5, -20.0);
+            let hit = queries.intersect_point(to_rapier(slab)).next().is_some();
+            hit
+        };
+        let feet_after_a_second = |mut b: WorldBuild| {
+            for _ in 0..60 {
+                b.schedule.run(&mut b.world);
+            }
+            b.world.get::<Player>(b.player).unwrap().pos.y
+        };
+        for ground in [None, Some(true)] {
+            let b = build_world(&[level(ground)], None);
+            assert!(probe(&b), "{ground:?}: the slab is there");
+            let y = feet_after_a_second(b);
+            assert!((y - GROUND_Y).abs() < 0.05, "{ground:?}: stood at {y}");
+        }
+        let b = build_world(&[level(Some(false))], None);
+        assert!(!probe(&b), "no slab");
+        assert!(
+            feet_after_a_second(b) < GROUND_Y - 1.0,
+            "and nothing to stand on"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The same level with no tags: nothing but concrete, so what the tagged
     /// walk heard came from the tags.
     #[test]

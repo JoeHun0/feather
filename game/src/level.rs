@@ -104,7 +104,8 @@ pub fn player_start(nodes: &[feather_assets::SceneNode]) -> (Vec3, Option<f32>) 
 }
 
 /// The parameters an `environment` marker (§13, §18) may carry.
-pub const ENVIRONMENT_PARAMS: [&str; 26] = [
+pub const ENVIRONMENT_PARAMS: [&str; 27] = [
+    "ground",
     "wind_speed",
     "wind_azimuth",
     "weather",
@@ -132,6 +133,25 @@ pub const ENVIRONMENT_PARAMS: [&str; 26] = [
     "exposure_min",
     "exposure_max",
 ];
+
+/// Whether the level stands on the engine's ground, the 80×80 slab whose
+/// top is `GROUND_Y`: the first `environment` marker's `ground`, true
+/// unless it says false. A level that brings its own (relief, or a hole for
+/// a pond, §18) says false, and nothing is under it but what it built.
+/// Also the params it couldn't read.
+pub fn level_ground(nodes: &[feather_assets::SceneNode]) -> (bool, Vec<String>) {
+    let spec = nodes
+        .iter()
+        .filter_map(|n| n.prefab.as_ref())
+        .find(|s| s.id == "environment");
+    match spec.filter(|s| s.params.get("ground").is_some()) {
+        None => (true, Vec::new()),
+        Some(s) => match s.bool("ground") {
+            Some(ground) => (ground, Vec::new()),
+            None => (true, vec!["ground".to_string()]),
+        },
+    }
+}
 
 /// The level's wind (§15's ropes sway in it): the first `environment`
 /// marker's `wind_speed` (m/s, at least 0) and `wind_azimuth` (the direction
@@ -384,6 +404,8 @@ pub fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> Wor
     bad_params.extend(bad_wind);
     let (level_weather, bad_weather) = level_weather(&scene_nodes);
     bad_params.extend(bad_weather);
+    let (ground, bad_ground) = level_ground(&scene_nodes);
+    bad_params.extend(bad_ground);
     for key in bad_params {
         eprintln!("[scene] environment: can't use param {key:?}; ignored");
     }
@@ -488,17 +510,20 @@ pub fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> Wor
     // scaled unit cube and given a matching cuboid collider (`spawn_static`).
     // Level pieces carry no Velocity/Spin, so `integrate` skips them and they
     // never wrap.
-    let ground = spawn_static(
-        &mut world,
-        Vec3::new(0.0, GROUND_Y - 0.5, 0.0),
-        Vec3::new(80.0, 1.0, 80.0),
-        MESH_LEVEL_CUBE,
-        ground_mat,
-    );
-    // This ground is a flat slab: it casts nothing useful but would rasterize
-    // the whole shadow map. It still *receives* shadows (receiving is sampling
-    // the map, not being in it). Relief terrain would drop this marker.
-    world.entity_mut(ground).insert(NoShadowCast);
+    // Unless the level brings its own ground.
+    if ground {
+        let ground = spawn_static(
+            &mut world,
+            Vec3::new(0.0, GROUND_Y - 0.5, 0.0),
+            Vec3::new(80.0, 1.0, 80.0),
+            MESH_LEVEL_CUBE,
+            ground_mat,
+        );
+        // This ground is a flat slab: it casts nothing useful but would
+        // rasterize the whole shadow map. It still *receives* shadows
+        // (receiving is sampling the map, not being in it).
+        world.entity_mut(ground).insert(NoShadowCast);
+    }
     // The demo's obstacle boxes, like its orbs, only when no scene was given:
     // a loaded level is the level, and five brown boxes in its middle aren't
     // part of it.
@@ -860,6 +885,36 @@ mod tests {
             (el2 - 10.0).abs() < 1e-3 && (az2 - az).abs() < 1e-3,
             "{el2} {az2}"
         );
+    }
+
+    /// `ground` (§18): the engine's slab unless the level says false; a
+    /// value that isn't a bool is reported and keeps the slab.
+    #[test]
+    fn the_environment_says_whether_the_level_brings_its_ground() {
+        assert_eq!(level_ground(&[]), (true, Vec::new()), "no marker: the slab");
+        let marker = |params| feather_assets::SceneNode {
+            mesh: None,
+            transform: Mat4::IDENTITY,
+            prefab: Some(feather_assets::PrefabSpec {
+                id: "environment".into(),
+                params,
+            }),
+        };
+        let with = |p| level_ground(&[marker(p)]);
+        assert_eq!(with(serde_json::json!({})), (true, Vec::new()));
+        assert_eq!(
+            with(serde_json::json!({ "ground": false })),
+            (false, Vec::new())
+        );
+        assert_eq!(
+            with(serde_json::json!({ "ground": true })),
+            (true, Vec::new())
+        );
+        assert_eq!(
+            with(serde_json::json!({ "ground": "no" })),
+            (true, vec!["ground".to_string()])
+        );
+        assert!(ENVIRONMENT_PARAMS.contains(&"ground"));
     }
 
     #[test]
