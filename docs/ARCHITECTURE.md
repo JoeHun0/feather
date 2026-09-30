@@ -1444,7 +1444,7 @@ groundwork. Nothing about a level's look is baked into a pipeline any more.
   `lights120` (after §8's filter).
 
 **Landed (§26): the weather engine (groundwork).** The weather and the time
-of day, built as X-Ray builds them. `app/src/weather.rs` is plain data and
+of day, built as X-Ray builds them. `game/src/weather.rs` is plain data and
 maths, testable without a GPU. Each frame `SessionWeather::frame` turns the
 level's `Environment`, the clock and the chosen weather into that frame's
 `Environment` and light direction.
