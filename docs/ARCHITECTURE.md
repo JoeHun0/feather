@@ -557,7 +557,8 @@ triangle with `LESS_OR_EQUAL` and no depth write, so it survives only where the
 depth buffer is still the cleared 1.0 and shades just the visible background
 instead of the whole screen — **geo 3.0 → 2.8 ms**. It shares `fullscreen.vert`
 with the tonemap pass, which is unaffected because that pass renders with no depth
-attachment. Still pending here: no MSAA resolve or transparent pass. (The
+attachment. Still pending here: no MSAA resolve or transparent pass (both
+landed since: the pass list's transparent seam, below). (The
 cluster pass landed — §12 — as a compute dispatch between shadow and geometry,
 guarded by a legacy `vkCmdPipelineBarrier` until the sync2 pass.)
 
@@ -3031,7 +3032,7 @@ and punctuation.
   SSR/volumetrics cost gets judged. **Landed** (§26): a timestamp query pool in
   `gfx` brackets the shadow, geometry, and post passes, reads back after the frame
   fence (no stall), and logs smoothed per-pass ms to stderr (`[gpu] shadow … cluster … geo …
-  ao … taa … bloom … expo … post … frame …`), with a `Renderer::gpu_times` accessor for a future overlay.
+  ao … transp … taa … bloom … expo … post … frame …`), with a `Renderer::gpu_times` accessor for a future overlay.
   **Caveat when reading these numbers:** absolute per-pass ms shift with overall
   GPU load/clock state — the fixed-size shadow pass measured 2.5 ms with a small
   window and 4.7 ms with a large one, unchanged work. Only compare A/B runs taken

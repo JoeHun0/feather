@@ -803,7 +803,7 @@ Everything goes to stderr.
 | `[gfx] device: …` | the GPU picked at startup. Check it: machines with an iGPU + dGPU list both |
 | `[gfx] MSAA: …` | requested vs actual sample count |
 | `[vulkan] …` | validation messages (debug builds), or the "layer not found" warning |
-| `[gpu] shadow … cluster … geo … ao … taa … bloom … expo … post … frame …` | smoothed per-pass GPU ms, about once a second |
+| `[gpu] shadow … cluster … geo … ao … transp … taa … bloom … expo … post … frame …` | smoothed per-pass GPU ms, about once a second |
 | `[quality] shadows / fxaa / taa / bloom / auto exposure: …` | a setting changed |
 | `[config] …` | a config file created / loaded / renamed, a line ignored or a key bound twice, plus the effective graphics settings at startup |
 | `[light] N visible lights exceeds MAX_LIGHTS` | lights past 128 were dropped this frame |
