@@ -859,6 +859,8 @@ dependencies = [
  "feather-platform",
  "feather-render",
  "glam 0.29.3",
+ "rapier3d",
+ "serde_json",
 ]
 
 [[package]]

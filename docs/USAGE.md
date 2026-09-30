@@ -586,7 +586,7 @@ OCCLUSION, live):
 ## 5. Tests
 
 `cargo test --workspace` runs 247 tests, in a few seconds once built (the
-app's, which step rapier and the mixer, take most of it).
+ones that step rapier, the ropes and the mixer take most of it).
 All of them are CPU-side: none needs a GPU, a window, a sound card or
 anything in `scratch/`, so they pass on a fresh clone.
 
@@ -600,7 +600,7 @@ cargo test --workspace a_scene_steps -- --nocapture                         # an
 ```
 
 - A filter matches the full test name, module included, as the output
-  prints it (`test audio::tests::surface_names_round_trip ... ok`).
+  prints it (`test surface::tests::surface_names_round_trip ... ok`).
   `--exact` needs that full name. And always `--workspace` (§2).
 - Each crate is its own test binary with its own `test result:` line. To
   total them:
@@ -619,11 +619,11 @@ directly. Reuse them when you add one:
 
 | Seam | What a test can do with it | Helpers |
 |---|---|---|
-| The controller is plain functions (`player_target`, `player_readback`) that the ECS systems wrap | step the real controller against real rapier colliders | `setup(boxes, start)` builds `Physics` with the ground and boxes; `step(…)` runs one tick, `run(…)` several (`app/src/main.rs`) |
-| Prefabs spawn from a `World` and `SpawnArgs` | spawn one node the way a scene does, then inspect its entity and collider | `prefab_world()`, `spawn_one(…)` (`app/src/main.rs`) |
+| The controller is plain functions (`player_target`, `player_readback`) that the ECS systems wrap | step the real controller against real rapier colliders | `setup(boxes, start)` builds `Physics` with the ground and boxes; `step(…)` runs one tick, `run(…)` several (`game/src/testing.rs`) |
+| Prefabs spawn from a `World` and `SpawnArgs` | spawn one node the way a scene does, then inspect its entity and collider | `prefab_world()`, `spawn_one(…)` (`game/src/prefab.rs`), `node(…)` (`game/src/testing.rs`) |
 | `Audio<B: Backend>` is generic over kira's backend | play through the real mixer into a buffer and measure what came out | the `Capture` backend, `audio(…)`, `peak(…)` (`app/src/audio.rs`) |
 | `Menu` needs neither the renderer nor the event loop | drive every screen, row and rebind; hit-test the layout at any window size | the menu tests in `app/src/main.rs` |
-| `build_world` is `Session::new` without the GPU upload | load a scene file into the game's own world and run the real schedule | `write_pad_level(…)`, `walk_pad_level(…)` (`app/src/main.rs`); next section |
+| `build_world` (`game/src/level.rs`) is `Session::new` without the GPU upload | load a scene file into the game's own world and run the real schedule | `write_pad_level(…)`, `walk_pad_level(…)` (`app/src/main.rs`); next section |
 | glTF can be written at test time | use real files without committing binaries | `write_fixture(…)` (`assets/src/lib.rs`), `write_pad_level(…)` |
 
 Temp directories come from `config::test_dir(name)` in `app` and

@@ -2676,9 +2676,8 @@ per mesh, just as leniently: an unknown name warns once and means concrete.
 
 **Pending:** chunk membership; the bake path (§17), since glTF is still parsed
 at runtime; and prefabs for lights and triggers, both blocked on the systems
-that would consume them. The registry lives in `app` beside the components it
-spawns; §22 wants it in `game`, which is blocked on moving the components
-there.
+that would consume them. The registry lives in `game` (`prefab.rs`) beside
+the components it spawns.
 
 - **Save/load is separate from scene loading.** Do **not** serialize the whole
   `World` (GPU/physics handles aren't serializable). Mark a **saveable subset**:
@@ -3085,6 +3084,10 @@ bake/      standalone offline CLI (import → runtime blobs)
 app        thin binary wiring it together
 ```
 
+**Landed (§26):** `game` holds the simulation and `app` the window, the
+frame, the GPU session, menus, config and audio. The pass order is still in
+`gfx` (`Renderer::draw_frame`), not `render`.
+
 ## 23. Build order (milestones)
 
 1. Clear screen (bootstrap, done) → triangle → textured mesh with camera
@@ -3148,15 +3151,23 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   `default-members = ["app"]` so plain `cargo run` means the game),
   `rust-toolchain.toml` (stable), GLSL→SPIR-V
   at build time via `shaderc` in `render/build.rs`, embedded from `OUT_DIR`.
+- **Crate split (§22)**: `game` owns the simulation: the ECS components and
+  systems, `Physics` (rapier), the FPS controller, point lights and their
+  extract, prefabs and colliders, level loading and `build_world`, ropes,
+  the weather and footstep surfaces. `render` has the cascade maths and the
+  view frustum. `app` keeps the window and event loop, the frame itself (in
+  `window_event`), `Session` (the GPU half of a world), menus, config, audio
+  (with `StepTracker`) and `--bench`. Still to split: the frame in
+  `window_event`, and the pass order out of `gfx` into `render`.
 - **Deps in use**: ash 0.38, ash-window 0.13, raw-window-handle 0.6, winit 0.30,
   vk-mem 0.4, glam 0.29, bevy_ecs 0.16, serde 1, rapier3d `=0.35.3` (exact
   pin; default features). rapier 0.35 builds on its own newer glam (0.33, via
   `glamx`) rather than nalgebra, so its `Vector`/`Pose` are *not* the workspace's
-  glam 0.29 `Vec3` — `app` converts at the boundary (`to_rapier`/`from_rapier`)
+  glam 0.29 `Vec3` — `game` converts at the boundary (`to_rapier`/`from_rapier`)
   until the workspace glam is bumped to match. Also `gltf 1` (`import`, `utils`,
   `extras` and `names` features, pulling in the `image` crate) and `serde_json 1`
   in `assets` — the latter for §18 prefab params, already in the tree via gltf.
-  `app` has `serde_json` as a dev-dependency only. `xxhash-rust` (xxh3) in
+  `app` and `game` have `serde_json` as a dev-dependency only. `xxhash-rust` (xxh3) in
   `assets` for the baked-texture content key; `intel_tex_2` (Intel's ISPC BCn
   encoder) in `bake` only, so the engine never links it. `kira =0.12.5` (on
   cpal, Ogg Vorbis decoding only) and `mint` in `app`, for §20 audio.

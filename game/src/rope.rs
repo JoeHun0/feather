@@ -154,7 +154,7 @@ impl Rope {
         }
     }
 
-    /// Where it hangs from (tests read it; the app's spawn test is one).
+    /// Where it hangs from.
     pub fn anchor(&self) -> Vec3 {
         self.points[0]
     }
