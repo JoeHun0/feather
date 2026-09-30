@@ -28,6 +28,7 @@ pub fn step(p: &mut Player, ph: &mut Physics, wish: Vec3, jump: bool, vgo: f32, 
     let input = InputState {
         wish,
         jump,
+        fire: false,
         vertical: vgo,
         noclip,
     };

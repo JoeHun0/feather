@@ -311,6 +311,7 @@ struct Input {
     up: bool,
     down: bool,
     jump: bool, // latched on the jump action's press edge; consumed by the fixed step
+    fire: bool, // latched on LMB press while playing; consumed by the fixed step
     mouse_dx: f32,
     mouse_dy: f32,
 }
@@ -1265,6 +1266,14 @@ impl ApplicationHandler for App {
                             self.handle_menu_outcome(outcome, event_loop);
                         }
                     }
+                } else if self.session.is_some()
+                    && !self.menu_active()
+                    && button == MouseButton::Left
+                    && state == ElementState::Pressed
+                {
+                    // Fire, hard-wired to LMB during play (§14) like the menu
+                    // keys: mouse buttons aren't bindable in `Controls` yet.
+                    self.input.fire = true;
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1334,6 +1343,7 @@ impl ApplicationHandler for App {
                         state.vertical = vgo;
                         state.noclip = s.noclip;
                         state.jump |= self.input.jump;
+                        state.latch(&mut self.input.fire);
                     }
                     self.input.jump = false;
 

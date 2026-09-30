@@ -2152,6 +2152,13 @@ never reports its release. All of it (parse errors, reserved keys, multi-key
 hold, repeat, rebinding) is unit-tested without a GPU through
 `Controls::key`, a pure function of (bindings, held set, event).
 
+**Landed (§26): fire.** Left mouse during play latches `InputState.fire`
+through the same edge contract as jump — published per frame at render rate,
+consumed and cleared by the fixed step, so one press feeds exactly one tick
+and held fire doesn't re-fire. Mouse buttons aren't part of `Controls` (it's
+keyboard-only, and the pause menu owns LMB while it's up), so fire is
+hard-wired like Esc/Enter; rebindable mouse buttons are the follow-up.
+
 ## 15. FPS controller + physics coupling
 
 - **Kinematic character controller** (rapier `KinematicCharacterController`) —
@@ -3444,6 +3451,10 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   coordinates so a model authored around the origin floats above the demo ground
   at `GROUND_Y`, and there is still no broad phase, so a large scene leans on
   the per-entity cull (and on LODs, §17, for its triangle count).
+- **Fire input (§14)**: LMB during play latches `InputState.fire` — published
+  per frame, consumed and cleared by the fixed step, so one press feeds exactly
+  one tick (same edge contract as jump). Hard-wired like the menu keys: mouse
+  buttons aren't in `Controls`/rebinding yet, so CONTROLS shows no row for it.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
   sky visibility and GTAO (§13), *not* cubemap IBL;

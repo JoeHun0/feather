@@ -141,14 +141,26 @@ impl Look {
 
 /// Gameplay input for one fixed tick (§14): abstract actions, not raw keys. The
 /// app fills this at render rate (building `wish` needs [`Look`]'s yaw); the fixed
-/// step consumes it and clears the latched jump edge, so one press feeds exactly
-/// one tick.
+/// step consumes it and clears the latched edges, so one press feeds exactly one
+/// tick.
 #[derive(Resource, Default)]
 pub struct InputState {
     pub wish: Vec3,    // desired horizontal move direction (unit or zero)
     pub jump: bool,    // latched press edge
+    pub fire: bool,    // latched press edge (LMB, §14)
     pub vertical: f32, // noclip vertical axis (+up/-down)
     pub noclip: bool,
+}
+
+impl InputState {
+    /// Publish a frame's pressed edge (§14): OR it into the tick input and
+    /// clear the frame's flag. The consumer system clears `fire` after its
+    /// tick, so one press fires exactly one shot; frames that run no fixed
+    /// step hold the edge until one does (same contract as `jump`).
+    pub fn latch(&mut self, edge: &mut bool) {
+        self.fire |= *edge;
+        *edge = false;
+    }
 }
 
 impl Player {
@@ -472,6 +484,18 @@ mod tests {
     use feather_assets::MeshData;
 
     const START: Vec3 = Vec3::new(0.0, GROUND_Y, 8.0);
+
+    #[test]
+    fn latches_one_fire_edge() {
+        let mut input = InputState::default();
+        let mut edge = true;
+        input.latch(&mut edge);
+        assert!(input.fire, "press latched for the fixed step");
+        assert!(!edge, "frame flag cleared: a second publish can't re-fire");
+        edge = false;
+        input.latch(&mut edge);
+        assert!(input.fire, "held until the consuming tick clears it");
+    }
 
     #[test]
     fn settles_on_ground() {

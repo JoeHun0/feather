@@ -175,12 +175,14 @@ them in OPTIONS > SOUND.
 
 ### Controls
 
-Defaults, rebindable in OPTIONS > CONTROLS or `config/controls.toml` (Esc isn't).
+Defaults, rebindable in OPTIONS > CONTROLS or `config/controls.toml` (Esc and
+left-mouse fire aren't).
 
 | In game | |
 |---|---|
 | WASD + mouse | move / look |
 | Space | jump |
+| Left mouse | fire (one shot per press; hard-wired, not rebindable yet) |
 | V | noclip (free flight) on/off |
 | Left Ctrl | fly down (noclip) |
 | `[` / `]` | exposure down / up (compensation, with auto-exposure on) |
