@@ -29,10 +29,9 @@
 
 mod audio;
 mod config;
-mod rope;
 mod weather;
 
-use audio::{Audio, AudioSettings, StepTracker, Surface};
+use audio::{Audio, AudioSettings, StepTracker};
 use config::controls::{Action, Controls};
 
 use std::collections::{HashMap, HashSet};
@@ -41,6 +40,7 @@ use std::time::Instant;
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::ExecutorKind;
 use feather_assets::MeshData;
+use feather_game::{rope, Surface};
 use feather_gfx::{GpuTimes, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use feather_platform::winit;
 use feather_render::{

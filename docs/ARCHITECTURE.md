@@ -2259,7 +2259,7 @@ hold, repeat, rebinding) is unit-tested without a GPU through
     NPCs would be. The tiles stay boxes, which measured the same as
     trimeshes.
 
-**Landed (§26): ropes.** Something hanging on a rope (`app/src/rope.rs`,
+**Landed (§26): ropes.** Something hanging on a rope (`game/src/rope.rs`,
 the `hanging` prefab), the first simulated thing in a level besides the
 player. It's its own small solver, not rapier:
 - **The chain:** points from a fixed anchor down to the item, stepped in the

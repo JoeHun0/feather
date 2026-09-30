@@ -154,12 +154,12 @@ impl Rope {
         }
     }
 
-    #[cfg(test)]
+    /// Where it hangs from (tests read it; the app's spawn test is one).
     pub fn anchor(&self) -> Vec3 {
         self.points[0]
     }
 
-    #[cfg(test)]
+    /// Its free end, where the item hangs.
     pub fn end(&self) -> Vec3 {
         *self.points.last().unwrap()
     }
