@@ -475,6 +475,74 @@ pub fn player_readback_sys(mut q: Query<&mut Player>, physics: Res<Physics>) {
     }
 }
 
+/// The player's health (the HUD's bar). Nothing drains it yet — the kill
+/// plane kills outright — but damage sources land here.
+#[derive(Component)]
+pub struct Health {
+    pub current: f32,
+    pub max: f32,
+}
+
+/// Where a killed player comes back: the `player_start` marker's spot (§18),
+/// or the hardcoded spawn when the scene places none. Inserted by
+/// `build_world`.
+#[derive(Resource)]
+pub struct SpawnPoint {
+    pub pos: Vec3,
+    pub yaw: Option<f32>,
+}
+
+/// The kill plane's height: below it, the player dies and respawns. From the
+/// `environment` marker's `kill_y` (level.rs), default `GROUND_Y - 4` — under
+/// the demo slab, over anything a level digs on purpose. A level that brings
+/// its own ground (the zone) sets it explicitly.
+#[derive(Resource)]
+pub struct KillPlane(pub f32);
+
+/// §15's kill plane, as a plain fn so the physics tests drive it directly.
+/// Below `kill_y` the player dies: back to the spawn point, velocity, look
+/// and health reset. Noclip is the caller's check — free flight goes
+/// wherever.
+pub fn kill_plane(
+    p: &mut Player,
+    look: &mut Look,
+    health: &mut Health,
+    physics: &mut Physics,
+    spawn: &SpawnPoint,
+    kill_y: f32,
+) {
+    if p.pos.y >= kill_y {
+        return;
+    }
+    p.pos = spawn.pos;
+    p.prev_pos = spawn.pos;
+    p.vel = Vec3::ZERO;
+    p.on_ground = false;
+    physics.bodies[p.body].set_next_kinematic_translation(to_rapier(spawn.pos + Player::CENTER));
+    if let Some(yaw) = spawn.yaw {
+        look.yaw = yaw;
+        look.pitch = 0.0;
+    }
+    health.current = health.max;
+}
+
+/// After the physics bracket (pos is fresh): the kill plane, unless noclip —
+/// flying below the world on purpose is not dying.
+pub fn kill_plane_sys(
+    mut q: Query<(&mut Player, &mut Look, &mut Health)>,
+    input: Res<InputState>,
+    spawn: Res<SpawnPoint>,
+    kill: Res<KillPlane>,
+    mut physics: ResMut<Physics>,
+) {
+    if input.noclip {
+        return;
+    }
+    for (mut p, mut look, mut health) in &mut q {
+        kill_plane(&mut p, &mut look, &mut health, &mut physics, &spawn, kill.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +563,102 @@ mod tests {
         edge = false;
         input.latch(&mut edge);
         assert!(input.fire, "held until the consuming tick clears it");
+    }
+
+    #[test]
+    fn falling_past_the_kill_plane_respawns_at_spawn() {
+        let (mut ph, mut p) = setup(&[], START);
+        let mut look = Look {
+            yaw: 5.0,
+            pitch: -1.0,
+        };
+        let mut health = Health {
+            current: 55.0,
+            max: 100.0,
+        };
+        let spawn = SpawnPoint {
+            pos: Vec3::new(1.0, GROUND_Y, -3.0),
+            yaw: Some(1.25),
+        };
+        p.pos.y = GROUND_Y - 20.0; // out of the world
+        kill_plane(
+            &mut p,
+            &mut look,
+            &mut health,
+            &mut ph,
+            &spawn,
+            GROUND_Y - 4.0,
+        );
+        assert_eq!(p.pos, spawn.pos);
+        assert_eq!(p.prev_pos, spawn.pos);
+        assert_eq!(p.vel, Vec3::ZERO);
+        assert!(!p.on_ground);
+        assert_eq!((look.yaw, look.pitch), (1.25, 0.0), "look resets to spawn");
+        assert_eq!(health.current, health.max);
+        // The body itself teleports on the next step, so the readback agrees.
+        ph.step();
+        player_readback(&mut p, &ph);
+        assert_eq!(p.pos, spawn.pos);
+    }
+
+    #[test]
+    fn above_the_kill_plane_is_left_alone() {
+        let (mut ph, mut p) = setup(&[], START);
+        let mut look = Look::new();
+        let mut health = Health {
+            current: 55.0,
+            max: 100.0,
+        };
+        let spawn = SpawnPoint {
+            pos: Vec3::new(1.0, GROUND_Y, -3.0),
+            yaw: Some(1.25),
+        };
+        kill_plane(
+            &mut p,
+            &mut look,
+            &mut health,
+            &mut ph,
+            &spawn,
+            GROUND_Y - 4.0,
+        );
+        assert_eq!(p.pos, START, "standing on the ground, untouched");
+        assert_eq!(health.current, 55.0, "no heal without a death");
+        assert_eq!(look.yaw, Look::new().yaw);
+    }
+
+    #[test]
+    fn noclip_flies_below_the_kill_plane() {
+        let (ph, p) = setup(&[], START);
+        let mut world = World::new();
+        world.insert_resource(ph);
+        world.insert_resource(SpawnPoint {
+            pos: Vec3::new(1.0, GROUND_Y, -3.0),
+            yaw: Some(1.25),
+        });
+        world.insert_resource(KillPlane(GROUND_Y - 4.0));
+        world.insert_resource(InputState {
+            noclip: true,
+            ..Default::default()
+        });
+        let e = world
+            .spawn((
+                p,
+                Look::new(),
+                Health {
+                    current: 100.0,
+                    max: 100.0,
+                },
+            ))
+            .id();
+        world.get_mut::<Player>(e).unwrap().pos.y = GROUND_Y - 50.0;
+        let mut schedule = Schedule::default();
+        schedule.add_systems(kill_plane_sys);
+        schedule.run(&mut world);
+        assert_eq!(
+            world.get::<Player>(e).unwrap().pos.y,
+            GROUND_Y - 50.0,
+            "noclip is exempt: flying below the world on purpose"
+        );
     }
 
     #[test]

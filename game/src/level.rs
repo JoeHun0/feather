@@ -7,7 +7,8 @@ use crate::components::{
     MESH_BUILTIN_COUNT, MESH_CUBE, MESH_LEVEL_CUBE, MESH_SPHERE, PALETTE,
 };
 use crate::controller::{
-    physics_step_sys, player_readback_sys, player_target_sys, InputState, Look, Player, GROUND_Y,
+    kill_plane_sys, physics_step_sys, player_readback_sys, player_target_sys, Health, InputState,
+    KillPlane, Look, Player, SpawnPoint, GROUND_Y,
 };
 use crate::physics::Physics;
 use crate::prefab::{prefab_registry, spawn_static_prop, ColliderStats, SpawnArgs};
@@ -105,8 +106,9 @@ pub fn player_start(nodes: &[feather_assets::SceneNode]) -> (Vec3, Option<f32>) 
 }
 
 /// The parameters an `environment` marker (§13, §18) may carry.
-pub const ENVIRONMENT_PARAMS: [&str; 27] = [
+pub const ENVIRONMENT_PARAMS: [&str; 28] = [
     "ground",
+    "kill_y",
     "wind_speed",
     "wind_azimuth",
     "weather",
@@ -150,6 +152,24 @@ pub fn level_ground(nodes: &[feather_assets::SceneNode]) -> (bool, Vec<String>) 
         Some(s) => match s.bool("ground") {
             Some(ground) => (ground, Vec::new()),
             None => (true, vec!["ground".to_string()]),
+        },
+    }
+}
+
+/// The kill plane's height (§15): the first `environment` marker's `kill_y`
+/// (metres; below it a fall kills and the player respawns at `player_start`).
+/// Defaults to `GROUND_Y - 4` — under the demo slab, over anything a level
+/// digs on purpose. Also the params it couldn't read.
+pub fn level_kill_y(nodes: &[feather_assets::SceneNode]) -> (f32, Vec<String>) {
+    let spec = nodes
+        .iter()
+        .filter_map(|n| n.prefab.as_ref())
+        .find(|s| s.id == "environment");
+    match spec.filter(|s| s.params.get("kill_y").is_some()) {
+        None => (GROUND_Y - 4.0, Vec::new()),
+        Some(s) => match s.f32("kill_y").filter(|v| v.is_finite()) {
+            Some(kill_y) => (kill_y, Vec::new()),
+            None => (GROUND_Y - 4.0, vec!["kill_y".to_string()]),
         },
     }
 }
@@ -407,6 +427,8 @@ pub fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> Wor
     bad_params.extend(bad_weather);
     let (ground, bad_ground) = level_ground(&scene_nodes);
     bad_params.extend(bad_ground);
+    let (kill_y, bad_kill_y) = level_kill_y(&scene_nodes);
+    bad_params.extend(bad_kill_y);
     for key in bad_params {
         eprintln!("[scene] environment: can't use param {key:?}; ignored");
     }
@@ -430,11 +452,25 @@ pub fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> Wor
     let body = Player::new(&mut physics, start_pos);
     world.insert_resource(physics);
     world.insert_resource(InputState::default());
+    world.insert_resource(SpawnPoint {
+        pos: start_pos,
+        yaw: start_yaw,
+    });
+    world.insert_resource(KillPlane(kill_y));
     let mut look = Look::new();
     if let Some(yaw) = start_yaw {
         look.yaw = yaw;
     }
-    let player = world.spawn((body, look)).id();
+    let player = world
+        .spawn((
+            body,
+            look,
+            Health {
+                current: 100.0,
+                max: 100.0,
+            },
+        ))
+        .id();
 
     // The drifting orb demo only runs when no scene was given — a loaded level
     // is what you want to look at, and 1000 orbs would bury it.
@@ -479,8 +515,16 @@ pub fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> Wor
     schedule.add_systems((integrate, tick, ropes, weapon_sys, targets_sys));
     // §15's coupling: ECS -> rapier, the step, then rapier -> ECS. Chained so
     // the bracket order is explicit (they all touch `Physics`, so bevy_ecs
-    // would serialise them regardless).
-    schedule.add_systems((player_target_sys, physics_step_sys, player_readback_sys).chain());
+    // would serialise them regardless). The kill plane reads the fresh pos.
+    schedule.add_systems(
+        (
+            player_target_sys,
+            physics_step_sys,
+            player_readback_sys,
+            kill_plane_sys,
+        )
+            .chain(),
+    );
 
     // Built-ins get the demo fit (centre + unit-scale); scene meshes keep their
     // authored transform, so identity.
@@ -743,6 +787,25 @@ mod tests {
         assert_eq!(w.speed, rope::Wind::default().speed);
         // environment() knows the keys, so it doesn't call them unknown.
         assert!(environment(&[marker]).1.is_empty());
+    }
+
+    /// The kill plane's height comes from its `environment` marker; a bad
+    /// value is reported and leaves the default.
+    #[test]
+    fn the_environment_sets_the_kill_plane() {
+        assert_eq!(level_kill_y(&[]), (GROUND_Y - 4.0, Vec::new()));
+        let marker = node(Some("environment"), serde_json::json!({ "kill_y": -20.0 }));
+        let (kill_y, bad) = level_kill_y(std::slice::from_ref(&marker));
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(kill_y, -20.0);
+        let marker = node(Some("environment"), serde_json::json!({ "kill_y": "deep" }));
+        assert_eq!(
+            level_kill_y(std::slice::from_ref(&marker)),
+            (GROUND_Y - 4.0, vec!["kill_y".to_string()])
+        );
+        // environment() knows the key, so it doesn't call it unknown.
+        let marker = node(Some("environment"), serde_json::json!({ "kill_y": "deep" }));
+        assert!(environment(std::slice::from_ref(&marker)).1.is_empty());
     }
 
     /// The level's weather comes from its `environment` marker; bad values

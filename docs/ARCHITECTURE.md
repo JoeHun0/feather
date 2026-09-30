@@ -2487,6 +2487,16 @@ player. It's its own small solver, not rapier:
   - **Cost** (pinned, 3 interleaved rounds, the same binary on the zone with
     lamps and with lanterns): frame 1.19–1.20 both. `lights120` 1.59 on both
     binaries. Predicted ±0.02 and unchanged.
+- **Landed: health and the kill plane.** The player carries `Health`
+  (currently just the HUD's bar — nothing drains it yet), and the level's
+  `environment` marker names `kill_y`: below it a fall kills and the player
+  respawns at `player_start` — position, velocity, look and health reset, the
+  kinematic body teleported so the next step can't read a stale spot back.
+  Noclip is exempt (flying below the world on purpose is not dying). The
+  default `GROUND_Y - 4` sits under the demo slab; a level that digs (the
+  zone, `ground: false`) sets it explicitly. The check runs after the physics
+  bracket on the fresh readback; plain fn + thin system, unit-tested with the
+  noclip exemption, plus an app e2e on the real schedule.
 - **Not done:** the player pushing a rope, rope collisions, a rope between
   two anchors (a laundry line), shadows from the lanterns' light, and
   per-object motion vectors for TAA.
@@ -2799,7 +2809,8 @@ Implemented prefabs are deliberately only those that do something today:
 
 - **`environment`** — a marker for the level's atmosphere (§13): sun
   elevation/azimuth, colour and intensity, the sky palette, the sun's glow
-  and disk, fog density, exposure. Consumed before the world is built, like
+  and disk, fog density, exposure, and the kill plane's height (`kill_y`, §15).
+  Consumed before the world is built, like
   `player_start`; first one wins. Params left out keep the default look, and
   unknown or unreadable ones are warned about and ignored.
 
@@ -3472,6 +3483,12 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   places seven. `Score` (shots/hits/kills/last-hit frame) is the HUD's data.
   Covered by 8 tests, each shown a failing mutation, including an app e2e
   that shoots a scene's orb on the real schedule.
+- **Health + kill plane (§15):** the player carries `Health`; the
+  `environment` marker's `kill_y` (default `GROUND_Y - 4`) is the kill plane —
+  below it the player respawns at `player_start` (position, velocity, look,
+  health; the body teleported), noclip exempt. The zone sets `kill_y`
+  explicitly, below its pond bed. 5 tests, each shown a failing mutation,
+  incl. an app e2e on the real schedule.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
   sky visibility and GTAO (§13), *not* cubemap IBL;

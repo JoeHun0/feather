@@ -2475,6 +2475,43 @@ mod tests {
         assert_eq!(q.iter(&b.world).count(), 1, "the orb is back");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The kill plane is wired end to end: `build_world` reads the marker,
+    /// inserts the resources and the system, and one schedule run respawns a
+    /// fallen player at the start with full health.
+    #[test]
+    fn the_kill_plane_respawns_on_the_real_schedule() {
+        let dir = crate::config::test_dir("e2e-killplane");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pit.gltf");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "asset": { "version": "2.0" },
+                "nodes": [{
+                    "extras": { "prefab": "environment", "params": { "kill_y": -10.0 } },
+                }],
+                "scenes": [{ "nodes": [0] }],
+                "scene": 0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut b = build_world(&[path.to_string_lossy().into_owned()], None);
+        let start = b.world.get::<Player>(b.player).expect("player").pos;
+        assert_eq!(start.y, GROUND_Y);
+        // Fall out of the world.
+        b.world.get_mut::<Player>(b.player).expect("player").pos.y = -30.0;
+        b.schedule.run(&mut b.world);
+        let p = b.world.get::<Player>(b.player).expect("player");
+        assert_eq!(p.pos, start, "back at the spawn");
+        let health = b
+            .world
+            .get::<feather_game::controller::Health>(b.player)
+            .expect("the player carries health");
+        assert_eq!(health.current, health.max);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// scene's own key under the bake root, and only there. A volume baked
     /// for another version of the level (a moved pad) isn't used, and nor is
     /// anything with the bake off.

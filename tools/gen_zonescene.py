@@ -145,6 +145,9 @@ GATE = (-4.0, 4.0)  # x span of the gate in the south fence
 ENVIRONMENT = {
     # The level brings its own ground: the app's slab would fill the pond.
     "ground": False,
+    # ... and digs below GROUND_Y (the pond bed), so the kill plane is lower
+    # than the demo default: a fall past the mud kills, wading doesn't.
+    "kill_y": G - 5.0,
     "sun_elevation": 35.0, "sun_azimuth": 210.0,
     "sun_color": [1.0, 0.92, 0.80], "sun_intensity": 2.5,
     "sky_zenith": [0.36, 0.39, 0.40], "sky_horizon": [0.58, 0.60, 0.56],
