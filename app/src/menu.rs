@@ -879,7 +879,7 @@ mod tests {
         assert_eq!(label(&m, &s, MenuAction::StepTime), "TIME  LEVEL");
         assert_eq!(label(&m, &s, MenuAction::CycleSpeed), "SPEED  10X");
         for (action, len) in [
-            (MenuAction::CycleWeather, weather::WEATHERS.len() + 1),
+            (MenuAction::CycleWeather, weather::tables().len() + 1),
             (MenuAction::CycleSpeed, weather::SPEEDS.len()),
             (MenuAction::CycleFogDensity, weather::FOG_DENSITIES.len()),
             (MenuAction::CycleFogHeight, weather::FOG_HEIGHTS.len()),
@@ -906,7 +906,7 @@ mod tests {
         assert_eq!(label(&m, &s, MenuAction::StepTime), "TIME  12 00");
         activate(&mut m, &mut s, MenuAction::StepTime);
         assert_eq!(label(&m, &s, MenuAction::StepTime), "TIME  13 00");
-        for _ in 0..weather::WEATHERS.len() {
+        for _ in 0..weather::tables().len() {
             activate(&mut m, &mut s, MenuAction::CycleWeather);
         }
         assert_eq!(label(&m, &s, MenuAction::CycleWeather), "WEATHER  LEVEL");

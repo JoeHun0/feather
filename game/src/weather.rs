@@ -774,7 +774,9 @@ const FOGGY_KEYS: [(f32, Key); 12] = [
 ];
 
 /// The weathers a level or the WEATHER menu can choose. WEATHER's first
-/// choice, LEVEL, is the level's own `environment` instead.
+/// choice, LEVEL, is the level's own `environment` instead. These compiled-in
+/// tables are the fallback: the tables in effect are [`tables`], which a
+/// data file may have replaced (§13's keys-as-data).
 pub const WEATHERS: [Weather; 3] = [
     Weather {
         name: "CLEAR",
@@ -790,23 +792,132 @@ pub const WEATHERS: [Weather; 3] = [
     },
 ];
 
+/// Owned weather tables, as parsed from a data file (the app owns the file;
+/// game just hosts the result). `install` makes them live.
+pub struct WeatherData {
+    pub name: String,
+    pub keys: Vec<(f32, Key)>,
+}
+
+impl From<&Weather> for WeatherData {
+    fn from(w: &Weather) -> Self {
+        Self {
+            name: w.name.to_string(),
+            keys: w.keys.to_vec(),
+        }
+    }
+}
+
+/// The installed tables, `None` = the compiled-in [`WEATHERS`]. Read through
+/// [`tables`], never `WEATHERS` directly, so a reload is seen everywhere at
+/// once.
+static TABLES: std::sync::RwLock<Option<&'static [Weather]>> = std::sync::RwLock::new(None);
+
+/// The weather tables in effect: installed ones, or the compiled-in
+/// defaults when nothing has been (or could be) installed.
+pub fn tables() -> &'static [Weather] {
+    TABLES.read().unwrap().unwrap_or(&WEATHERS)
+}
+
+/// Make `data` the tables in effect. Leaks the names and keys into `'static`
+/// — a few KB per call, and calls are rare (someone saved the file).
+pub fn install(data: Vec<WeatherData>) {
+    let live: Vec<Weather> = data
+        .into_iter()
+        .map(|w| Weather {
+            name: Box::leak(w.name.into_boxed_str()),
+            keys: Box::leak(w.keys.into_boxed_slice()),
+        })
+        .collect();
+    *TABLES.write().unwrap() = Some(Box::leak(live.into_boxed_slice()));
+}
+
+/// Back to the compiled-in defaults. Tests only: unit tests share a process,
+/// so global-swapping tests live in `tests/weather_tables.rs` and use this
+/// to leave no trace.
+#[doc(hidden)]
+pub fn reset() {
+    *TABLES.write().unwrap() = None;
+}
+
+/// Every reason `tables` can't go live: names the menu font can't show, no
+/// keys, unsorted or out-of-range hours, values the shaders and the exposure
+/// can't use. Shared by the well-formedness test and the file parser, so
+/// what the test guards is exactly what a file must pass.
+pub fn problems(data: &[WeatherData]) -> Vec<String> {
+    let mut bad = Vec::new();
+    for w in data {
+        if !w.name.bytes().all(|b| b.is_ascii_uppercase()) {
+            bad.push(format!("{}: name must be A-Z", w.name));
+        }
+        if w.keys.is_empty() {
+            bad.push(format!("{}: no keys", w.name));
+        }
+        if !w.keys.windows(2).all(|p| p[0].0 < p[1].0) {
+            bad.push(format!("{}: keys unsorted", w.name));
+        }
+
+        for &(h, k) in &w.keys {
+            if !(0.0..24.0).contains(&h) {
+                bad.push(format!("{} {h}: hour out of range", w.name));
+                continue;
+            }
+            let tag = format!("{} {h}", w.name);
+            for c in [
+                k.sky_zenith,
+                k.sky_horizon,
+                k.sky_ground,
+                k.sky_sun_color,
+                k.sun_color,
+                k.moon_color,
+                k.fog_color,
+            ] {
+                if !(c.is_finite() && c.min_element() > 0.0) {
+                    bad.push(format!("{tag}: colour {c:?}"));
+                }
+            }
+            for v in [k.sky_intensity, k.sun_intensity, k.moon_intensity] {
+                if !(v.is_finite() && v > 0.0) {
+                    bad.push(format!("{tag}: intensity {v}"));
+                }
+            }
+            for v in [
+                k.sun_glow,
+                k.sun_disk,
+                k.fog_density,
+                k.fog_falloff,
+                k.fog_sun,
+            ] {
+                if !(v.is_finite() && v >= 0.0) {
+                    bad.push(format!("{tag}: shape {v}"));
+                }
+            }
+            if !(0.0 < k.exposure_min && k.exposure_min < k.exposure_max) {
+                bad.push(format!("{tag}: exposure range"));
+            }
+        }
+    }
+    bad
+}
+
 /// The weather `name` names (any case), as a WEATHER choice: 0 for
-/// `level`, i for `WEATHERS[i - 1]`.
+/// `level`, i for the i-th table.
 pub fn choice_named(name: &str) -> Option<usize> {
     if name.eq_ignore_ascii_case("level") {
         return Some(0);
     }
-    WEATHERS
+    tables()
         .iter()
         .position(|w| w.name.eq_ignore_ascii_case(name))
         .map(|i| i + 1)
 }
 
-/// A WEATHER choice's name.
+/// A WEATHER choice's name. A choice past the tables (a reload shrank the
+/// list) reads LEVEL rather than indexing out of range.
 pub fn choice_name(choice: usize) -> &'static str {
     match choice {
         0 => "LEVEL",
-        i => WEATHERS[i - 1].name,
+        i => tables().get(i - 1).map_or("LEVEL", |w| w.name),
     }
 }
 
@@ -944,7 +1055,7 @@ impl SessionWeather {
     /// palette isn't a weather's, it's at once. A weather needs a clock: one
     /// starts where the sun is nearest the level's.
     pub fn cycle_weather(&mut self) {
-        let next = (self.choice + 1) % (WEATHERS.len() + 1);
+        let next = (self.choice + 1) % (tables().len() + 1);
         self.transition = match (self.choice, next, self.last) {
             (1.., 1.., Some(from)) => Some(Transition { from, elapsed: 0.0 }),
             _ => None,
@@ -980,7 +1091,14 @@ impl SessionWeather {
     /// travels, from the level's `environment` and the path of its sun.
     /// Remembers what it showed, for the next change of weather.
     pub fn frame(&mut self, level: &Environment, path: &SolarPath) -> (Environment, Vec3) {
-        let (mut env, light) = match (self.choice, self.clock) {
+        // A reload may have shrunk the table list: a stale choice falls back
+        // to LEVEL rather than indexing out of range.
+        let choice = if self.choice <= tables().len() {
+            self.choice
+        } else {
+            0
+        };
+        let (mut env, light) = match (choice, self.clock) {
             // The level's own look, exactly.
             (0, None) => (*level, level.sun_dir),
             // The level's palette under a moving sun (SUN ONLY): the sun sets
@@ -1000,7 +1118,7 @@ impl SessionWeather {
             }
             (i, clock) => {
                 let h = clock.unwrap_or(self.level_hour);
-                let now = WEATHERS[i - 1].sample(reference_hour(h, path.day()));
+                let now = tables()[i - 1].sample(reference_hour(h, path.day()));
                 let key = match self.transition {
                     Some(t) => {
                         let s = (t.elapsed / TRANSITION_HOURS).clamp(0.0, 1.0);
@@ -1186,48 +1304,13 @@ mod tests {
     /// Every weather's keys are sorted within a day, and every value is one
     /// the shaders and the exposure can use. OVERCAST's 15:00 key is the
     /// zone's own `environment` (gen_zonescene.py), the look it had before.
+    /// The value rules live in `problems`, shared with the data-file parser.
     #[test]
     fn the_weathers_are_well_formed() {
+        let data: Vec<WeatherData> = WEATHERS.iter().map(WeatherData::from).collect();
+        assert_eq!(problems(&data), Vec::<String>::new());
         for w in &WEATHERS {
-            assert!(w.name.bytes().all(|b| b.is_ascii_uppercase()), "{}", w.name);
             assert_eq!(choice_named(&w.name.to_lowercase()), Some(choice_of(w)));
-            assert!(
-                w.keys.windows(2).all(|p| p[0].0 < p[1].0),
-                "{} unsorted",
-                w.name
-            );
-            assert!(w.keys.iter().all(|&(h, _)| (0.0..24.0).contains(&h)));
-            for &(h, k) in w.keys {
-                let colours = [
-                    k.sky_zenith,
-                    k.sky_horizon,
-                    k.sky_ground,
-                    k.sky_sun_color,
-                    k.sun_color,
-                    k.moon_color,
-                    k.fog_color,
-                ];
-                for c in colours {
-                    assert!(
-                        c.is_finite() && c.min_element() > 0.0,
-                        "{} {h}: {c}",
-                        w.name
-                    );
-                }
-                for v in [k.sky_intensity, k.sun_intensity, k.moon_intensity] {
-                    assert!(v.is_finite() && v > 0.0, "{} {h}", w.name);
-                }
-                for v in [
-                    k.sun_glow,
-                    k.sun_disk,
-                    k.fog_density,
-                    k.fog_falloff,
-                    k.fog_sun,
-                ] {
-                    assert!(v.is_finite() && v >= 0.0, "{} {h}", w.name);
-                }
-                assert!(0.0 < k.exposure_min && k.exposure_min < k.exposure_max);
-            }
         }
         let zone = include_str!("../../tools/gen_zonescene.py");
         let zone = &zone[zone.find("ENVIRONMENT = {").unwrap()..];
