@@ -2074,6 +2074,7 @@ mod tests {
     use feather_game::level::{demo_boxes, WorldBuild};
     use feather_game::physics::{to_rapier, Physics};
     use feather_game::prefab::ColliderStats;
+    use feather_game::weapon;
     use feather_game::Surface;
     use rapier3d::prelude::QueryFilter;
 
@@ -2421,7 +2422,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A level's baked sky visibility (§13) reaches the session: found by the
+    /// The playable loop end to end on the game's own wiring: a scene's
+    /// `target` node spawns through build_world, the real schedule fires a
+    /// latched edge per press, hits pop the orb, and it respawns.
+    #[test]
+    fn a_scene_target_can_be_shot_popped_and_respawned() {
+        let dir = crate::config::test_dir("e2e-target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("orb.gltf");
+        // A level that is just one orb: no meshes, no buffers. The default
+        // spawn (0, GROUND_Y, 8) faces -Z, so an orb at eye height, z = 3,
+        // sits 5 m dead ahead.
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "asset": { "version": "2.0" },
+                "nodes": [{
+                    "translation": [0.0, -7.4, 3.0],
+                    "extras": { "prefab": "target", "params": { "hits": 2.0 } },
+                }],
+                "scenes": [{ "nodes": [0] }],
+                "scene": 0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut b = build_world(&[path.to_string_lossy().into_owned()], None);
+        let orb = {
+            let mut q = b
+                .world
+                .query::<(bevy_ecs::entity::Entity, &weapon::Target)>();
+            q.iter(&b.world).next().expect("the scene's orb").0
+        };
+        // Two presses, one hit each; the second press pops the orb (hits: 2).
+        for (press, want) in [(1, Some(1)), (2, None)] {
+            b.world.resource_mut::<InputState>().fire = true;
+            b.schedule.run(&mut b.world);
+            let score = b.world.resource::<weapon::Score>();
+            assert_eq!(score.shots, press, "one shot per press");
+            assert_eq!(score.hits, press);
+            drop(score);
+            assert_eq!(
+                b.world.get::<weapon::Target>(orb).map(|t| t.hits_left),
+                want
+            );
+        }
+        assert_eq!(b.world.resource::<weapon::Score>().kills, 1);
+        for _ in 0..weapon::RESPAWN_TICKS {
+            b.schedule.run(&mut b.world);
+        }
+        let mut q = b.world.query::<&weapon::Target>();
+        assert_eq!(q.iter(&b.world).count(), 1, "the orb is back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// scene's own key under the bake root, and only there. A volume baked
     /// for another version of the level (a moved pad) isn't used, and nor is
     /// anything with the bake off.

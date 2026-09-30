@@ -11,6 +11,7 @@ use crate::controller::{
 };
 use crate::physics::Physics;
 use crate::prefab::{prefab_registry, spawn_static_prop, ColliderStats, SpawnArgs};
+use crate::weapon::{targets_sys, weapon_sys, Score, TargetRespawns};
 use crate::{rope, weather, Surface};
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::ExecutorKind;
@@ -421,6 +422,8 @@ pub fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> Wor
     world.insert_resource(FrameCount::default());
     world.insert_resource(LevelWind(wind));
     world.insert_resource(ColliderStats::default());
+    world.insert_resource(Score::default());
+    world.insert_resource(TargetRespawns::default());
     let mut physics = Physics::new();
     // Feet on the ground. The player is a normal ECS entity: sim state in
     // `Player`, render-rate angles in `Look` (§15).
@@ -473,7 +476,7 @@ pub fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> Wor
 
     let mut schedule = Schedule::default();
     schedule.set_executor_kind(ExecutorKind::MultiThreaded);
-    schedule.add_systems((integrate, tick, ropes));
+    schedule.add_systems((integrate, tick, ropes, weapon_sys, targets_sys));
     // §15's coupling: ECS -> rapier, the step, then rapier -> ECS. Chained so
     // the bracket order is explicit (they all touch `Physics`, so bevy_ecs
     // would serialise them regardless).

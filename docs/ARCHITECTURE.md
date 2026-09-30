@@ -2803,6 +2803,15 @@ Implemented prefabs are deliberately only those that do something today:
   `player_start`; first one wins. Params left out keep the default look, and
   unknown or unreadable ones are warned about and ignored.
 
+- **`target`** — a shootable orb for the playable loop (the weapon lives in
+  `game/src/weapon.rs`): a glowing sphere (own mesh; a marker node's geometry
+  is ignored) that flashes on a hit and pops after `hits` of them, respawning
+  a few seconds later at its authored spot. No collider — a shot tests the
+  ray against the rapier world (walls) and analytically against each orb's
+  radius, nearest wins — which sidesteps the collider→entity mapping that
+  `physics.rs` notes `user_data` is reserved for. Orbs are `Transform`
+  entities, not dynamic ones, so the §12 light extract carries their glow.
+
 **Unknown ids warn once and fall back to static geometry** rather than failing,
 which is what lets a scene be authored ahead of the engine. Extras parsing is
 lenient for the same reason: malformed data costs one prop, not the level.
@@ -3455,6 +3464,14 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   per frame, consumed and cleared by the fixed step, so one press feeds exactly
   one tick (same edge contract as jump). Hard-wired like the menu keys: mouse
   buttons aren't in `Controls`/rebinding yet, so CONTROLS shows no row for it.
+- **Weapon + targets (§18)**: a hitscan shot per latched fire edge — the ray
+  tests the rapier world (walls) and each `Target` orb's radius analytically,
+  nearest wins. A hit flashes the orb (light + size pulse, ~0.2 s); `hits`
+  hits pop it onto a 5 s respawn queue that restores the authored spot. The
+  `target` prefab (a marker node; geometry ignored) spawns an orb; the zone
+  places seven. `Score` (shots/hits/kills/last-hit frame) is the HUD's data.
+  Covered by 8 tests, each shown a failing mutation, including an app e2e
+  that shoots a scene's orb on the real schedule.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
   sky visibility and GTAO (§13), *not* cubemap IBL;

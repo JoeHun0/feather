@@ -157,6 +157,9 @@ ENVIRONMENT = {
 }
 LAMP = {"color": [1.0, 0.78, 0.5], "intensity": 10.0, "radius": 12.0,
         "source_radius": 0.1}
+# The playable loop's orbs (game/src/weapon.rs's `target` prefab): one press
+# one shot, three hits pop one. Default colour/intensity; tune by eye.
+TARGET_PARAMS = {"hits": 3.0}
 
 # Alpha cutout (ARCHITECTURE.md §5). A chain-link enclosure round the
 # compressor, from ambientCG's Fence006 (rusty diamond mesh), and grass tufts
@@ -1572,6 +1575,22 @@ def check_hanging(doc, blob):
     return not bad
 
 
+def targets(z):
+    # Floating at roughly eye height, spread across the yard so a new game
+    # opens with one in sight from the gate.
+    for x, y, zz in (
+        (0.0, PAVE_TOP + 2.0, 16.0),    # the hangar door
+        (-8.0, MUD_TOP + 1.7, 20.0),    # the yard, left of the road
+        (-14.0, MUD_TOP + 1.7, -4.0),   # the pond bank
+        (2.5, PAVE_TOP + 2.1, 24.0),    # the gate apron
+        (-18.0, MUD_TOP + 1.6, -16.0),  # behind the hangar
+        (21.0, MUD_TOP + 1.9, -9.5),    # the office front
+        (14.0, MUD_TOP + 1.8, 18.0),    # the east yard
+    ):
+        z.place(None, (x, y, zz), name="target",
+                extras={"prefab": "target", "params": TARGET_PARAMS})
+
+
 def markers(z):
     lamp = {"prefab": "point_light", "params": LAMP}
     # The office's; the hangar is lit by its lanterns (see `lanterns`).
@@ -1594,6 +1613,7 @@ def build(seed):
     counts.update(foliage(z))
     counts["grass"] = grass(z)
     markers(z)
+    targets(z)
     counts["lanterns"] = lanterns(z)
     return z, counts
 

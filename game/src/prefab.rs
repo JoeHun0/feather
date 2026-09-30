@@ -108,6 +108,43 @@ pub fn spawn_static_prop(world: &mut World, args: &SpawnArgs) {
     spawn_scene_node(world, args, true, false);
 }
 
+/// A shootable orb (the playable loop's target): a glowing sphere that
+/// flashes on a hit and pops after `hits` of them, respawning a few seconds
+/// later where the level put it. The node's own geometry is ignored — an orb
+/// is its own mesh (weapon.rs). Params: `hits` (default 3), `radius`
+/// (metres, default 0.5), `color` (linear rgb, default a warm amber),
+/// `intensity` (its light, default 3).
+pub fn spawn_target(world: &mut World, args: &SpawnArgs) {
+    let hits = args
+        .spec
+        .and_then(|s| s.f32("hits"))
+        .filter(|v| *v >= 1.0)
+        .map(|v| v as u32)
+        .unwrap_or(3);
+    let radius = args
+        .spec
+        .and_then(|s| s.f32("radius"))
+        .filter(|v| *v > 0.0)
+        .unwrap_or(0.5);
+    let color = args
+        .spec
+        .and_then(|s| s.vec3("color"))
+        .filter(|c| c.min_element() >= 0.0)
+        .unwrap_or(Vec3::new(1.0, 0.62, 0.25));
+    let intensity = args
+        .spec
+        .and_then(|s| s.f32("intensity"))
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(3.0);
+    world.spawn(crate::weapon::target_bundle(
+        args.transform,
+        hits,
+        radius,
+        color,
+        intensity,
+    ));
+}
+
 /// Shared body of the geometry prefabs.
 /// Triangle budget above which a prop collides as a convex hull instead of its
 /// exact mesh (§15). Measured on a 34k-triangle Poly Haven lantern: standing on
@@ -344,6 +381,7 @@ pub fn prefab_registry() -> HashMap<&'static str, SpawnFn> {
     r.insert("prop", spawn_prop as SpawnFn);
     r.insert("point_light", spawn_point_light as SpawnFn);
     r.insert("hanging", spawn_hanging as SpawnFn);
+    r.insert("target", spawn_target as SpawnFn);
     r
 }
 
@@ -542,6 +580,39 @@ mod tests {
         let mut w = prefab_world();
         spawn_one(&mut w, n.prefab.as_ref(), &cube);
         assert_eq!(w.query::<&NoShadowCast>().iter(&w).count(), 0);
+    }
+
+    #[test]
+    fn target_spawns_a_glowing_orb() {
+        use crate::weapon::Target;
+        let n = node(
+            Some("target"),
+            serde_json::json!({ "hits": 2.0, "color": [1.0, 0.0, 0.0] }),
+        );
+        let mut w = prefab_world();
+        let args = SpawnArgs {
+            transform: Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0)),
+            mesh: None,
+            material: 0,
+            mesh_data: None,
+            baked: None,
+            spec: n.prefab.as_ref(),
+            surface: Surface::default(),
+        };
+        prefab_registry().get("target").copied().unwrap()(&mut w, &args);
+        // One orb: its own sphere and light, no collider (weapon.rs tests the
+        // ray against `radius`), placed at the node's transform.
+        let mut q = w.query::<(&Transform, &Mesh, &PointLight, &Target)>();
+        assert_eq!(q.iter(&w).count(), 1, "exactly one orb");
+        let (t, _, light, target) = q.iter(&w).next().unwrap();
+        assert_eq!(target.hits_left, 2, "the hits param");
+        assert_eq!(light.color, Vec3::new(1.0, 0.0, 0.0), "the color param");
+        assert!((t.0.transform_point3(Vec3::ZERO) - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-6);
+        assert_eq!(
+            w.resource::<Physics>().colliders.len(),
+            0,
+            "orbs don't collide"
+        );
     }
 
     #[test]

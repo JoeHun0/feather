@@ -10,6 +10,7 @@ pub mod rope;
 pub mod surface;
 #[cfg(test)]
 mod testing;
+pub mod weapon;
 pub mod weather;
 
 pub use surface::Surface;
