@@ -11,9 +11,12 @@ use std::error::Error;
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::Arc;
 
+use ash::vk::Handle;
 use ash::{vk, Device, Entry, Instance};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use vk_mem::Alloc; // brings create_buffer/create_image into scope
+
+use crate::passes::{self, Barrier, Kind, Load, Pass, Res, Use};
 
 pub const FRAMES_IN_FLIGHT: usize = 2;
 // Validation is wanted on debug builds; whether it's actually enabled also
@@ -74,9 +77,9 @@ fn clamp_samples(limits: &vk::PhysicalDeviceLimits, want: u32) -> vk::SampleCoun
     }
     MSAA_FALLBACK
 }
-// GPU timing (§21): timestamps per frame-in-flight — shadow (start, end),
-// geometry (start, end), post (start, end). Frame is shadow-start → post-end.
-const TIMESTAMPS_PER_FRAME: u32 = 16;
+// GPU timing (§21): timestamps per frame-in-flight, a pair per timed pass
+// (`passes::slot`). Frame is shadow start → post end.
+const TIMESTAMPS_PER_FRAME: u32 = passes::slot::COUNT;
 /// GTAO's targets (§13): its raw and denoised visibility at half resolution
 /// and its depth levels, one float each.
 /// R32F because the passes write them as storage images, and it's on the
@@ -316,6 +319,9 @@ pub struct Renderer {
     // hold descriptors on them know to re-point. (A view handle can't tell:
     // a new view may reuse a freed one's handle.)
     targets_generation: u64,
+    /// Every image's layout and last uses, across frames (§10): what
+    /// `draw_frame` derives each pass's barriers from.
+    sync: passes::Tracker<u64>,
     // Tonemapped LDR intermediate for the FXAA pass (§13). Same _SRGB format as
     // the swapchain, so one tonemap pipeline serves both targets. Always
     // allocated (~8 MB at 1080p) so the toggle needs no resource churn.
@@ -670,6 +676,7 @@ impl Renderer {
             ao_depth: Some(ao_depth),
             nearest_sampler,
             targets_generation: 0,
+            sync: passes::Tracker::new(),
             ldr: Some(ldr),
             bloom: Some(bloom),
             fxaa: false,
@@ -785,20 +792,20 @@ impl Renderer {
         // Mask to valid bits and wrapping-subtract, so a counter wrap within the
         // valid range still yields the right delta. Then ns → ms.
         let to_ms = |start: u64, end: u64| (end & m).wrapping_sub(start & m) as f32 * period * 1e-6;
-        // Slots: shadow (0,1), geometry (2,3), post (4,5), cluster (6,7),
-        // bloom (8,9), exposure (10,11), ao (12,13), taa (14,15). The later ones sit at the
-        // end rather than in pass order; frame = shadow start → post end,
-        // which spans them all. AO runs inside geometry's span (after the
-        // prepass, before the main pass), so geometry leaves it out.
-        let shadow = to_ms(data[0], data[1]);
-        let cluster = to_ms(data[6], data[7]);
-        let ao = to_ms(data[12], data[13]);
-        let taa = to_ms(data[14], data[15]);
-        let geo = to_ms(data[2], data[12]) + to_ms(data[13], data[3]);
-        let bloom = to_ms(data[8], data[9]);
-        let exposure = to_ms(data[10], data[11]);
-        let post = to_ms(data[4], data[5]);
-        let frame_ms = to_ms(data[0], data[5]);
+        // A pair of slots per timed pass (`passes::slot`); frame = shadow
+        // start → post end, which spans them all. Geometry is the depth
+        // prepass and the main pass, without GTAO between them.
+        use passes::slot;
+        let span = |(a, b): (u32, u32)| to_ms(data[a as usize], data[b as usize]);
+        let shadow = span(slot::SHADOW);
+        let cluster = span(slot::CLUSTER);
+        let ao = span(slot::AO);
+        let taa = span(slot::TAA);
+        let geo = span(slot::PREPASS) + span(slot::MAIN);
+        let bloom = span(slot::BLOOM);
+        let exposure = span(slot::EXPOSURE);
+        let post = span(slot::POST);
+        let frame_ms = span((slot::SHADOW.0, slot::POST.1));
         self.gpu_times_raw = GpuTimes {
             shadow_ms: shadow,
             cluster_ms: cluster,
@@ -940,6 +947,26 @@ impl Renderer {
     }
 
     /// Whether last frame's TAA output is there to blend with.
+    /// Whether the geometry is multisampled (`set_msaa`).
+    pub fn multisampled(&self) -> bool {
+        self.samples != vk::SampleCountFlags::TYPE_1
+    }
+
+    /// Whether TAA runs this frame (`set_taa`).
+    pub fn taa_on(&self) -> bool {
+        self.taa_on
+    }
+
+    /// Whether FXAA follows the tonemap (`set_fxaa`).
+    pub fn fxaa_on(&self) -> bool {
+        self.fxaa
+    }
+
+    /// Whether anything casts into the shadow map (`set_shadow_casters`).
+    pub fn has_shadow_casters(&self) -> bool {
+        self.shadow_casters
+    }
+
     pub fn taa_history_valid(&self) -> bool {
         self.taa_valid
     }
@@ -1012,6 +1039,7 @@ impl Renderer {
         // Drops the old image (freeing view + allocation) before the new one.
         self.shadow = None;
         self.shadow = Some(create_shadow(self.allocator(), &self.device, dim));
+        self.sync.reset();
     }
 
     /// Depth format of the shadow map (for the depth-only shadow pipeline).
@@ -1707,49 +1735,12 @@ impl Renderer {
         self.recreate_swapchain();
     }
 
-    /// Records and submits one frame: `shadow` renders the sun depth map — once
-    /// per cascade, into its own array layer (§11) —
-    /// `geometry` draws into the linear HDR target (sampling that shadow map),
-    /// then `post` (the tonemap pass) samples the HDR and writes the sRGB
-    /// swapchain. `shadow` gets the shadow-map extent; `geometry`/`post` get the
-    /// window extent. All three receive `(cmd, extent, frame_in_flight)`.
-    // One callback per pass, in frame order: grouping them in a struct would
-    // only move the list.
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw_frame(
-        &mut self,
-        // Called once per cascade with its index — hence `Fn`, not `FnOnce`.
-        shadow: impl Fn(vk::CommandBuffer, vk::Extent2D, usize, usize),
-        // Compute work between the shadow and geometry passes (the §12 light
-        // clusters); its writes are made visible to fragment shaders.
-        cluster: impl FnOnce(vk::CommandBuffer, usize),
-        // The depth prepass (§10), in a depth-only rendering of its own, so
-        // GTAO can read the depth before anything is shaded.
-        prepass: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
-        // Compute between the prepass and the main pass (§13's GTAO): it may
-        // sample `depth_sample_view` (read-only depth layout) and write all
-        // the `ao_views` and `ao_depth_views` (GENERAL); the denoised result
-        // and the depth levels are made visible to fragment shaders.
-        ao: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
-        // The lit pass and the sky, over the prepass's depth (loaded, tested,
-        // never written).
-        geometry: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
-        // TAA's resolve (§13), compute, only when it's on: it reads the scene
-        // HDR, the depth and last frame's history (`taa_views().0`) and writes
-        // this frame's (`.1`, GENERAL), which bloom, exposure and the tonemap
-        // then read.
-        taa: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
-        // Compute work between geometry and the tonemap (§13's bloom): it may
-        // sample the HDR result and read/write the bloom chain, which it finds
-        // in GENERAL layout; the tonemap then samples level 0.
-        bloom: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
-        // Compute after bloom (§13's auto-exposure): it may sample the HDR
-        // result; it owns and synchronises its own buffers.
-        exposure: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
-        post: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
-        aa: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
-        ui: impl FnOnce(vk::CommandBuffer, vk::Extent2D, usize),
-    ) {
+    /// Records and submits one frame: `passes`, in order (`render::frame`
+    /// builds them), then the swapchain's hand-off to the presentation
+    /// engine. The barriers come from the passes' declared uses
+    /// ([`passes::Tracker`]); gfx records the renderings they describe and
+    /// calls each pass's recorder inside, with `(cmd, extent, frame, index)`.
+    pub fn draw_frame(&mut self, mut passes: Vec<Pass<'_>>) {
         if self.window_extent.width == 0 || self.window_extent.height == 0 {
             return;
         }
@@ -1790,60 +1781,77 @@ impl Renderer {
         };
 
         let cmd = self.command_buffers[frame];
-        let image = self.images[image_index as usize];
-        let swap_view = self.image_views[image_index as usize];
-        let depth = self.depth.as_ref().unwrap();
-        let hdr = self.hdr.as_ref().unwrap();
-        let shadow_img = self.shadow.as_ref().unwrap();
-        // With MSAA the geometry pass renders into the multisampled `hdr` and
-        // resolves into `hdr_resolve`; the tonemap pass reads whichever image
-        // actually holds the single-sample result.
-        let hdr_resolve = self.hdr_resolve.as_ref();
-        let sampled = hdr_resolve.unwrap_or(hdr);
-        // TAA (§13): last frame's history and this frame's.
-        let (taa_on, taa_valid) = (self.taa_on, self.taa_valid);
-        let (taa_prev, taa_out) = {
-            let h = self.taa_history.as_ref().expect("taa history alive");
-            (h[1 - self.taa_index].handle, h[self.taa_index].handle)
-        };
-        let bloom_chain = self.bloom.as_ref().expect("bloom chain alive");
-        // With FXAA the tonemap renders into the LDR intermediate and the AA pass
-        // writes the swapchain; without it the tonemap writes the swapchain directly.
-        let ldr = self.ldr.as_ref().expect("ldr target alive");
-        let fxaa = self.fxaa;
-        let post_view = if fxaa { ldr.view } else { swap_view };
-        let post_image = if fxaa { ldr.handle } else { image };
+        let taa_on = self.taa_on;
         let extent = self.window_extent;
-        let shadow_extent = vk::Extent2D {
-            width: self.shadow_dim,
-            height: self.shadow_dim,
-        };
-        let color_range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        };
-        let depth_range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::DEPTH,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        };
 
-        // The shadow image is layered; `depth_range` above describes the
-        // single-layer geometry depth buffer and must not be reused for it.
-        let shadow_range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::DEPTH,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: SHADOW_CASCADES as u32,
+        // Plan the frame's barriers: each pass's uses as needs on physical
+        // images, then the swapchain's hand-off. The swapchain image was
+        // just acquired and the clusters are this frame's own buffer, so
+        // both start over; everything else carries on from last frame.
+        let swapchain_key = self.frame_image(Res::Swapchain, image_index).key;
+        self.sync.set(swapchain_key, passes::State::ACQUIRED);
+        self.sync.set(CLUSTERS_KEY, passes::State::FRESH);
+        let needs: Vec<Vec<(u64, passes::Need)>> = {
+            let key = |r: Res| self.frame_image(r, image_index).key;
+            let of = |uses: &[(Res, Use)]| -> Vec<(u64, passes::Need)> {
+                uses.iter()
+                    .flat_map(|&(r, u)| passes::needs(r, u))
+                    .map(|(r, n)| (key(r), n))
+                    .collect()
+            };
+            let present = [(Res::Swapchain, Use::Present)];
+            passes
+                .iter()
+                .map(|p| of(&p.uses))
+                .chain([of(&present)])
+                .collect()
+        };
+        let plan = self.sync.plan(&needs);
+        let image = |r: Res| self.frame_image(r, image_index);
+        let by_key: Vec<(u64, FrameImage)> = [
+            Res::Shadow,
+            Res::Depth,
+            Res::DepthResolve,
+            Res::Hdr,
+            Res::HdrResolve,
+            Res::AoRaw,
+            Res::AoHalf,
+            Res::AoDepth,
+            Res::TaaPrev,
+            Res::TaaOut,
+            Res::Bloom,
+            Res::Ldr,
+            Res::Swapchain,
+            Res::Clusters,
+        ]
+        .into_iter()
+        .filter(|&r| self.has_image(r))
+        .map(|r| (image(r).key, image(r)))
+        .collect();
+        let find = |key: u64| {
+            by_key
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, i)| *i)
+                .expect("a planned resource the frame has")
         };
 
         let dev = &self.device;
+        let ts_base = frame as u32 * TIMESTAMPS_PER_FRAME;
+        let mut stamped = [false; TIMESTAMPS_PER_FRAME as usize];
+        let stamp = |slot: Option<u32>, stamped: &mut [bool]| {
+            if let (true, Some(s)) = (self.timestamps_supported, slot) {
+                unsafe {
+                    dev.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        self.query_pool,
+                        ts_base + s,
+                    )
+                };
+                stamped[s as usize] = true;
+            }
+        };
         unsafe {
             dev.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
                 .unwrap();
@@ -1853,822 +1861,62 @@ impl Renderer {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
             .unwrap();
-
-            // GPU timing: reset this frame's query slots (must be outside a render
-            // pass) and stamp the shadow-pass start. Bottom-of-pipe for all eight, so
-            // each delta measures the work recorded between two write points.
-            let ts_base = frame as u32 * TIMESTAMPS_PER_FRAME;
+            // Reset this frame's query slots (outside any rendering).
             if self.timestamps_supported {
                 dev.cmd_reset_query_pool(cmd, self.query_pool, ts_base, TIMESTAMPS_PER_FRAME);
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base,
-                );
             }
 
-            // ---- Shadow pass: render the sun depth map (depth-only). ----
-
-            // Shadow: UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL (prior contents dropped).
-            // One image serves every frame in flight, so the transition (a write)
-            // must wait for the previous frame's use of it — its depth writes and
-            // the geometry pass sampling it — rather than start at TOP_OF_PIPE. A
-            // barrier's first scope covers earlier submissions on the queue.
-            let shadow_to_attach = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(shadow_img.image.handle)
-                .subresource_range(shadow_range)
-                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[shadow_to_attach],
-            );
-
-            // Nothing casts: one *layered* pass clears every cascade to "far",
-            // so the receiver compares as fully lit, at the cost of a single
-            // pass instead of four. The callback still runs once, because the
-            // mesh renderer uses it to upload this frame's buffers.
-            let cascade_views: &[vk::ImageView] = if self.shadow_casters {
-                &shadow_img.layer_views
-            } else {
-                std::slice::from_ref(&shadow_img.image.view)
-            };
-            let pass_layers = if self.shadow_casters {
-                1
-            } else {
-                SHADOW_CASCADES as u32
-            };
-
-            // One depth-only pass per cascade, each into its own array layer.
-            // The layout transitions above and below cover all layers at once,
-            // so only the attachment view changes inside the loop.
-            for (cascade, &layer_view) in cascade_views.iter().enumerate() {
-                let shadow_attachment = vk::RenderingAttachmentInfo::default()
-                    .image_view(layer_view)
-                    .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .clear_value(vk::ClearValue {
-                        depth_stencil: vk::ClearDepthStencilValue {
-                            depth: 1.0,
-                            stencil: 0,
-                        },
-                    });
-                let shadow_rendering = vk::RenderingInfo::default()
-                    .render_area(vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: shadow_extent,
-                    })
-                    .layer_count(pass_layers)
-                    .depth_attachment(&shadow_attachment);
-
-                dev.cmd_begin_rendering(cmd, &shadow_rendering);
-                shadow(cmd, shadow_extent, frame, cascade);
-                dev.cmd_end_rendering(cmd);
-            }
-
-            // Shadow: DEPTH_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY (geometry samples it).
-            let shadow_to_read = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(shadow_img.image.handle)
-                .subresource_range(shadow_range)
-                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[shadow_to_read],
-            );
-            if self.timestamps_supported {
-                // shadow end, then geometry start.
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 1,
-                );
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 6,
-                );
-            }
-
-            // ---- Cluster pass (§12): compute, outside any render pass. ----
-            // Its writes are read by the geometry pass's fragment shader, so a
-            // global barrier (not per-buffer: the pass owns whatever it binds)
-            // orders compute writes before fragment reads.
-            cluster(cmd, frame);
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 7,
-                );
-            }
-            let cluster_to_frag = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[cluster_to_frag],
-                &[],
-                &[],
-            );
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 2,
-                );
-            }
-
-            // ---- Geometry: the depth prepass, GTAO, then the lit pass into the
-            // linear HDR target. ----
-
-            // HDR: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL (prior contents discarded).
-            // Shared across frames in flight: wait for the previous frame's colour
-            // writes/resolve and the tonemap pass sampling it.
-            let to_hdr = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(hdr.handle)
-                .subresource_range(color_range)
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_hdr],
-            );
-
-            // Same transition for the resolve target when MSAA is on — it is
-            // written by the resolve at end_rendering.
-            if let Some(r) = hdr_resolve {
-                // Shared across frames: wait for the previous resolve and tonemap read.
-                let to_resolve = vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(r.handle)
-                    .subresource_range(color_range)
-                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-                dev.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_resolve],
-                );
-            }
-
-            // Depth: UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL, and the same for
-            // its sample-0 resolve under MSAA. Shared across frames: wait for
-            // the previous frame's depth tests and GTAO's reads. A depth
-            // resolve writes in COLOR_ATTACHMENT_OUTPUT, as colour resolves do.
-            let depth_resolve = self.depth_resolve.as_ref();
-            let to_attachment = |image: vk::Image| {
-                vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(image)
-                    .subresource_range(depth_range)
-                    .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                    .dst_access_mask(
-                        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
-                            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                    )
-            };
-            let mut to_depth = vec![to_attachment(depth.handle)];
-            to_depth.extend(depth_resolve.map(|r| to_attachment(r.handle)));
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &to_depth,
-            );
-
-            // ---- Depth prepass (§10): depth only, kept for GTAO and the main
-            // pass. ----
-            let prepass_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(depth.view)
-                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                });
-            let prepass_attachment = match depth_resolve {
-                Some(r) => prepass_attachment
-                    .resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO)
-                    .resolve_image_view(r.view)
-                    .resolve_image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
-                None => prepass_attachment,
-            };
-            let prepass_rendering = vk::RenderingInfo::default()
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent,
-                })
-                .layer_count(1)
-                .depth_attachment(&prepass_attachment);
-            dev.cmd_begin_rendering(cmd, &prepass_rendering);
-            prepass(cmd, extent, frame);
-            dev.cmd_end_rendering(cmd);
-
-            // The single-sample depth GTAO reads (the buffer itself, or its
-            // resolve): to DEPTH_STENCIL_READ_ONLY, for compute reads and, at
-            // 1x, as the main pass's depth, which it only tests. Under MSAA
-            // the multisampled buffer stays an attachment, and this orders
-            // its prepass writes before the main pass's tests.
-            let sampled_depth = depth_resolve.unwrap_or(depth);
-            let mut depth_to_read = vec![vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(sampled_depth.handle)
-                .subresource_range(depth_range)
-                .src_access_mask(
-                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
-                        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                )
-                .dst_access_mask(
-                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
-                )];
-            if depth_resolve.is_some() {
-                depth_to_read.push(
-                    vk::ImageMemoryBarrier::default()
-                        .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                        .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(depth.handle)
-                        .subresource_range(depth_range)
-                        .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                        .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ),
-                );
-            }
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::COMPUTE_SHADER
-                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &depth_to_read,
-            );
-
-            // ---- GTAO (§13): compute between the prepass and the main pass. ----
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 12,
-                );
-            }
-            // All its targets: UNDEFINED -> GENERAL. Shared across frames in
-            // flight, so wait for the previous frame's GTAO writes and main
-            // pass reads (§21's rule). Done even with GTAO off: the main
-            // pass's descriptor names this layout.
-            let (ao_raw, ao_half, ao_depth) = (
-                self.ao_raw.as_ref().expect("ao alive"),
-                self.ao_half.as_ref().expect("ao alive"),
-                self.ao_depth.as_ref().expect("ao alive"),
-            );
-            let depth_levels = vk::ImageSubresourceRange {
-                level_count: AO_DEPTH_LEVELS as u32,
-                ..color_range
-            };
-            let to_general = |image: vk::Image, range| {
-                vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::GENERAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(image)
-                    .subresource_range(range)
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            };
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[
-                    to_general(ao_raw.handle, color_range),
-                    to_general(ao_half.handle, color_range),
-                    to_general(ao_depth.image.handle, depth_levels),
-                ],
-            );
-            ao(cmd, extent, frame);
-            // Its result and depth levels, visible to the main pass's
-            // fragment shader, which upsamples between them.
-            let to_read = |image: vk::Image, range| {
-                vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(vk::ImageLayout::GENERAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(image)
-                    .subresource_range(range)
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            };
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[
-                    to_read(ao_half.handle, color_range),
-                    to_read(ao_depth.image.handle, depth_levels),
-                ],
-            );
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 13,
-                );
-            }
-
-            // ---- Main pass: the lit opaque pass and the sky, into HDR. ----
-            let hdr_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(hdr.view)
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(vk::ClearValue {
-                    color: vk::ClearColorValue { float32: CLEAR_COLOR },
-                });
-            // The prepass's depth, tested and never written: read-only at 1x
-            // (GTAO sampled that same image), an attachment under MSAA.
-            let depth_layout = if depth_resolve.is_some() {
-                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
-            } else {
-                vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
-            };
-            // Stored as NONE, not DONT_CARE: the pass only tests the depth,
-            // and DONT_CARE would count as a write leaving it undefined,
-            // where TAA (§13) reads it at 1x after this pass.
-            let depth_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(depth.view)
-                .image_layout(depth_layout)
-                .load_op(vk::AttachmentLoadOp::LOAD)
-                .store_op(vk::AttachmentStoreOp::NONE);
-            // Dynamic rendering resolves at cmd_end_rendering, so no manual blit.
-            let hdr_attachment = match hdr_resolve {
-                Some(r) => hdr_attachment
-                    .resolve_mode(vk::ResolveModeFlags::AVERAGE)
-                    .resolve_image_view(r.view)
-                    .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
-                None => hdr_attachment,
-            };
-            let hdr_attachments = [hdr_attachment];
-            let geo_rendering = vk::RenderingInfo::default()
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent,
-                })
-                .layer_count(1)
-                .color_attachments(&hdr_attachments)
-                .depth_attachment(&depth_attachment);
-
-            dev.cmd_begin_rendering(cmd, &geo_rendering);
-            geometry(cmd, extent, frame);
-            dev.cmd_end_rendering(cmd);
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 3,
-                );
-            }
-
-            // ---- Tonemap pass: sample HDR, write the sRGB swapchain. ----
-
-            // HDR: COLOR_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL, read by
-            // the bloom compute passes and the tonemap's fragment shader.
-            let hdr_to_read = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(sampled.handle)
-                .subresource_range(color_range)
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[hdr_to_read],
-            );
-
-            // ---- TAA (§13): resolve into this frame's history. ----
-            // Timed even when off (a zero span): an unwritten query would
-            // hold up the whole frame's readback.
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 14,
-                );
-            }
-            if taa_on {
-                let layout = |image, old, new, src, dst| {
-                    vk::ImageMemoryBarrier::default()
-                        .old_layout(old)
-                        .new_layout(new)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(image)
-                        .subresource_range(color_range)
-                        .src_access_mask(src)
-                        .dst_access_mask(dst)
-                };
-                // This frame's output: UNDEFINED -> GENERAL, after its last
-                // readers: last frame's resolve (as history) and, the frame
-                // before, bloom, exposure and the tonemap (§21's rule).
-                let mut to_taa = vec![layout(
-                    taa_out,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::GENERAL,
-                    vk::AccessFlags::empty(),
-                    vk::AccessFlags::SHADER_WRITE,
-                )];
-                // With no history, the other one may never have been
-                // written: give it the layout the descriptor names. The
-                // shader won't read it.
-                if !taa_valid {
-                    to_taa.push(layout(
-                        taa_prev,
-                        vk::ImageLayout::UNDEFINED,
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                        vk::AccessFlags::empty(),
-                        vk::AccessFlags::SHADER_READ,
-                    ));
+            for (pass, barriers) in passes.iter_mut().zip(&plan) {
+                stamp(pass.timer.0, &mut stamped);
+                record_barriers(dev, cmd, barriers, &find);
+                match pass.kind {
+                    Kind::Graphics { per_layer } => {
+                        self.record_rendering(cmd, pass, per_layer, frame, image_index);
+                    }
+                    Kind::Compute => {
+                        if let Some(rec) = pass.record.as_mut() {
+                            rec(cmd, extent, frame, 0);
+                        }
+                    }
+                    Kind::Copy { src, dst } => {
+                        let (s, d) = (image(src), image(dst));
+                        let layers = vk::ImageSubresourceLayers {
+                            aspect_mask: s.aspect,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        };
+                        let region = vk::ImageCopy {
+                            src_subresource: layers,
+                            dst_subresource: layers,
+                            extent: vk::Extent3D {
+                                width: s.extent.width,
+                                height: s.extent.height,
+                                depth: 1,
+                            },
+                            ..Default::default()
+                        };
+                        dev.cmd_copy_image(
+                            cmd,
+                            s.handle,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            d.handle,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &[region],
+                        );
+                    }
                 }
-                dev.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::COMPUTE_SHADER
-                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &to_taa,
-                );
-                taa(cmd, extent, frame);
-                // Its output, for bloom, exposure and the tonemap.
-                let taa_to_read = layout(
-                    taa_out,
-                    vk::ImageLayout::GENERAL,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::AccessFlags::SHADER_WRITE,
-                    vk::AccessFlags::SHADER_READ,
-                );
-                dev.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER
-                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[taa_to_read],
-                );
+                stamp(pass.timer.1, &mut stamped);
             }
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 15,
-                );
+            // The swapchain's hand-off.
+            record_barriers(dev, cmd, plan.last().expect("present planned"), &find);
+            // Any slot no pass wrote (TAA off), so the readback can't wait
+            // on it: a zero span.
+            for s in 0..TIMESTAMPS_PER_FRAME {
+                if !stamped[s as usize] {
+                    stamp(Some(s), &mut stamped);
+                }
             }
-
-            // ---- Bloom (§13): compute over the bloom chain. ----
-
-            // Bloom chain: UNDEFINED -> GENERAL, every level. Shared across
-            // frames in flight, so this waits for the previous frame's bloom
-            // writes and tonemap reads (§21's rule). Done even when bloom is
-            // off: the tonemap's descriptor names this layout.
-            let bloom_range = vk::ImageSubresourceRange {
-                level_count: bloom_chain.extents.len() as u32,
-                ..color_range
-            };
-            let to_bloom = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(bloom_chain.image.handle)
-                .subresource_range(bloom_range)
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_bloom],
-            );
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 8,
-                );
-            }
-            bloom(cmd, extent, frame);
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 9,
-                );
-            }
-            // Its writes, visible to the tonemap's fragment shader.
-            let bloom_to_read = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(bloom_chain.image.handle)
-                .subresource_range(bloom_range)
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[bloom_to_read],
-            );
-
-            // ---- Auto-exposure (§13): metering compute. ----
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 10,
-                );
-            }
-            exposure(cmd, extent, frame);
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 11,
-                );
-            }
-
-            // Swapchain: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
-            // Without FXAA this is the swapchain image: COLOR_ATTACHMENT_OUTPUT is the
-            // stage the acquire semaphore waits at, so the transition chains after the
-            // acquire. With FXAA it is the shared LDR image, whose previous-frame
-            // writes and FXAA read this also waits for.
-            let to_color = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(post_image)
-                .subresource_range(color_range)
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_color],
-            );
-
-            // The fullscreen tonemap covers every pixel, so the swapchain load
-            // op is DONT_CARE (no clear needed).
-            let swap_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(post_view)
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::DONT_CARE)
-                .store_op(vk::AttachmentStoreOp::STORE);
-            let swap_attachments = [swap_attachment];
-            let post_rendering = vk::RenderingInfo::default()
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent,
-                })
-                .layer_count(1)
-                .color_attachments(&swap_attachments);
-
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 4,
-                );
-            }
-            dev.cmd_begin_rendering(cmd, &post_rendering);
-            post(cmd, extent, frame);
-            dev.cmd_end_rendering(cmd);
-
-            if fxaa {
-                // LDR: COLOR_ATTACHMENT -> SHADER_READ_ONLY, then swapchain
-                // UNDEFINED -> COLOR_ATTACHMENT, and run FXAA into it.
-                let ldr_to_read = vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(ldr.handle)
-                    .subresource_range(color_range)
-                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
-                let swap_to_color = vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(image)
-                    .subresource_range(color_range)
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-                dev.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER
-                        | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[ldr_to_read, swap_to_color],
-                );
-
-                let aa_attachment = vk::RenderingAttachmentInfo::default()
-                    .image_view(swap_view)
-                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
-                    .store_op(vk::AttachmentStoreOp::STORE);
-                let aa_attachments = [aa_attachment];
-                let aa_rendering = vk::RenderingInfo::default()
-                    .render_area(vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent,
-                    })
-                    .layer_count(1)
-                    .color_attachments(&aa_attachments);
-                dev.cmd_begin_rendering(cmd, &aa_rendering);
-                aa(cmd, extent, frame);
-                dev.cmd_end_rendering(cmd);
-            }
-            if self.timestamps_supported {
-                dev.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.query_pool,
-                    ts_base + 5,
-                );
-            }
-
-            // ---- UI overlay (§19): last, blended over the finished LDR image. ----
-            // The post chain just wrote this same attachment, and the overlay
-            // blends against it, so the write must be visible to the read.
-            let ui_after_post = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(color_range)
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::COLOR_ATTACHMENT_READ
-                        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                );
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[ui_after_post],
-            );
-
-            // LOAD, not CLEAR: the overlay draws on top of the rendered frame.
-            let ui_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(swap_view)
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::LOAD)
-                .store_op(vk::AttachmentStoreOp::STORE);
-            let ui_attachments = [ui_attachment];
-            let ui_rendering = vk::RenderingInfo::default()
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent,
-                })
-                .layer_count(1)
-                .color_attachments(&ui_attachments);
-            dev.cmd_begin_rendering(cmd, &ui_rendering);
-            ui(cmd, extent, frame);
-            dev.cmd_end_rendering(cmd);
-
-            // Swapchain: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
-            let to_present = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(color_range)
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::empty());
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_present],
-            );
 
             dev.end_command_buffer(cmd).unwrap();
 
@@ -2683,24 +1931,26 @@ impl Renderer {
                 .signal_semaphores(&signal_sems);
             dev.queue_submit(self.queue, &[submit], self.in_flight[frame])
                 .unwrap();
-            // This frame's output is next frame's history. Before the
-            // present, whose swapchain recreation resets it.
-            if taa_on {
-                self.taa_index = 1 - self.taa_index;
-                self.taa_valid = true;
-            }
+        }
+        drop(passes);
+        // This frame's output is next frame's history. Before the present,
+        // whose swapchain recreation resets it.
+        if taa_on {
+            self.taa_index = 1 - self.taa_index;
+            self.taa_valid = true;
+        }
 
-            let swapchains = [self.swapchain];
-            let indices = [image_index];
-            let present = vk::PresentInfoKHR::default()
-                .wait_semaphores(&signal_sems)
-                .swapchains(&swapchains)
-                .image_indices(&indices);
-            match self.swapchain_loader.queue_present(self.queue, &present) {
-                Ok(false) => {}
-                Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swapchain(),
-                Err(e) => panic!("queue_present: {e:?}"),
-            }
+        let signal_sems = [self.render_finished[image_index as usize]];
+        let swapchains = [self.swapchain];
+        let indices = [image_index];
+        let present = vk::PresentInfoKHR::default()
+            .wait_semaphores(&signal_sems)
+            .swapchains(&swapchains)
+            .image_indices(&indices);
+        match unsafe { self.swapchain_loader.queue_present(self.queue, &present) } {
+            Ok(false) => {}
+            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swapchain(),
+            Err(e) => panic!("queue_present: {e:?}"),
         }
 
         // The command buffer (with this frame's timestamp writes) is submitted, so
@@ -2710,6 +1960,223 @@ impl Renderer {
         }
 
         self.current_frame = (frame + 1) % FRAMES_IN_FLIGHT;
+    }
+
+    /// Record a graphics pass: one rendering over its colour and depth uses
+    /// (resolves included), or one per layer of its depth attachment.
+    unsafe fn record_rendering(
+        &self,
+        cmd: vk::CommandBuffer,
+        pass: &mut Pass<'_>,
+        per_layer: bool,
+        frame: usize,
+        image_index: u32,
+    ) {
+        let load_op = |l: Load| match l {
+            Load::Clear => vk::AttachmentLoadOp::CLEAR,
+            Load::Load => vk::AttachmentLoadOp::LOAD,
+            Load::DontCare => vk::AttachmentLoadOp::DONT_CARE,
+        };
+        let mut colors = Vec::new();
+        let mut depth = None;
+        let mut extent = None;
+        let mut layers = 1;
+        for &(r, u) in &pass.uses {
+            match u {
+                Use::Color { load, resolve } => {
+                    let i = self.frame_image(r, image_index);
+                    extent.get_or_insert(i.extent);
+                    let a = vk::RenderingAttachmentInfo::default()
+                        .image_view(i.view)
+                        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .load_op(load_op(load))
+                        .store_op(vk::AttachmentStoreOp::STORE)
+                        .clear_value(vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: CLEAR_COLOR,
+                            },
+                        });
+                    colors.push(match resolve {
+                        Some(to) => a
+                            .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                            .resolve_image_view(self.frame_image(to, image_index).view)
+                            .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                        None => a,
+                    });
+                }
+                Use::Depth {
+                    load,
+                    write,
+                    resolve,
+                } => {
+                    let i = self.frame_image(r, image_index);
+                    extent.get_or_insert(i.extent);
+                    layers = i.layers;
+                    // A depth that is only tested is stored as NONE, not
+                    // DONT_CARE: DONT_CARE would count as a write and leave
+                    // it undefined for whoever reads it next.
+                    let a = vk::RenderingAttachmentInfo::default()
+                        .image_view(i.view)
+                        .image_layout(if write {
+                            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
+                        } else {
+                            vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                        })
+                        .load_op(load_op(load))
+                        .store_op(if write {
+                            vk::AttachmentStoreOp::STORE
+                        } else {
+                            vk::AttachmentStoreOp::NONE
+                        })
+                        .clear_value(vk::ClearValue {
+                            depth_stencil: vk::ClearDepthStencilValue {
+                                depth: 1.0,
+                                stencil: 0,
+                            },
+                        });
+                    depth = Some(match resolve {
+                        Some(to) => a
+                            .resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO)
+                            .resolve_image_view(self.frame_image(to, image_index).view)
+                            .resolve_image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
+                        None => a,
+                    });
+                    if per_layer {
+                        assert_eq!(r, Res::Shadow, "only the shadow map renders per layer");
+                    }
+                }
+                _ => {}
+            }
+        }
+        let extent = extent.expect("a rendering has an attachment");
+        let area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        let mut render = |view: Option<vk::ImageView>, layer_count: u32, index: usize| {
+            let d = depth.map(|d| match view {
+                Some(v) => d.image_view(v),
+                None => d,
+            });
+            let mut info = vk::RenderingInfo::default()
+                .render_area(area)
+                .layer_count(layer_count)
+                .color_attachments(&colors);
+            if let Some(d) = d.as_ref() {
+                info = info.depth_attachment(d);
+            }
+            self.device.cmd_begin_rendering(cmd, &info);
+            if let Some(rec) = pass.record.as_mut() {
+                rec(cmd, extent, frame, index);
+            }
+            self.device.cmd_end_rendering(cmd);
+        };
+        if per_layer {
+            // One depth-only rendering per cascade, each into its own layer.
+            let views = &self.shadow.as_ref().expect("shadow map alive").layer_views;
+            for (layer, &view) in views.iter().enumerate() {
+                render(Some(view), 1, layer);
+            }
+        } else {
+            render(None, layers, 0);
+        }
+    }
+
+    /// Whether `r` exists this frame: the resolves only under MSAA.
+    fn has_image(&self, r: Res) -> bool {
+        match r {
+            Res::DepthResolve => self.depth_resolve.is_some(),
+            Res::HdrResolve => self.hdr_resolve.is_some(),
+            _ => true,
+        }
+    }
+
+    /// The physical image `r` names this frame, with what its barriers and
+    /// renderings need.
+    fn frame_image(&self, r: Res, image_index: u32) -> FrameImage {
+        let color = vk::ImageAspectFlags::COLOR;
+        let depth = vk::ImageAspectFlags::DEPTH;
+        let window = self.window_extent;
+        let plain = |i: &Image, aspect, extent| FrameImage {
+            key: i.handle.as_raw(),
+            handle: i.handle,
+            view: i.view,
+            aspect,
+            levels: 1,
+            layers: 1,
+            extent,
+        };
+        let taa = |k: usize| {
+            let h = self.taa_history.as_ref().expect("taa history alive");
+            plain(&h[k], color, window)
+        };
+        match r {
+            Res::Shadow => {
+                let s = self.shadow.as_ref().expect("shadow map alive");
+                let dim = self.shadow_dim;
+                FrameImage {
+                    layers: SHADOW_CASCADES as u32,
+                    ..plain(
+                        &s.image,
+                        depth,
+                        vk::Extent2D {
+                            width: dim,
+                            height: dim,
+                        },
+                    )
+                }
+            }
+            Res::Depth => plain(self.depth.as_ref().unwrap(), depth, window),
+            Res::DepthResolve => plain(self.depth_resolve.as_ref().expect("MSAA"), depth, window),
+            Res::Hdr => plain(self.hdr.as_ref().unwrap(), color, window),
+            Res::HdrResolve => plain(self.hdr_resolve.as_ref().expect("MSAA"), color, window),
+            Res::AoRaw => plain(
+                self.ao_raw.as_ref().expect("ao alive"),
+                color,
+                ao_half_extent(window),
+            ),
+            Res::AoHalf => plain(
+                self.ao_half.as_ref().expect("ao alive"),
+                color,
+                ao_half_extent(window),
+            ),
+            Res::AoDepth => FrameImage {
+                levels: AO_DEPTH_LEVELS as u32,
+                ..plain(
+                    &self.ao_depth.as_ref().expect("ao alive").image,
+                    color,
+                    window,
+                )
+            },
+            Res::TaaPrev => taa(1 - self.taa_index),
+            Res::TaaOut => taa(self.taa_index),
+            Res::Bloom => {
+                let b = self.bloom.as_ref().expect("bloom chain alive");
+                FrameImage {
+                    levels: b.extents.len() as u32,
+                    ..plain(&b.image, color, window)
+                }
+            }
+            Res::Ldr => plain(self.ldr.as_ref().expect("ldr target alive"), color, window),
+            Res::Swapchain => FrameImage {
+                key: self.images[image_index as usize].as_raw(),
+                handle: self.images[image_index as usize],
+                view: self.image_views[image_index as usize],
+                aspect: color,
+                levels: 1,
+                layers: 1,
+                extent: window,
+            },
+            Res::Clusters => FrameImage {
+                key: CLUSTERS_KEY,
+                handle: vk::Image::null(),
+                view: vk::ImageView::null(),
+                aspect: color,
+                levels: 0,
+                layers: 0,
+                extent: window,
+            },
+        }
     }
 
     /// (Re)create the render targets that depend on the window extent and the
@@ -2757,6 +2224,7 @@ impl Renderer {
         self.taa_history = Some([0, 1].map(|_| create_taa(self.allocator(), &self.device, extent)));
         self.taa_valid = false;
         self.targets_generation += 1;
+        self.sync.reset();
     }
 
     /// Change the geometry-pass sample count, recreating the targets that carry
@@ -2976,6 +2444,87 @@ fn create_swapchain_resources(
         extent,
         render_finished,
     })
+}
+
+/// An image as one frame's passes see it (`Renderer::frame_image`).
+#[derive(Clone, Copy)]
+struct FrameImage {
+    /// The tracker's key: the image's handle.
+    key: u64,
+    handle: vk::Image,
+    view: vk::ImageView,
+    aspect: vk::ImageAspectFlags,
+    levels: u32,
+    layers: u32,
+    extent: vk::Extent2D,
+}
+
+/// The tracker's key for the light clusters, which are no image: no image's
+/// handle is 0.
+const CLUSTERS_KEY: u64 = 0;
+
+/// Record `barriers`: one call per pair of stage masks, the clusters as a
+/// memory barrier and the rest as image barriers over every level and
+/// layer.
+unsafe fn record_barriers(
+    dev: &Device,
+    cmd: vk::CommandBuffer,
+    barriers: &[Barrier<u64>],
+    find: &impl Fn(u64) -> FrameImage,
+) {
+    type Group = (
+        (vk::PipelineStageFlags, vk::PipelineStageFlags),
+        Vec<vk::MemoryBarrier<'static>>,
+        Vec<vk::ImageMemoryBarrier<'static>>,
+    );
+    let mut groups: Vec<Group> = Vec::new();
+    for b in barriers {
+        let stages = (b.src_stages, b.dst_stages);
+        let g = match groups.iter().position(|g| g.0 == stages) {
+            Some(i) => &mut groups[i],
+            None => {
+                groups.push((stages, Vec::new(), Vec::new()));
+                groups.last_mut().unwrap()
+            }
+        };
+        if b.key == CLUSTERS_KEY {
+            g.1.push(
+                vk::MemoryBarrier::default()
+                    .src_access_mask(b.src_access)
+                    .dst_access_mask(b.dst_access),
+            );
+            continue;
+        }
+        let i = find(b.key);
+        g.2.push(
+            vk::ImageMemoryBarrier::default()
+                .old_layout(b.old)
+                .new_layout(b.new)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(i.handle)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: i.aspect,
+                    base_mip_level: 0,
+                    level_count: i.levels,
+                    base_array_layer: 0,
+                    layer_count: i.layers,
+                })
+                .src_access_mask(b.src_access)
+                .dst_access_mask(b.dst_access),
+        );
+    }
+    for ((src, dst), memory, images) in &groups {
+        dev.cmd_pipeline_barrier(
+            cmd,
+            *src,
+            *dst,
+            vk::DependencyFlags::empty(),
+            memory,
+            &[],
+            images,
+        );
+    }
 }
 
 fn create_depth(

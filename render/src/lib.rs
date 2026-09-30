@@ -5,6 +5,7 @@ mod bloom;
 mod cascades;
 mod environment;
 mod exposure;
+pub mod frame;
 mod frustum;
 mod fxaa;
 mod mesh;

@@ -581,6 +581,54 @@ predicted at most +0.02 ms, and it held.
 (§13) resolves the (jittered) HDR image into a history, which bloom,
 exposure and the tonemap then read in place of the scene's.
 
+**Landed (§26): the pass list.** The decision above, minus the hand-written
+half.
+- **`render::frame::frame_passes`** is the frame, in order. Each pass
+  declares its uses: colour or depth attachment (with its load op and any
+  resolve target), sampled (by which stage, in which layout), storage, copy,
+  or the cluster buffer. `FrameOpts` (MSAA, TAA, FXAA, casters) picks the
+  passes and which images they read. The app supplies one recorder per pass.
+- **`gfx::passes::Tracker`** derives the barriers. It keeps each image's
+  layout, last write and the stages that have read it since, and plans each
+  pass's barriers from its uses. A transition made for a reader serves
+  every later read in that layout, so GTAO's depth barrier covers the main
+  pass's depth test and TAA's read, as the hand-written one did. A clear or
+  full overwrite starts from `UNDEFINED`.
+  - The state persists across frames and is reset when targets are
+    recreated, so §21's cross-frame rule is no longer written, it's derived.
+  - Swapchain images start each frame as "acquired", first usable at the
+    semaphore's stage. The clusters, one buffer per frame in flight, start
+    fresh.
+  - It's pure CPU and unit-tested, each test with a mutation that fails it.
+- **`Renderer::draw_frame(passes)`** records the barriers and the renderings
+  the uses describe (MSAA resolves included, and one rendering per cascade
+  for the shadow map), and calls each recorder. It keeps the fence, the
+  acquire, the submit and the present. Its ~750 lines of barriers are gone.
+- **Timing:** a pair of timestamp slots per timed pass, written before the
+  pass's barriers and after its work. Any slot left unwritten (TAA off) is
+  stamped at the end, so the readback never waits on it. `geo` is now the
+  prepass's span plus the main pass's.
+- **One deliberate change:** under MSAA the main pass's multisampled depth is
+  in `DEPTH_STENCIL_READ_ONLY_OPTIMAL`, as at 1×. It used to stay an
+  attachment. It's tested and never written either way.
+- **Verified:**
+  - HDR dumps from three zone views are **bit-identical** to the old
+    binary's, at 1× and MSAA 4×, TAA on and off (`--no-auto-exposure`, one
+    fixed step a frame). Control: `--no-ao` changes 2.9% of pixels.
+  - Sync validation is 0 at 1×, TAA off, and MSAA 4×/8× after USAGE §8's
+    filter (the known false positive is still one per frame). The same holds
+    with TAA and FXAA toggled live and two window resizes mid-run.
+- **Measured** (release, 3+3 interleaved rounds against 8bb1587): shadow,
+  geo, ao and taa medians are unchanged to 0.01 ms.
+  - The cluster dispatch now overlaps the shadow pass: `cluster` 0.03 →
+    0.00 ms on `lights120`, frame 1.07–1.08 → 1.05–1.06. The old shadow
+    barrier happened to hold it back, and nothing orders the two, as the
+    clusters read only the lights the shadow pass uploads from the CPU.
+  - bloom, exposure and post were bimodal in *both* binaries (bloom 0.07 or
+    0.10 ms): the memory clock wandered 456–1218 MHz within runs despite
+    `profile_standard`. So the zone's frame median (0.82–0.86 vs 0.84–0.87)
+    doesn't resolve 0.02 ms.
+
 Barriers: Vulkan 1.3 **sync2** (`VkImageMemoryBarrier2`, timeline semaphores).
 Key hazards: shadow depth W→R before opaque; HDR color W→R at resolve; cluster
 buffer W(compute)→R(fragment). Queues: graphics for all passes; cluster
@@ -3064,7 +3112,9 @@ and punctuation.
   earlier submissions on the queue, so this orders frame N+1 after frame N.
   Verified at 0 messages across default, MSAA 4×, FXAA, shadows-off, all
   three combined, and the main menu; `--bench` timings were unchanged. Any
-  *new* per-frame image must follow the same rule.
+  *new* per-frame image must follow the same rule. Since the pass list (§10)
+  nobody writes that barrier: the tracker keeps each image's uses across
+  frames and derives it.
 - **Debug draw:** immediate line/shape renderer (bounds, frustums, rapier
   colliders) + fullscreen debug modes via push-constant flags (wireframe,
   cascade tint, cluster-light heatmap, overdraw).
@@ -3085,8 +3135,9 @@ app        thin binary wiring it together
 ```
 
 **Landed (§26):** `game` holds the simulation and `app` the window, the
-frame, the GPU session, menus, config and audio. The pass order is still in
-`gfx` (`Renderer::draw_frame`), not `render`.
+frame, the GPU session, menus, config and audio. The frame's pass order
+is `render`'s (`render::frame`, §10); `gfx` executes the list and derives
+its barriers.
 
 ## 23. Build order (milestones)
 
@@ -3158,7 +3209,7 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   view frustum. `app` keeps the window and event loop, the frame itself (in
   `window_event`), `Session` (the GPU half of a world), menus, config, audio
   (with `StepTracker`) and `--bench`. Still to split: the frame in
-  `window_event`, and the pass order out of `gfx` into `render`.
+  `window_event`. The pass order moved to `render` with the pass list (§10).
 - **Deps in use**: ash 0.38, ash-window 0.13, raw-window-handle 0.6, winit 0.30,
   vk-mem 0.4, glam 0.29, bevy_ecs 0.16, serde 1, rapier3d `=0.35.3` (exact
   pin; default features). rapier 0.35 builds on its own newer glam (0.33, via
@@ -3405,7 +3456,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   per-frame). With `FRAMES_IN_FLIGHT = 2` the shared targets carried a
   cross-frame WAW hazard until each `UNDEFINED` transition took the previous
   frame's uses as its source stages (§21); sync validation has been clean since.
-  The sync2 barrier + timeline-semaphore pass (§10) is still pending.
+  Those barriers are derived now (the pass list, §10). They're still legacy
+  `vkCmdPipelineBarrier`, since `synchronization2` isn't enabled; the sync2
+  and timeline-semaphore pass is pending.
 - **Anti-aliasing (§3, §10, §13)**: MSAA, FXAA and TAA have landed (§13, and
   below). The groundwork was a **single knob**, `MSAA_SAMPLES` /
   `Renderer::samples()`, that the HDR + depth targets and the mesh/sky pipelines

@@ -585,7 +585,7 @@ OCCLUSION, live):
 
 ## 5. Tests
 
-`cargo test --workspace` runs 247 tests, in a few seconds once built (the
+`cargo test --workspace` runs 259 tests, in a few seconds once built (the
 ones that step rapier, the ropes and the mixer take most of it).
 All of them are CPU-side: none needs a GPU, a window, a sound card or
 anything in `scratch/`, so they pass on a fresh clone.
@@ -726,6 +726,7 @@ let p = b.world.get::<Player>(b.player).unwrap();       // read back what you ne
 | End to end | app | a glTF level written by the test (flat pads, each material tagged grass, wood, `Carpet`, snow, an unknown name or nothing) goes through the game's own world build (`build_world`, the CPU half of `Session::new`) and the real schedule: the player starts at the scene's marker, the load counts colliders per surface, and walking the row, every step sounds like the pad under it (unknown and untagged: concrete), and every pad gets one; the same level untagged steps only on concrete |
 | Menus | app | row layout and hit-testing at several window sizes, including scrolling a screen taller than the window (the selection stays visible, hovering a visible row never scrolls, hits map back to the right row); wraparound, Esc/back behaviour, OPTIONS reachable from both menus, MSAA only outside a session, DISPLAY toggles windowed/fullscreen, FIELD OF VIEW steps its presets (and the projection really uses it); SENSITIVITY / INVERT Y change and save; rebinding waits for a key, ignores menu keys, takes the key from its old action (which shows NONE), and is cancelled by Esc, moving away or BACK; RESET KEYS; **every label drawable by the 5×7 A–Z/0–9 font** |
 | Shadows (CSM) | app | split distances, texel snapping, cascade spheres cover their frustum slice at every FOV from 30° to 120°; caster pancaking (the tower's top is culled by the full cascade frustum but kept by caster culling, and sits up-light of the near plane) |
+| Pass list | gfx, render | the barrier tracker: a clear waits for last frame's readers; one transition serves every later read in its layout (GTAO's depth barrier covers the main pass's test and TAA's read); a write waits for every reader; a tested-and-sampled depth merges into one layout, and one image in two layouts in one pass is refused; the swapchain chains after the acquire; a reset starts from `UNDEFINED`; a resolve writes its target; a buffer's read waits for its write. The frame plan, for every MSAA/TAA/FXAA/caster combination: in a steady frame every barrier waits for some earlier use; single-sample readers take the resolves under MSAA; the post chain reads TAA's output and writes where FXAA says |
 | Lights | app | falloff reaches exactly 0 at the radius; frustum culling by sphere, not point; sphere-light specular (a CPU reference of the shader): src = 0 is the old point light, the smooth-metal singularity goes away, the highlight is the source's size, energy roughly conserved |
 | Prefabs | app, assets | `player_start` placement, `prop`/`point_light` params and defaults, extras parsing, fallback for unknown prefabs; `environment`: no marker and an empty one keep the default look, every param lands, left-out params keep defaults and bad ones are reported, the sun's elevation/azimuth convention, and (end-to-end) a level's marker reaches `build_world`; the orb demo's obstacle boxes stand in the demo but not in a loaded level (end-to-end) |
 | Materials | assets, render | glTF `alphaMode`/`alphaCutoff`/`doubleSided` load as `AlphaMode::Mask`(cutoff, default 0.5)/`Blend`/`Opaque` and the flag; the GPU record carries the cutoff only for MASK and the double-sided bit, which matches `mesh.frag`'s; glTF `occlusionTexture` and its strength load (an ARM map shares MR's image, one conversion), and the GPU record packs its slot above the flags (MR's own slot for an ARM map, 0 for none) with the strength in `params.z`, at the shift `mesh.frag` declares; `mesh.frag`'s occlusion follows glTF's strength rule and combines with GTAO by `min`; masked instances' runs follow every opaque one (one pipeline switch a pass), with the same instances and triangles, and a scene without masked materials builds the runs it always did; `mesh.frag` never discards or demotes (masked materials rely on its early-Z, testing depth for EQUAL against the prepass's cut) |
@@ -798,6 +799,13 @@ echo profile_standard | sudo tee /sys/class/drm/card1/device/power_dpm_force_per
 
 Find the right `cardN` with `grep -H . /sys/class/drm/card[0-9]/device/device`: the
 RX 7800 XT is `0x747e`. The setting resets on reboot, or write `auto`.
+
+It may not hold the **memory** clock. On 2026-09-30, `pp_dpm_mclk` wandered
+456–1218 MHz within single runs, and bandwidth-bound passes (bloom, exposure,
+post) came out bimodal in both binaries of an A/B (bloom median 0.07 or 0.10 ms
+from run to run). Sample it during a run
+(`grep '\*' /sys/class/drm/card1/device/pp_dpm_mclk` once a second), and judge
+those passes over more rounds, or not at all.
 
 ### `--bench`
 

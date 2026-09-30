@@ -51,6 +51,7 @@ use feather_game::lights::{extract_lights, PointLight};
 use feather_game::{rope, weather};
 use feather_gfx::{GpuTimes, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use feather_platform::winit;
+use feather_render::frame::{frame_passes, FrameOpts, Recorders};
 use feather_render::{
     cascade_splits, fit_cascade, slice_sphere, world_sphere, AoPass, AoProjection, BloomPass,
     CascadeSetup, ClusterView, Environment, ExposureParams, ExposurePass, FrameStats, Frustum,
@@ -1753,24 +1754,30 @@ impl ApplicationHandler for App {
                     // draw methods take &self, only `prepare_frame` above needed
                     // &mut, and that already ran.
                     let session = self.session.as_ref();
-                    r.draw_frame(
+                    let opts = FrameOpts {
+                        msaa: r.multisampled(),
+                        taa: r.taa_on(),
+                        fxaa: r.fxaa_on(),
+                        shadow_casters: r.has_shadow_casters(),
+                    };
+                    let recorders = Recorders {
                         // Shadow pass: sun depth map (also flushes this frame's
                         // buffers). No session means no casters and no buffers —
                         // the pass still clears, so every fragment reads as lit.
-                        |cmd, extent, frame, cascade| {
+                        shadow: Box::new(|cmd, extent, frame, cascade| {
                             if let Some(s) = session {
                                 s.mesh.draw_shadow(cmd, extent, frame, cascade);
                             }
-                        },
+                        }),
                         // Light clusters (§12): after draw_shadow has uploaded
                         // this frame's lights + globals, before the main pass.
-                        |cmd, frame| {
+                        cluster: Box::new(|cmd, _, frame, _| {
                             if let Some(s) = session {
                                 s.mesh.dispatch_clusters(cmd, frame);
                             }
-                        },
+                        }),
                         // Depth prepass (§10), on its own so GTAO can read it.
-                        |cmd, extent, frame| {
+                        prepass: Box::new(|cmd, extent, frame, _| {
                             if let (Some(s), Some(v)) = (session, frame_view) {
                                 s.mesh.draw_depth_prepass(
                                     cmd,
@@ -1781,9 +1788,9 @@ impl ApplicationHandler for App {
                                     v.camera_pos,
                                 );
                             }
-                        },
+                        }),
                         // GTAO (§13), from the prepass's depth.
-                        |cmd, extent, frame| {
+                        ao: Box::new(|cmd, extent, frame, _| {
                             if ao_on {
                                 ap.update(
                                     frame,
@@ -1801,12 +1808,12 @@ impl ApplicationHandler for App {
                                 };
                                 ap.dispatch(cmd, frame, extent, proj);
                             }
-                        },
+                        }),
                         // Geometry: the lit opaque pass over the prepass's depth
                         // (each pixel shaded once), then the sky depth-tested into
                         // whatever background is left. Skipped wholesale in the
                         // main menu, leaving the attachment's clear colour.
-                        |cmd, extent, frame| {
+                        main: Box::new(|cmd, extent, frame, _| {
                             if let (Some(s), Some(v)) = (session, frame_view) {
                                 s.mesh.draw_main(
                                     cmd,
@@ -1825,9 +1832,9 @@ impl ApplicationHandler for App {
                                     v.light_dir,
                                 );
                             }
-                        },
+                        }),
                         // TAA (§13): only invoked while it's on.
-                        |cmd, extent, frame| {
+                        taa: Box::new(|cmd, extent, frame, _| {
                             tp.update(
                                 frame,
                                 scene_hdr_view,
@@ -1839,26 +1846,26 @@ impl ApplicationHandler for App {
                                 nearest,
                             );
                             tp.dispatch(cmd, frame, extent, &taa_push);
-                        },
+                        }),
                         // Bloom (§13): down the chain and back up, before the
                         // tonemap mixes it in.
-                        |cmd, extent, frame| {
+                        bloom: Box::new(|cmd, extent, frame, _| {
                             if bloom_on {
                                 bp.update(frame, hdr_view, &bloom_views, hdr_sampler);
                                 bp.dispatch(cmd, frame, extent, &bloom_extents);
                             }
-                        },
+                        }),
                         // Auto-exposure (§13). First the result this frame
                         // slot's last run left (its fence has been waited
                         // on), for the bench; then this frame's metering.
-                        |cmd, extent, frame| {
+                        exposure: Box::new(|cmd, extent, frame, _| {
                             if auto_on {
                                 metered = Some(ep.last(frame));
                                 ep.update(frame, hdr_view, hdr_sampler);
                                 ep.dispatch(cmd, frame, extent, exposure_params);
                             }
-                        },
-                        |cmd, extent, frame| {
+                        }),
+                        post: Box::new(|cmd, extent, frame, _| {
                             tm.update(frame, hdr_view, bloom_views[0], exposure_state, hdr_sampler);
                             let strength = if bloom_on { BLOOM_STRENGTH } else { 0.0 };
                             tm.draw(
@@ -1870,16 +1877,17 @@ impl ApplicationHandler for App {
                                 bloom_views.len(),
                                 auto_on,
                             );
-                        },
+                        }),
                         // Only invoked when FXAA is enabled.
-                        |cmd, extent, frame| {
+                        aa: Box::new(|cmd, extent, frame, _| {
                             fx.update(frame, ldr_view, hdr_sampler);
                             fx.draw(cmd, extent, frame);
-                        },
+                        }),
                         // Overlay, blended over the finished frame. No-op when the
                         // menu is closed (nothing was built).
-                        |cmd, extent, frame| ui.draw(cmd, extent, frame),
-                    );
+                        ui: Box::new(|cmd, extent, frame, _| ui.draw(cmd, extent, frame)),
+                    };
+                    r.draw_frame(frame_passes(opts, recorders));
                 }
 
                 if let (Some(b), Some(m)) = (self.bench.as_mut(), metered) {
