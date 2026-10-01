@@ -3564,6 +3564,11 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   `&Font` so layouts and renderer share one set of metrics, and the
   menu/console/HUD sizes are em-based (`h/36`, `h/50`, floors) retuned to
   the old on-screen heights.
+- **Console charset (§19):** with the real font in place, the typing filter
+  widened from A–Z/0–9/space/`.`/`-` to all printable ASCII, and the line
+  keeps the case it was typed in — `Weather FOGGY` parses the same as
+  `weather foggy` but the history and echo read as typed. Two tests carry
+  mutation controls (the old filter and the forced uppercase both fail).
 - **Weather keys as data (§13):** the CLEAR/OVERCAST/FOGGY key tables live in
   `config/weather.json` (shipped, field-for-field the compiled-in defaults),
   hot-reloaded on mtime change — a bad file keeps the running look and names

@@ -222,8 +222,9 @@ shot lands), a health bar and number, and the kill count. It's hidden in
 
 **Console:** `` ` `` (while playing) opens a command line over the live
 world — the sim keeps running, so changes show at once; Esc or `` ` ``
-closes, Up/Down walk the command history, and everything is case-insensitive.
-It drives the same settings as the menus and the F1–F3 keys, and nothing it
+closes, Up/Down walk the command history. Anything printable ASCII types
+as-is, in the case you typed it; commands match case-insensitively. It
+drives the same settings as the menus and the F1–F3 keys, and nothing it
 changes is saved except `fov`.
 
 | Command | What it does |

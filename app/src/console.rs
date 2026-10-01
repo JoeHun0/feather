@@ -66,12 +66,13 @@ impl Console {
         self.open = !self.open;
     }
 
-    /// Type text: letters, digits, space, `.` and `-` (what the font can
-    /// show); accepted case-insensitively, kept and shown uppercase.
+    /// Type text: any printable ASCII lands as typed (the UI font covers
+    /// 0x20–0x7E); `parse` matches commands case-insensitively, so `weather
+    /// FOGGY` and `Weather foggy` are the same command.
     pub fn text(&mut self, s: &str) {
         for c in s.chars() {
-            if c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '-') {
-                self.line.push(c.to_ascii_uppercase());
+            if c.is_ascii_graphic() || c == ' ' {
+                self.line.push(c);
             }
         }
     }
@@ -313,11 +314,18 @@ mod tests {
     fn typing_appends_whats_printable() {
         let mut c = Console::new();
         c.text("weather Fog.");
-        assert_eq!(c.line, "WEATHER FOG.");
-        c.text("1-2+3,4`x"); // '+' and '`' drop, the rest land
-        assert_eq!(c.line, "WEATHER FOG.1-234X");
+        assert_eq!(c.line, "weather Fog.", "case is kept as typed");
+        // Everything printable lands — punctuation included, since the font
+        // has it; non-ASCII does not.
+        c.text("1-2+3,4`x");
+        assert_eq!(c.line, "weather Fog.1-2+3,4`x");
+        c.text("fög");
+        assert_eq!(
+            c.line, "weather Fog.1-2+3,4`xfg",
+            "only the non-ASCII drops"
+        );
         c.backspace();
-        assert_eq!(c.line, "WEATHER FOG.1-234");
+        assert_eq!(c.line, "weather Fog.1-2+3,4`xf", "backspace pops the g");
         for _ in 0..99 {
             c.backspace();
         }
@@ -325,17 +333,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_matches_regardless_of_case() {
+        assert_eq!(parse("Weather FOGGY").unwrap(), Command::Weather(3));
+        assert_eq!(parse("WEATHER foggy").unwrap(), Command::Weather(3));
+        assert_eq!(parse("FogDensity OFF").unwrap(), Command::FogDensity(None));
+        assert_eq!(parse("TIME Level").unwrap(), Command::Time(None));
+        assert_eq!(
+            parse("TeLePoRt 0 -7.36 37").unwrap(),
+            Command::Teleport(0.0, -7.36, 37.0)
+        );
+        // The submitted line is kept as typed, for the history and the echo.
+        let mut c = Console::new();
+        c.text("Weather Foggy");
+        assert_eq!(c.enter().as_deref(), Some("Weather Foggy"));
+    }
+
+    #[test]
     fn enter_submits_and_history_dedupes() {
         let mut c = Console::new();
         assert_eq!(c.enter(), None, "an empty line is nothing");
         c.text("help");
-        assert_eq!(c.enter().as_deref(), Some("HELP"));
+        assert_eq!(c.enter().as_deref(), Some("help"));
+        c.text("HELP");
+        assert_eq!(
+            c.enter().as_deref(),
+            Some("HELP"),
+            "case differs, no dedupe"
+        );
         c.text("help");
-        assert_eq!(c.enter().as_deref(), Some("HELP"));
-        assert_eq!(c.history.len(), 1, "consecutive duplicates collapse");
-        c.text("clear");
-        assert_eq!(c.enter().as_deref(), Some("CLEAR"));
-        assert_eq!(c.history, ["HELP", "CLEAR"]);
+        assert_eq!(c.enter().as_deref(), Some("help"));
+        assert_eq!(c.history, ["help", "HELP", "help"]);
         assert!(c.line.is_empty());
     }
 
@@ -348,17 +375,17 @@ mod tests {
         c.enter();
         c.text("partial");
         c.history_prev();
-        assert_eq!(c.line, "B");
+        assert_eq!(c.line, "b");
         c.history_prev();
-        assert_eq!(c.line, "A", "up walks to the oldest");
+        assert_eq!(c.line, "a", "up walks to the oldest");
         c.history_prev();
-        assert_eq!(c.line, "A", "and stays at the oldest");
+        assert_eq!(c.line, "a", "and stays at the oldest");
         c.history_next();
-        assert_eq!(c.line, "B");
+        assert_eq!(c.line, "b");
         c.history_next();
-        assert_eq!(c.line, "PARTIAL", "down restores the line being typed");
+        assert_eq!(c.line, "partial", "down restores the line being typed");
         c.history_next();
-        assert_eq!(c.line, "PARTIAL", "and stays at the newest");
+        assert_eq!(c.line, "partial", "and stays at the newest");
     }
 
     #[test]
