@@ -109,7 +109,8 @@ Settings persist in `config/` (gitignored, relative to the working directory,
 so run from the repo root), one file per concern. The first normal run writes
 each with defaults and comments; delete one to reset it. All are a flat
 `key = value` subset of TOML parsed by hand (`app/src/config/`), with no
-`[sections]`.
+`[sections]` — except `weather.json`, which is JSON because its keys are
+nested lists (see below).
 
 **`graphics.toml`** — saved when you change a setting in the menu or with the
 F1 / F2 / F3 bindings. Only that key's value is rewritten; comments, other lines and
@@ -163,6 +164,28 @@ them in OPTIONS > SOUND.
 | `master` | everything | `80` |
 | `sfx` | footsteps, jumps, landings | `100` |
 | `ambience` | the hum of visible lamps | `100` |
+
+**`weather.json`** — the weather key tables (§13): what CLEAR, OVERCAST and
+FOGGY look like through the day, hour by hour. It's data, not settings, so
+it ships in the repo and is **hot-reloaded**: save a change and the running
+game applies it the moment the file's mtime moves (the log prints
+`[weather] reloaded`) — the sky and fog tune by eye, no recompile. A bad
+file changes nothing: every problem is logged (`[weather] keeping the
+current keys: …`) and the look in effect stays.
+
+- Top level: `{ "weathers": [ … ] }`, one object per weather: `"name"`
+  (A–Z, what the WEATHER menu shows; a level's `environment` marker picks a
+  weather by name too) and `"keys"`, sorted by `"hour"` (0–24, the last
+  blends into the first across midnight).
+- Every key carries all 17 fields — `hour`; the sky palette `sky_zenith`,
+  `sky_horizon`, `sky_ground`, `sky_sun_color` (linear `[r, g, b]`) and
+  `sky_intensity`; the sun `sun_color`, `sun_intensity`, `sun_glow`,
+  `sun_disk`; the moon `moon_color`, `moon_intensity`; the fog `fog_density`,
+  `fog_falloff`, `fog_color`, `fog_sun`; and the auto-exposure range
+  `exposure_min`, `exposure_max`. There is no inheritance: each key spells
+  everything out, and unknown fields are ignored.
+- The shipped file is exactly the compiled-in defaults; a test keeps them
+  equal, so tuning always starts from the look you already had.
 
 **All files:**
 

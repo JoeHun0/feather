@@ -301,6 +301,10 @@ struct Configs {
     controls_file: Option<config::ConfigFile>,
     audio: AudioSettings,
     audio_file: Option<config::ConfigFile>,
+    /// The weather key tables' file, watched for hot reloads (§13). `None`
+    /// under `--bench` (which skips config files) or when the file can't
+    /// be used; the compiled-in keys carry on either way.
+    weather_file: Option<config::weather::WeatherFile>,
 }
 
 #[derive(Default)]
@@ -490,6 +494,10 @@ struct App {
     /// Volumes (`config/audio.toml`, §20) and the file to save them to.
     audio_settings: AudioSettings,
     audio_file: Option<config::ConfigFile>,
+    /// The weather key tables' file, watched for hot reloads (§13). `None`
+    /// under `--bench` or when the file couldn't be used; the compiled-in
+    /// keys carry on either way.
+    weather_file: Option<config::weather::WeatherFile>,
     /// The mixer; `None` = silent (no device, or `--bench`).
     audio: Option<Audio<kira::DefaultBackend>>,
     /// Turns the player's motion into footsteps / jump / landing sounds.
@@ -648,6 +656,7 @@ impl App {
             controls_file,
             audio: audio_settings,
             audio_file,
+            weather_file,
         } = configs;
         let light = Environment::default().sun_dir;
         Self {
@@ -672,6 +681,7 @@ impl App {
             controls_file,
             audio_settings,
             audio_file,
+            weather_file,
             audio,
             steps: StepTracker::default(),
             last_shots: 0,
@@ -1444,7 +1454,18 @@ impl ApplicationHandler for App {
                     let inv_view_proj = draw_view_proj.inverse();
                     // The weather (§13): the clock moves with the simulation
                     // (not while paused, nor in a bench, which must repeat),
-                    // and this frame's atmosphere and light follow.
+                    // and this frame's atmosphere and light follow. The key
+                    // tables hot-reload: a changed file installs before the
+                    // frame samples it; a bad file keeps the current tables.
+                    if let Some(f) = self.weather_file.as_mut() {
+                        match f.poll() {
+                            Some(Ok(())) => eprintln!("[weather] reloaded"),
+                            Some(Err(problems)) => {
+                                eprintln!("[weather] keeping the current keys: {problems:?}")
+                            }
+                            None => {}
+                        }
+                    }
                     if self.bench.is_none() {
                         self.settings.weather.advance(steps as f32 * FIXED_DT);
                     }
@@ -2034,18 +2055,22 @@ fn main() {
             controls_file: None,
             audio: AudioSettings::default(),
             audio_file: None,
+            weather_file: None,
         }
     } else {
         let graphics = config::graphics::load(&mut settings);
         let (controls, controls_file) = config::controls::load();
         let mut audio = AudioSettings::default();
         let audio_file = config::audio::load(&mut audio);
+        let weather_file =
+            config::weather::WeatherFile::load(std::path::Path::new(config::weather::CONFIG_PATH));
         Configs {
             graphics,
             controls,
             controls_file,
             audio,
             audio_file,
+            weather_file,
         }
     };
     // Audio never stops a run: no device means silence. `--bench` is silent

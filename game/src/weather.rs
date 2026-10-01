@@ -794,6 +794,7 @@ pub const WEATHERS: [Weather; 3] = [
 
 /// Owned weather tables, as parsed from a data file (the app owns the file;
 /// game just hosts the result). `install` makes them live.
+#[derive(Debug)]
 pub struct WeatherData {
     pub name: String,
     pub keys: Vec<(f32, Key)>,

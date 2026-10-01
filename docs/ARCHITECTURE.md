@@ -1688,6 +1688,20 @@ level's `Environment`, the clock and the chosen weather into that frame's
     luminance). Scaling the fog colour by the sky visibility would fix it.
   - Keys are only as good as their authoring: none has been tuned by eye.
 
+**Landed (§26): the keys are data.** The key tables left the source for
+`config/weather.json` — three weathers, every key's 17 fields spelled out,
+no inheritance — hot-reloaded when the file's mtime moves, so the look tunes
+by eye without a recompile. `game` hosts the tables behind `weather::tables()`
+(the compiled-in `WEATHERS` stay as the fallback; `--bench` never reads the
+file); `install` leaks the parsed owned data into `'static', a few KB per
+reload. The well-formedness rules moved into `weather::problems`, shared by
+the defaults' test and the file parser — a file must pass exactly what the
+tests guard, and a rejected file keeps the running look while naming every
+problem. Global-swap tests live in `game/tests/weather_tables.rs`, their own
+process, since unit tests would race on the global; the shipped file is
+tested field-for-field equal to the compiled-in defaults, so tuning starts
+from the look there was.
+
 **Landed (§26): height fog.** Fog was uniform (`1 − e^{−density·dist}`,
 towards the sky's colour), only on geometry, so the horizon stayed crisp and
 the ground's edge showed. Now it can pool on the ground.
@@ -3511,6 +3525,13 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   `Score.shots` advances. 3 layout tests with mutation controls (the
   left-half anchor among them), and the shot's peak in the clip
   normalisation test.
+- **Weather keys as data (§13):** the CLEAR/OVERCAST/FOGGY key tables live in
+  `config/weather.json` (shipped, field-for-field the compiled-in defaults),
+  hot-reloaded on mtime change — a bad file keeps the running look and names
+  every problem. game hosts them behind `weather::tables()` with `WEATHERS`
+  as the fallback; `--bench` never reads the file. `weather::problems` is the
+  one well-formedness check, shared by the defaults' test and the parser.
+  6 tests with mutation controls across the two binaries.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
   sky visibility and GTAO (§13), *not* cubemap IBL;

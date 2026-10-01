@@ -15,6 +15,7 @@
 pub mod audio;
 pub mod controls;
 pub mod graphics;
+pub mod weather;
 
 use std::fs;
 use std::io;

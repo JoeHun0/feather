@@ -19,8 +19,6 @@ glam.workspace = true
 rapier3d.workspace = true
 kira.workspace = true
 mint.workspace = true
-
-[dev-dependencies]
-# Tests only: constructing PrefabSpec params. The runtime reads them through
-# PrefabSpec's typed accessors, so the binary itself needs no JSON dependency.
+# config/weather.json: the weather key tables are data now (§13), parsed at
+# load and on change. Already in the tree for assets; no new download.
 serde_json = "1"
