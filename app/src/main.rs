@@ -35,7 +35,7 @@ mod menu;
 
 use audio::{Audio, AudioSettings, SoundEvent, StepTracker};
 use config::controls::{Action, Controls};
-use menu::{menu_hit, menu_layout, ControlsSave, Menu, MenuOutcome, MenuScreen};
+use menu::{menu_hit, menu_layout, row_text_y, ControlsSave, Menu, MenuOutcome, MenuScreen};
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -1844,13 +1844,20 @@ impl ApplicationHandler for App {
                         let title = self.menu.screen.title();
                         ui.text(
                             (w - ui.text_width(title, title_px)) * 0.5,
-                            layout.title_y,
+                            row_text_y(
+                                ui.font(),
+                                layout.title_y,
+                                ui.text_height(title_px),
+                                title_px,
+                            ),
                             title_px,
                             [0.9, 0.9, 0.9, 1.0],
                             title,
                         );
 
-                        let pad = px * 4.0;
+                        // The same pad the layout grew the bars by (§19's
+                        // single source of truth): text inset == bar growth.
+                        let pad = layout.pad;
                         // Short dim bars where rows are scrolled out of view
                         // (the font has no arrow glyphs).
                         let marker = [0.55, 0.55, 0.55, 0.9];
@@ -1881,8 +1888,14 @@ impl ApplicationHandler for App {
                                 (false, false) => [0.40, 0.40, 0.40, 1.0],
                             };
                             // Text sits inset from the bar by the same padding
-                            // the rect was grown by.
-                            ui.text(rx + pad, ry + pad * 0.5, px, color, &row.label);
+                            // the rect was grown by (layout.pad).
+                            ui.text(
+                                rx + pad,
+                                row_text_y(ui.font(), ry, rh, px),
+                                px,
+                                color,
+                                &row.label,
+                            );
                         }
                     } else if self.console.open {
                         // The console over live play: the log, the prompt, a

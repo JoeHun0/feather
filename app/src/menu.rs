@@ -583,6 +583,9 @@ pub fn menu_font_size(h: f32) -> f32 {
 pub struct MenuLayout {
     /// Font size (em, screen px) the rows are laid out at.
     pub size: f32,
+    /// How far the row bars are grown past the text box on every side. The
+    /// redraw insets the text by exactly this, so bar and text cannot drift.
+    pub pad: f32,
     pub title_y: f32,
     /// Index of the first visible row.
     pub first: usize,
@@ -644,12 +647,22 @@ pub fn menu_layout(
         .collect();
     MenuLayout {
         size,
+        pad,
         title_y,
         first,
         rects,
         more_above: first > 0,
         more_below: first + visible < n,
     }
+}
+
+/// Where a row label's text top goes so the visible glyphs sit vertically
+/// centred in its bar. `UiPass::text` takes the *line-box* top, which leaves
+/// ascender slack above an all-caps label; `Font::visual_extents` is the
+/// band caps and digits actually occupy.
+pub fn row_text_y(font: &Font, rect_y: f32, rect_h: f32, size: f32) -> f32 {
+    let (top, bottom) = font.visual_extents(size);
+    rect_y + (rect_h - (bottom - top)) * 0.5 - top
 }
 
 /// Index of the row under `(cx, cy)`, if any. Physical pixels, matching both
@@ -814,6 +827,30 @@ mod tests {
         assert_eq!(menu_hit(&l, w * 0.5, h - 1.0), None, "bottom hit");
         assert_eq!(menu_hit(&l, 0.0, r[0].1 + 1.0), None, "left hit");
         assert_eq!(menu_hit(&l, w - 1.0, r[0].1 + 1.0), None, "right hit");
+    }
+
+    /// The visible band of a row's text (caps + digits) is centred in its
+    /// bar. `text()` draws from the line-box top, so the label's top must be
+    /// lifted past the ascender slack — a regression here reads as text
+    /// sitting on the bar's bottom edge.
+    #[test]
+    fn row_text_centres_the_visible_band_in_the_bar() {
+        let font = font();
+        for h in [200.0, 720.0, 1440.0] {
+            let size = menu_font_size(h);
+            let rows = rows_of(MenuScreen::Root);
+            let l = menu_layout(&font, 1280.0, h, &rows, 0, 0);
+            for &(_, ry, _, rh) in &l.rects {
+                let y = row_text_y(&font, ry, rh, size);
+                let (top, bottom) = font.visual_extents(size);
+                let band_mid = y + (top + bottom) * 0.5;
+                let bar_mid = ry + rh * 0.5;
+                assert!(
+                    (band_mid - bar_mid).abs() < 0.01,
+                    "text band off centre at h={h}: {band_mid} vs {bar_mid}"
+                );
+            }
+        }
     }
 
     /// A menu as it exists with a world loaded: the app resets to `Root` when a

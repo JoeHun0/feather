@@ -52,6 +52,12 @@ pub struct Font {
     pub line: f32,
     /// Baseline offset from the line's top.
     pub ascent: f32,
+    /// Distance from the line's top to the cap line ('H' top) — where the
+    /// visible text of an all-caps label starts.
+    pub cap_top: f32,
+    /// Distance from the line's top to the 'H' bottom ≈ the baseline; caps
+    /// and digits live between `cap_top` and `cap_bottom`.
+    pub cap_bottom: f32,
     /// UV of the solid cell's centre, for sampling rectangles.
     pub solid: [f32; 2],
 }
@@ -152,6 +158,9 @@ impl Font {
             glyphs.push(glyph);
         }
 
+        let h = &glyphs['H' as usize - FIRST as usize];
+        let cap_top = ascent + h.min_y;
+        let cap_bottom = cap_top + h.h;
         Some(Self {
             atlas,
             width,
@@ -160,6 +169,8 @@ impl Font {
             raster_em: raster_em as f32,
             line,
             ascent,
+            cap_top,
+            cap_bottom,
             solid,
         })
     }
@@ -184,6 +195,16 @@ impl Font {
     /// One line's height at `size` screen pixels per em.
     pub fn height(&self, size: f32) -> f32 {
         self.line * size / self.raster_em
+    }
+
+    /// Where the *visible* text of an all-caps line sits, at `size`: offsets
+    /// from the line-box top to its cap line and baseline ('H' extents).
+    /// `UiPass::text` draws from the line-box top; menus centre rows by
+    /// these, not by the full line height (which leaves ascender and
+    /// descender slack above and below the glyphs).
+    pub fn visual_extents(&self, size: f32) -> (f32, f32) {
+        let s = size / self.raster_em;
+        (self.cap_top * s, self.cap_bottom * s)
     }
 }
 
@@ -310,5 +331,26 @@ mod tests {
             (a - 5.0 * adv).abs() < 1e-3,
             "width is five monospace advances"
         );
+    }
+
+    #[test]
+    fn visual_extents_bound_the_cap_band() {
+        let f = font();
+        let (top, bottom) = f.visual_extents(18.0);
+        assert!(top > 0.0, "caps start below the line top");
+        assert!(bottom > top, "the cap band has height");
+        assert!(
+            bottom < f.height(18.0),
+            "the baseline sits above the line's bottom"
+        );
+        // The whole band scales with size.
+        let (t2, b2) = f.visual_extents(36.0);
+        assert!((t2 - top * 2.0).abs() < 1e-3, "cap_top ∝ size");
+        assert!((b2 - bottom * 2.0).abs() < 1e-3, "cap_bottom ∝ size");
+        // 'H' really is where the extents come from: its bitmap spans the
+        // band, in raster units.
+        let h = f.glyph('H').unwrap();
+        assert!((top - (f.ascent + h.min_y)).abs() < 1e-3);
+        assert!((bottom - top - h.h).abs() < 1e-3);
     }
 }

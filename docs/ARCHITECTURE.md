@@ -3567,7 +3567,13 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   CPU/GPU seam: `UiPass::new` replicates the R8 atlas into the RGBA8 alpha
   and `ui.frag` samples alpha (`texture(u_atlas, v_uv).a`) — the first cut
   sampled `.r` and rendered every glyph as a solid rectangle, caught in
-  review, pinned by a source test both ways (`ui::tests`).
+  review, pinned by a source test both ways (`ui::tests`). Two alignment
+  fixes followed in review: the redraw insets row text by `layout.pad`
+  (it kept computing the old `px * 4` locally — 4 *ems* ≈ 116 px, which
+  threw every label right and down out of its bar), and rows are now
+  centred by their *visible* band (`Font::visual_extents`, the 'H' cap
+  box) rather than the line-box top, which left caps sitting on the bar's
+  bottom edge (`menu::row_text_y`, tested centre-of-band == centre-of-bar).
 - **Console charset (§19):** with the real font in place, the typing filter
   widened from A–Z/0–9/space/`.`/`-` to all printable ASCII, and the line
   keeps the case it was typed in — `Weather FOGGY` parses the same as
