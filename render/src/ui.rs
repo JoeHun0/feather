@@ -18,8 +18,9 @@ macro_rules! spv {
 
 const GLYPH_W: usize = 5;
 const GLYPH_H: usize = 7;
-/// Slot 0 is solid, slot 1 is blank, then A-Z, then 0-9.
-const SLOTS: usize = 38;
+/// Slot 0 is solid, slot 1 is blank, then A-Z, then 0-9, then `.` and `-`
+/// (the console echoes coordinates and fog values).
+const SLOTS: usize = 40;
 const MAX_QUADS: usize = 1024;
 
 /// 5x7 glyphs, one byte per row, bit 4 = leftmost pixel. Verified legible by
@@ -63,12 +64,16 @@ const GLYPHS: [[u8; GLYPH_H]; SLOTS] = [
     [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08], // 7
     [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E], // 8
     [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C], // 9
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x04], // .
+    [0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00], // -
 ];
 
 fn slot_of(c: char) -> usize {
     match c.to_ascii_uppercase() {
         'A'..='Z' => 2 + (c.to_ascii_uppercase() as usize - 'A' as usize),
         '0'..='9' => 28 + (c as usize - '0' as usize),
+        '.' => 38,
+        '-' => 39,
         _ => 1, // blank
     }
 }

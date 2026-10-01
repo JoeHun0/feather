@@ -213,11 +213,33 @@ left-mouse fire aren't).
 | F2 | FXAA on/off |
 | F3 | TAA on/off |
 | F11 | windowed / fullscreen |
+| `` ` `` | the developer console |
 | Esc | pause |
 
 While playing you also get a HUD: a crosshair (with a brief flash when a
 shot lands), a health bar and number, and the kill count. It's hidden in
 `--bench`, where nothing may draw.
+
+**Console:** `` ` `` (while playing) opens a command line over the live
+world — the sim keeps running; Esc or `` ` `` closes, Up/Down walk the
+history. Everything is case-insensitive and it drives the same settings as
+the menus and F1–F3:
+
+| Command | What it does |
+|---|---|
+| `weather level clear overcast foggy` | the look, at once (the menu blends instead) |
+| `time 0-24` / `time level` | the clock's hour, or the level's fixed sun |
+| `speed n` | game seconds per real second (0 pauses) |
+| `fog_density v` / `off` | raw fog over the weather's, or back to it |
+| `fog_height v` / `off` | the fog's height falloff, or the weather's |
+| `exposure v` | tonemap compensation |
+| `fov 30-120` | vertical field of view, saved like the menu's |
+| `noclip` | free flight on/off |
+| `teleport x y z` | move the player (the kill plane's respawn) |
+| `clear`, `help` | clear the log / list the commands |
+
+Unknown commands and bad values print their usage; nothing is saved except
+`fov`.
 
 **Menus:** mouse (hover + click) or arrows + Enter. **Esc** steps back one
 screen, and resumes play only from the pause menu's top level.

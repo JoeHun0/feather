@@ -2983,6 +2983,21 @@ size (`app/src/hud.rs`, `menu_layout`'s pattern), unit-tested at three sizes.
 It reads `Health` and `Score` straight off the world, and draws only when a
 session is live and unpaused — never over the menus, never under `--bench`.
 
+**Landed (§26): the developer console.** `` ` `` in play opens a Quake-style
+command line on the same UiPass: a dim top panel, a 64-line scrollback, a
+prompt with a blinking block cursor (the font has no `]`, so a solid marker
+stands in; it grew `.` and `-` glyphs so coordinates and fog values read).
+State and parsing live in `app/src/console.rs`, renderer- and event-loop-
+free like `Menu`, so the parser, the typing filter, the history walk and
+the log cap are unit-tested without a GPU. It opens only while playing and
+owns the keyboard while open — held keys and a latched shot drop, mouselook
+gates like pausing — and it is not a pause: the fixed step keeps running,
+so `weather foggy` + `time 18.5` retune the sky while you stand in it.
+Commands are a fixed v1 set applied through the same code paths as the
+menus (F1–F3, GAMEPLAY), so the two cannot drift; weather and time
+jump-cut rather than blend, deliberately, to tune by. game grew the two
+knobs it needed: `SessionWeather::choose` and the raw fog overrides.
+
 Still pending: **egui** for the dev UI (this is the *game* HUD path, not a
 replacement for it), SDF/MSDF text for scale-independent glyphs, and lower-case
 and punctuation.
@@ -3532,6 +3547,12 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   as the fallback; `--bench` never reads the file. `weather::problems` is the
   one well-formedness check, shared by the defaults' test and the parser.
   6 tests with mutation controls across the two binaries.
+- **Developer console (§19):** `` ` `` in play opens a command line over
+  the live world, not a pause: weather/time/speed and raw fog overrides
+  (game's `SessionWeather::choose` + the raw fields), exposure/fov/noclip/
+  teleport, command history, a 64-line log. Parsing and state are unit
+  tested without a GPU; the UiPass font gained `.` and `-` glyphs. 6
+  mutation controls.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
   sky visibility and GTAO (§13), *not* cubemap IBL;

@@ -29,6 +29,7 @@
 
 mod audio;
 mod config;
+mod console;
 mod hud;
 mod menu;
 
@@ -49,6 +50,7 @@ use feather_game::controller::{
 };
 use feather_game::level::build_world;
 use feather_game::lights::{extract_lights, PointLight};
+use feather_game::physics::{to_rapier, Physics};
 use feather_game::{rope, weather};
 use feather_gfx::{GpuTimes, Renderer, FRAMES_IN_FLIGHT, SHADOW_CASCADES};
 use feather_platform::winit;
@@ -61,7 +63,7 @@ use feather_render::{
 };
 use glam::{Mat4, Vec3, Vec4};
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
@@ -514,6 +516,8 @@ struct App {
     paused: bool,
     /// Pause-menu navigation state (screen + selection + ancestor stack).
     menu: Menu,
+    /// The developer console (§19): a live overlay, never a pause.
+    console: console::Console,
     /// Last known cursor position in physical pixels, for menu hit-testing.
     /// `None` until the pointer first moves — winit reports no position before
     /// that, so there is genuinely nothing to hit-test against.
@@ -688,6 +692,7 @@ impl App {
             held_keys: HashSet::new(),
             paused: false,
             menu: Menu::new(),
+            console: console::Console::new(),
             cursor: None,
             light_dir: Vec4::new(light.x, light.y, light.z, 0.0),
             exposure: 1.0,
@@ -1019,6 +1024,127 @@ impl App {
         self.input.down = c.held(held, Action::Down);
     }
 
+    /// A key event while the console owns the keyboard: editing keys by
+    /// code, everything printable as text. Escape and ` close it; Enter
+    /// submits.
+    fn console_key(&mut self, event: &KeyEvent) {
+        let pressed = event.state == ElementState::Pressed;
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return;
+        };
+        match code {
+            KeyCode::Backquote | KeyCode::Escape if pressed => self.console.toggle(),
+            KeyCode::Backspace if pressed => self.console.backspace(),
+            KeyCode::ArrowUp if pressed => self.console.history_prev(),
+            KeyCode::ArrowDown if pressed => self.console.history_next(),
+            KeyCode::Enter if pressed && !event.repeat => {
+                if let Some(line) = self.console.enter() {
+                    self.run_console(&line);
+                }
+            }
+            _ if pressed => {
+                if let Some(text) = &event.text {
+                    self.console.text(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Run one submitted console line: echo what it did, or the usage.
+    fn run_console(&mut self, line: &str) {
+        match console::parse(line) {
+            Ok(cmd) => {
+                for out in self.apply_command(cmd) {
+                    self.console.push(out);
+                }
+            }
+            Err(usage) => self.console.push(usage),
+        }
+    }
+
+    /// Apply one parsed command; the lines it produced for the log.
+    fn apply_command(&mut self, cmd: console::Command) -> Vec<String> {
+        use console::Command::*;
+        match cmd {
+            Weather(i) => {
+                self.settings.weather.choose(i);
+                vec![format!("WEATHER {}", weather::choice_name(i))]
+            }
+            Time(None) => {
+                self.settings.weather.clock = None;
+                vec!["TIME LEVEL".to_string()]
+            }
+            Time(Some(h)) => {
+                self.settings.weather.clock = Some(h as f64);
+                vec![format!("TIME {h:.2}")]
+            }
+            Speed(v) => {
+                self.settings.weather.speed = v;
+                vec![format!("SPEED {v}")]
+            }
+            FogDensity(None) => {
+                self.settings.weather.fog_density_raw = None;
+                vec!["FOG DENSITY WEATHER".to_string()]
+            }
+            FogDensity(Some(v)) => {
+                self.settings.weather.fog_density_raw = Some(v);
+                vec![format!("FOG DENSITY {v}")]
+            }
+            FogHeight(None) => {
+                self.settings.weather.fog_height_raw = None;
+                vec!["FOG HEIGHT WEATHER".to_string()]
+            }
+            FogHeight(Some(v)) => {
+                self.settings.weather.fog_height_raw = Some(v);
+                vec![format!("FOG HEIGHT {v}")]
+            }
+            Exposure(v) => {
+                self.exposure = v;
+                vec![format!("EXPOSURE {v}")]
+            }
+            Fov(v) => {
+                self.settings.fov_deg = v;
+                self.persist(config::graphics::Key::Fov);
+                vec![format!("FOV {v}")]
+            }
+            Noclip => match self.session.as_mut() {
+                Some(s) => {
+                    s.noclip = !s.noclip;
+                    vec![if s.noclip {
+                        "NOCLIP ON".to_string()
+                    } else {
+                        "NOCLIP OFF".to_string()
+                    }]
+                }
+                None => vec!["NO SESSION".to_string()],
+            },
+            Teleport(x, y, z) => match self.session.as_mut() {
+                Some(s) => {
+                    // The kill plane's teleport: the ECS state and the body
+                    // together, so nothing reads a stale spot back.
+                    let at = Vec3::new(x, y, z);
+                    let body = {
+                        let mut p = s.world.get_mut::<Player>(s.player).expect("player body");
+                        p.pos = at;
+                        p.prev_pos = at;
+                        p.vel = Vec3::ZERO;
+                        p.body
+                    };
+                    s.world.resource_mut::<Physics>().bodies[body]
+                        .set_next_kinematic_translation(to_rapier(at + Player::CENTER));
+                    vec![format!("TELEPORT {x} {y} {z}")]
+                }
+                None => vec!["NO SESSION".to_string()],
+            },
+            Clear => {
+                self.console.clear();
+                Vec::new()
+            }
+            Help => console::HELP.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
     /// Save `key`'s current value to the settings file. Called only where the
     /// player changed it, so CLI overrides are never written back. A failed
     /// write is logged, never fatal.
@@ -1146,6 +1272,29 @@ impl ApplicationHandler for App {
                             let outcome = self.menu.capture_key(&mut self.controls, code);
                             self.handle_menu_outcome(outcome, event_loop);
                         }
+                        return;
+                    }
+                    // The console's toggle is hard-wired like the menu keys
+                    // (§14), and only while playing: not over the menus, not
+                    // in --bench.
+                    if pressed
+                        && code == KeyCode::Backquote
+                        && self.session.is_some()
+                        && !self.menu_active()
+                    {
+                        self.console.toggle();
+                        if self.console.open {
+                            // Typing must not also walk or shoot: drop held
+                            // keys and a latched shot, like focus loss.
+                            self.held_keys.clear();
+                            self.sync_held_actions();
+                            self.input.fire = false;
+                        }
+                        return;
+                    }
+                    // While the console is open, it owns the keyboard.
+                    if self.console.open {
+                        self.console_key(&event);
                         return;
                     }
                     match code {
@@ -1285,6 +1434,7 @@ impl ApplicationHandler for App {
                     }
                 } else if self.session.is_some()
                     && !self.menu_active()
+                    && !self.console.open
                     && button == MouseButton::Left
                     && state == ElementState::Pressed
                 {
@@ -1299,8 +1449,9 @@ impl ApplicationHandler for App {
                 self.last_frame = now;
 
                 // Paused: swallow the accumulated look delta so releasing Esc
-                // does not snap the camera by the whole menu's worth of motion.
-                if self.paused {
+                // does not snap the camera by the whole menu's worth of
+                // motion. The console gates the same way while open.
+                if self.paused || self.console.open {
                     self.input.mouse_dx = 0.0;
                     self.input.mouse_dy = 0.0;
                 }
@@ -1313,7 +1464,7 @@ impl ApplicationHandler for App {
                 let mut frame_view: Option<FrameView> = None;
                 if let Some(s) = self.session.as_mut() {
                     // Look updates at render rate for responsive aim (§15).
-                    let sens = if self.paused {
+                    let sens = if self.paused || self.console.open {
                         0.0
                     } else {
                         self.controls.look_scale()
@@ -1654,8 +1805,8 @@ impl ApplicationHandler for App {
                 if let Some(ui) = self.ui.as_mut() {
                     let size = self.window.as_ref().unwrap().inner_size();
                     ui.begin(size.width, size.height);
+                    let (w, h) = (size.width as f32, size.height as f32);
                     if self.paused || self.session.is_none() {
-                        let (w, h) = (size.width as f32, size.height as f32);
                         // Dim the frozen scene. Colours are linear: this is drawn
                         // into the _SRGB swapchain, which encodes on store. In the
                         // main menu there is no scene behind it, just the geometry
@@ -1720,12 +1871,20 @@ impl ApplicationHandler for App {
                             // the rect was grown by.
                             ui.text(rx + pad, ry + pad * 0.5, px, color, &row.label);
                         }
+                    } else if self.console.open {
+                        // The console over live play: the log, the prompt, a
+                        // blinking block cursor.
+                        let frame = self
+                            .session
+                            .as_ref()
+                            .map(|s| s.world.resource::<FrameCount>().0)
+                            .unwrap_or(0);
+                        self.console.draw(ui, w, h, frame % 24 < 12);
                     } else if self.bench.is_none() {
                         // The HUD: crosshair, hit marker, health, kills (§19).
                         // This arm means playing (session is Some, not
                         // paused); never drawn in --bench, where nothing
                         // may.
-                        let (w, h) = (size.width as f32, size.height as f32);
                         if let Some(s) = self.session.as_ref() {
                             let health = s
                                 .world
