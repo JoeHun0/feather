@@ -1373,21 +1373,27 @@ impl ApplicationHandler for App {
                             &self.audio_settings,
                             in_session,
                         );
-                        let layout = menu_layout(
-                            size.width as f32,
-                            size.height as f32,
-                            &rows,
-                            self.menu.index,
-                            self.menu.scroll,
-                        );
-                        if let Some(i) = menu_hit(&layout, position.x as f32, position.y as f32) {
-                            self.menu.hover(
-                                i,
-                                &self.settings,
-                                &self.controls,
-                                &self.audio_settings,
-                                in_session,
-                            );
+                        let layout = self.ui.as_ref().map(|ui| {
+                            menu_layout(
+                                ui.font(),
+                                size.width as f32,
+                                size.height as f32,
+                                &rows,
+                                self.menu.index,
+                                self.menu.scroll,
+                            )
+                        });
+                        if let Some(layout) = layout {
+                            if let Some(i) = menu_hit(&layout, position.x as f32, position.y as f32)
+                            {
+                                self.menu.hover(
+                                    i,
+                                    &self.settings,
+                                    &self.controls,
+                                    &self.audio_settings,
+                                    in_session,
+                                );
+                            }
                         }
                     }
                 }
@@ -1408,28 +1414,33 @@ impl ApplicationHandler for App {
                             &self.audio_settings,
                             in_session,
                         );
-                        let layout = menu_layout(
-                            size.width as f32,
-                            size.height as f32,
-                            &rows,
-                            self.menu.index,
-                            self.menu.scroll,
-                        );
-                        if let Some(i) = menu_hit(&layout, cx, cy) {
-                            self.menu.hover(
-                                i,
-                                &self.settings,
-                                &self.controls,
-                                &self.audio_settings,
-                                in_session,
-                            );
-                            let outcome = self.menu.activate(
-                                &mut self.settings,
-                                &mut self.controls,
-                                &mut self.audio_settings,
-                                in_session,
-                            );
-                            self.handle_menu_outcome(outcome, event_loop);
+                        let layout = self.ui.as_ref().map(|ui| {
+                            menu_layout(
+                                ui.font(),
+                                size.width as f32,
+                                size.height as f32,
+                                &rows,
+                                self.menu.index,
+                                self.menu.scroll,
+                            )
+                        });
+                        if let Some(layout) = layout {
+                            if let Some(i) = menu_hit(&layout, cx, cy) {
+                                self.menu.hover(
+                                    i,
+                                    &self.settings,
+                                    &self.controls,
+                                    &self.audio_settings,
+                                    in_session,
+                                );
+                                let outcome = self.menu.activate(
+                                    &mut self.settings,
+                                    &mut self.controls,
+                                    &mut self.audio_settings,
+                                    in_session,
+                                );
+                                self.handle_menu_outcome(outcome, event_loop);
+                            }
                         }
                     }
                 } else if self.session.is_some()
@@ -1822,15 +1833,17 @@ impl ApplicationHandler for App {
                             &self.audio_settings,
                             self.session.is_some(),
                         );
-                        let layout = menu_layout(w, h, &rows, self.menu.index, self.menu.scroll);
+                        let layout =
+                            menu_layout(ui.font(), w, h, &rows, self.menu.index, self.menu.scroll);
                         self.menu.scroll = layout.first;
-                        let px = layout.px;
+                        // `px` here and below is the menu's font size (em px).
+                        let px = layout.size;
                         let title_px = px * 1.6;
                         // Title names the current screen, so a submenu is
                         // self-identifying.
                         let title = self.menu.screen.title();
                         ui.text(
-                            (w - UiPass::text_width(title, title_px)) * 0.5,
+                            (w - ui.text_width(title, title_px)) * 0.5,
                             layout.title_y,
                             title_px,
                             [0.9, 0.9, 0.9, 1.0],

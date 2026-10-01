@@ -7,7 +7,7 @@ use crate::config::controls::{Action, Controls};
 use crate::{audio, config, GraphicsSettings};
 use feather_game::weather;
 use feather_platform::winit::keyboard::KeyCode;
-use feather_render::UiPass;
+use feather_render::Font;
 
 /// One screen of the pause menu (§19). Screens form a tree rooted at `Root`;
 /// `Menu` walks it with an explicit stack.
@@ -566,10 +566,11 @@ impl Menu {
     }
 }
 
-/// Font pixel size for the menu at a given framebuffer height. One place, so
-/// the layout and the renderer cannot disagree about how big the text is.
-pub fn menu_font_px(h: f32) -> f32 {
-    (h / 220.0).max(2.0).floor()
+/// Font size (em, in screen px) for the menu at a given framebuffer height.
+/// One place, so the layout and the renderer cannot disagree about how big
+/// the text is.
+pub fn menu_font_size(h: f32) -> f32 {
+    (h / 36.0).max(10.0)
 }
 
 /// Where one screen of the menu goes, in **physical** pixels.
@@ -580,7 +581,8 @@ pub fn menu_font_px(h: f32) -> f32 {
 /// are the padded bar rather than the tight text box, which also makes a
 /// comfortably larger click target than the glyphs alone.
 pub struct MenuLayout {
-    pub px: f32,
+    /// Font size (em, screen px) the rows are laid out at.
+    pub size: f32,
     pub title_y: f32,
     /// Index of the first visible row.
     pub first: usize,
@@ -596,12 +598,19 @@ pub struct MenuLayout {
 /// starts at `scroll`, moved only as far as needed to keep row `index` in it.
 /// The caller stores `first` back as the new `scroll`, so the list moves when
 /// the selection leaves it and not otherwise.
-pub fn menu_layout(w: f32, h: f32, rows: &[MenuRow], index: usize, scroll: usize) -> MenuLayout {
-    let px = menu_font_px(h);
-    let text_h = UiPass::text_height(px);
+pub fn menu_layout(
+    font: &Font,
+    w: f32,
+    h: f32,
+    rows: &[MenuRow],
+    index: usize,
+    scroll: usize,
+) -> MenuLayout {
+    let size = menu_font_size(h);
+    let text_h = font.height(size);
     let line = text_h * 2.2;
-    let pad = px * 4.0;
-    let title_h = UiPass::text_height(px * 1.6);
+    let pad = size * 0.55;
+    let title_h = font.height(size * 1.6);
     // Room for the rows once the title, a line of gap under it and a margin
     // top and bottom are taken out.
     let avail = h - title_h - line - pad * 2.0;
@@ -627,14 +636,14 @@ pub fn menu_layout(w: f32, h: f32, rows: &[MenuRow], index: usize, scroll: usize
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let tw = UiPass::text_width(&row.label, px);
+            let tw = font.width(&row.label, size);
             let x = (w - tw) * 0.5;
             let y = top + line * i as f32;
             (x - pad, y - pad * 0.5, tw + pad * 2.0, text_h + pad)
         })
         .collect();
     MenuLayout {
-        px,
+        size,
         title_y,
         first,
         rects,
@@ -667,7 +676,7 @@ mod tests {
     // runs without a GPU or a window.
 
     /// A few sizes worth covering: the default window, a typical one, a wide
-    /// one, and one small enough that `menu_font_px` clamps to its 2.0 floor.
+    /// one, and one small enough that `menu_font_size` clamps to its floor.
     const SIZES: [(f32, f32); 4] = [
         (640.0, 480.0),
         (1280.0, 720.0),
@@ -698,6 +707,12 @@ mod tests {
         )
     }
 
+    /// The same font the renderer draws with (menu_layout sizes from it).
+    fn font() -> Font {
+        Font::rasterize(include_bytes!("../../render/fonts/DejaVuSansMono.ttf"), 18)
+            .expect("the bundled font rasterizes")
+    }
+
     /// Every screen, every size, every selected row: the layout keeps what it
     /// shows on screen, ordered, disjoint and centred, and the selected row is
     /// always among the visible ones. CONTROLS (13 rows) has to scroll at the
@@ -706,10 +721,11 @@ mod tests {
     fn menu_layout_keeps_rows_onscreen_and_the_selection_visible() {
         for screen in SCREENS {
             let rows = rows_of(screen);
+            let font = font();
             assert!(!rows.is_empty(), "{screen:?} has no rows");
             for (w, h) in SIZES {
                 for index in 0..rows.len() {
-                    let l = menu_layout(w, h, &rows, index, 0);
+                    let l = menu_layout(&font, w, h, &rows, index, 0);
                     let visible = l.first..l.first + l.rects.len();
                     assert!(
                         visible.contains(&index),
@@ -723,7 +739,7 @@ mod tests {
                         let (_, y1, _, _) = pair[1];
                         assert!(y1 >= y0 + h0, "{screen:?} rows overlap at {w}x{h}");
                     }
-                    let title_bottom = l.title_y + UiPass::text_height(l.px * 1.6);
+                    let title_bottom = l.title_y + font.height(l.size * 1.6);
                     for &(x, y, rw, rh) in &l.rects {
                         assert!(
                             y >= title_bottom,
@@ -747,21 +763,22 @@ mod tests {
     fn a_tall_screen_scrolls_only_as_far_as_the_selection_needs() {
         let rows = rows_of(MenuScreen::Controls);
         let (w, h) = (320.0, 200.0);
-        let cap = menu_layout(w, h, &rows, 0, 0).rects.len();
+        let font = font();
+        let cap = menu_layout(&font, w, h, &rows, 0, 0).rects.len();
         assert!(cap < rows.len(), "CONTROLS should scroll at {w}x{h}");
         // Stepping down scrolls one row at a time once past the window...
         let mut scroll = 0;
         for index in 0..rows.len() {
-            let l = menu_layout(w, h, &rows, index, scroll);
+            let l = menu_layout(&font, w, h, &rows, index, scroll);
             assert_eq!(l.first, index.saturating_sub(cap - 1), "row {index}");
             scroll = l.first;
         }
         // ...and selecting any visible row (the mouse) doesn't move it.
         for index in scroll..scroll + cap {
-            assert_eq!(menu_layout(w, h, &rows, index, scroll).first, scroll);
+            assert_eq!(menu_layout(&font, w, h, &rows, index, scroll).first, scroll);
         }
         // A stale scroll past the end is clamped.
-        let l = menu_layout(w, h, &rows, rows.len() - 1, 999);
+        let l = menu_layout(&font, w, h, &rows, rows.len() - 1, 999);
         assert_eq!(l.first + l.rects.len(), rows.len());
     }
 
@@ -769,9 +786,10 @@ mod tests {
     fn menu_rect_centres_hit_their_own_row() {
         for screen in SCREENS {
             let rows = rows_of(screen);
+            let font = font();
             for (w, h) in SIZES {
                 // Scrolled to the bottom, so hits must add `first` back.
-                let l = menu_layout(w, h, &rows, rows.len() - 1, 0);
+                let l = menu_layout(&font, w, h, &rows, rows.len() - 1, 0);
                 for (vi, &(x, y, rw, rh)) in l.rects.iter().enumerate() {
                     let (cx, cy) = (x + rw * 0.5, y + rh * 0.5);
                     assert_eq!(
@@ -788,7 +806,7 @@ mod tests {
     fn menu_misses_gaps_and_backdrop() {
         let rows = rows_of(MenuScreen::Root);
         let (w, h) = (1280.0, 720.0);
-        let l = menu_layout(w, h, &rows, 0, 0);
+        let l = menu_layout(&font(), w, h, &rows, 0, 0);
         let r = &l.rects;
         let gap_y = (r[0].1 + r[0].3 + r[1].1) * 0.5;
         assert_eq!(menu_hit(&l, w * 0.5, gap_y), None, "gap hit");
@@ -1303,9 +1321,9 @@ mod tests {
         assert!(m.stack.is_empty());
     }
 
-    /// Menu labels must stay inside what the 5x7 UI font can draw (A-Z, 0-9 and
-    /// space); anything else renders as a blank, which would silently mangle a
-    /// row. Guards against someone adding a colon or brackets later.
+    /// Menu labels must stay inside what the UI font can draw (printable
+    /// ASCII); anything else renders as nothing, which would silently mangle
+    /// a row. Guards against someone adding an em dash or «» later.
     #[test]
     fn menu_labels_are_drawable() {
         let s = GraphicsSettings::default();
@@ -1320,7 +1338,7 @@ mod tests {
             ) {
                 for c in row.label.chars() {
                     assert!(
-                        c.is_ascii_uppercase() || c.is_ascii_digit() || c == ' ',
+                        c.is_ascii_graphic() || c == ' ',
                         "{screen:?} label {:?} has undrawable {c:?}",
                         row.label
                     );

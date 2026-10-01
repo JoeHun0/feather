@@ -5,6 +5,7 @@ mod bloom;
 mod cascades;
 mod environment;
 mod exposure;
+pub mod font;
 pub mod frame;
 mod frustum;
 mod fxaa;
@@ -18,6 +19,7 @@ pub use bloom::{BloomPass, BLOOM_STRENGTH};
 pub use cascades::{cascade_splits, fit_cascade, slice_sphere, SHADOW_DISTANCE, SHADOW_LAMBDA};
 pub use environment::Environment;
 pub use exposure::{ExposureParams, ExposurePass, ExposureReadback};
+pub use font::Font;
 pub use frustum::{world_sphere, Frustum};
 pub use fxaa::FxaaPass;
 pub use mesh::{

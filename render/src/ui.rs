@@ -2,13 +2,18 @@
 //! pipeline drawing alpha-blended textured quads into the swapchain **after**
 //! tonemap/FXAA, i.e. in LDR/sRGB, which is where §13 and §19 both put UI.
 //!
-//! The atlas is a 5x7 pixel font plus a single solid texel, so rectangles and
-//! text share one draw. Nearest sampling keeps the font crisp when scaled up.
-//! This is deliberately minimal — enough for a pause menu and a future HUD,
-//! without committing to egui (which §19 reserves for the *dev* UI).
+//! Text comes from `font::Font`: DejaVu Sans Mono rasterized once at startup
+//! into an R8 coverage atlas (see font.rs for the license). The atlas has a
+//! blank padding border around every glyph, so LINEAR sampling stays clean at
+//! any scale — rectangles and text still share the one atlas/draw, the solid
+//! texel included. This is deliberately minimal — enough for a pause menu and
+//! a future HUD, without committing to egui (which §19 reserves for the *dev*
+//! UI).
 
 use ash::vk;
 use feather_gfx::{Image, MappedBuffer, Renderer, FRAMES_IN_FLIGHT};
+
+use crate::font::Font;
 
 macro_rules! spv {
     ($name:expr) => {
@@ -16,67 +21,9 @@ macro_rules! spv {
     };
 }
 
-const GLYPH_W: usize = 5;
-const GLYPH_H: usize = 7;
-/// Slot 0 is solid, slot 1 is blank, then A-Z, then 0-9, then `.` and `-`
-/// (the console echoes coordinates and fog values).
-const SLOTS: usize = 40;
+/// Raster size the font is cached at; `size / raster_em` is the screen scale.
+const RASTER_EM: u32 = 18;
 const MAX_QUADS: usize = 1024;
-
-/// 5x7 glyphs, one byte per row, bit 4 = leftmost pixel. Verified legible by
-/// rendering the table to ASCII rather than by eye on screen.
-const GLYPHS: [[u8; GLYPH_H]; SLOTS] = [
-    [0x1F; GLYPH_H],                            // solid block (rectangles)
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // space
-    [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11], // A
-    [0x1E, 0x11, 0x1E, 0x11, 0x11, 0x11, 0x1E], // B
-    [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E], // C
-    [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E], // D
-    [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F], // E
-    [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10], // F
-    [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E], // G
-    [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11], // H
-    [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F], // I
-    [0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C], // J
-    [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11], // K
-    [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F], // L
-    [0x11, 0x1B, 0x15, 0x11, 0x11, 0x11, 0x11], // M
-    [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11], // N
-    [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E], // O
-    [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10], // P
-    [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D], // Q
-    [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11], // R
-    [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E], // S
-    [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04], // T
-    [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E], // U
-    [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04], // V
-    [0x11, 0x11, 0x11, 0x11, 0x15, 0x1B, 0x11], // W
-    [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11], // X
-    [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04], // Y
-    [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F], // Z
-    [0x0E, 0x13, 0x15, 0x19, 0x11, 0x11, 0x0E], // 0
-    [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x1F], // 1
-    [0x0E, 0x11, 0x01, 0x06, 0x08, 0x10, 0x1F], // 2
-    [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E], // 3
-    [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02], // 4
-    [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E], // 5
-    [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E], // 6
-    [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08], // 7
-    [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E], // 8
-    [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C], // 9
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x04], // .
-    [0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00], // -
-];
-
-fn slot_of(c: char) -> usize {
-    match c.to_ascii_uppercase() {
-        'A'..='Z' => 2 + (c.to_ascii_uppercase() as usize - 'A' as usize),
-        '0'..='9' => 28 + (c as usize - '0' as usize),
-        '.' => 38,
-        '-' => 39,
-        _ => 1, // blank
-    }
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -105,42 +52,30 @@ pub struct UiPass {
     sampler: vk::Sampler,
     verts: Vec<UiVertex>,
     screen: [f32; 2],
+    font: Font,
 }
 
 impl UiPass {
     pub fn new(renderer: &Renderer) -> Self {
         let device = renderer.device();
 
-        // Atlas: SLOTS glyphs side by side, coverage replicated into RGBA8 so the
-        // existing create_texture upload path can be reused.
-        let aw = SLOTS * GLYPH_W;
-        let mut pixels = vec![0u8; aw * GLYPH_H * 4];
-        for (slot, glyph) in GLYPHS.iter().enumerate() {
-            for (row, bits) in glyph.iter().enumerate() {
-                for col in 0..GLYPH_W {
-                    let on = bits & (1 << (GLYPH_W - 1 - col)) != 0;
-                    let idx = (row * aw + slot * GLYPH_W + col) * 4;
-                    pixels[idx..idx + 4].copy_from_slice(&[
-                        255,
-                        255,
-                        255,
-                        if on { 255 } else { 0 },
-                    ]);
-                    if !on {
-                        pixels[idx] = 0;
-                    }
-                }
-            }
+        // Rasterize the bundled font once, replicate coverage into RGBA8 so
+        // the existing create_texture upload path can be reused.
+        let font = Font::rasterize(include_bytes!("../fonts/DejaVuSansMono.ttf"), RASTER_EM)
+            .expect("the bundled UI font rasterizes");
+        let mut pixels = vec![0u8; font.width * font.height * 4];
+        for (i, &cov) in font.atlas.iter().enumerate() {
+            pixels[i * 4..i * 4 + 4].copy_from_slice(&[255, 255, 255, cov]);
         }
-        let atlas = renderer.create_texture(&pixels, aw as u32, GLYPH_H as u32, false);
-        // Nearest: a pixel font scaled up should stay crisp, and it avoids
-        // bleeding between neighbouring glyphs in the atlas.
+        let atlas = renderer.create_texture(&pixels, font.width as u32, font.height as u32, false);
+        // LINEAR: the atlas's per-glyph padding borders make sure no
+        // neighbour bleeds in, and small text stays smooth.
         let sampler = unsafe {
             device
                 .create_sampler(
                     &vk::SamplerCreateInfo::default()
-                        .mag_filter(vk::Filter::NEAREST)
-                        .min_filter(vk::Filter::NEAREST)
+                        .mag_filter(vk::Filter::LINEAR)
+                        .min_filter(vk::Filter::LINEAR)
                         .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                         .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                         .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
@@ -322,6 +257,7 @@ impl UiPass {
             sampler,
             verts: Vec::new(),
             screen: [1.0, 1.0],
+            font,
         }
     }
 
@@ -336,13 +272,20 @@ impl UiPass {
         self.verts.is_empty()
     }
 
-    /// Width in pixels that `text` will occupy at `px` per font pixel.
-    pub fn text_width(text: &str, px: f32) -> f32 {
-        (text.chars().count() * (GLYPH_W + 1)) as f32 * px
+    /// The font driving `text`, for callers that lay text out before drawing
+    /// (`menu_layout` sizes its rows from the same advances the GPU will use).
+    pub fn font(&self) -> &Font {
+        &self.font
     }
 
-    pub fn text_height(px: f32) -> f32 {
-        GLYPH_H as f32 * px
+    /// Width in pixels that `text` will occupy at `size` pixels per em.
+    pub fn text_width(&self, text: &str, size: f32) -> f32 {
+        self.font.width(text, size)
+    }
+
+    /// One line's pixel height at `size` pixels per em.
+    pub fn text_height(&self, size: f32) -> f32 {
+        self.font.height(size)
     }
 
     fn quad(&mut self, x: f32, y: f32, w: f32, h: f32, uv0: [f32; 2], uv1: [f32; 2], c: [f32; 4]) {
@@ -367,40 +310,35 @@ impl UiPass {
 
     /// Filled rectangle. `color` is **linear** — this pass writes an _SRGB target.
     pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
-        // Sample the middle of the solid slot, so filtering cannot reach a
+        // Sample the centre of the solid cell, so filtering cannot reach a
         // neighbouring glyph.
-        let aw = (SLOTS * GLYPH_W) as f32;
-        let u = 2.5 / aw;
-        self.quad(
-            x,
-            y,
-            w,
-            h,
-            [u, 0.5 / GLYPH_H as f32],
-            [u, 0.5 / GLYPH_H as f32],
-            color,
-        );
+        let u = self.font.solid;
+        self.quad(x, y, w, h, u, u, color);
     }
 
-    /// Draw `text` with its top-left at `(x, y)`, one font pixel = `px` screen
-    /// pixels. `color` is linear.
-    pub fn text(&mut self, x: f32, y: f32, px: f32, color: [f32; 4], text: &str) {
-        let aw = (SLOTS * GLYPH_W) as f32;
-        let mut cx = x;
+    /// Draw `text` with the top of its line box at `(x, y)`, at `size` pixels
+    /// per em. `color` is linear. Characters outside printable ASCII are
+    /// skipped (see font.rs).
+    pub fn text(&mut self, x: f32, y: f32, size: f32, color: [f32; 4], text: &str) {
+        let s = size / self.font.raster_em;
+        let baseline = y + self.font.ascent * s;
+        let mut pen = x;
         for ch in text.chars() {
-            let slot = slot_of(ch) as f32;
-            let u0 = slot * GLYPH_W as f32 / aw;
-            let u1 = (slot + 1.0) * GLYPH_W as f32 / aw;
-            self.quad(
-                cx,
-                y,
-                GLYPH_W as f32 * px,
-                GLYPH_H as f32 * px,
-                [u0, 0.0],
-                [u1, 1.0],
-                color,
-            );
-            cx += (GLYPH_W + 1) as f32 * px;
+            let Some(g) = self.font.glyph(ch).copied() else {
+                continue;
+            };
+            if g.w > 0.0 {
+                self.quad(
+                    pen + g.min_x * s,
+                    baseline + g.min_y * s,
+                    g.w * s,
+                    g.h * s,
+                    [g.u0, g.v0],
+                    [g.u1, g.v1],
+                    color,
+                );
+            }
+            pen += g.advance * s;
         }
     }
 

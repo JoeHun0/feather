@@ -9,6 +9,7 @@ feather-gfx.workspace = true
 feather-assets.workspace = true
 ash.workspace = true
 glam.workspace = true
+ab_glyph = "0.2"
 
 [build-dependencies]
 shaderc.workspace = true

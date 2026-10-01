@@ -884,6 +884,7 @@ dependencies = [
 name = "feather-render"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "ash",
  "feather-assets",
  "feather-gfx",

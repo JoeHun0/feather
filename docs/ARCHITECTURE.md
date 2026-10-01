@@ -2878,10 +2878,22 @@ the components it spawns.
 **Landed (§26):** the **lightweight custom renderer**, as a `UiPass` drawing
 alpha-blended textured quads into the swapchain *after* tonemap/FXAA (LDR/sRGB,
 where §13 and §19 both place UI). One pipeline serves both rectangles and text:
-the atlas is a **5×7 pixel font** plus a single solid texel, sampled NEAREST so
-scaled glyphs stay crisp and cannot bleed into their neighbours. Colours are
+the atlas is a rasterized **DejaVu Sans Mono** (see below) plus a solid block
+cell, sampled LINEAR — every glyph cell carries a blank padding border, so
+scaled text stays smooth and cannot bleed into its neighbours. Colours are
 specified **linear**, since the `_SRGB` swapchain encodes on store and Vulkan
 blends `_SRGB` attachments in linear space.
+
+**Landed (§26): the font.** The hand-drawn 5×7 bitmap and its 40-glyph table
+are gone. `render::font::Font::rasterize` bakes the bundled
+`render/fonts/DejaVuSansMono.ttf` (Bitstream Vera license, see
+`render/fonts/LICENSE`) into an R8 coverage atlas once at startup, via
+`ab_glyph` (already in the lockfile through winit's Wayland path — no new
+dependency to fetch). All 95 printable-ASCII glyphs are cached at an 18 px em
+with their real bearings and advances; drawing scales that atlas, so text can
+be any size without re-rasterizing. `Font` is GPU-free, so metric queries and
+the atlas itself are unit-tested; `menu_layout`/`hud_layout` take a `&Font` so
+the layout maths and the renderer cannot disagree about text size.
 
 Its first consumer is the **Esc pause menu**, now a small screen tree: root
 (CONTINUE / OPTIONS / EXIT) → OPTIONS (GRAPHICS / CONTROLS / SOUND / GAMEPLAY) →
@@ -2930,8 +2942,8 @@ acts on. That keeps the whole thing unit-testable without a GPU, which is how
 the screen tree, wrap-around, BACK-restores-selection, the inert rows and the
 rebind flow are all covered. Esc walks back one screen at a time and only unpauses from the root.
 
-Row labels use **A-Z, 0-9 and spaces only** — the 5x7 font renders anything else
-blank, so a colon would silently become whitespace; a test guards this.
+Row labels stay inside **printable ASCII** — the font renders anything else
+as nothing, so an em dash would silently become a gap; a test guards this.
 
 Pausing stops the fixed step, releases the cursor and ignores mouselook (§14's
 focus flag), while rendering continues so the frozen scene shows behind the
@@ -2985,8 +2997,8 @@ session is live and unpaused — never over the menus, never under `--bench`.
 
 **Landed (§26): the developer console.** `` ` `` in play opens a Quake-style
 command line on the same UiPass: a dim top panel, a 64-line scrollback, a
-prompt with a blinking block cursor (the font has no `]`, so a solid marker
-stands in; it grew `.` and `-` glyphs so coordinates and fog values read).
+prompt with a blinking block cursor (a solid marker by look, not `]`; the
+font's `.`/`-` keep coordinates and fog values readable).
 State and parsing live in `app/src/console.rs`, renderer- and event-loop-
 free like `Menu`, so the parser, the typing filter, the history walk and
 the log cap are unit-tested without a GPU. It opens only while playing and
@@ -2999,8 +3011,7 @@ jump-cut rather than blend, deliberately, to tune by. game grew the two
 knobs it needed: `SessionWeather::choose` and the raw fog overrides.
 
 Still pending: **egui** for the dev UI (this is the *game* HUD path, not a
-replacement for it), SDF/MSDF text for scale-independent glyphs, and lower-case
-and punctuation.
+replacement for it) and SDF/MSDF text for scale-independent glyphs.
 
 ## 20. Audio
 
@@ -3540,6 +3551,19 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   `Score.shots` advances. 3 layout tests with mutation controls (the
   left-half anchor among them), and the shot's peak in the clip
   normalisation test.
+- **Real UI font (§19):** the hand-drawn 5×7 bitmap and its 40-glyph table
+  are gone. `render::font::Font::rasterize` bakes the bundled
+  `render/fonts/DejaVuSansMono.ttf` (Bitstream Vera license, shipped in the
+  repo) into an R8 coverage atlas once at startup via `ab_glyph` (already in
+  the lockfile through winit's Wayland path — nothing new to fetch). All 95
+  printable-ASCII glyphs are cached at an 18 px em with real bearings and
+  advances; a 2 px padding border per cell lets LINEAR sampling scale text
+  cleanly. `Font` is GPU-free and unit-tested (per-glyph coverage, monospace
+  advances, padding clear, deterministic atlas + a golden hash — 5 tests,
+  each shown a failing mutation); `menu_layout`/`hud_layout` now take a
+  `&Font` so layouts and renderer share one set of metrics, and the
+  menu/console/HUD sizes are em-based (`h/36`, `h/50`, floors) retuned to
+  the old on-screen heights.
 - **Weather keys as data (§13):** the CLEAR/OVERCAST/FOGGY key tables live in
   `config/weather.json` (shipped, field-for-field the compiled-in defaults),
   hot-reloaded on mtime change — a bad file keeps the running look and names

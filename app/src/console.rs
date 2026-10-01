@@ -138,9 +138,10 @@ impl Console {
     /// The panel: a dim backdrop over the top of the screen, the log's last
     /// lines, and the prompt with a blinking block cursor.
     pub fn draw(&self, ui: &mut UiPass, w: f32, h: f32, blink: bool) {
-        let px = (h / 300.0).max(2.0).floor();
-        let margin = px * 4.0;
-        let pitch = UiPass::text_height(px) + px * 1.5;
+        let size = (h / 50.0).max(9.0);
+        let margin = size * 0.6;
+        let text_h = ui.text_height(size);
+        let pitch = text_h + size * 0.4;
         let panel = h * 0.4;
         ui.rect(0.0, 0.0, w, panel, [0.02, 0.02, 0.02, 0.75]);
         let text = [0.8, 0.85, 0.8, 0.95];
@@ -150,19 +151,24 @@ impl Console {
             if y < margin {
                 break;
             }
-            ui.text(margin, y, px, text, line);
+            ui.text(margin, y, size, text, line);
             y -= pitch;
         }
-        // The prompt: a solid marker (the font has no `]`), then the line,
-        // then the cursor.
-        let base = panel - margin - UiPass::text_height(px);
-        let marker = px * 0.9;
-        ui.rect(margin, base + px, marker, marker, [0.55, 0.8, 0.35, 0.9]);
-        let text_x = margin + marker + px;
-        ui.text(text_x, base, px, text, &self.line);
+        // The prompt: a solid marker, then the line, then the cursor.
+        let base = panel - margin - text_h;
+        let marker = size * 0.55;
+        ui.rect(
+            margin,
+            base + size * 0.3,
+            marker,
+            marker,
+            [0.55, 0.8, 0.35, 0.9],
+        );
+        let text_x = margin + marker + size * 0.5;
+        ui.text(text_x, base, size, text, &self.line);
         if blink {
-            let cx = text_x + UiPass::text_width(&self.line, px) + px * 0.5;
-            ui.rect(cx, base, px * 0.7, UiPass::text_height(px), text);
+            let cx = text_x + ui.text_width(&self.line, size) + size * 0.3;
+            ui.rect(cx, base, size * 0.4, text_h, text);
         }
     }
 }

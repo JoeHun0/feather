@@ -4,13 +4,15 @@
 //! never over the menus, and never under `--bench`.
 
 use feather_game::weapon::Score;
-use feather_render::UiPass;
+use feather_render::{Font, UiPass};
 
 /// The HUD's geometry for one framebuffer size. Rects are `(x, y, w, h)` in
 /// physical pixels, top-left origin (UiPass's space).
 pub struct HudLayout {
-    /// Screen px per font px (§19's 5×7 font).
+    /// Screen px per font px: the scale unit for the crosshair and the bar.
     pub px: f32,
+    /// Text size (em, screen px) the labels draw at.
+    pub size: f32,
     /// Clearance from the screen edges for the anchored pieces.
     pub margin: f32,
     /// The crosshair's centre dot.
@@ -30,7 +32,7 @@ pub struct HudLayout {
 
 /// Where the HUD's pieces go on a `w`×`h` framebuffer. Pure, so the tests
 /// can hold it to the screen.
-pub fn hud_layout(w: f32, h: f32) -> HudLayout {
+pub fn hud_layout(font: &Font, w: f32, h: f32) -> HudLayout {
     let px = (h / 260.0).max(2.0).floor();
     let margin = px * 4.0;
     let (cx, cy) = (w * 0.5, h * 0.5);
@@ -57,11 +59,14 @@ pub fn hud_layout(w: f32, h: f32) -> HudLayout {
     ];
     let bar_h = px * 2.0;
     let bar = [margin, h - margin - bar_h, px * 22.0, bar_h];
-    let text_h = UiPass::text_height(px);
+    // Text size (em, screen px): same scale the menu uses.
+    let size = (h / 36.0).max(10.0);
+    let text_h = font.height(size);
     let health_text = (margin, bar[1] - text_h - px * 0.75);
     let kills_y = h - margin - text_h;
     HudLayout {
         px,
+        size,
         margin,
         dot,
         ticks,
@@ -75,8 +80,9 @@ pub fn hud_layout(w: f32, h: f32) -> HudLayout {
 /// Draw one frame's HUD. `health` is the 0–1 fraction; `frame` is
 /// `FrameCount`, for the hit marker's fade.
 pub fn draw(ui: &mut UiPass, w: f32, h: f32, health: f32, score: &Score, frame: u64) {
-    let l = hud_layout(w, h);
+    let l = hud_layout(ui.font(), w, h);
     let px = l.px;
+    let size = l.size;
     let cross = [0.9, 0.9, 0.9, 0.75];
     ui.rect(l.dot[0], l.dot[1], l.dot[2], l.dot[3], cross);
     for t in &l.ticks {
@@ -112,16 +118,16 @@ pub fn draw(ui: &mut UiPass, w: f32, h: f32, health: f32, score: &Score, frame: 
     ui.text(
         l.health_text.0,
         l.health_text.1,
-        px,
+        size,
         [0.85, 0.85, 0.85, 0.9],
         &health_text,
     );
     // Kills, bottom-right, right-anchored.
     let kills = format!("KILLS {}", score.kills);
     ui.text(
-        w - l.margin - UiPass::text_width(&kills, px),
+        w - l.margin - ui.text_width(&kills, size),
         l.kills_y,
-        px,
+        size,
         [0.85, 0.85, 0.85, 0.9],
         &kills,
     );
@@ -131,14 +137,21 @@ pub fn draw(ui: &mut UiPass, w: f32, h: f32, health: f32, score: &Score, frame: 
 mod tests {
     use super::*;
 
+    /// The same font the renderer draws with.
+    fn font() -> Font {
+        Font::rasterize(include_bytes!("../../render/fonts/DejaVuSansMono.ttf"), 18)
+            .expect("the bundled font rasterizes")
+    }
+
     /// One source of truth for every size the layout must hold to: the
     /// crosshair centred, everything on screen, the anchors where they
     /// belong. (Mutants that nudge the centre or swap an anchor must fail
     /// here.)
     #[test]
     fn layout_is_centered_on_screen_and_anchored() {
+        let font = font();
         for (w, h) in [(1920.0, 1080.0), (1280.0, 720.0), (800.0, 600.0)] {
-            let l = hud_layout(w, h);
+            let l = hud_layout(&font, w, h);
             let (cx, cy) = (w * 0.5, h * 0.5);
             assert_eq!(l.dot[0] + l.dot[2] * 0.5, cx, "dot centred, {w}x{h}");
             assert_eq!(l.dot[1] + l.dot[3] * 0.5, cy, "dot centred, {w}x{h}");
@@ -174,7 +187,7 @@ mod tests {
             );
             assert!(l.health_text.1 < l.bar[1], "number above the bar, {w}x{h}");
             assert!(
-                l.kills_y + UiPass::text_height(l.px) <= h - l.margin + 1e-6,
+                l.kills_y + font.height(l.size) <= h - l.margin + 1e-6,
                 "kills bottom, {w}x{h}"
             );
         }
@@ -184,8 +197,9 @@ mod tests {
     /// legible and the bar stays a bar.
     #[test]
     fn tiny_windows_stay_legible() {
-        let l = hud_layout(640.0, 480.0);
-        assert!(l.px >= 2.0, "the font has a floor");
+        let l = hud_layout(&font(), 640.0, 480.0);
+        assert!(l.px >= 2.0, "the px unit has a floor");
+        assert!(l.size >= 10.0, "the font has a floor");
         assert!(l.bar[2] > l.bar[3] * 3.0, "the bar is wider than tall");
         assert!(l.margin >= l.px, "the margin clears the text");
     }
