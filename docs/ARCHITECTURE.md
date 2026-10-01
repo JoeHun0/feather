@@ -3563,7 +3563,11 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   each shown a failing mutation); `menu_layout`/`hud_layout` now take a
   `&Font` so layouts and renderer share one set of metrics, and the
   menu/console/HUD sizes are em-based (`h/36`, `h/50`, floors) retuned to
-  the old on-screen heights.
+  the old on-screen heights. The coverage channel is pinned across the
+  CPU/GPU seam: `UiPass::new` replicates the R8 atlas into the RGBA8 alpha
+  and `ui.frag` samples alpha (`texture(u_atlas, v_uv).a`) — the first cut
+  sampled `.r` and rendered every glyph as a solid rectangle, caught in
+  review, pinned by a source test both ways (`ui::tests`).
 - **Console charset (§19):** with the real font in place, the typing filter
   widened from A–Z/0–9/space/`.`/`-` to all printable ASCII, and the line
   keeps the case it was typed in — `Weather FOGGY` parses the same as

@@ -402,3 +402,33 @@ fn load_shader(device: &ash::Device, bytes: &[u8]) -> vk::ShaderModule {
             .expect("create shader module")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! The atlas channel contract, GPU-free: `UiPass::new` replicates the R8
+    //! coverage into the alpha channel of the RGBA8 upload, and ui.frag reads
+    //! coverage from alpha. A `.r`/`.a` mismatch between the two renders
+    //! every glyph as a solid rectangle (landed once, in review).
+
+    const FRAG: &str = include_str!("../shaders/ui.frag");
+    const THIS: &str = include_str!("ui.rs");
+
+    #[test]
+    fn the_shader_reads_the_channel_the_upload_writes() {
+        // The implementation only, not this test's own string literals.
+        let code = THIS.split("#[cfg(test)]").next().unwrap();
+        let expansion = "pixels[i * 4..i * 4 + 4].copy_from_slice(&[255, 255, 255, cov]);";
+        assert!(
+            code.contains(expansion),
+            "UiPass::new must replicate coverage into alpha"
+        );
+        assert!(
+            FRAG.contains("texture(u_atlas, v_uv).a"),
+            "ui.frag must sample alpha for coverage"
+        );
+        assert!(
+            !FRAG.contains("texture(u_atlas, v_uv).r"),
+            "sampling .r makes every glyph quad solid"
+        );
+    }
+}
