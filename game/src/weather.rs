@@ -999,11 +999,16 @@ struct Transition {
 /// starts from the level's (`new`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SessionWeather {
-    /// 0 = LEVEL, i = `WEATHERS[i - 1]`.
+    /// 0 = LEVEL, i = the i-th of `tables()`.
     pub choice: usize,
     /// Indices into `FOG_DENSITIES` and `FOG_HEIGHTS`.
     pub fog_density: usize,
     pub fog_height: usize,
+    /// Raw overrides over the presets above (the console's `fog_density` /
+    /// `fog_height` commands): applied last in `frame`; `None` means the
+    /// preset decides.
+    pub fog_density_raw: Option<f32>,
+    pub fog_height_raw: Option<f32>,
     /// Hours of local solar time, [0, 24), or `None` for the level's own sun,
     /// fixed: only LEVEL can run without a clock.
     pub clock: Option<f64>,
@@ -1066,6 +1071,20 @@ impl SessionWeather {
         }
         self.choice = next;
         if next != 0 && self.clock.is_none() {
+            self.clock = Some(self.level_hour);
+        }
+    }
+
+    /// Set the choice directly (the console's `weather` command), by index:
+    /// 0 = LEVEL, i = the i-th table. No transition — a jump cut to the new
+    /// look, which is what tuning wants; the menu's cycling blends instead.
+    /// A weather needs a clock: one starts where the sun is nearest the
+    /// level's, as when cycling.
+    pub fn choose(&mut self, choice: usize) {
+        self.choice = choice.min(tables().len());
+        self.transition = None;
+        self.last = None;
+        if self.choice != 0 && self.clock.is_none() {
             self.clock = Some(self.level_hour);
         }
     }
@@ -1136,6 +1155,14 @@ impl SessionWeather {
             env.fog_density = d;
         }
         if let Some(f) = FOG_HEIGHTS[self.fog_height].1 {
+            env.fog_falloff = f;
+        }
+        // Raw overrides win over the presets (the console sets them; the
+        // menu never does).
+        if let Some(d) = self.fog_density_raw {
+            env.fog_density = d;
+        }
+        if let Some(f) = self.fog_height_raw {
             env.fog_falloff = f;
         }
         (env, light)
@@ -1571,5 +1598,70 @@ mod tests {
         w.speed = 600.0;
         w.cycle_speed();
         assert_eq!(w.speed_label(), "PAUSED");
+    }
+
+    /// The console's `choose` jumps: no transition from what's on screen, the
+    /// clock starts if it hasn't, and a choice past the tables falls to LEVEL.
+    #[test]
+    fn choose_jumps_without_a_transition() {
+        let level = Environment::default();
+        let path = SolarPath::default();
+        let mut w = SessionWeather::new(&LevelWeather::default(), level.sun_dir);
+        w.cycle_weather(); // -> CLEAR
+        let _ = w.frame(&level, &path); // what a blend would start from
+        w.cycle_weather(); // -> OVERCAST, a transition brewing
+        assert!(w.transition().is_some());
+        w.choose(1); // back to CLEAR
+        assert!(w.transition().is_none(), "a jump cut, not a blend");
+        assert_eq!(w.choice, 1);
+        assert!(w.clock.is_some(), "a weather needs a clock");
+        // choose starts the clock itself, like cycling, when there isn't one.
+        let mut fresh = SessionWeather::new(&LevelWeather::default(), level.sun_dir);
+        assert!(fresh.clock.is_none());
+        fresh.choose(1);
+        assert!(fresh.clock.is_some(), "choose starts the clock");
+        w.choose(usize::MAX);
+        assert_eq!(
+            w.choice,
+            tables().len(),
+            "clamped to the last weather, not out of range"
+        );
+        // And the frame it produces is sane.
+        w.choose(1);
+        let _ = w.frame(&level, &path);
+    }
+
+    /// Raw fog overrides (the console's `fog_density` / `fog_height`) win
+    /// over the weather's keys and the menu's presets; `None` restores the
+    /// preset.
+    #[test]
+    fn raw_fog_overrides_win_then_restore() {
+        let level = Environment::default();
+        let path = SolarPath::default();
+        let mut w = SessionWeather::new(&LevelWeather::default(), level.sun_dir);
+        w.choose(choice_named("clear").unwrap());
+        // A preset that means "a non-zero value", not "the weather's" or
+        // "off": THIN.
+        let preset = FOG_DENSITIES
+            .iter()
+            .position(|&(_, d)| d.is_some_and(|v| v > 0.0))
+            .unwrap();
+        w.fog_density = preset;
+        let (env, _) = w.frame(&level, &path);
+        assert!(
+            (env.fog_density - FOG_DENSITIES[preset].1.unwrap()).abs() < 1e-7,
+            "the preset applies"
+        );
+
+        w.fog_density_raw = Some(0.123);
+        let (env, _) = w.frame(&level, &path);
+        assert!((env.fog_density - 0.123).abs() < 1e-7, "the raw value wins");
+
+        w.fog_density_raw = None;
+        let (env, _) = w.frame(&level, &path);
+        assert!(
+            (env.fog_density - FOG_DENSITIES[preset].1.unwrap()).abs() < 1e-7,
+            "the preset is back when the override clears"
+        );
     }
 }
