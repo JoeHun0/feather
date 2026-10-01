@@ -221,25 +221,26 @@ shot lands), a health bar and number, and the kill count. It's hidden in
 `--bench`, where nothing may draw.
 
 **Console:** `` ` `` (while playing) opens a command line over the live
-world — the sim keeps running; Esc or `` ` `` closes, Up/Down walk the
-history. Everything is case-insensitive and it drives the same settings as
-the menus and F1–F3:
+world — the sim keeps running, so changes show at once; Esc or `` ` ``
+closes, Up/Down walk the command history, and everything is case-insensitive.
+It drives the same settings as the menus and the F1–F3 keys, and nothing it
+changes is saved except `fov`.
 
 | Command | What it does |
 |---|---|
-| `weather level clear overcast foggy` | the look, at once (the menu blends instead) |
-| `time 0-24` / `time level` | the clock's hour, or the level's fixed sun |
-| `speed n` | game seconds per real second (0 pauses) |
-| `fog_density v` / `off` | raw fog over the weather's, or back to it |
-| `fog_height v` / `off` | the fog's height falloff, or the weather's |
-| `exposure v` | tonemap compensation |
-| `fov 30-120` | vertical field of view, saved like the menu's |
-| `noclip` | free flight on/off |
-| `teleport x y z` | move the player (the kill plane's respawn) |
-| `clear`, `help` | clear the log / list the commands |
+| `weather <name>` | `LEVEL`, `CLEAR`, `OVERCAST` or `FOGGY` — the look, **at once** (a jump cut; the WEATHER menu blends over 30 game minutes instead). A named weather starts the clock where the level's sun is nearest, if it wasn't running |
+| `time <hour>` | the clock's hour, `0`–`24` in decimals (`18.5` = 18:30). `time level` is the level's own fixed sun |
+| `speed <n>` | game seconds per real second: `0` pauses the clock, `600` runs a day in 2.4 minutes. Never saved |
+| `fog_density <v>` / `off` | the fog's density per metre at its height, over the weather's own; `off` hands it back (`v` ≥ 0) |
+| `fog_height <v>` / `off` | how fast the fog thins going up, per metre (`0` = even at every height); `off` restores the weather's |
+| `exposure <v>` | tonemap compensation, greater than 0 (`1` = none; the same value `[` / `]` step) |
+| `fov <deg>` | vertical field of view, 30–120 degrees; saved to `graphics.toml` like the GAMEPLAY menu |
+| `noclip` | free flight on/off — the same toggle as `V` |
+| `teleport <x> <y> <z>` | move the player, metres, feet position; the same teleport the kill plane's respawn uses |
+| `clear` | empty the log |
+| `help` | list the commands |
 
-Unknown commands and bad values print their usage; nothing is saved except
-`fov`.
+Unknown commands and bad values print their usage and change nothing.
 
 **Menus:** mouse (hover + click) or arrows + Enter. **Esc** steps back one
 screen, and resumes play only from the pause menu's top level.
