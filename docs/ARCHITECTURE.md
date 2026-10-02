@@ -2461,6 +2461,14 @@ the `dynamic` prefab): they fall, settle and sleep.
     person can push with.
   - The KCC reports hits from the prop's side, in world space: `normal1`
     points out of the prop.
+- **Shots knock them:**
+  - When the rapier world is nearer than any orb, `fire` gives a dynamic
+    prop `SHOT_IMPULSE` = 30 N·s along the shot, at the hit point. A
+    20 kg box takes 1.50 m/s and slides 0.13 m (predicted: 1.5 m/s and
+    0.1–0.4 m).
+  - `weapon_sys` now runs before the physics bracket. Before, its order
+    against the chain was ambiguous, so a shot's impulse could land a tick
+    early or late from run to run.
 - **Not done:** collision layers (`InteractionGroups`): nothing needs
   separating yet, since the controller should collide with props and shots
   should hit them. Also not done: impact sounds, lights on dynamic props
@@ -2487,9 +2495,13 @@ the `dynamic` prefab): they fall, settle and sleep.
     the player and moves under 1 cm (control: no `PUSH_FORCE` cap); the
     player stands on a box's top (control: the controller blind to dynamic
     bodies);
+  - a shot knocks a box along it, which then slides a little (control: no
+    impulse). An orb in front takes the shot instead and the box isn't
+    pushed (control: the wall knocked as well);
   - app e2e: a glTF cube with the prefab goes through `build_world` and the
-    real schedule, falls, is drawn between its poses and rests (controls:
-    the readback left out of the chain, the prefab unregistered).
+    real schedule, falls, is drawn between its poses, rests, and slides away
+    when shot from the spawn (controls: the readback left out of the chain,
+    the prefab unregistered, no shot impulse).
 
 **Landed (§26): ropes.** Something hanging on a rope (`game/src/rope.rs`,
 the `hanging` prefab), the first simulated thing in a level besides the
@@ -3686,8 +3698,9 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   plane is removed, and the sky bake leaves `dynamic` nodes out. The
   `[scene] colliders` line counts them. The player pushes them (`push_props`:
   the blocked motion shared by mass, capped at `PUSH_FORCE` = 600 N a tick,
-  in place of rapier's uncapped impulses) and stands on them. 11 tests, each
-  shown a failing mutation, including an app e2e on the real schedule. No
+  in place of rapier's uncapped impulses) and stands on them, and a shot
+  knocks them (`SHOT_IMPULSE` = 30 N·s; `weapon_sys` now runs before the
+  physics bracket). 13 tests, each shown a failing mutation, including an app e2e on the real schedule. No
   scene uses the prefab yet.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
