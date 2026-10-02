@@ -48,6 +48,7 @@ use feather_game::components::{
 use feather_game::controller::{
     InputState, Look, Player, CAMERA_FAR, CAMERA_NEAR, DEFAULT_FOV_DEG, EYE_HEIGHT, FOV_PRESETS,
 };
+use feather_game::dynamic::{body_model, Body, BodyPose, PrevBodyPose};
 use feather_game::level::build_world;
 use feather_game::lights::{extract_lights, PointLight};
 use feather_game::physics::{to_rapier, Physics};
@@ -1756,6 +1757,33 @@ impl ApplicationHandler for App {
                         }
                     }
 
+                    // Dynamic bodies (§15): rapier moves them each fixed step, so
+                    // their pose interpolates like the moving entities above.
+                    let mut qb = s.world.query::<(
+                        &Body,
+                        &BodyPose,
+                        &PrevBodyPose,
+                        &Mesh,
+                        &Material,
+                        Option<&NoShadowCast>,
+                    )>();
+                    for (body, pose, prev, mesh, material, no_cast) in qb.iter(&s.world) {
+                        let id = (mesh.0 .0 as usize).min(mesh_max);
+                        let model = body_model(&prev.0, pose, body.scale, alpha) * fits[id];
+                        let item = (MeshId(id as u32), InstanceData::new(model, material.0));
+                        let (c, radius) = world_sphere(&model, spheres[id]);
+                        if camera_frustum.contains_sphere(c, radius) {
+                            main_items.push(item);
+                        }
+                        if casts && no_cast.is_none() {
+                            for (ci, f) in light_frusta.iter().enumerate() {
+                                if f.contains_sphere(c, radius) {
+                                    shadow_items[ci].push(item);
+                                }
+                            }
+                        }
+                    }
+
                     // Ropes (§15): each segment a stretched unit cylinder, then
                     // the item, all interpolated like the moving entities.
                     let rope_fit = fits[MESH_ROPE as usize];
@@ -2751,6 +2779,85 @@ mod tests {
             .get::<feather_game::controller::Health>(b.player)
             .expect("the player carries health");
         assert_eq!(health.current, health.max);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scene's `dynamic` node (§15) through `build_world` and the real
+    /// schedule: a cube authored half a metre up falls onto the ground and
+    /// rests there, and is drawn between its poses.
+    #[test]
+    fn a_scene_dynamic_body_falls_on_the_real_schedule() {
+        let dir = crate::config::test_dir("e2e-dynamic");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A unit cube: 8 corners and 12 triangles in a side file.
+        let corners: Vec<[f32; 3]> = (0..8)
+            .map(|i| {
+                let c = |bit: i32| if i & bit == 0 { -0.5 } else { 0.5 };
+                [c(1), c(2), c(4)]
+            })
+            .collect();
+        let tris: [u16; 36] = [
+            0, 1, 3, 0, 3, 2, 4, 6, 7, 4, 7, 5, 0, 4, 5, 0, 5, 1, 2, 3, 7, 2, 7, 6, 0, 2, 6, 0, 6,
+            4, 1, 5, 7, 1, 7, 3,
+        ];
+        let mut bin: Vec<u8> = corners
+            .iter()
+            .flatten()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        bin.extend(tris.iter().flat_map(|i| i.to_le_bytes()));
+        std::fs::write(dir.join("cube.bin"), &bin).unwrap();
+        let path = dir.join("drop.gltf");
+        let y = GROUND_Y + 1.0;
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "asset": { "version": "2.0" },
+                "buffers": [{ "uri": "cube.bin", "byteLength": bin.len() }],
+                "bufferViews": [
+                    { "buffer": 0, "byteOffset": 0, "byteLength": 96 },
+                    { "buffer": 0, "byteOffset": 96, "byteLength": 72 },
+                ],
+                "accessors": [
+                    { "bufferView": 0, "componentType": 5126, "count": 8, "type": "VEC3",
+                      "min": [-0.5, -0.5, -0.5], "max": [0.5, 0.5, 0.5] },
+                    { "bufferView": 1, "componentType": 5123, "count": 36, "type": "SCALAR" },
+                ],
+                "meshes": [{ "primitives": [{ "attributes": { "POSITION": 0 }, "indices": 1 }] }],
+                "nodes": [{
+                    "mesh": 0,
+                    "translation": [0.0, y, 0.0],
+                    "extras": { "prefab": "dynamic", "params": { "mass": 20.0 } },
+                }],
+                "scenes": [{ "nodes": [0] }],
+                "scene": 0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut b = build_world(&[path.to_string_lossy().into_owned()], None);
+        let pose = |b: &mut WorldBuild| {
+            let mut q = b.world.query::<(&BodyPose, &PrevBodyPose)>();
+            let (p, prev) = q.single(&b.world).expect("the scene's body");
+            (*p, prev.0)
+        };
+        assert_eq!(pose(&mut b).0.pos.y, y);
+        b.schedule.run(&mut b.world);
+        let (cur, prev) = pose(&mut b);
+        assert!(cur.pos.y < prev.pos.y, "falling");
+        let mid = body_model(&prev, &cur, Vec3::ONE, 0.5).w_axis.y;
+        assert!(
+            cur.pos.y < mid && mid < prev.pos.y,
+            "drawn between its poses"
+        );
+        for _ in 0..120 {
+            b.schedule.run(&mut b.world);
+        }
+        let rest = pose(&mut b).0.pos.y;
+        assert!(
+            (rest - (GROUND_Y + 0.5)).abs() < 0.01,
+            "resting on the ground: {rest}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
     /// scene's own key under the bake root, and only there. A volume baked

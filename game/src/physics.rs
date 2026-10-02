@@ -3,12 +3,22 @@
 use crate::components::FIXED_DT;
 use crate::Surface;
 use bevy_ecs::prelude::*;
-use glam::Vec3;
+use glam::{Quat, Vec3};
 use rapier3d::prelude::{
     BroadPhaseBvh, CCDSolver, Collider, ColliderBuilder, ColliderHandle, ColliderSet,
     ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet, NarrowPhase,
-    PhysicsPipeline, RigidBodySet, Vector,
+    PhysicsPipeline, Pose, RigidBodyBuilder, RigidBodyHandle, RigidBodySet, Rotation, Vector,
 };
+
+/// Gravity on dynamic bodies (§15), m/s². Only they feel it: fixed and
+/// kinematic bodies ignore world gravity, and the player's controller keeps
+/// its own, gamier `GRAVITY`.
+pub const BODY_GRAVITY: f32 = 9.81;
+/// rapier has no rolling resistance, so a lying barrel nudged on flat ground
+/// would roll on for good. A little damping settles bodies the way friction
+/// against the air and the ground would.
+pub const BODY_LINEAR_DAMPING: f32 = 0.1;
+pub const BODY_ANGULAR_DAMPING: f32 = 0.8;
 
 /// The workspace pins glam 0.29 but rapier 0.35 builds on its own (newer) glam, so
 /// `Vec3` and rapier's `Vector` are distinct types. Convert at the boundary.
@@ -20,10 +30,18 @@ pub fn from_rapier(v: Vector) -> Vec3 {
     Vec3::new(v.x, v.y, v.z)
 }
 
+pub fn quat_to_rapier(q: Quat) -> Rotation {
+    Rotation::from_xyzw(q.x, q.y, q.z, q.w)
+}
+
+pub fn quat_from_rapier(q: Rotation) -> Quat {
+    Quat::from_xyzw(q.x, q.y, q.z, q.w)
+}
+
 /// All rapier state as one raw ECS resource (§15: raw rapier, not bevy_rapier).
-/// There is no gravity here — the character controller is kinematic and the
-/// player owns its vertical velocity — so the world only ever holds fixed level
-/// colliders plus the player's position-based kinematic body.
+/// It holds the fixed level colliders, the player's position-based kinematic
+/// body (the controller owns its vertical velocity, so world gravity never
+/// touches it), and the `dynamic` props, the only bodies gravity moves.
 #[derive(Resource)]
 pub struct Physics {
     pub pipeline: PhysicsPipeline,
@@ -68,7 +86,7 @@ impl Physics {
     /// added since the last step are invisible to the controller until this runs.
     pub fn step(&mut self) {
         self.pipeline.step(
-            Vector::ZERO,
+            Vector::new(0.0, -BODY_GRAVITY, 0.0),
             &self.params,
             &mut self.islands,
             &mut self.broad_phase,
@@ -113,6 +131,49 @@ impl Physics {
         let h = size * 0.5;
         self.colliders
             .insert(ColliderBuilder::cuboid(h.x, h.y, h.z).translation(to_rapier(center)))
+    }
+
+    /// A dynamic body (§15) at `pos`/`rot`, colliding as the convex hull of
+    /// `points`, which are in the body's own frame (scaled, not rotated). Its
+    /// mass is `mass` kg when given, else the hull's volume times `density`
+    /// (kg/m³). CCD keeps a knocked prop from passing through thin walls. `None`
+    /// when the points have no hull.
+    pub fn add_dynamic_hull(
+        &mut self,
+        points: &[Vector],
+        pos: Vec3,
+        rot: Quat,
+        mass: Option<f32>,
+        density: f32,
+    ) -> Option<(RigidBodyHandle, ColliderHandle)> {
+        let collider = ColliderBuilder::convex_hull(points)?;
+        let collider = match mass {
+            Some(m) => collider.mass(m),
+            None => collider.density(density),
+        };
+        let body = self.bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .pose(Pose::from_parts(to_rapier(pos), quat_to_rapier(rot)))
+                .linear_damping(BODY_LINEAR_DAMPING)
+                .angular_damping(BODY_ANGULAR_DAMPING)
+                .ccd_enabled(true),
+        );
+        let collider = self
+            .colliders
+            .insert_with_parent(collider, body, &mut self.bodies);
+        Some((body, collider))
+    }
+
+    /// Take a body and its colliders out of the world.
+    pub fn remove_body(&mut self, body: RigidBodyHandle) {
+        self.bodies.remove(
+            body,
+            &mut self.islands,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            true,
+        );
     }
 }
 

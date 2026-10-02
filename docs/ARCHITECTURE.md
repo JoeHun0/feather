@@ -2412,6 +2412,57 @@ hard-wired like Esc/Enter; rebindable mouse buttons are the follow-up.
     NPCs would be. The tiles stay boxes, which measured the same as
     trimeshes.
 
+**Landed (§26): dynamic bodies.** Props rapier moves (`game/src/dynamic.rs`,
+the `dynamic` prefab): they fall, settle and sleep.
+- **Gravity:** `Physics::step` now passes `BODY_GRAVITY` = 9.81 m/s². Only
+  dynamic bodies feel it. Fixed colliders and the player's position-based
+  kinematic body ignore world gravity, and the controller keeps its own
+  gamier `GRAVITY` = 26, so nothing that existed before moves differently.
+- **Collision:** the convex hull of the node's mesh, in the body's own frame.
+  The node's rotation and translation become the body's pose. Its scale is
+  baked into the hull's points, because a rapier pose can't scale (static
+  colliders bake the whole matrix into world space instead). Mass is
+  `mass` kg, else the hull's volume × `density` (default 150 kg/m³, a
+  hollow drum). Damping (linear 0.1, angular 0.8) stands in for the rolling
+  resistance rapier lacks, so a nudged barrel stops. CCD is on, so a fast
+  one can't pass through a thin wall.
+- **Sync:** `bodies_readback_sys` is the rapier → ECS half for bodies. It
+  runs in the physics chain after the player's readback: the pose a body had
+  becomes `PrevBodyPose`, and rapier's becomes `BodyPose`. Extract draws
+  `body_model(prev, cur, scale, alpha)`: position lerped, rotation slerped,
+  then the scale. So bodies interpolate like every other moving thing, and
+  they are culled and cast shadows like static props (`shadow: false`
+  opts out).
+- **Kill plane:** a body below `kill_y` is taken out of rapier and
+  despawned. Otherwise one pushed off the world's edge would fall forever,
+  awake.
+- **Not in the sky bake:** `sky_occludes` leaves out `dynamic` nodes. One
+  baked in would leave a dark ghost where it used to stand.
+- **Not done:** collision layers (`InteractionGroups`): nothing needs
+  separating yet, since the controller should collide with props and shots
+  should hit them. Also not done: impact sounds, lights on dynamic props
+  (the light extract and the hums read `Transform`, which bodies don't
+  carry), joints, and props as anything but convex hulls (trimesh dynamics
+  are unstable and costly).
+- **Tests:**
+  - a body dropped 1 m falls, rests at its half-height and sleeps, and its
+    collider carries the node's surface (control: zero gravity);
+  - a scaled, turned body authored at rest moves under 1 mm in 5 s, sleeps,
+    and is drawn exactly as authored (control: a hull built without the
+    node's scale);
+  - the draw interpolates between the poses (control: the lerp reversed);
+  - the kill plane removes a fallen body from the world and from rapier
+    (control: the ECS despawn alone);
+  - params: `mass` beats `density`, both reach rapier, and bad or unknown
+    ones are named (controls: precedence swapped, no unknown-key check);
+  - `shadow: false` applies `NoShadowCast`, and a node without a mesh
+    builds nothing;
+  - `sky_occludes` and the sky key ignore `dynamic` nodes (control: no
+    exception);
+  - app e2e: a glTF cube with the prefab goes through `build_world` and the
+    real schedule, falls, is drawn between its poses and rests (controls:
+    the readback left out of the chain, the prefab unregistered).
+
 **Landed (§26): ropes.** Something hanging on a rope (`game/src/rope.rs`,
 the `hanging` prefab), the first simulated thing in a level besides the
 player. It's its own small solver, not rapier:
@@ -2712,7 +2763,8 @@ each point of the level sees. The renderer's side is §13.
     already gives the sky, so an open point shades as before.
 - **Occluders** (`sky_occludes`): every mesh node the sun's shadow sees, i.e.
   not `shadow: false`, and not cutouts, whose alpha the CPU doesn't test
-  (grass and chain-link are mostly holes). Each is traced at its coarsest
+  (grass and chain-link are mostly holes). Not `dynamic` props either
+  (§15), which needn't stay where they were baked. Each is traced at its coarsest
   baked LOD within 5 cm at its placed scale. That takes the zone from 825k
   placed triangles to 114k.
 - **Ray casting:** our own BVH (binned SAH, any-hit and nearest-hit walks),
@@ -2836,6 +2888,11 @@ Implemented prefabs are deliberately only those that do something today:
   radius, nearest wins — which sidesteps the collider→entity mapping that
   `physics.rs` notes `user_data` is reserved for. Orbs are `Transform`
   entities, not dynamic ones, so the §12 light extract carries their glow.
+
+- **`dynamic`** — a prop rapier moves (§15): a dynamic body colliding as the
+  convex hull of its mesh, with params `mass` (kg), else `density`
+  (kg/m³, default 150), and `shadow`. A node without a mesh, or a mesh
+  without a hull, falls back to static geometry.
 
 **Unknown ids warn once and fall back to static geometry** rather than failing,
 which is what lets a scene be authored ahead of the engine. Extras parsing is
@@ -3325,7 +3382,8 @@ its barriers.
 4. Physics + FPS controller (rapier), fixed timestep + interpolation → walkable.
    (Landed: fixed timestep + interpolation, the rapier kinematic FPS controller
    against static colliders, and the ECS↔rapier sync systems with the player as an
-   ECS entity. Remaining: dynamic bodies — see §26.)
+   ECS entity, and dynamic props (§15). Remaining: collision layers — see
+   §26.)
 5. Bounded arena content, chunked culling, bindless materials, PBR bake path.
    (Landed: per-view frustum culling, bindless-lite materials, and glTF scene
    loading, the offline bake for textures and meshes, and mesh LODs. Remaining:
@@ -3592,12 +3650,22 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   teleport, command history, a 64-line log. Parsing and state are unit
   tested without a GPU; the UiPass font gained `.` and `-` glyphs. 6
   mutation controls.
+- **Dynamic bodies (§15):** the `dynamic` prefab spawns a prop as a rapier
+  dynamic body: a convex hull with the node's scale baked in, and mass from
+  `mass` or `density`. rapier now steps with `BODY_GRAVITY`, which only
+  dynamic bodies feel. `bodies_readback_sys` joins the physics chain, extract
+  draws each body interpolated between its poses, a body below the kill
+  plane is removed, and the sky bake leaves `dynamic` nodes out. The
+  `[scene] colliders` line counts them. 8 tests, each shown a failing
+  mutation, including an app e2e on the real schedule. No scene uses the
+  prefab yet.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
   sky visibility and GTAO (§13), *not* cubemap IBL;
   step 4 mostly landed — fixed timestep + interpolation and the rapier kinematic
-  FPS controller against static colliders, with the ECS↔rapier sync systems
-  (dynamic bodies still pending, see below). Steps 5+ not started.
+  FPS controller against static colliders, with the ECS↔rapier sync systems,
+  and dynamic props (§15; collision layers still pending). Steps 5+ not
+  started.
 
 ### Current simplifications to revisit
 
@@ -3640,7 +3708,7 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   the top of the capsule touches or would reach this tick (shallow ones only
   once a slide has given up), which otherwise stalled the controller (§15). The controller maths stay plain functions (`player_target`/`player_readback`) that
   the systems wrap, so the physics tests drive the real logic. Still open: no `InteractionGroups` layers
-  (nothing to separate yet); the drifting orbs and their spin are still
+  (nothing to separate yet, dynamic props included, §15); the drifting orbs and their spin are still
   non-physical (cosmetic, not rigid bodies). Known limits: the ground is a finite 80×80 box, so walking
   off the edge falls forever (no kill-plane/respawn); slope climbing/sliding uses
   rapier's 45° defaults but no level geometry exercises it; a jump that clips a
@@ -3766,8 +3834,8 @@ and a parameterised `prop` with per-node collider/shadow opt-outs, and `hanging`
 §15's ropes; unknown ids
 fall back to static geometry; chunk membership and light/trigger prefabs
 pending) / save; rapier beyond the player (kinematic FPS controller, static
-colliders and the ECS↔rapier sync systems landed — dynamic bodies and collision
-layers pending; ropes, §15, are their own Verlet solver);
+colliders, the ECS↔rapier sync systems and dynamic props landed, §15 —
+collision layers pending; ropes, §15, are their own Verlet solver);
 skinning; UI/HUD (§19's lightweight quad/text renderer + the Esc pause menu
 landed, with keyboard *and* mouse navigation, an OPTIONS screen tree, and live
 display-mode/shadow-quality/FXAA/TAA controls under GRAPHICS, and in game a temporary

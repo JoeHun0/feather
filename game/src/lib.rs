@@ -2,6 +2,7 @@
 
 pub mod components;
 pub mod controller;
+pub mod dynamic;
 pub mod level;
 pub mod lights;
 pub mod physics;

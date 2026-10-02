@@ -324,14 +324,18 @@ const SKY_MAX_CELLS: u64 = 1 << 26;
 /// Whether a scene node's geometry blocks the sky in the sky bake: what the
 /// sun's shadow sees (a node with `shadow: false` doesn't), except cutouts,
 /// whose alpha the CPU bake doesn't test. Grass and chain-link are mostly
-/// holes, so leaving them out is closer than treating them as solid.
+/// holes, so leaving them out is closer than treating them as solid. Nor
+/// does a `dynamic` prop, which needn't stay where it was baked.
 pub fn sky_occludes(node: &SceneNode, mesh: &MeshData) -> bool {
     let casts = node
         .prefab
         .as_ref()
         .and_then(|p| p.bool("shadow"))
         .unwrap_or(true);
-    casts && !matches!(mesh.material.alpha_mode, AlphaMode::Mask(_))
+    // A `dynamic` prop (§15) moves: baked in, it would leave a dark ghost
+    // where it used to stand.
+    let moves = node.prefab.as_ref().is_some_and(|p| p.id == "dynamic");
+    casts && !moves && !matches!(mesh.material.alpha_mode, AlphaMode::Mask(_))
 }
 
 /// Content key of a scene's sky volume: every occluder's mesh (by
@@ -1098,5 +1102,38 @@ mod tests {
         let mut two_sided = scene(vec![node(0, 0.0, None)]);
         two_sided.meshes[0].material.double_sided = true;
         assert_ne!(base, sky_key(&two_sided));
+    }
+
+    /// A `dynamic` prop (§15) moves, so the sky bake leaves it out: its key
+    /// and its occluders are as if it weren't there. A `prop` with the same
+    /// mesh in the same place still occludes.
+    #[test]
+    fn dynamic_props_dont_occlude_the_sky() {
+        use crate::{PrefabSpec, SceneNode};
+        use glam::Mat4;
+        let wall = MeshData::cube(1.0);
+        let node = |id: &str, x: f32| SceneNode {
+            mesh: Some(0),
+            transform: Mat4::from_translation(Vec3::new(x, 0.0, 0.0)),
+            prefab: Some(PrefabSpec {
+                id: id.into(),
+                params: serde_json::json!({ "mass": 20.0 }),
+            }),
+        };
+        assert!(!sky_occludes(&node("dynamic", 0.0), &wall));
+        assert!(sky_occludes(&node("prop", 0.0), &wall));
+        let scene = |nodes| SceneData {
+            meshes: vec![wall.clone()],
+            nodes,
+        };
+        let base = sky_key(&scene(vec![node("prop", 0.0)]));
+        assert_eq!(
+            base,
+            sky_key(&scene(vec![node("prop", 0.0), node("dynamic", 3.0)]))
+        );
+        assert_ne!(
+            base,
+            sky_key(&scene(vec![node("prop", 0.0), node("prop", 3.0)]))
+        );
     }
 }

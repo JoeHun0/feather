@@ -199,6 +199,8 @@ pub struct ColliderStats {
     pub lod: usize,
     pub hull: usize,
     pub boxes: usize,
+    /// `dynamic` props' hulls (§15), not counted in `hull`.
+    pub dynamic: usize,
     /// Per surface (§20), indexed by `Surface::index`.
     pub surfaces: [usize; Surface::ALL.len()],
 }
@@ -382,6 +384,7 @@ pub fn prefab_registry() -> HashMap<&'static str, SpawnFn> {
     r.insert("point_light", spawn_point_light as SpawnFn);
     r.insert("hanging", spawn_hanging as SpawnFn);
     r.insert("target", spawn_target as SpawnFn);
+    r.insert("dynamic", crate::dynamic::spawn_dynamic as SpawnFn);
     r
 }
 

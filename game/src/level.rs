@@ -10,6 +10,7 @@ use crate::controller::{
     kill_plane_sys, physics_step_sys, player_readback_sys, player_target_sys, Health, InputState,
     KillPlane, Look, Player, SpawnPoint, GROUND_Y,
 };
+use crate::dynamic::{bodies_kill_plane_sys, bodies_readback_sys};
 use crate::physics::Physics;
 use crate::prefab::{prefab_registry, spawn_static_prop, ColliderStats, SpawnArgs};
 use crate::weapon::{targets_sys, weapon_sys, Score, TargetRespawns};
@@ -513,15 +514,18 @@ pub fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> Wor
     let mut schedule = Schedule::default();
     schedule.set_executor_kind(ExecutorKind::MultiThreaded);
     schedule.add_systems((integrate, tick, ropes, weapon_sys, targets_sys));
-    // §15's coupling: ECS -> rapier, the step, then rapier -> ECS. Chained so
-    // the bracket order is explicit (they all touch `Physics`, so bevy_ecs
-    // would serialise them regardless). The kill plane reads the fresh pos.
+    // §15's coupling: ECS -> rapier, the step, then rapier -> ECS (the
+    // player, then the dynamic bodies). Chained so the bracket order is
+    // explicit (they all touch `Physics`, so bevy_ecs would serialise them
+    // regardless). The kill planes read the fresh poses.
     schedule.add_systems(
         (
             player_target_sys,
             physics_step_sys,
             player_readback_sys,
+            bodies_readback_sys,
             kill_plane_sys,
+            bodies_kill_plane_sys,
         )
             .chain(),
     );
@@ -632,8 +636,8 @@ pub fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> Wor
         eprintln!("scene: {spawned} nodes spawned, {colliders} colliders built");
         let st = world.resource::<ColliderStats>();
         eprintln!(
-            "[scene] colliders: {} mesh ({} from LODs), {} hull, {} box",
-            st.mesh, st.lod, st.hull, st.boxes
+            "[scene] colliders: {} mesh ({} from LODs), {} hull, {} box, {} dynamic",
+            st.mesh, st.lod, st.hull, st.boxes, st.dynamic
         );
         eprintln!("[scene] surfaces: {}", st.surfaces_line());
     }
