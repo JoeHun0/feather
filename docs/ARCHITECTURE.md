@@ -2437,10 +2437,24 @@ the `dynamic` prefab): they fall, settle and sleep.
   dynamic bodies feel it. Fixed colliders and the player's position-based
   kinematic body ignore world gravity, and the controller keeps its own
   gamier `GRAVITY` = 26, so nothing that existed before moves differently.
-- **Collision:** the convex hull of the node's mesh, in the body's own frame.
+- **Collision:** the node's `collider`, in the body's own frame:
+  - `hull` (the default) is the convex hull of the mesh;
+  - `box` is a cuboid round its bounds;
+  - `cylinder` is an upright (local Y) cylinder round its bounds, as wide
+    as the wider side.
+
   The node's rotation and translation become the body's pose. Its scale is
-  baked into the hull's points, because a rapier pose can't scale (static
-  colliders bake the whole matrix into world space instead). Mass is
+  baked into the shape, because a rapier pose can't scale (static colliders
+  bake the whole matrix into world space instead).
+  - **Why the primitives:** the zone's scanned barrels as hulls (150–190
+    points) kept rocking and walking on their bottoms' near-coplanar facets.
+    On the zone's ground, upright ones crept 3–10 cm, and two still rocked
+    after 10 s.
+  - As cylinders, all 16 slept within 0.5 s. Upright ones moved 0.1 mm and
+    lying ones at most 8 mm.
+  - Alone on one big cuboid, the same hull moved 1 cm and slept within 1 s,
+    against 0.1 mm for the cylinder. So it's the hull, made worse by the
+    thin slabs under it. Mass is
   `mass` kg, else the hull's volume × `density` (default 150 kg/m³, a
   hollow drum). Damping (linear 0.1, angular 0.8) stands in for the rolling
   resistance rapier lacks, so a nudged barrel stops. CCD is on, so a fast
@@ -2492,8 +2506,9 @@ the `dynamic` prefab): they fall, settle and sleep.
   separating yet, since the controller should collide with props and shots
   should hit them. Also not done: impact sounds, lights on dynamic props
   (the light extract and the hums read `Transform`, which bodies don't
-  carry), joints, and props as anything but convex hulls (trimesh dynamics
-  are unstable and costly).
+  carry), joints, and trimesh props (unstable and costly). A mesh with
+  several primitives becomes one body per primitive, so a prop that should
+  move as one needs a single-primitive mesh.
 - **Tests:**
   - a body dropped 1 m falls, rests at its half-height and sleeps, and its
     collider carries the node's surface (control: zero gravity);
@@ -2507,6 +2522,9 @@ the `dynamic` prefab): they fall, settle and sleep.
     ones are named (controls: precedence swapped, no unknown-key check);
   - `shadow: false` applies `NoShadowCast`, and a node without a mesh
     builds nothing;
+  - `collider` gives a hull, a box with the node-scaled bounds, or a
+    cylinder as tall as them and as wide as the wider side (controls: the
+    narrower side, the scale left out, `cylinder` unparsed);
   - `sky_occludes` and the sky key ignore `dynamic` nodes (control: no
     exception);
   - walking into a 20 kg box pushes it over 1 m along the walk, not
@@ -2948,8 +2966,9 @@ Implemented prefabs are deliberately only those that do something today:
   `physics.rs` notes `user_data` is reserved for. Orbs are `Transform`
   entities, not dynamic ones, so the §12 light extract carries their glow.
 
-- **`dynamic`** — a prop rapier moves (§15): a dynamic body colliding as the
-  convex hull of its mesh, with params `mass` (kg), else `density`
+- **`dynamic`** — a prop rapier moves (§15): a dynamic body colliding as its
+  `collider` (`hull` of its mesh by default, or a `box` or upright
+  `cylinder` round its bounds), with params `mass` (kg), else `density`
   (kg/m³, default 150), and `shadow`. A node without a mesh, or a mesh
   without a hull, falls back to static geometry.
 
@@ -3724,7 +3743,8 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   the blocked motion shared by mass, capped at `PUSH_FORCE` = 600 N a tick,
   in place of rapier's uncapped impulses) and stands on them, and a shot
   knocks them (`SHOT_IMPULSE` = 30 N·s; `weapon_sys` now runs before the
-  physics bracket). 13 tests, each shown a failing mutation, including an app e2e on the real schedule. No
+  physics bracket). A `collider` param picks a hull, box or cylinder: scanned
+  hulls rocked on their facets. 14 tests, each shown a failing mutation, including an app e2e on the real schedule. No
   scene uses the prefab yet.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,

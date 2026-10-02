@@ -161,10 +161,8 @@ impl Physics {
     }
 
     /// A dynamic body (§15) at `pos`/`rot`, colliding as the convex hull of
-    /// `points`, which are in the body's own frame (scaled, not rotated). Its
-    /// mass is `mass` kg when given, else the hull's volume times `density`
-    /// (kg/m³). CCD keeps a knocked prop from passing through thin walls. `None`
-    /// when the points have no hull.
+    /// `points`, which are in the body's own frame (scaled, not rotated).
+    /// `None` when the points have no hull.
     pub fn add_dynamic_hull(
         &mut self,
         points: &[Vector],
@@ -174,6 +172,21 @@ impl Physics {
         density: f32,
     ) -> Option<(RigidBodyHandle, ColliderHandle)> {
         let collider = ColliderBuilder::convex_hull(points)?;
+        Some(self.add_dynamic(collider, pos, rot, mass, density))
+    }
+
+    /// A dynamic body (§15) at `pos`/`rot` with `collider`, which is in the
+    /// body's own frame. Its mass is `mass` kg when given, else the shape's
+    /// volume times `density` (kg/m³). CCD keeps a knocked prop from passing
+    /// through thin walls.
+    pub fn add_dynamic(
+        &mut self,
+        collider: ColliderBuilder,
+        pos: Vec3,
+        rot: Quat,
+        mass: Option<f32>,
+        density: f32,
+    ) -> (RigidBodyHandle, ColliderHandle) {
         let collider = match mass {
             Some(m) => collider.mass(m),
             None => collider.density(density),
@@ -188,7 +201,7 @@ impl Physics {
         let collider = self
             .colliders
             .insert_with_parent(collider, body, &mut self.bodies);
-        Some((body, collider))
+        (body, collider)
     }
 
     /// Take a body and its colliders out of the world.

@@ -8,14 +8,47 @@ use crate::physics::{from_rapier, quat_from_rapier, tag_surface, to_rapier, Phys
 use crate::prefab::{spawn_static_prop, ColliderStats, SpawnArgs};
 use bevy_ecs::prelude::*;
 use glam::{Mat4, Quat, Vec3};
-use rapier3d::prelude::{RigidBodyHandle, Vector};
+use rapier3d::prelude::{ColliderBuilder, RigidBodyHandle, Vector};
 
 /// A `dynamic` node's mass when it names neither `mass` nor `density`: the
-/// hull's volume at 150 kg/m³, about a hollow steel drum or a crate.
+/// shape's volume at 150 kg/m³, about a hollow steel drum or a crate.
 pub const DEFAULT_DENSITY: f32 = 150.0;
 
 /// The parameters a `dynamic` node may carry.
-pub const DYNAMIC_PARAMS: [&str; 3] = ["mass", "density", "shadow"];
+pub const DYNAMIC_PARAMS: [&str; 4] = ["mass", "density", "collider", "shadow"];
+
+/// What a `dynamic` prop collides as (its `collider` param), in its own
+/// frame. A scanned mesh's hull has a bottom of many near-coplanar facets,
+/// and a barrel stood on one kept rocking and walking for seconds; a
+/// primitive fitted to the mesh's bounds rests still (§15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyShape {
+    /// The convex hull of the mesh.
+    Hull,
+    /// A cuboid round its bounds.
+    Box,
+    /// An upright (local Y) cylinder round its bounds: a barrel, a drum.
+    Cylinder,
+}
+
+/// A `dynamic` node's params over the defaults.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DynamicParams {
+    /// kg; `None` takes the mass from `density`.
+    pub mass: Option<f32>,
+    pub density: f32,
+    pub shape: BodyShape,
+}
+
+impl Default for DynamicParams {
+    fn default() -> Self {
+        Self {
+            mass: None,
+            density: DEFAULT_DENSITY,
+            shape: BodyShape::Hull,
+        }
+    }
+}
 
 /// The entity's rigid body, and the node's scale, which the body's pose
 /// can't hold: the collider was built scaled, and the draw re-applies it.
@@ -37,14 +70,13 @@ pub struct BodyPose {
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct PrevBodyPose(pub BodyPose);
 
-/// A `dynamic` node's mass (kg) and density over the defaults, and the
-/// params it couldn't use: unknown ones, and ones out of range or not
-/// numbers. `mass` wins over `density` when both are given.
-pub fn dynamic_params(
-    spec: Option<&feather_assets::PrefabSpec>,
-) -> (Option<f32>, f32, Vec<String>) {
+/// A `dynamic` node's params over the defaults, and the ones it couldn't
+/// use: unknown ones, and ones out of range or of the wrong kind. `mass`
+/// wins over `density` when both are given.
+pub fn dynamic_params(spec: Option<&feather_assets::PrefabSpec>) -> (DynamicParams, Vec<String>) {
+    let mut p = DynamicParams::default();
     let Some(spec) = spec else {
-        return (None, DEFAULT_DENSITY, Vec::new());
+        return (p, Vec::new());
     };
     let mut bad: Vec<String> = spec
         .params
@@ -64,18 +96,57 @@ pub fn dynamic_params(
             }
         },
     };
-    let mass = num("mass", |v| v > 0.0 && v <= 100_000.0);
-    let density = num("density", |v| v > 0.0 && v <= 20_000.0).unwrap_or(DEFAULT_DENSITY);
-    (mass, density, bad)
+    p.mass = num("mass", |v| v > 0.0 && v <= 100_000.0);
+    if let Some(d) = num("density", |v| v > 0.0 && v <= 20_000.0) {
+        p.density = d;
+    }
+    if spec.params.get("collider").is_some() {
+        match spec.str("collider") {
+            Some("hull") => p.shape = BodyShape::Hull,
+            Some("box") => p.shape = BodyShape::Box,
+            Some("cylinder") => p.shape = BodyShape::Cylinder,
+            _ => bad.push("collider".to_string()),
+        }
+    }
+    (p, bad)
+}
+
+/// A body's collider in its own frame, from its mesh's vertices with the
+/// node's scale applied (a rapier pose can't scale). `None` when a hull
+/// has nothing to wrap.
+pub fn body_collider(
+    data: &feather_assets::MeshData,
+    scale: Vec3,
+    shape: BodyShape,
+) -> Option<ColliderBuilder> {
+    let (a, b) = data.bounds();
+    // A negative scale mirrors the bounds; min/max puts them back in order.
+    let (lo, hi) = ((a * scale).min(b * scale), (a * scale).max(b * scale));
+    let (half, center) = ((hi - lo) * 0.5, to_rapier((lo + hi) * 0.5));
+    match shape {
+        BodyShape::Hull => {
+            let points: Vec<Vector> = data
+                .vertices
+                .iter()
+                .map(|v| to_rapier(Vec3::from(v.pos) * scale))
+                .collect();
+            ColliderBuilder::convex_hull(&points)
+        }
+        BodyShape::Box => Some(ColliderBuilder::cuboid(half.x, half.y, half.z).translation(center)),
+        BodyShape::Cylinder => {
+            Some(ColliderBuilder::cylinder(half.y, half.x.max(half.z)).translation(center))
+        }
+    }
 }
 
 /// A prop rapier moves (§15): it falls, settles, and can be pushed. It
-/// collides as the convex hull of its mesh, in its own frame: the node's
-/// rotation and translation become the body's pose, and its scale is baked
-/// into the hull, since a rapier pose can't scale. A node with no mesh, or
-/// one whose points have no hull, falls back to static geometry.
+/// collides as its `collider` shape (default the convex hull of its mesh),
+/// in its own frame: the node's rotation and translation become the body's
+/// pose, and its scale is baked into the shape, since a rapier pose can't
+/// scale. A node with no mesh, or one whose points have no hull, falls back
+/// to static geometry.
 pub fn spawn_dynamic(world: &mut World, args: &SpawnArgs) {
-    let (mass, density, bad) = dynamic_params(args.spec);
+    let (params, bad) = dynamic_params(args.spec);
     for key in bad {
         eprintln!("[scene] dynamic: can't use param {key:?}; ignored");
     }
@@ -85,19 +156,15 @@ pub fn spawn_dynamic(world: &mut World, args: &SpawnArgs) {
         return;
     };
     let (scale, rot, pos) = args.transform.to_scale_rotation_translation();
-    let points: Vec<Vector> = data
-        .vertices
-        .iter()
-        .map(|v| to_rapier(Vec3::from(v.pos) * scale))
-        .collect();
-    let built = world
-        .resource_mut::<Physics>()
-        .add_dynamic_hull(&points, pos, rot, mass, density);
-    let Some((handle, collider)) = built else {
+    let Some(shape) = body_collider(data, scale, params.shape) else {
         eprintln!("[scene] dynamic: no hull for its mesh; spawning as static geometry");
         spawn_static_prop(world, args);
         return;
     };
+    let (handle, collider) =
+        world
+            .resource_mut::<Physics>()
+            .add_dynamic(shape, pos, rot, params.mass, params.density);
     tag_surface(
         &mut world.resource_mut::<Physics>().colliders[collider],
         args.surface,
@@ -352,14 +419,23 @@ mod tests {
     #[test]
     fn dynamic_params_set_the_mass_and_bad_ones_are_named() {
         let spec = |v| node(Some("dynamic"), v).prefab;
-        assert_eq!(dynamic_params(None), (None, DEFAULT_DENSITY, vec![]));
-        let s = spec(serde_json::json!({ "mass": 20.0, "density": 500.0, "shadow": false }));
-        assert_eq!(dynamic_params(s.as_ref()), (Some(20.0), 500.0, vec![]));
-        let s = spec(serde_json::json!({ "mass": -1.0, "density": "x", "colour": 1 }));
-        let (mass, density, mut bad) = dynamic_params(s.as_ref());
+        assert_eq!(dynamic_params(None), (DynamicParams::default(), vec![]));
+        let s = spec(serde_json::json!({
+            "mass": 20.0, "density": 500.0, "collider": "cylinder", "shadow": false
+        }));
+        let want = DynamicParams {
+            mass: Some(20.0),
+            density: 500.0,
+            shape: BodyShape::Cylinder,
+        };
+        assert_eq!(dynamic_params(s.as_ref()), (want, vec![]));
+        let s = spec(serde_json::json!({
+            "mass": -1.0, "density": "x", "collider": "sphere", "colour": 1
+        }));
+        let (p, mut bad) = dynamic_params(s.as_ref());
         bad.sort();
-        assert_eq!((mass, density), (None, DEFAULT_DENSITY));
-        assert_eq!(bad, ["colour", "density", "mass"]);
+        assert_eq!(p, DynamicParams::default());
+        assert_eq!(bad, ["collider", "colour", "density", "mass"]);
 
         // What reaches rapier: `mass` wins, else the 1 m³ cube's volume times
         // the density.
@@ -374,6 +450,40 @@ mod tests {
             let (body, _) = the_body(&mut w);
             let mass = w.resource::<Physics>().bodies[body.handle].mass();
             assert!((mass - want).abs() < 0.01, "mass {mass}, want {want}");
+        }
+    }
+
+    /// `collider` picks the shape, fitted to the mesh's bounds with the
+    /// node's scale: a cube scaled (0.6, 0.9, 0.4) as a box is that box, and
+    /// as a cylinder stands 0.9 tall and 0.6 across (the wider side).
+    #[test]
+    fn the_collider_param_shapes_the_body() {
+        use rapier3d::parry::shape::ShapeType;
+        let cube = MeshData::cube(1.0);
+        let scale = Vec3::new(0.6, 0.9, 0.4);
+        for (collider, want) in [
+            ("hull", ShapeType::ConvexPolyhedron),
+            ("box", ShapeType::Cuboid),
+            ("cylinder", ShapeType::Cylinder),
+        ] {
+            let (mut w, _) = body_world();
+            spawn(
+                &mut w,
+                Mat4::from_scale(scale),
+                serde_json::json!({ "collider": collider }),
+                &cube,
+            );
+            let (body, _) = the_body(&mut w);
+            let physics = w.resource::<Physics>();
+            let c = &physics.colliders[physics.bodies[body.handle].colliders()[0]];
+            assert_eq!(c.shape().shape_type(), want, "{collider}");
+            let a = c.compute_aabb();
+            let size = from_rapier(a.maxs - a.mins);
+            let want_size = match want {
+                ShapeType::Cylinder => Vec3::new(0.6, 0.9, 0.6),
+                _ => scale,
+            };
+            assert!(size.abs_diff_eq(want_size, 1e-3), "{collider}: {size}");
         }
     }
 
