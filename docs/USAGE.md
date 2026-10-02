@@ -489,7 +489,9 @@ electricity poles. Kerosene lanterns hang on ropes from the hangar's roof
 beams, swaying in the draught, and are its only lamps. You spawn on the road outside the gate,
 facing it. Seven target orbs float at eye height around the yard (left
 mouse to shoot: a hit flashes one, three hits pop it, and it comes back in
-five seconds where it was).
+five seconds where it was). The barrels are physical: walk into one to
+shove it along, stand on one, or shoot it to knock it over or send it
+rolling.
 
 - **Assets:** 8 tiling Poly Haven textures at 2K (precast concrete, factory
   brick, rusty corrugated iron, rusty metal, damaged concrete floor, damaged
@@ -544,7 +546,10 @@ five seconds where it was).
   - shadows under trees 9 m or more away are slightly lighter than under
     near ones: their casters use a quarter of the leaf cards (the foliage
     LOD floor);
-  - trunks stop you, bushes don't.
+  - trunks stop you, bushes don't;
+  - barrels standing still at load (no jitter, no slow creep), drawn
+    smoothly as they slide, tip or roll, with their shadows following;
+    a rolling one slows and comes to rest rather than rolling on.
 
 ### Baking — `feather-bake`
 

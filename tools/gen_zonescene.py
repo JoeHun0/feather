@@ -163,6 +163,11 @@ LAMP = {"color": [1.0, 0.78, 0.5], "intensity": 10.0, "radius": 12.0,
 # The playable loop's orbs (game/src/weapon.rs's `target` prefab): one press
 # one shot, three hits pop one. Default colour/intensity; tune by eye.
 TARGET_PARAMS = {"hits": 3.0}
+# The barrels are props rapier moves (ARCHITECTURE.md §15's `dynamic`
+# prefab): empty 200 l steel drums, about 20 kg, so the player can shove
+# one along and a shot knocks it. As cylinders: the scans' hulls rocked on
+# their facets. Tyres and barriers stay put.
+BARREL = {"prefab": "dynamic", "params": {"mass": 20.0, "collider": "cylinder"}}
 
 # Alpha cutout (ARCHITECTURE.md §5). A chain-link enclosure round the
 # compressor, from ambientCG's Fence006 (rusty diamond mesh), and grass tufts
@@ -739,7 +744,7 @@ def props(z):
             key = rng.choice(("barrel_a", "barrel_b"))
             x, zz = cx + rng.uniform(-1.4, 1.4), cz + rng.uniform(-1.4, 1.4)
             rot = lying() if rng.random() < 0.2 else yaw_q(rng.uniform(0, 360))
-            count(key, z.put(key, x, zz, floor=floor, rot=rot))
+            count(key, z.put(key, x, zz, floor=floor, rot=rot, extras=BARREL))
     # Tyre stacks, and a few lying about.
     for cx, cz, floor in ((-15.0, 24.0, MUD_TOP), (14.0, -24.0, MUD_TOP), (-10.0, 10.5, PAVE_TOP)):
         for k in range(rng.randint(2, 5)):

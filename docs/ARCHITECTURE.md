@@ -2502,6 +2502,27 @@ the `dynamic` prefab): they fall, settle and sleep.
   - `weapon_sys` now runs before the physics bracket. Before, its order
     against the chain was ambiguous, so a shot's impulse could land a tick
     early or late from run to run.
+- **The zone** (`tools/gen_zonescene.py`): its barrels are
+  `{"mass": 20, "collider": "cylinder"}`, about an empty 200 l drum.
+  Nothing else in a level changes: the rng draws are the same, so at seed
+  11 only the 16 barrel nodes' extras differ, and `--check` passes seeds
+  1–200.
+  - **Settling** (a temporary harness on the real world build, 600 ticks):
+    - all 16 asleep from tick 30;
+    - upright ones moved 0.1 mm, lying ones at most 8 mm.
+    - Predicted all asleep within 2 s, under 2 cm and 5 cm: right only after
+      the `box` correction and the cylinders (above).
+  - **Cost:**
+    - a tick's median was 0.12 ms with the barrels static and dynamic,
+      awake or asleep (release, the whole schedule);
+    - the bench (pinned core clock, 3 interleaved rounds): every pass's
+      median within 0.01 ms of the previous binary on the static zone;
+    - `Mtris main/shadow` and the LOD mix identical, so the same barrels
+      are drawn through the bodies' extract;
+    - `lights120` unchanged.
+  - **Sky:** the barrels are out of its sky volume now, so the zone needs
+    its sky rebaked (`feather-bake scratch/zone.glb`, 2 s).
+  - **Validation:** sync-clean at 1× and MSAA 4× (filtered).
 - **Not done:** collision layers (`InteractionGroups`): nothing needs
   separating yet, since the controller should collide with props and shots
   should hit them. Also not done: impact sounds, lights on dynamic props
@@ -3744,8 +3765,10 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   in place of rapier's uncapped impulses) and stands on them, and a shot
   knocks them (`SHOT_IMPULSE` = 30 N·s; `weapon_sys` now runs before the
   physics bracket). A `collider` param picks a hull, box or cylinder: scanned
-  hulls rocked on their facets. 14 tests, each shown a failing mutation, including an app e2e on the real schedule. No
-  scene uses the prefab yet.
+  hulls rocked on their facets. 14 tests, each shown a failing mutation,
+  including an app e2e on the real schedule. The zone's 16 barrels are
+  dynamic cylinders of 20 kg: all asleep 0.5 s after load, and the bench and
+  sync validation are unchanged.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
   sky visibility and GTAO (§13), *not* cubemap IBL;
