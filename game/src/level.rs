@@ -513,7 +513,10 @@ pub fn build_world(scenes: &[String], bake_dir: Option<&std::path::Path>) -> Wor
 
     let mut schedule = Schedule::default();
     schedule.set_executor_kind(ExecutorKind::MultiThreaded);
-    schedule.add_systems((integrate, tick, ropes, weapon_sys, targets_sys));
+    schedule.add_systems((integrate, tick, ropes, targets_sys));
+    // A shot reads the player and can knock a prop (§15), so it goes before
+    // the physics bracket: its impulse lands in this tick's step, every run.
+    schedule.add_systems(weapon_sys.before(player_target_sys));
     // §15's coupling: ECS -> rapier, the step, then rapier -> ECS (the
     // player, then the dynamic bodies). Chained so the bracket order is
     // explicit (they all touch `Physics`, so bevy_ecs would serialise them

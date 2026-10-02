@@ -18,6 +18,9 @@ pub const MAX_RANGE: f32 = 100.0;
 pub const TARGET_MATERIAL: u32 = 16;
 /// Fixed ticks a popped orb takes to return (5 s at FIXED_DT).
 pub const RESPAWN_TICKS: u32 = 300;
+/// What a shot gives a dynamic prop it hits (§15), N·s, along the shot at
+/// the hit point: 1.5 m/s to a 20 kg barrel.
+pub const SHOT_IMPULSE: f32 = 30.0;
 /// Per-tick flash decay: 0.82^12 ≈ 0.09, so a hit glows for about 0.2 s.
 const FLASH_DECAY: f32 = 0.82;
 
@@ -116,7 +119,8 @@ fn ray_sphere(origin: Vec3, dir: Vec3, center: Vec3, radius: f32) -> Option<f32>
 /// One hitscan shot from `eye` along `dir`. Walls are the rapier world (so a
 /// shot can't pass geometry); targets are analytic spheres; whichever is
 /// nearer wins. A hit flashes the orb and, at `hits_left == 0`, pops it onto
-/// the respawn queue. Returns whether an orb was hit.
+/// the respawn queue; a dynamic prop (§15) is knocked by `SHOT_IMPULSE`.
+/// Returns whether an orb was hit.
 pub fn fire(world: &mut World, eye: Vec3, dir: Vec3) -> bool {
     let dir = dir.normalize_or_zero();
     if dir == Vec3::ZERO {
@@ -157,6 +161,20 @@ pub fn fire(world: &mut World, eye: Vec3, dir: Vec3) -> bool {
         }
     }
     let Some(entity) = hit else {
+        // The rapier world was nearest: knock it, if it moves.
+        if let Some((collider, t)) = wall {
+            let mut physics = world.resource_mut::<Physics>();
+            if let Some(body) = physics.colliders[collider].parent() {
+                let body = &mut physics.bodies[body];
+                if body.is_dynamic() {
+                    body.apply_impulse_at_point(
+                        to_rapier(dir * SHOT_IMPULSE),
+                        to_rapier(eye + dir * t),
+                        true,
+                    );
+                }
+            }
+        }
         return false;
     };
     let frame = world.resource::<FrameCount>().0;
@@ -325,6 +343,57 @@ mod tests {
         world.resource_mut::<Physics>().step();
         assert!(!fire(&mut world, EYE, Vec3::new(0.0, 0.0, -1.0)));
         assert_eq!(world.resource::<Score>().hits, 0);
+    }
+
+    /// A 20 kg unit box at `at`.
+    fn add_box(world: &mut World, at: Vec3) -> rapier3d::prelude::RigidBodyHandle {
+        let cube: Vec<_> = feather_assets::MeshData::cube(1.0)
+            .vertices
+            .iter()
+            .map(|v| to_rapier(Vec3::from(v.pos)))
+            .collect();
+        let mut physics = world.resource_mut::<Physics>();
+        let (h, _) = physics
+            .add_dynamic_hull(&cube, at, glam::Quat::IDENTITY, Some(20.0), 1.0)
+            .expect("a cube has a hull");
+        physics.step();
+        h
+    }
+
+    #[test]
+    fn a_shot_knocks_a_prop_along_it() {
+        let (mut world, _) = world_with_target();
+        let at = Vec3::new(0.0, GROUND_Y + 0.5, -3.0);
+        let h = add_box(&mut world, at);
+        let dir = (at - EYE).normalize();
+        assert!(!fire(&mut world, EYE, dir), "no orb hit");
+        let v = crate::physics::from_rapier(world.resource::<Physics>().bodies[h].linvel());
+        let along = v.dot(dir);
+        assert!(along > 1.0, "knocked along the shot: {v:?}");
+        assert!(
+            (v - dir * along).length() < 0.5 * along,
+            "mostly along it: {v:?}"
+        );
+        for _ in 0..120 {
+            world.resource_mut::<Physics>().step();
+        }
+        let moved =
+            crate::physics::from_rapier(world.resource::<Physics>().bodies[h].translation()) - at;
+        assert!(
+            moved.z < -0.05 && moved.z > -1.0,
+            "slid a little: {moved:?}"
+        );
+    }
+
+    #[test]
+    fn an_orb_in_front_of_a_prop_takes_the_shot() {
+        let (mut world, orb) = world_with_target();
+        let h = add_box(&mut world, Vec3::new(0.0, GROUND_Y + 1.6, -8.0));
+        assert!(fire(&mut world, EYE, Vec3::new(0.0, 0.0, -1.0)));
+        assert_eq!(world.get::<Target>(orb).expect("orb").hits_left, 2);
+        // It's falling (it floats at eye height), but nothing pushed it.
+        let v = crate::physics::from_rapier(world.resource::<Physics>().bodies[h].linvel());
+        assert_eq!((v.x, v.z), (0.0, 0.0), "untouched: {v:?}");
     }
 
     #[test]

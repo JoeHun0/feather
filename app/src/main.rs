@@ -2783,8 +2783,8 @@ mod tests {
     }
 
     /// A scene's `dynamic` node (§15) through `build_world` and the real
-    /// schedule: a cube authored half a metre up falls onto the ground and
-    /// rests there, and is drawn between its poses.
+    /// schedule: a cube authored half a metre up falls onto the ground,
+    /// rests there and is drawn between its poses, and a shot knocks it.
     #[test]
     fn a_scene_dynamic_body_falls_on_the_real_schedule() {
         let dir = crate::config::test_dir("e2e-dynamic");
@@ -2853,11 +2853,23 @@ mod tests {
         for _ in 0..120 {
             b.schedule.run(&mut b.world);
         }
-        let rest = pose(&mut b).0.pos.y;
+        let rest = pose(&mut b).0.pos;
         assert!(
-            (rest - (GROUND_Y + 0.5)).abs() < 0.01,
+            (rest.y - (GROUND_Y + 0.5)).abs() < 0.01,
             "resting on the ground: {rest}"
         );
+        // Shoot it from the default spawn, 8 m back: it slides off along -Z.
+        let eye = b.world.get::<Player>(b.player).expect("player").pos + Vec3::Y * EYE_HEIGHT;
+        let to = rest - eye;
+        b.world.get_mut::<Look>(b.player).expect("look").pitch =
+            to.y.atan2(Vec3::new(to.x, 0.0, to.z).length());
+        b.world.resource_mut::<InputState>().fire = true;
+        for _ in 0..60 {
+            b.schedule.run(&mut b.world);
+        }
+        assert_eq!(b.world.resource::<weapon::Score>().shots, 1);
+        let shot = pose(&mut b).0.pos;
+        assert!(shot.z < rest.z - 0.05, "knocked away: {rest} -> {shot}");
         let _ = std::fs::remove_dir_all(&dir);
     }
     /// scene's own key under the bake root, and only there. A volume baked
