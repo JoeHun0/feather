@@ -407,4 +407,66 @@ mod tests {
         assert_eq!(w.query::<&Body>().iter(&w).count(), 0);
         assert_eq!(w.resource::<Physics>().bodies.len(), 0);
     }
+
+    // ---- the player and props (§15) ----
+
+    /// The player 3 m behind a unit box of `mass` kg resting on the ground,
+    /// facing it along -Z.
+    fn player_and_box(mass: f32) -> (Physics, crate::controller::Player, RigidBodyHandle) {
+        let (mut ph, p) = crate::testing::setup(&[], Vec3::new(0.0, GROUND_Y, 3.0));
+        let cube: Vec<Vector> = MeshData::cube(1.0)
+            .vertices
+            .iter()
+            .map(|v| to_rapier(Vec3::from(v.pos)))
+            .collect();
+        let at = Vec3::new(0.0, GROUND_Y + 0.5, 0.0);
+        let (h, _) = ph
+            .add_dynamic_hull(&cube, at, Quat::IDENTITY, Some(mass), DEFAULT_DENSITY)
+            .expect("a cube has a hull");
+        ph.step();
+        (ph, p, h)
+    }
+
+    #[test]
+    fn walking_into_a_light_prop_pushes_it() {
+        let (mut ph, mut p, h) = player_and_box(20.0);
+        let start = from_rapier(ph.bodies[h].translation());
+        crate::testing::run(&mut p, &mut ph, 120, Vec3::NEG_Z);
+        let moved = from_rapier(ph.bodies[h].translation()) - start;
+        assert!(moved.z < -1.0, "pushed along the walk: {moved:?}");
+        assert!(moved.x.abs() < 0.05, "and not sideways: {moved:?}");
+        assert!(p.pos.z < 1.0, "the player followed it: {}", p.pos.z);
+    }
+
+    /// A prop whose friction on the ground beats `PUSH_FORCE` doesn't move,
+    /// and holds the player: 500 kg, about a full drum.
+    #[test]
+    fn a_heavy_prop_holds_the_player() {
+        let (mut ph, mut p, h) = player_and_box(500.0);
+        let start = from_rapier(ph.bodies[h].translation());
+        crate::testing::run(&mut p, &mut ph, 120, Vec3::NEG_Z);
+        let moved = from_rapier(ph.bodies[h].translation()) - start;
+        assert!(moved.length() < 0.01, "moved {moved:?}");
+        assert!(p.pos.z > 0.5 + crate::controller::PLAYER_RADIUS - 0.05);
+    }
+
+    #[test]
+    fn the_player_stands_on_a_prop() {
+        let (mut ph, mut p, h) = player_and_box(20.0);
+        // Drop the player onto the box's top.
+        p.pos = Vec3::new(0.0, GROUND_Y + 1.5, 0.0);
+        p.prev_pos = p.pos;
+        p.on_ground = false;
+        let body = p.body;
+        ph.bodies[body].set_translation(to_rapier(p.pos + crate::controller::Player::CENTER), true);
+        crate::testing::run(&mut p, &mut ph, 120, Vec3::ZERO);
+        assert!(p.on_ground);
+        assert!(
+            (p.pos.y - (GROUND_Y + 1.0)).abs() < 0.03,
+            "feet on its top: {}",
+            p.pos.y
+        );
+        let rest = from_rapier(ph.bodies[h].translation());
+        assert!((rest - Vec3::new(0.0, GROUND_Y + 0.5, 0.0)).length() < 0.01);
+    }
 }

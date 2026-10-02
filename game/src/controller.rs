@@ -6,7 +6,9 @@ use crate::physics::{collider_surface, from_rapier, to_rapier, Physics};
 use crate::Surface;
 use bevy_ecs::prelude::*;
 use glam::{Mat4, Vec3};
-use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
+use rapier3d::control::{
+    CharacterAutostep, CharacterCollision, CharacterLength, KinematicCharacterController,
+};
 use rapier3d::geometry::ContactManifold;
 use rapier3d::parry::bounding_volume::BoundingVolume;
 use rapier3d::parry::query::{DefaultQueryDispatcher, PersistentQueryDispatcher, ShapeCastOptions};
@@ -29,6 +31,12 @@ pub const MOVE_SPEED: f32 = 8.0; // target ground speed, units/s
 pub const MOVE_ACCEL: f32 = 14.0; // how fast horizontal velocity chases the target
 pub const GRAVITY: f32 = 26.0;
 pub const JUMP_SPEED: f32 = 9.0; // ~1.5 units apex
+/// What the player weighs to a dynamic prop it walks into (§15), kg: the
+/// blocked motion is shared out by the two masses.
+pub const PLAYER_MASS: f32 = 80.0;
+/// The most the player can push with, N: about what feet hold on the
+/// ground. A prop whose friction on the ground is more stays put (§15).
+pub const PUSH_FORCE: f32 = 600.0;
 pub const FLY_SPEED: f32 = 14.0; // noclip movement speed
 /// How far below a grounded player the surface probe looks (§20). The
 /// controller holds the capsule ~2 cm off the ground and counts contacts
@@ -213,6 +221,8 @@ impl Player {
 pub fn player_target(p: &mut Player, physics: &mut Physics, input: &InputState) {
     let (wish, jump, vgo, noclip) = (input.wish, input.jump, input.vertical, input.noclip);
     p.prev_pos = p.pos;
+    // What the slide ran into that a push can move: dynamic props (§15).
+    let mut pushes: Vec<CharacterCollision> = Vec::new();
 
     let motion = if noclip {
         // Free flight: velocity follows input directly, no gravity or collision.
@@ -269,8 +279,12 @@ pub fn player_target(p: &mut Player, physics: &mut Physics, input: &InputState) 
         let mut hits = 0;
         let moved =
             p.controller
-                .move_shape(FIXED_DT, &queries, shape, &at, to_rapier(desired), |_| {
-                    hits += 1
+                .move_shape(FIXED_DT, &queries, shape, &at, to_rapier(desired), |c| {
+                    hits += 1;
+                    let parent = physics.colliders[c.handle].parent();
+                    if parent.is_some_and(|b| physics.bodies[b].is_dynamic()) {
+                        pushes.push(c);
+                    }
                 });
         p.slide_hits = hits;
         let actual = from_rapier(moved.translation);
@@ -308,8 +322,44 @@ pub fn player_target(p: &mut Player, physics: &mut Physics, input: &InputState) 
         actual
     };
 
+    push_props(physics, &pushes);
+
     physics.bodies[p.body]
         .set_next_kinematic_translation(to_rapier(p.pos + Player::CENTER + motion));
+}
+
+/// Push the dynamic props the slide ran into (§15). Each gets the impulse
+/// that would share the blocked part of the motion out by the two masses,
+/// at the point the capsule touched it, but all of them together no more
+/// than `PUSH_FORCE` for a tick. rapier's own
+/// `solve_character_collision_impulses` has no such cap: it gives every
+/// contact point the whole share every tick, and walking into a 5000 kg
+/// box moved it 0.7 m in 2 s.
+pub fn push_props(physics: &mut Physics, pushes: &[CharacterCollision]) {
+    let mut budget = PUSH_FORCE * FIXED_DT;
+    for c in pushes {
+        let Some(handle) = physics.colliders[c.handle].parent() else {
+            continue;
+        };
+        // The controller's shape-cast reports the hit from the prop's side,
+        // in world space: `normal1` points out of the prop at the player, and
+        // `witness1` is the touched point on its surface.
+        let n = -c.hit.normal1;
+        let point = c.hit.witness1;
+        let body = &mut physics.bodies[handle];
+        let blocked = c.translation_remaining.dot(n) / FIXED_DT;
+        let dv = blocked - body.velocity_at_point(point).dot(n);
+        if dv <= 0.0 {
+            continue;
+        }
+        let share = body.mass() * PLAYER_MASS / (body.mass() + PLAYER_MASS);
+        let j = (dv * share).min(budget);
+        body.apply_impulse_at_point(n * j, point, true);
+        budget -= j;
+        if budget <= 0.0 {
+            break;
+        }
+    }
 }
 
 /// How many passes rapier's slide makes before it gives up (§15).

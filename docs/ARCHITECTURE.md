@@ -2438,6 +2438,29 @@ the `dynamic` prefab): they fall, settle and sleep.
   awake.
 - **Not in the sky bake:** `sky_occludes` leaves out `dynamic` nodes. One
   baked in would leave a dark ghost where it used to stand.
+- **The player pushes them** (`push_props`):
+  - The controller collides with props like any other geometry: it slides
+    along them, stands on them, and never steps up onto them (autostep
+    leaves dynamic bodies out).
+  - Each slide hit on a prop also gives it an impulse along the hit, at the
+    touched point. That impulse is the share of the blocked motion the two
+    masses split (`PLAYER_MASS` = 80 kg).
+  - All of a tick's pushes together are capped at `PUSH_FORCE` = 600 N,
+    about what feet hold on the ground, so ground friction decides what
+    moves.
+  - Measured over 2 s of walking into a unit box:
+    - 20 kg: 2.4 m;
+    - 80 kg: 2.0 m;
+    - 500 kg and 5000 kg: 0.000 m.
+  - Pushing is a slow walk, because the controller re-derives speed from
+    the blocked motion each tick.
+  - **Predicted wrong:** I planned on rapier's own
+    `solve_character_collision_impulses`. With it, a 5000 kg box moved
+    0.73 m in those 2 s, and a 20 kg one tumbled 6.5 m. It gives every
+    contact point the whole mass-ratio share every tick, about 60× what a
+    person can push with.
+  - The KCC reports hits from the prop's side, in world space: `normal1`
+    points out of the prop.
 - **Not done:** collision layers (`InteractionGroups`): nothing needs
   separating yet, since the controller should collide with props and shots
   should hit them. Also not done: impact sounds, lights on dynamic props
@@ -2459,6 +2482,11 @@ the `dynamic` prefab): they fall, settle and sleep.
     builds nothing;
   - `sky_occludes` and the sky key ignore `dynamic` nodes (control: no
     exception);
+  - walking into a 20 kg box pushes it over 1 m along the walk, not
+    sideways (controls: no push, the normal reversed); a 500 kg one holds
+    the player and moves under 1 cm (control: no `PUSH_FORCE` cap); the
+    player stands on a box's top (control: the controller blind to dynamic
+    bodies);
   - app e2e: a glTF cube with the prefab goes through `build_world` and the
     real schedule, falls, is drawn between its poses and rests (controls:
     the readback left out of the chain, the prefab unregistered).
@@ -3656,9 +3684,11 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   dynamic bodies feel. `bodies_readback_sys` joins the physics chain, extract
   draws each body interpolated between its poses, a body below the kill
   plane is removed, and the sky bake leaves `dynamic` nodes out. The
-  `[scene] colliders` line counts them. 8 tests, each shown a failing
-  mutation, including an app e2e on the real schedule. No scene uses the
-  prefab yet.
+  `[scene] colliders` line counts them. The player pushes them (`push_props`:
+  the blocked motion shared by mass, capped at `PUSH_FORCE` = 600 N a tick,
+  in place of rapier's uncapped impulses) and stands on them. 11 tests, each
+  shown a failing mutation, including an app e2e on the real schedule. No
+  scene uses the prefab yet.
 - **Build order (§23)**: step 1 done; step 2 done; step 3 mostly — PBR direct
   lighting + full textures + analytic-sky IBL + 4-cascade CSM + punctual lights,
   sky visibility and GTAO (§13), *not* cubemap IBL;
