@@ -224,7 +224,9 @@ pub enum ColliderKind {
     Auto,
     Mesh,
     Hull,
-    /// Oriented bounding box: the hull of the local bounds' eight corners.
+    /// Oriented bounding box: a cuboid round the local bounds, turned and
+    /// scaled with the node (the hull of its eight corners if the node's
+    /// matrix is sheared).
     Box,
     None,
 }
@@ -300,6 +302,13 @@ pub fn build_collider(
         ),
         ColliderKind::Box => {
             let (lo, hi) = data.bounds();
+            // A real cuboid where the node's matrix allows one. The hull of
+            // the eight corners is only the fallback, for a sheared matrix:
+            // quickhull flattens a thin, wide box onto one face (an 80 m x
+            // 2 cm slab came out zero-thick at its bottom, §15).
+            if let Some(h) = physics.add_static_obb(transform, lo, hi) {
+                return Some((h, BuiltCollider::Box));
+            }
             (
                 (0..8)
                     .map(|i| {
@@ -516,7 +525,7 @@ mod tests {
     use crate::controller::{Player, GROUND_Y};
     use crate::level::mesh_surfaces;
 
-    use crate::physics::collider_surface;
+    use crate::physics::{collider_surface, from_rapier};
     use crate::testing::{node, setup, step};
 
     // ---- §18 prefabs ----
@@ -799,9 +808,61 @@ mod tests {
         )
     }
 
+    /// A `box` collider is a real cuboid round the node's bounds. As the
+    /// hull of its eight corners, an 80 m x 2 cm slab (the zone's mud) came
+    /// out zero-thick at its bottom face: quickhull took it for flat.
+    #[test]
+    fn a_box_collider_keeps_its_shape() {
+        let cube = MeshData::cube(1.0);
+        let aabb = |t: Mat4| {
+            let mut ph = Physics::new();
+            let (h, built) =
+                build_collider(&mut ph, &cube, None, t, ColliderKind::Box).expect("a collider");
+            assert_eq!(built, BuiltCollider::Box);
+            let a = ph.colliders[h].compute_aabb();
+            let shape = ph.colliders[h].shape().shape_type();
+            (from_rapier(a.mins), from_rapier(a.maxs), shape)
+        };
+        // The zone's mud: thin and wide.
+        let slab = Mat4::from_scale_rotation_translation(
+            Vec3::new(80.0, 0.02, 33.0),
+            glam::Quat::IDENTITY,
+            Vec3::new(0.0, -8.99, -23.5),
+        );
+        let (lo, hi, _) = aabb(slab);
+        assert!(
+            (lo.y + 9.0).abs() < 1e-4 && (hi.y + 8.98).abs() < 1e-4,
+            "y {}..{}",
+            lo.y,
+            hi.y
+        );
+        // Turned and stretched: its bounds are those of the moved corners.
+        let turned = Mat4::from_scale_rotation_translation(
+            Vec3::new(4.0, 0.5, 2.0),
+            glam::Quat::from_rotation_y(0.5),
+            Vec3::new(1.0, 2.0, 3.0),
+        );
+        let corners = (0..8).map(|i| {
+            let c = |bit: i32| if i & bit == 0 { -0.5 } else { 0.5 };
+            turned.transform_point3(Vec3::new(c(1), c(2), c(4)))
+        });
+        let (want_lo, want_hi) =
+            corners.fold((Vec3::MAX, Vec3::MIN), |(l, h), p| (l.min(p), h.max(p)));
+        let (lo, hi, shape) = aabb(turned);
+        assert!(
+            lo.abs_diff_eq(want_lo, 1e-4) && hi.abs_diff_eq(want_hi, 1e-4),
+            "{lo}..{hi}"
+        );
+        assert_eq!(shape, rapier3d::parry::shape::ShapeType::Cuboid);
+        // Sheared (a stretch across a turn), a cuboid can't follow: the hull.
+        let sheared = Mat4::from_scale(Vec3::new(3.0, 1.0, 1.0)) * Mat4::from_rotation_y(0.5);
+        let (_, _, shape) = aabb(sheared);
+        assert_eq!(shape, rapier3d::parry::shape::ShapeType::ConvexPolyhedron);
+    }
+
     #[test]
     fn collider_param_selects_the_proxy() {
-        use rapier3d::parry::shape::ShapeType::{ConvexPolyhedron, TriMesh};
+        use rapier3d::parry::shape::ShapeType::{ConvexPolyhedron, Cuboid, TriMesh};
         let cube = MeshData::cube(1.0); // 12 triangles
         let dense = MeshData::uv_sphere(64, 64, 1.0); // well past TRIMESH_MAX_TRIS
         assert!(dense.indices.len() / 3 > TRIMESH_MAX_TRIS);
@@ -823,7 +884,7 @@ mod tests {
             (
                 &dense,
                 serde_json::json!({ "collider": "box" }),
-                Some(ConvexPolyhedron),
+                Some(Cuboid),
             ),
             (&dense, serde_json::json!({ "collider": "none" }), None),
             // `collide: false` still wins, so older scenes keep their meaning.

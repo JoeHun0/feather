@@ -2201,8 +2201,8 @@ hard-wired like Esc/Enter; rebindable mouse buttons are the follow-up.
   must sample at sim rate (drives collision).
 - **Collision proxies, never detailed render meshes.** **Landed (§26):** each
   scene primitive collides by the `collider` prefab param: `mesh` (exact
-  trimesh), `hull` (convex hull), `box` (oriented bounds, as a hull of their
-  eight corners) or `none`. The default `auto` keeps the exact mesh within
+  trimesh), `hull` (convex hull), `box` (a cuboid round the oriented bounds)
+  or `none`. The default `auto` keeps the exact mesh within
   `TRIMESH_MAX_TRIS` = 2048 triangles and uses a hull above it. The measurement
   behind it: standing on a 34k-triangle Poly Haven lantern's trimesh cost
   **27 ms per physics tick in debug** (213 ms stepping off its rim; 2.5 / 27 ms
@@ -2213,6 +2213,25 @@ hard-wired like Esc/Enter; rebindable mouse buttons are the follow-up.
   geometry still gets a zero-thickness hull that collides fine (tested); only
   points with no hull at all fall back to the exact mesh. `collide: false`
   still wins, so older scenes keep their meaning.
+
+  **Correction (§26): `box` is a real cuboid.**
+  - **Before:** it was the convex hull of the bounds' eight corners, and
+    quickhull takes a thin, wide box for flat.
+  - **Effect on the zone:** its 2 cm mud and paving slabs (80 × 0.02 ×
+    33 m, 24 × 0.02 × 22 m) came out zero-thick, on their *bottom* faces.
+    - The player walked 2 cm below the visible ground, which nobody
+      noticed.
+    - Its first dynamic barrels dropped exactly 2 cm and slid, which is
+      how it was found.
+    - An 8 × 0.02 × 3.3 m slab was still right.
+  - **Now:** `add_static_obb` builds a rapier cuboid. The node's rotation
+    turns it and its scale stretches the half-extents. The corner hull is
+    left only for a sheared matrix (a stretch across a turn), which a
+    cuboid can't follow.
+  - **Test** (`a_box_collider_keeps_its_shape`): the zone's mud slab keeps
+    its 2 cm; a turned, stretched box has its moved corners' bounds; a
+    sheared one is a hull. Controls: the hull path, no shear check, no
+    rotation.
 
   **Landed (§26): colliders from the baked LODs.** Between those two, `auto`
   now tries the mesh bake (§17) first. An over-budget mesh uses the *finest*
@@ -3690,6 +3709,11 @@ the ratios and the reasoning should carry over, the absolute numbers will not.
   teleport, command history, a 64-line log. Parsing and state are unit
   tested without a GPU; the UiPass font gained `.` and `-` glyphs. 6
   mutation controls.
+- **`box` colliders are cuboids (§15):** they were the hull of their
+  bounds' corners, which quickhull flattened onto one face for a thin,
+  wide box. The zone's 2 cm ground slabs were zero-thick at their bottoms,
+  2 cm under the visible ground. Now they're rapier cuboids, and the hull is
+  kept only for sheared matrices. 1 test with 3 mutation controls.
 - **Dynamic bodies (§15):** the `dynamic` prefab spawns a prop as a rapier
   dynamic body: a convex hull with the node's scale baked in, and mass from
   `mass` or `density`. rapier now steps with `BODY_GRAVITY`, which only

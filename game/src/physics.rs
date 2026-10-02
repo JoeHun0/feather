@@ -3,7 +3,7 @@
 use crate::components::FIXED_DT;
 use crate::Surface;
 use bevy_ecs::prelude::*;
-use glam::{Quat, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use rapier3d::prelude::{
     BroadPhaseBvh, CCDSolver, Collider, ColliderBuilder, ColliderHandle, ColliderSet,
     ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet, NarrowPhase,
@@ -131,6 +131,33 @@ impl Physics {
         let h = size * 0.5;
         self.colliders
             .insert(ColliderBuilder::cuboid(h.x, h.y, h.z).translation(to_rapier(center)))
+    }
+
+    /// A fixed cuboid round the local box `lo..hi` placed by `transform`:
+    /// its rotation turns the cuboid and its scale stretches it. `None` when
+    /// the matrix is sheared (non-uniform scale under a rotation), which a
+    /// cuboid can't follow.
+    pub fn add_static_obb(
+        &mut self,
+        transform: Mat4,
+        lo: Vec3,
+        hi: Vec3,
+    ) -> Option<ColliderHandle> {
+        let (scale, rot, _) = transform.to_scale_rotation_translation();
+        let rebuilt =
+            Mat4::from_scale_rotation_translation(scale, rot, transform.w_axis.truncate());
+        let tolerance = 1e-5 * scale.abs().max_element().max(1.0);
+        if !rebuilt.abs_diff_eq(transform, tolerance) {
+            return None;
+        }
+        let h = (hi - lo) * 0.5 * scale.abs();
+        let center = transform.transform_point3((lo + hi) * 0.5);
+        Some(
+            self.colliders.insert(
+                ColliderBuilder::cuboid(h.x, h.y, h.z)
+                    .position(Pose::from_parts(to_rapier(center), quat_to_rapier(rot))),
+            ),
+        )
     }
 
     /// A dynamic body (§15) at `pos`/`rot`, colliding as the convex hull of
